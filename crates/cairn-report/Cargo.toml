@@ -1,0 +1,15 @@
+[package]
+name = "cairn-report"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cairn-core = { path = "../cairn-core" }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+csv.workspace = true
+thiserror.workspace = true
+# zip/flate2/rsa added at S3 for archive + encryption (FR15).

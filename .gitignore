@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target
+**/*.rs.bk
+
+# Cargo.lock IS committed for this workspace (reproducible builds, NFR7).
+# Do NOT add Cargo.lock here.
+
+# Tool output — never commit triage results
+/out
+/test-data
+
+# Forensic fixtures & sample evidence — kept out of git (size + sensitivity).
+# EVTX-ATTACK-SAMPLES is fetched by a script into tests/ (stage1-plan T8), not committed.
+*.evtx
+*.zip
+*.hve
+*.dat
+/tests/samples/
+/tests/EVTX-ATTACK-SAMPLES/
+
+# Decoded plain rules (the encoded form is the bundled one; ADR-0002)
+/rules/plain/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp

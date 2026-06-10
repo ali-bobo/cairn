@@ -1,0 +1,41 @@
+# Cairn workspace. Stage 1 crates only are wired; later-stage crates added per docs/stage1-plan.md.
+[workspace]
+resolver = "2"
+members = [
+    "crates/cairn-core",
+    "crates/cairn-sigma",
+    "crates/cairn-report",
+    "crates/cairn-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["<set me>"]
+repository = "<set me>"
+
+# Shared dep versions. Pin exact versions during S1 once `cargo check` passes.
+# NOTE: versions below are plausible-at-2025 starting points, NOT verified to compile here.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1"
+sha2 = "0.10"
+csv = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# external forensic/sigma crates wired in S1 build steps, not here yet:
+# evtx = "0.8"            # T4
+# sigma engine           # T6 (see docs/sigma-engine-benchmark-plan.md)
+
+[profile.release]
+# legitimacy: NO strip, NO panic=abort tricks for "small/low-entropy" binary.
+# A normal, debuggable, signed release is the goal. See docs/threat-model.md.
+opt-level = 3
+lto = "thin"
