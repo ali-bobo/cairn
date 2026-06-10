@@ -123,3 +123,78 @@ impl Finding {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A Sigma finding survives a JSON round-trip unchanged, and serializes with the
+    /// `cairn.finding/1` schema tag (golden rule 5 / SRS §5.1).
+    #[test]
+    fn finding_round_trips_with_schema_and_author() {
+        let mut f = Finding::new(
+            Severity::High,
+            "Suspicious PowerShell",
+            FindingSource::Sigma,
+        );
+        f.rule_id = Some("abc-123".into());
+        f.rule_author = Some("Florian Roth".into());
+        f.mitre = vec!["T1059.001".into()];
+        f.host = "WS01".into();
+        f.artifact = "evtx:Security".into();
+        f.entity.process = Some(EntityProcess {
+            pid: 4242,
+            ppid: 1000,
+            image: r"C:\Windows\System32\cmd.exe".into(),
+            cmdline: "cmd /c whoami".into(),
+            signed: Some(true),
+            integrity: Some("Medium".into()),
+        });
+        f.details = "encoded command observed".into();
+
+        let json = serde_json::to_string(&f).unwrap();
+        let back: Finding = serde_json::from_str(&json).unwrap();
+
+        // No PartialEq on Finding (chrono/uuid fields); compare canonical JSON instead.
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        assert_eq!(f.schema, crate::schema::FINDING);
+        assert_eq!(back.schema, "cairn.finding/1");
+        // DRL 1.1 attribution must round-trip.
+        assert_eq!(back.rule_author.as_deref(), Some("Florian Roth"));
+    }
+
+    /// Severity and FindingSource serialize as lowercase strings (SRS §5.1 enum values).
+    #[test]
+    fn severity_and_source_serialize_lowercase() {
+        assert_eq!(
+            serde_json::to_string(&Severity::Critical).unwrap(),
+            "\"critical\""
+        );
+        assert_eq!(serde_json::to_string(&Severity::Info).unwrap(), "\"info\"");
+        assert_eq!(
+            serde_json::to_string(&FindingSource::Sigma).unwrap(),
+            "\"sigma\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FindingSource::Heuristic).unwrap(),
+            "\"heuristic\""
+        );
+    }
+
+    /// Optional fields with `skip_serializing_if` are omitted when None (compact output),
+    /// and a heuristic finding carries its explainability `reason` (golden rule 6).
+    #[test]
+    fn optional_fields_omitted_when_none_and_reason_round_trips() {
+        let mut f = Finding::new(Severity::Low, "rare egress", FindingSource::Heuristic);
+        f.reason = Some("connection to raw public IP with no DNS, unsigned parent".into());
+
+        let json = serde_json::to_string(&f).unwrap();
+        // rule_id/rule_author/user/details_client are None -> absent from output.
+        assert!(!json.contains("rule_id"));
+        assert!(!json.contains("rule_author"));
+        assert!(!json.contains("details_client"));
+        // reason is Some -> present and round-trips.
+        let back: Finding = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.reason.as_deref(), f.reason.as_deref());
+    }
+}

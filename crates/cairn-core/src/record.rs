@@ -115,3 +115,67 @@ pub struct ExecutionRecord {
     /// shimcache presence != execution; this flags engine-provided exec evidence.
     pub execution_confirmed: Option<bool>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use serde_json::json;
+
+    fn sample_event() -> EventRecord {
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "NewProcessName".into(),
+            json!(r"C:\Windows\System32\cmd.exe"),
+        );
+        data.insert("ProcessId".into(), json!("0x1a2b"));
+        EventRecord {
+            ts: Utc.with_ymd_and_hms(2026, 6, 10, 12, 0, 0).unwrap(),
+            channel: "Security".into(),
+            event_id: 4688,
+            provider: "Microsoft-Windows-Security-Auditing".into(),
+            computer: "WS01".into(),
+            record_id: 987654,
+            data,
+        }
+    }
+
+    /// A Record round-trips losslessly and is tagged by `kind` (internal bus type).
+    #[test]
+    fn event_record_round_trips_with_kind_tag() {
+        let rec = Record::Event(sample_event());
+        let json = serde_json::to_string(&rec).unwrap();
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        // Adjacent/internal tagging via #[serde(tag = "kind", rename_all = "snake_case")].
+        assert!(json.contains("\"kind\":\"event\""));
+    }
+
+    /// Contract (SRS §5 / A2): Record is an INTERNAL bus type and carries NO inline
+    /// `schema` field — unlike Finding and Manifest. This guards the decision.
+    #[test]
+    fn record_has_no_inline_schema_field() {
+        let json = serde_json::to_string(&Record::Event(sample_event())).unwrap();
+        assert!(
+            !json.contains("\"schema\""),
+            "Record must not carry an inline schema field: {json}"
+        );
+    }
+
+    /// Each variant keeps its own snake_case kind tag.
+    #[test]
+    fn execution_record_kind_tag_is_snake_case() {
+        let rec = Record::Execution(ExecutionRecord {
+            source: "amcache".into(),
+            path: r"C:\tmp\evil.exe".into(),
+            first_run: None,
+            last_run: None,
+            run_count: None,
+            sha1: None,
+            user_sid: None,
+            execution_confirmed: Some(false),
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"kind\":\"execution\""));
+    }
+}
