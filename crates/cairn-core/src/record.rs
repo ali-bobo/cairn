@@ -29,8 +29,8 @@ pub enum Record {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventRecord {
     pub ts: DateTime<Utc>,
-    pub channel: String,       // e.g. "Security"
-    pub event_id: u32,         // e.g. 4688
+    pub channel: String, // e.g. "Security"
+    pub event_id: u32,   // e.g. 4688
     pub provider: String,
     pub computer: String,
     pub record_id: u64,
@@ -52,7 +52,7 @@ pub struct ProcessRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetConnRecord {
-    pub proto: String,         // tcp|udp
+    pub proto: String, // tcp|udp
     pub laddr: String,
     pub lport: u16,
     pub raddr: Option<String>,
@@ -63,8 +63,8 @@ pub struct NetConnRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistenceRecord {
-    pub mechanism: String,     // run_key|service|scheduled_task|wmi_subscription|ifeo|startup|winlogon
-    pub location: String,      // registry key / file path / wmi binding
+    pub mechanism: String, // run_key|service|scheduled_task|wmi_subscription|ifeo|startup|winlogon
+    pub location: String,  // registry key / file path / wmi binding
     pub value: Option<String>,
     pub command: Option<String>,
     pub binary_path: Option<String>,
@@ -89,7 +89,7 @@ pub struct FileMetaRecord {
 pub struct UsnEventRecord {
     pub ts: DateTime<Utc>,
     pub path: String,
-    pub reason: String,        // create|delete|rename|...
+    pub reason: String, // create|delete|rename|...
     pub mft_ref: u64,
 }
 
@@ -105,7 +105,7 @@ pub struct RegValueRecord {
 /// Evidence-of-execution from Amcache/Shimcache/Prefetch/UserAssist/BAM/SRUM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRecord {
-    pub source: String,        // amcache|shimcache|prefetch|userassist|bam|srum
+    pub source: String, // amcache|shimcache|prefetch|userassist|bam|srum
     pub path: String,
     pub first_run: Option<DateTime<Utc>>,
     pub last_run: Option<DateTime<Utc>>,

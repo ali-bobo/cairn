@@ -81,6 +81,18 @@ Authenticode-sign + timestamp releases; ship README intent statement (done);
 embed version/manifest resources; publish hashes; open-source; produce the SOC
 pre-allowlist runbook (docs/SOC-runbook-template.md); submit binary to MS WDSI.
 
+## Local dev environment notes
+- Build artifacts are kept OUT of the OneDrive-synced tree. Set `CARGO_TARGET_DIR`
+  to a local path (or recreate `.cargo/config.toml`, which is gitignored as it holds
+  a machine-specific absolute path). This avoids OneDrive syncing/locking `target/`.
+- On Windows with real-time AV (e.g. PC-cillin), cargo build-probe executables
+  (serde/anyhow/thiserror build scripts) can trip a scan and surface `os error 5` on
+  cleanup. Exclude the target dir from AV scanning; if a `cargo clean` rebuild ever
+  re-locks a probe, just re-run the build (probes are cached afterward).
+- Toolchain is pinned via `rust-toolchain.toml`; `Cargo.lock` is committed (NFR7).
+- `build.rs` stamps the git commit into `CAIRN_BUILD_SHA` (shown by `cairn --version`,
+  recorded as manifest `tool.build_sha`).
+
 ## Definition of done for a task
 Compiles (`cargo check`), passes its acceptance test, no clippy warnings, no
 golden-rule violation, manifest/Finding schemas unchanged unless the task says so.

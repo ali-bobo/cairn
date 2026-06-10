@@ -13,17 +13,17 @@
 
 #![forbid(unsafe_code)] // raw-volume/WinAPI unsafe lives only in collector crates, behind review.
 
-pub mod record;
+pub mod config;
 pub mod finding;
 pub mod manifest;
+pub mod record;
 pub mod traits;
-pub mod config;
 
+pub use config::{Config, OutputKind, Profile, Target};
 pub use finding::{Entity, Finding, FindingSource, Severity};
 pub use manifest::{Manifest, SourceEntry};
 pub use record::Record;
-pub use traits::{Analyzer, Collector, CollectCtx, OutputSink};
-pub use config::{Config, OutputKind, Profile, Target};
+pub use traits::{Analyzer, CollectCtx, Collector, OutputSink};
 
 use thiserror::Error;
 

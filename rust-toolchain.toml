@@ -1,0 +1,4 @@
+# Pin the toolchain for reproducible builds (NFR7). CI and local rustup both honor this.
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]

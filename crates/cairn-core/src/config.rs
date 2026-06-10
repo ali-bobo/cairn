@@ -12,7 +12,11 @@ pub enum Target {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Profile { Minimal, Standard, Verbose }
+pub enum Profile {
+    Minimal,
+    Standard,
+    Verbose,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OutputKind {

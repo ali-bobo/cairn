@@ -13,8 +13,13 @@ pub struct CollectCtx<'a> {
 impl<'a> CollectCtx<'a> {
     /// Helper for graceful-degrade (FR13): skip+record instead of hard-fail.
     pub fn require_admin(&self, what: &str) -> Result<()> {
-        if self.admin { Ok(()) } else {
-            Err(crate::CairnError::Privilege { what: what.into(), need: "Administrator".into() })
+        if self.admin {
+            Ok(())
+        } else {
+            Err(crate::CairnError::Privilege {
+                what: what.into(),
+                need: "Administrator".into(),
+            })
         }
     }
 }
@@ -27,7 +32,9 @@ pub trait Collector: Send + Sync {
     /// orchestrator can skip-and-log rather than abort the whole run.
     fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>>;
     /// Provenance for the manifest (path/method/sha256). Empty if N/A.
-    fn sources(&self) -> Vec<SourceEntry> { vec![] }
+    fn sources(&self) -> Vec<SourceEntry> {
+        vec![]
+    }
 }
 
 /// An Analyzer turns Records into Findings. MUST NOT touch the host.

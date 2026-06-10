@@ -16,26 +16,42 @@ pub struct Manifest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolInfo { pub name: String, pub version: String, pub build_sha: String, pub sigma_ruleset_ver: String }
+pub struct ToolInfo {
+    pub name: String,
+    pub version: String,
+    pub build_sha: String,
+    pub sigma_ruleset_ver: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunInfo {
     pub started_utc: DateTime<Utc>,
     pub finished_utc: Option<DateTime<Utc>>,
-    pub cmdline: String, pub operator: String, pub case_id: String,
+    pub cmdline: String,
+    pub operator: String,
+    pub case_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HostInfo { pub hostname: String, pub os_build: String, pub timezone: String, pub wall_clock_utc_skew: String }
+pub struct HostInfo {
+    pub hostname: String,
+    pub os_build: String,
+    pub timezone: String,
+    pub wall_clock_utc_skew: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Privileges { pub admin: bool, pub se_backup: bool, pub se_debug: bool }
+pub struct Privileges {
+    pub admin: bool,
+    pub se_backup: bool,
+    pub se_debug: bool,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceEntry {
     pub artifact: String,
     pub path: String,
-    pub method: String,   // api|raw_ntfs|vss
+    pub method: String, // api|raw_ntfs|vss
     pub size: u64,
     pub sha256: String,
     #[serde(default)]
@@ -43,7 +59,10 @@ pub struct SourceEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputEntry { pub file: String, pub sha256: String }
+pub struct OutputEntry {
+    pub file: String,
+    pub sha256: String,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Counts {

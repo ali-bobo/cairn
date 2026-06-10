@@ -21,6 +21,10 @@
 # Decoded plain rules (the encoded form is the bundled one; ADR-0002)
 /rules/plain/
 
+# Machine-specific cargo config (absolute target-dir outside OneDrive — per-machine).
+# Set CARGO_TARGET_DIR or recreate .cargo/config.toml locally; see CLAUDE.md dev notes.
+/.cargo/config.toml
+
 # OS / editor
 .DS_Store
 Thumbs.db
