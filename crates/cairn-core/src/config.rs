@@ -6,6 +6,8 @@ use std::path::PathBuf;
 pub enum Target {
     /// Analyze artifacts already on disk (EVTX dir/files, mounted image).
     Dir(PathBuf),
+    /// Analyze an explicit list of files (the `cairn evtx <files...>` entry, SRS §6).
+    Files(Vec<PathBuf>),
     /// Collect from the live running host.
     Live,
 }
@@ -55,5 +57,47 @@ impl Default for Config {
             since: None,
             use_vss: false,
         }
+    }
+}
+
+impl Config {
+    /// Build the Stage-1 `cairn evtx <files> --rules <dir>` run config: analyze an
+    /// explicit file list, output off-target by default, no live/admin collection.
+    pub fn for_evtx(files: Vec<PathBuf>, rules_dir: Option<PathBuf>) -> Self {
+        Config {
+            target: Target::Files(files),
+            rules_dir,
+            ..Config::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `cairn evtx <files> --rules <dir>` maps to a Config whose target is the file
+    /// list, rules_dir is set, and output stays off-target by default (golden rule 4).
+    #[test]
+    fn for_evtx_maps_files_rules_and_default_output() {
+        let files = vec![PathBuf::from("Security.evtx"), PathBuf::from("System.evtx")];
+        let cfg = Config::for_evtx(files.clone(), Some(PathBuf::from("./rules")));
+
+        match &cfg.target {
+            Target::Files(fs) => assert_eq!(fs, &files),
+            other => panic!("expected Target::Files, got {other:?}"),
+        }
+        assert_eq!(cfg.rules_dir, Some(PathBuf::from("./rules")));
+        // Stage-1 evtx run is file analysis, not live; no admin features.
+        assert!(!cfg.admin_features);
+        // Output defaults off-target (a dir), never DryRun unless asked.
+        assert!(matches!(cfg.output, OutputKind::Dir(_)));
+    }
+
+    /// Rules dir is optional; absent means "use bundled rules" (resolved later).
+    #[test]
+    fn for_evtx_allows_no_rules_dir() {
+        let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], None);
+        assert_eq!(cfg.rules_dir, None);
     }
 }
