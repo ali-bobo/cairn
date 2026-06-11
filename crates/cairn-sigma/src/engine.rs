@@ -5,19 +5,21 @@
 //! tags (from `tags`). The engine stays behind the `SigmaMatcher` trait so it can be
 //! swapped (e.g. for tau-engine) per ADR-0001's fallback.
 
-use crate::SigmaMatcher;
+use crate::{LogsourceMap, SigmaMatcher};
 use cairn_core::finding::{Finding, FindingSource, Severity};
 use cairn_core::record::EventRecord;
 use cairn_core::{CairnError, Result};
 use sigma_rust::Rule;
 use std::path::Path;
 
-/// SigmaMatcher backed by sigma-rust. Holds compiled rules and the set of channels
-/// they reference (load-optimization hook).
+/// SigmaMatcher backed by sigma-rust. Holds compiled rules, the set of channels they
+/// reference (load-optimization hook), and the de-abstraction map used to gate a rule
+/// to the EVTX channel/event_id its logsource actually denotes.
 #[derive(Default)]
 pub struct Engine {
     rules: Vec<Rule>,
     channels: Vec<String>,
+    logsource: LogsourceMap,
 }
 
 impl Engine {
@@ -42,7 +44,35 @@ impl Engine {
             .collect();
         channels.sort();
         channels.dedup();
-        Engine { rules, channels }
+        Engine {
+            rules,
+            channels,
+            logsource: LogsourceMap::windows_builtin(),
+        }
+    }
+
+    /// Logsource gate: does `ev` belong to the EVTX channel/event_id that `rule`'s
+    /// `logsource` denotes? Resolves the rule's (category, product, service) via the
+    /// de-abstraction map; the event passes if its (channel, event_id) is among the
+    /// resolved entries (an entry's `event_id == 0` means "any EID in that channel").
+    ///
+    /// **Fail-open:** a logsource that resolves to nothing (unknown category, or a rule
+    /// with no logsource) passes — the gate only constrains rules it can map, so it
+    /// never silently drops a detection it doesn't understand. This trades a little
+    /// over-firing on unmapped rules for zero false-negatives, the right bias for triage.
+    fn event_passes_logsource(&self, rule: &Rule, ev: &EventRecord) -> bool {
+        let ls = &rule.logsource;
+        let entries = self.logsource.resolve(
+            ls.category.as_deref(),
+            ls.product.as_deref(),
+            ls.service.as_deref(),
+        );
+        if entries.is_empty() {
+            return true; // fail-open: unmapped logsource
+        }
+        entries
+            .iter()
+            .any(|e| e.channel == ev.channel && (e.event_id == 0 || e.event_id == ev.event_id))
     }
 
     /// Convert one normalized EventRecord into a sigma-rust Event by serializing its
@@ -110,7 +140,9 @@ impl SigmaMatcher for Engine {
         let findings = self
             .rules
             .iter()
-            .filter(|rule| rule.is_match(&sigma_ev))
+            // Gate first (cheap channel/EID check) so a rule only matches events of the
+            // type its logsource denotes; then run the full content match.
+            .filter(|rule| self.event_passes_logsource(rule, ev) && rule.is_match(&sigma_ev))
             .map(|rule| Self::finding_from(rule, ev))
             .collect();
         Ok(findings)
@@ -195,6 +227,71 @@ detection:
     fn referenced_channels_is_available() {
         let engine = Engine::from_rules(&[RULE]).unwrap();
         let _ = engine.referenced_channels();
+    }
+
+    /// Logsource gate (T8 follow-up): a `process_creation` rule must fire on a
+    /// process-creation event (Sysmon EID 1) but NOT on a same-channel image_load event
+    /// (Sysmon EID 7) that happens to carry a matching `Image` field. Before this gate,
+    /// the engine matched on field content alone and over-fired on EID 7.
+    #[test]
+    fn logsource_gate_blocks_wrong_event_id_in_same_channel() {
+        let engine = Engine::from_rules(&[RULE]).unwrap();
+        let sysmon = |eid: u32| {
+            let mut data = serde_json::Map::new();
+            data.insert(
+                "Image".into(),
+                serde_json::json!(r"C:\Windows\System32\cmd.exe"),
+            );
+            EventRecord {
+                ts: Utc::now(),
+                channel: "Microsoft-Windows-Sysmon/Operational".into(),
+                event_id: eid,
+                provider: "Microsoft-Windows-Sysmon".into(),
+                computer: "WS01".into(),
+                record_id: 1,
+                data,
+            }
+        };
+        // EID 1 = process_creation -> rule fires.
+        assert_eq!(
+            engine.match_event(&sysmon(1)).unwrap().len(),
+            1,
+            "EID 1 should fire"
+        );
+        // EID 7 = image_load -> same Image, but wrong event type, gate blocks it.
+        assert!(
+            engine.match_event(&sysmon(7)).unwrap().is_empty(),
+            "EID 7 (image_load) must NOT fire a process_creation rule"
+        );
+    }
+
+    /// Fail-open: a rule whose logsource doesn't resolve to any concrete EVTX entry
+    /// (unknown category) still matches on field content — the gate only constrains
+    /// rules it can map, so unmapped detections are never silently dropped.
+    #[test]
+    fn logsource_gate_fails_open_for_unmapped_logsource() {
+        const ODD: &str = r#"
+title: Odd logsource
+id: odd-0001
+author: T
+level: low
+logsource:
+    category: definitely_not_a_known_category
+detection:
+    selection:
+        Image|endswith: '\cmd.exe'
+    condition: selection
+"#;
+        let engine = Engine::from_rules(&[ODD]).unwrap();
+        // event() builds a Security 4688 record carrying cmd.exe.
+        assert_eq!(
+            engine
+                .match_event(&event(r"C:\Windows\System32\cmd.exe"))
+                .unwrap()
+                .len(),
+            1,
+            "unmapped logsource must fail open (still match on content)"
+        );
     }
 
     /// `--rules-plain` parity (ADR-0002 / T8b): loading the SAME rule from a plain `.yml`

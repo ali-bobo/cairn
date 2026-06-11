@@ -47,21 +47,24 @@ Compare:
   the same corpus. Cairn is single-threaded over the file list today; `rayon` fan-out
   across files (collectors are independent) is the lever if it misses the bar.
 
-## Known parity delta (recorded 2026-06-11)
+## Resolved parity delta — logsource gate (fixed 2026-06-11)
 
-**Logsource gate not yet enforced in matching.** The engine matches purely on field
-content; `LogsourceMap`/`referenced_channels()` exist but are not applied as a pre-match
-filter. Observed on the `exec_msxsl` fixture: the `Msxsl.EXE Execution` rule
-(logsource `process_creation`) fires on BOTH the Sysmon EID-1 (process_creation) record
-and an EID-7 (image_load) record, because the EID-7 record also carries an `Image` field
-ending in `msxsl.exe`. Hayabusa would gate that rule to process-creation channels/EIDs
-and not fire on EID 7.
+**Was:** the engine matched purely on field content, so a `process_creation` rule could
+over-fire on a non-process-creation event carrying the same field. Observed on the
+`exec_msxsl` fixture: `Msxsl.EXE Execution` fired on BOTH the Sysmon EID-1
+(process_creation) record AND an EID-7 (image_load) record (both carry an `Image` ending
+in `msxsl.exe`).
 
-- **Impact:** over-firing (extra Cairn-only hits on the wrong event type), not a miss.
-- **Fix (follow-up, T5/T6 enhancement):** before matching a rule against an event, resolve
-  the rule's `logsource` via `LogsourceMap` and skip events whose channel/event_id aren't
-  in the resolved set. The de-abstraction map is already built; only the match-time gate
-  is missing. Tracked for a post-T8 hardening pass.
+**Fix:** `Engine::event_passes_logsource` now resolves each rule's `logsource` via
+`LogsourceMap::windows_builtin()` and gates matching to the EVTX channel/event_id the
+logsource denotes (an entry `event_id == 0` means "any EID in that channel"). The gate is
+**fail-open**: a logsource that resolves to nothing (unknown category / no logsource)
+still matches on content, so unmapped detections are never silently dropped — the right
+bias for triage (no false-negatives; a little over-firing only on rules the map can't
+place). Verified end-to-end: the EID-7 msxsl over-fire is gone; the fixture run now emits
+exactly the two correct process-creation hits. Tests:
+`engine::tests::logsource_gate_*`.
 
-This delta is deliberately left to keep T8d (manifest `sigma_ruleset_ver`) focused; it is
-documented here so the corpus run interprets the Cairn-only hits correctly.
+This is intentionally a content gate, not a full Hayabusa logsource resolver — it covers
+the common Windows logsources seeded in `LogsourceMap`. Rules outside that seed set fall
+through fail-open; extend the map to gate them too.
