@@ -7,6 +7,7 @@
 //!
 //! The concrete matcher is hidden behind `SigmaMatcher` so the chosen engine
 //! (sigma-engine | sigmars | tau-engine) is swappable. See benchmark plan.
+#![forbid(unsafe_code)] // pure rule logic; no raw-volume/WinAPI here (CLAUDE.md convention).
 
 use cairn_core::{finding::Finding, record::EventRecord, Result};
 

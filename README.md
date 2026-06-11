@@ -40,6 +40,24 @@ files). Cairn degrades gracefully without them and records what it skipped.
 cargo build --release --workspace
 ```
 
+## Usage (Stage 1)
+Triage one or more EVTX files against the bundled, pinned Sigma rules, then verify
+the run's integrity:
+```
+# Parse EVTX + run Sigma -> ./out/{timeline.csv, findings.jsonl, manifest.json, run.log}
+cairn evtx Security.evtx Sysmon.evtx --rules rules/sigma
+
+# Re-hash the outputs and re-check the ruleset against the manifest (ADR-0003).
+# Exits non-zero if any output byte or any rule was tampered with.
+cairn verify out/manifest.json --rules rules/sigma
+```
+The bundled rules are XOR-encoded on disk only to avoid AV false-positives on the
+`.yml` detection strings (NOT a security control; the key is public). To audit or run
+un-encoded rules, regenerate the plain copies with `rules/fetch-and-encode.sh` and pass
+`--rules-plain` (with `--rules rules/plain`). Every Sigma finding carries its rule's
+author (DRL 1.1); output defaults off-target and the tool logs its own actions to
+`run.log`.
+
 ## License
 Code: Apache-2.0. Bundled Sigma rules: Detection Rule License (DRL) 1.1 —
 rule authors are credited in detection output as the license requires.

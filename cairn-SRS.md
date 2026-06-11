@@ -280,11 +280,17 @@ cairn/
 - Legitimacy work (sign/README/WDSI/runbook) completed BEFORE first real client use, regardless of stage.
 
 ## 17. Open decisions (log)
-- D1 Sigma engine choice — pending parity benchmark.
-- D2 ESE/SRUM crate maturity — may slip to S3/cut.
-- D3 raw-NTFS vs VSS default — default raw, VSS flag.
-- D4 rule-encoding on disk (XOR) vs plain — lean encode to avoid AV FP on .yml.
-- D5 codename/binary name — placeholder `cairn`.
+- D1 Sigma engine choice — **RESOLVED (ADR-0001, Accepted): `sigma-rust` 0.7.** Native
+  Sigma 2.0, exposes author/id/level/tags (DRL 1.1 reachable). tau-engine kept as the
+  behind-the-trait fallback. Parity covered by the T8 harness (docs/perf-harness.md).
+- D2 ESE/SRUM crate maturity — may slip to S3/cut. (still open; S3 concern)
+- D3 raw-NTFS vs VSS default — default raw, VSS flag. (S2+ concern; no S1 code yet)
+- D4 rule-encoding on disk (XOR) vs plain — **RESOLVED (ADR-0002, Accepted): encode.**
+  Public XOR key (codec.rs), decoded-as-data-never-executed, `--rules-plain` SOC bypass.
+  Ruleset integrity is separately proven by the ADR-0003 aggregate hash, recorded in the
+  manifest as `tool.sigma_ruleset_ver` and re-checked by `cairn verify` (T9).
+- D5 codename/binary name — `cairn` confirmed for S1 (was placeholder; now the shipped
+  binary name).
 
 ## 18. Risks
 - Crowded space (Hayabusa/Chainsaw/Velociraptor already strong) → value is integration+workflow fit, not raw engine novelty.

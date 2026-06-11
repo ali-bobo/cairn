@@ -3,6 +3,7 @@
 //! Authorized DFIR use only. The tool logs its own actions (run.log) and is
 //! designed to be SEEN and recognized as benign by EDR — never to evade it.
 //! See README.md and docs/threat-model.md.
+#![forbid(unsafe_code)] // CLI orchestration only; no raw-volume/WinAPI in S1.
 
 use cairn_core::finding::Finding;
 use cairn_core::manifest::{Counts, HostInfo, Manifest, Privileges, RunInfo, ToolInfo};

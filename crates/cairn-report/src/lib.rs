@@ -1,4 +1,5 @@
 //! cairn-report: timeline + summary + manifest + output sinks. SRS §5.2, §6, §12.
+#![forbid(unsafe_code)] // pure formatting + hashing + file I/O; no raw-volume/WinAPI.
 use cairn_core::{
     finding::Finding,
     manifest::{Manifest, OutputEntry},
