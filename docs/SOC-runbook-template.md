@@ -7,9 +7,15 @@ the engagement, not an evasion measure. Fill the bracketed fields per engagement
 ## 1. Artifacts to provide the client SOC
 - Binary name: `cairn.exe`, version `[x.y.z]`, build `[build_sha]`.
 - SHA-256 of the exact binary: `[hash]` (publish; must match what you run).
-- Authenticode signer: `[publisher / cert thumbprint]`, timestamped.
+- Authenticode signer: `[publisher / cert thumbprint]`, timestamped — **note: releases
+  are UNSIGNED until a signing service is provisioned; until then allow-list by hash,
+  not certificate** (see `docs/verifying-a-release.md`).
 - Link to source + release notes: `[repo URL]`.
 - Statement of intent and scope: `docs/threat-model.md` + this runbook.
+
+> How to obtain the hash / version / (eventual) signer for the boxes above:
+> see **`docs/verifying-a-release.md`**. The build commit is also embedded in the
+> binary (`cairn --version`) and in every run's `manifest.tool.build_sha`.
 
 ## 2. Allow-list mechanisms (client applies, per their EDR)
 - Microsoft Defender for Endpoint: add allow indicator by **file hash** AND by

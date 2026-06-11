@@ -1,0 +1,76 @@
+name: release
+
+# Build a signed, hash-published Windows release on a version tag (legitimacy, SRS §13).
+# The signing step is GATED on a signing service being configured (see "Signing" below)
+# so this workflow is valid and runnable today, producing an UNSIGNED build + its
+# SHA-256; wiring a cert later turns on signing with no other change.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write # create the GitHub Release + upload assets
+
+jobs:
+  windows-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build release (normal profile — no strip/abort; golden rule 2)
+        run: cargo build --release --locked --bin cairn
+
+      # ---- Signing (placeholder until a cert is provisioned) -------------------------
+      # Code-signing certs (OV/EV) now REQUIRE the private key in an HSM or a cloud
+      # signing service — you can't sign from a bare file in CI. Pick ONE when ready:
+      #
+      #   * SignPath.io  — FREE for public OSS projects; add the SignPath GitHub app and
+      #     replace this block with its action. (Needs the repo to be public OSS.)
+      #   * Azure Trusted Signing — Microsoft's service (~US$10/mo individual after
+      #     identity verification); use azure/trusted-signing-action.
+      #   * SSL.com eSigner / Certum — cloud signing with their actions.
+      #
+      # Until then this step detects no signing secret and ships an UNSIGNED build,
+      # clearly labelled. It NEVER embeds a cert/key in the workflow (global secret
+      # policy) — wire it via repo secrets / an OIDC-based signing action.
+      - name: Sign (skipped — no signing service configured yet)
+        shell: pwsh
+        run: |
+          if ($env:SIGNING_CONFIGURED -eq "1") {
+            Write-Error "SIGNING_CONFIGURED set but no signing step wired; add your signing action here."
+            exit 1
+          } else {
+            Write-Host "::warning::No signing service configured — shipping an UNSIGNED build. See release.yml 'Signing' notes."
+          }
+
+      - name: Compute SHA-256 (publish this; SOC runbook §1)
+        shell: pwsh
+        run: |
+          $exe = "target/release/cairn.exe"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  cairn.exe" | Out-File -Encoding ascii cairn.exe.sha256
+          Write-Host "SHA-256: $hash"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cairn-windows
+          path: |
+            target/release/cairn.exe
+            cairn.exe.sha256
+
+      - name: Attach to GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/release/cairn.exe
+            cairn.exe.sha256
+          body: |
+            Cairn release. Verify before running (see docs/verifying-a-release.md):
+            - SHA-256 is published in `cairn.exe.sha256` and shown in the build log.
+            - `cairn --version` prints the version + build commit embedded in the binary.
+            - Signature: **UNSIGNED** until a code-signing service is provisioned
+              (see `.github/workflows/release.yml`). Do not allow-list an unsigned build
+              by certificate; use the published hash in the interim.
