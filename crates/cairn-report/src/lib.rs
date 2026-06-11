@@ -181,6 +181,101 @@ impl OutputSink for DirSink {
 }
 // TODO(claude-code) S3: ZipSink + EncryptedZipSink (asymmetric, public key only); DryRunSink.
 
+/// One file's integrity status during `verify` (SRS §12 / stage1-plan T9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckStatus {
+    /// File present and its SHA-256 matches the manifest.
+    Ok,
+    /// File present but its hash differs from the manifest (tampered).
+    Mismatch { expected: String, actual: String },
+    /// File listed in the manifest is absent on disk.
+    Missing,
+}
+
+/// One verified entry: which file, and whether it matched.
+#[derive(Debug, Clone)]
+pub struct CheckResult {
+    pub file: String,
+    pub status: CheckStatus,
+}
+
+/// Result of re-hashing a manifest's outputs and sources against the files on disk.
+/// `ok()` is true only if every checked file is present and matches.
+#[derive(Debug, Default)]
+pub struct VerifyReport {
+    pub outputs: Vec<CheckResult>,
+    pub sources: Vec<CheckResult>,
+}
+
+impl VerifyReport {
+    /// All checked entries are `Ok` (no mismatch, no missing).
+    pub fn ok(&self) -> bool {
+        self.outputs
+            .iter()
+            .chain(&self.sources)
+            .all(|c| c.status == CheckStatus::Ok)
+    }
+
+    /// Just the failing entries (mismatch or missing), for reporting.
+    pub fn failures(&self) -> Vec<&CheckResult> {
+        self.outputs
+            .iter()
+            .chain(&self.sources)
+            .filter(|c| c.status != CheckStatus::Ok)
+            .collect()
+    }
+}
+
+/// Read and parse a `manifest.json` from disk (verify entry point). Keeps serde_json in
+/// the report crate so the CLI doesn't need it directly.
+pub fn read_manifest(path: &std::path::Path) -> Result<Manifest> {
+    let text = std::fs::read_to_string(path)?;
+    Ok(serde_json::from_str(&text)?)
+}
+
+/// Re-hash every output (relative to `base_dir`) and every source (by its recorded
+/// absolute path) listed in `manifest`, comparing each to the recorded SHA-256
+/// (stage1-plan T9). Does NOT verify the manifest's own integrity (a manifest can't
+/// self-hash) nor the ruleset — the CLI composes the ADR-0003 ruleset check separately.
+///
+/// A read error on a listed file is reported as `Missing` rather than aborting the whole
+/// verify (graceful degrade, golden rule 8) — verify should report ALL problems at once.
+pub fn verify_manifest(manifest: &Manifest, base_dir: &std::path::Path) -> VerifyReport {
+    let check = |name: &str, path: std::path::PathBuf, expected: &str| -> CheckResult {
+        let status = match std::fs::read(&path) {
+            Ok(bytes) => {
+                let actual = sha256_hex(&bytes);
+                if actual == expected {
+                    CheckStatus::Ok
+                } else {
+                    CheckStatus::Mismatch {
+                        expected: expected.to_string(),
+                        actual,
+                    }
+                }
+            }
+            Err(_) => CheckStatus::Missing,
+        };
+        CheckResult {
+            file: name.to_string(),
+            status,
+        }
+    };
+
+    VerifyReport {
+        outputs: manifest
+            .outputs
+            .iter()
+            .map(|o| check(&o.file, base_dir.join(&o.file), &o.sha256))
+            .collect(),
+        sources: manifest
+            .sources
+            .iter()
+            .map(|s| check(&s.path, std::path::PathBuf::from(&s.path), &s.sha256))
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +432,72 @@ mod tests {
         sink.write_manifest(&minimal_manifest()).unwrap();
         let outputs = sink.finalize().unwrap();
         assert_eq!(outputs.len(), 3);
+    }
+
+    /// verify passes on a clean output set: every file the manifest lists is present and
+    /// its SHA-256 matches (stage1-plan T9 happy path).
+    #[test]
+    fn verify_passes_on_clean_outputs() {
+        let dir = std::env::temp_dir().join("cairn_verify_clean_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(dir.clone());
+        let findings = vec![finding(100, "f1", 1)];
+        sink.write_timeline_csv(&findings).unwrap();
+        sink.write_findings_jsonl(&findings).unwrap();
+
+        let mut manifest = minimal_manifest();
+        manifest.outputs = sink.outputs_so_far();
+
+        let report = verify_manifest(&manifest, &dir);
+        assert!(
+            report.ok(),
+            "clean outputs should verify: {:?}",
+            report.failures()
+        );
+        assert_eq!(report.outputs.len(), 2);
+    }
+
+    /// verify fails loudly when a single output byte is tampered after the manifest was
+    /// written (stage1-plan T9 acceptance: tampered byte must be caught).
+    #[test]
+    fn verify_fails_on_tampered_output_byte() {
+        let dir = std::env::temp_dir().join("cairn_verify_tamper_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(dir.clone());
+        let findings = vec![finding(100, "f1", 1)];
+        sink.write_timeline_csv(&findings).unwrap();
+        let mut manifest = minimal_manifest();
+        manifest.outputs = sink.outputs_so_far();
+
+        // Tamper: append a byte to timeline.csv after its hash was recorded.
+        let p = dir.join("timeline.csv");
+        let mut content = std::fs::read(&p).unwrap();
+        content.push(b'!');
+        std::fs::write(&p, &content).unwrap();
+
+        let report = verify_manifest(&manifest, &dir);
+        assert!(!report.ok(), "tampered output must fail verify");
+        assert!(matches!(
+            report.outputs[0].status,
+            CheckStatus::Mismatch { .. }
+        ));
+    }
+
+    /// verify reports a listed output that's gone as Missing (not a panic, not silently OK).
+    #[test]
+    fn verify_reports_missing_output() {
+        let dir = std::env::temp_dir().join("cairn_verify_missing_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut manifest = minimal_manifest();
+        manifest.outputs = vec![OutputEntry {
+            file: "nope.csv".into(),
+            sha256: "0".repeat(64),
+        }];
+
+        let report = verify_manifest(&manifest, &dir);
+        assert!(!report.ok());
+        assert_eq!(report.outputs[0].status, CheckStatus::Missing);
     }
 
     /// Output-path safety (threat-model #3): if an output name is a pre-planted symlink,

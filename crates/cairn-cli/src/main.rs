@@ -64,8 +64,18 @@ enum Cmd {
         #[arg(long)]
         pin: Option<String>,
     },
-    /// Re-hash an output archive and verify against its manifest.
-    Verify { manifest: PathBuf },
+    /// Re-hash a run's outputs (and optionally its ruleset) against the manifest.
+    Verify {
+        /// Path to manifest.json. Outputs are resolved relative to its directory.
+        manifest: PathBuf,
+        /// Rules dir to re-verify against manifest.tool.sigma_ruleset_ver (ADR-0003).
+        /// Omit to skip the ruleset check and verify only the output/source hashes.
+        #[arg(long)]
+        rules: Option<PathBuf>,
+        /// Treat the rules dir as un-encoded `.yml` (matches the run's --rules-plain).
+        #[arg(long)]
+        rules_plain: bool,
+    },
 }
 
 #[derive(Parser)]
@@ -188,6 +198,64 @@ fn build_manifest(cfg: &Config, hostname: &str, records: u64, findings: &[Findin
     }
 }
 
+/// `cairn verify <manifest> [--rules <dir>]` (stage1-plan T9): re-hash the outputs (and
+/// sources) the manifest lists, and — if a rules dir is given — recompute the ADR-0003
+/// ruleset aggregate and compare it to `tool.sigma_ruleset_ver`. Logs every check and
+/// returns `true` only if all pass. A tampered output byte OR a modified rule fails it.
+fn run_verify(
+    manifest_path: &std::path::Path,
+    rules: Option<PathBuf>,
+    rules_plain: bool,
+) -> anyhow::Result<bool> {
+    let manifest = cairn_report::read_manifest(manifest_path)?;
+    let base_dir = manifest_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+
+    let report = cairn_report::verify_manifest(&manifest, base_dir);
+    for c in report.outputs.iter().chain(report.sources.iter()) {
+        match &c.status {
+            cairn_report::CheckStatus::Ok => tracing::info!(file = %c.file, "verify ok"),
+            cairn_report::CheckStatus::Mismatch { expected, actual } => {
+                tracing::error!(file = %c.file, %expected, %actual, "HASH MISMATCH")
+            }
+            cairn_report::CheckStatus::Missing => {
+                tracing::error!(file = %c.file, "MISSING (listed in manifest, not on disk)")
+            }
+        }
+    }
+    let mut all_ok = report.ok();
+
+    // ADR-0003 ruleset integrity: recompute "<pin>+<aggregate>" over the given rules dir
+    // and compare to what the manifest recorded. Only when --rules is supplied; a manifest
+    // with no recorded ruleset version (parse-only run) has nothing to check.
+    match (rules, manifest.tool.sigma_ruleset_ver.as_str()) {
+        (Some(dir), recorded) if !recorded.is_empty() => {
+            let computed = cairn_sigma::ruleset::ruleset_version(&dir, rules_plain)?;
+            if computed == recorded {
+                tracing::info!("ruleset ok ({recorded})");
+            } else {
+                tracing::error!(%recorded, %computed, "RULESET MISMATCH (ADR-0003)");
+                all_ok = false;
+            }
+        }
+        (Some(_), "") => {
+            tracing::warn!("manifest has no sigma_ruleset_ver; skipping ruleset check")
+        }
+        (None, recorded) if !recorded.is_empty() => {
+            tracing::warn!("ruleset recorded but no --rules given; skipping ruleset check")
+        }
+        _ => {}
+    }
+
+    if all_ok {
+        tracing::info!("VERIFY OK");
+    } else {
+        tracing::error!(failures = report.failures().len(), "VERIFY FAILED");
+    }
+    Ok(all_ok)
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -295,7 +363,17 @@ fn main() -> anyhow::Result<()> {
                     tracing::info!("TODO S2+: orchestrate collectors + analyzers + report");
                 }
                 Cmd::UpdateRules { .. } => tracing::info!("TODO S4"),
-                Cmd::Verify { .. } => tracing::info!("TODO S3: re-hash archive vs manifest"),
+                Cmd::Verify {
+                    manifest,
+                    rules,
+                    rules_plain,
+                } => {
+                    // Non-zero exit on any integrity failure so scripts/CI can detect it.
+                    let ok = run_verify(&manifest, rules, rules_plain)?;
+                    if !ok {
+                        std::process::exit(1);
+                    }
+                }
                 Cmd::Evtx { .. } => unreachable!(),
             }
         }
@@ -360,5 +438,76 @@ mod tests {
         );
         assert_eq!(agg.len(), 64, "aggregate is a SHA-256 hex");
         assert!(agg.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    /// Build a tiny real run (timeline + findings + manifest) in a temp dir, the way the
+    /// evtx subcommand does, so verify has a genuine artifact set to check.
+    fn write_run(dir: &std::path::Path) {
+        use cairn_core::finding::{Finding, FindingSource, Severity};
+        let mut f = Finding::new(Severity::High, "t", FindingSource::Sigma);
+        f.rule_author = Some("A".into());
+        let findings = vec![f];
+        let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], None);
+        let mut manifest = build_manifest(&cfg, "WS01", 1, &findings);
+        let mut sink = DirSink::new(dir.to_path_buf());
+        sink.write_timeline_csv(&findings).unwrap();
+        sink.write_findings_jsonl(&findings).unwrap();
+        manifest.outputs = sink.outputs_so_far();
+        sink.write_manifest(&manifest).unwrap();
+        let _ = sink.finalize().unwrap();
+    }
+
+    /// verify passes on an untouched run (T9 happy path): all output hashes match.
+    #[test]
+    fn run_verify_passes_on_clean_run() {
+        let dir = std::env::temp_dir().join("cairn_run_verify_clean");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_run(&dir);
+        let ok = run_verify(&dir.join("manifest.json"), None, false).unwrap();
+        assert!(ok, "clean run must verify");
+    }
+
+    /// verify fails on a tampered output byte (T9 acceptance).
+    #[test]
+    fn run_verify_fails_on_tampered_output() {
+        let dir = std::env::temp_dir().join("cairn_run_verify_tamper");
+        let _ = std::fs::remove_dir_all(&dir);
+        write_run(&dir);
+        // Flip a byte in findings.jsonl after the manifest recorded its hash.
+        let p = dir.join("findings.jsonl");
+        let mut c = std::fs::read(&p).unwrap();
+        c.push(b' ');
+        std::fs::write(&p, &c).unwrap();
+        let ok = run_verify(&dir.join("manifest.json"), None, false).unwrap();
+        assert!(!ok, "tampered output must fail verify");
+    }
+
+    /// verify fails when the ruleset is modified vs the manifest's sigma_ruleset_ver
+    /// (ADR-0003 / T9 acceptance: a swapped/edited rule is caught).
+    #[test]
+    fn run_verify_fails_on_modified_ruleset() {
+        let dir = std::env::temp_dir().join("cairn_run_verify_rules");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A run whose manifest pins a ruleset_ver computed over an original rules dir.
+        let rules = dir.join("rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        std::fs::write(rules.join("r.yml"), b"title: original\n").unwrap();
+
+        use cairn_core::finding::{Finding, FindingSource, Severity};
+        let findings = vec![Finding::new(Severity::Low, "t", FindingSource::Sigma)];
+        let cfg = Config::for_evtx(vec![], Some(rules.clone())).with_rules_plain(true);
+        let mut manifest = build_manifest(&cfg, "WS01", 0, &findings);
+        let mut sink = DirSink::new(dir.clone());
+        sink.write_timeline_csv(&findings).unwrap();
+        sink.write_findings_jsonl(&findings).unwrap();
+        manifest.outputs = sink.outputs_so_far();
+        sink.write_manifest(&manifest).unwrap();
+        sink.finalize().unwrap();
+
+        // Now modify a rule and verify against the modified dir: ruleset check must fail.
+        std::fs::write(rules.join("r.yml"), b"title: TAMPERED\n").unwrap();
+        let ok = run_verify(&dir.join("manifest.json"), Some(rules), true).unwrap();
+        assert!(!ok, "modified ruleset must fail verify");
     }
 }
