@@ -1,7 +1,7 @@
 # ADR-0003: Sigma ruleset supply-chain integrity
 
-- **Status:** Proposed
-- **Date:** 2026-06-10 (UTC)
+- **Status:** Accepted (canonicalization implemented + verified, T8)
+- **Date:** 2026-06-10 (UTC); accepted 2026-06-11 (UTC)
 - **Deciders:** project owner
 - **SRS / spec link:** §6 (`update-rules --pin`), §9 (ruleset source), §5.3 (manifest
   `sigma_ruleset_ver`); threat-model.md (untrusted-input #2)
@@ -41,6 +41,29 @@ policy) and a tampering vector (threat-model untrusted-input #2).
 
 **To accept:** confirm the canonicalization is reproducible across machines and that the
 aggregate hash is stable under the XOR codec (compute pre-encode).
+
+### Accepted — implementation (T8a)
+
+`cairn_sigma::ruleset::aggregate_hash(dir, plain)` implements the canonicalization:
+per-file SHA-256 over the **decoded** YAML (`load_rule_bytes(path, plain)`), relative
+paths joined with `/` (OS-independent), sorted lexicographically, each emitted as
+`"<relpath>\n<file-hash-hex>\n"` into a final SHA-256. Unit tests pin the invariants:
+stable under the XOR codec (encoded `plain=false` and plain `--rules-plain` trees of the
+same rules hash identically), order-independent, tamper-evident, and an empty set hashes
+to the well-defined SHA-256 of empty input.
+
+### Bundled rule set — current pin (T8c)
+
+The Stage-1 bundle (`rules/sigma/`, XOR-encoded; plain copies regenerated into the
+gitignored `rules/plain/`) is pinned to:
+
+- **SigmaHQ/sigma @ `98781da19cf60c48ce6e7f2d3ad11c9ba389191a`**
+
+Rules are fetched + encoded reproducibly by `rules/fetch-and-encode.sh` (which re-verifies
+each rule carries `author:`, DRL 1.1 / golden rule 5). The subset maps to the
+EVTX-ATTACK-SAMPLES fixtures (hh/CHM `T1218.001`, msxsl `T1220`, mshta `T1218.005`); grow
+it by extending the script's `RULES` list and re-running. `manifest.tool.sigma_ruleset_ver`
+is `"<commit-sha>+<aggregate-sha256>"` (T8d).
 
 ## Consequences
 

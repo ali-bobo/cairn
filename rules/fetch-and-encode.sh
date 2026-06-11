@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Fetch the pinned SigmaHQ rule subset and XOR-encode it into rules/sigma/ (ADR-0002,
+# ADR-0003). Reproducible: rules are pinned to an immutable upstream commit, decoded
+# YAML is what gets hashed for sigma_ruleset_ver. The XOR key is PUBLIC and is NOT a
+# security control — it only keeps verbatim malicious strings out of on-disk `.yml` so
+# byte-pattern AV doesn't false-positive (see crates/cairn-sigma/src/codec.rs).
+#
+# Plain rules land in rules/plain/ (gitignored, for --rules-plain + audit); encoded
+# rules land in rules/sigma/ (committed, the bundled form). Run from anywhere.
+set -euo pipefail
+
+# --- ADR-0003 provenance: the upstream commit this rule set is pinned to. ---
+PIN="98781da19cf60c48ce6e7f2d3ad11c9ba389191a"  # SigmaHQ/sigma
+KEY="cairn-rules-v1-not-a-secret"               # public XOR key (codec.rs::KEY)
+
+here="$(cd "$(dirname "$0")" && pwd)"
+plain="$here/plain"
+enc="$here/sigma"
+mkdir -p "$plain" "$enc"
+
+# Bundled rule subset (relative to rules/windows/process_creation in SigmaHQ). Chosen
+# to map to the EVTX-ATTACK-SAMPLES fixtures (hh/CHM, msxsl, mshta). All are DRL 1.1
+# and carry a real `author` (golden rule 5). Extend this list to grow the bundle.
+RULES=(
+  "windows/process_creation/proc_creation_win_hh_chm_execution.yml"
+  "windows/process_creation/proc_creation_win_msxsl_execution.yml"
+  "windows/process_creation/proc_creation_win_mshta_susp_execution.yml"
+)
+base="https://raw.githubusercontent.com/SigmaHQ/sigma/$PIN/rules"
+
+# XOR a file against the repeating public key (same transform as codec::xor).
+xor_encode() {
+  local in="$1" out="$2"
+  KEY="$KEY" python3 - "$in" "$out" <<'PY'
+import os, sys
+key = os.environ["KEY"].encode()
+data = open(sys.argv[1], "rb").read()
+enc = bytes(b ^ key[i % len(key)] for i, b in enumerate(data))
+open(sys.argv[2], "wb").write(enc)
+PY
+}
+
+for rel in "${RULES[@]}"; do
+  name="$(basename "$rel")"
+  echo "fetch $name"
+  curl -fsSL -o "$plain/$name" "$base/$rel"
+  grep -q '^author:' "$plain/$name" || { echo "ERROR: $name has no author (DRL 1.1)"; exit 1; }
+  xor_encode "$plain/$name" "$enc/$name"
+done
+
+echo "pinned to SigmaHQ@$PIN"
+echo "plain  -> $plain (gitignored)"
+echo "encoded-> $enc (committed)"
