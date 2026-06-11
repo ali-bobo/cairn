@@ -66,6 +66,12 @@ fn timeline_row(f: &Finding) -> [String; 10] {
 /// Render the detection timeline as Hayabusa-compatible CSV (SRS §5.2): one row per
 /// rule hit, sorted by (ts, record_id) for reproducibility (NFR4), with identical
 /// detections de-duplicated (FR5 — the count is reflected in the Summary, not here).
+///
+/// Panic-free by contract: this is on a forensic tool's output path, so even the
+/// theoretically-impossible CSV-buffer errors must not abort a run. On any internal
+/// writer error we fall back to a hand-built CSV (the inputs are our own owned Strings,
+/// which the manual path quotes safely), so the worst case is a slightly less optimal
+/// quoting, never a panic.
 pub fn timeline_csv(findings: &[Finding]) -> String {
     let mut rows: Vec<[String; 10]> = findings.iter().map(timeline_row).collect();
     // Deterministic order: Timestamp then RecordID (cols 0 and 5).
@@ -73,12 +79,41 @@ pub fn timeline_csv(findings: &[Finding]) -> String {
     rows.dedup(); // identical adjacent detections collapse (rows are sorted)
 
     let mut wtr = csv::Writer::from_writer(Vec::new());
-    wtr.write_record(TIMELINE_COLS).expect("header");
-    for r in &rows {
-        wtr.write_record(r).expect("row");
+    let via_csv = wtr
+        .write_record(TIMELINE_COLS)
+        .and_then(|()| {
+            for r in &rows {
+                wtr.write_record(r)?;
+            }
+            Ok(())
+        })
+        .ok()
+        .and_then(|()| wtr.into_inner().ok())
+        .and_then(|bytes| String::from_utf8(bytes).ok());
+
+    via_csv.unwrap_or_else(|| manual_csv(&rows))
+}
+
+/// RFC-4180 fallback used only if the `csv` writer ever errs (it shouldn't for our
+/// owned-String inputs). Quotes a field when it contains `,`, `"`, CR or LF; doubles
+/// embedded quotes. Keeps `timeline_csv` total (never panics).
+fn manual_csv(rows: &[[String; 10]]) -> String {
+    fn field(s: &str) -> std::borrow::Cow<'_, str> {
+        if s.contains([',', '"', '\n', '\r']) {
+            std::borrow::Cow::Owned(format!("\"{}\"", s.replace('"', "\"\"")))
+        } else {
+            std::borrow::Cow::Borrowed(s)
+        }
     }
-    let bytes = wtr.into_inner().expect("csv buffer");
-    String::from_utf8(bytes).expect("csv is utf-8")
+    let mut out = String::new();
+    out.push_str(&TIMELINE_COLS.join(","));
+    out.push_str("\r\n");
+    for r in rows {
+        let line: Vec<std::borrow::Cow<'_, str>> = r.iter().map(|c| field(c)).collect();
+        out.push_str(&line.join(","));
+        out.push_str("\r\n");
+    }
+    out
 }
 
 /// Detection summary built from Findings (counts by severity, tops). Summary-first (FR4).
@@ -312,6 +347,27 @@ mod tests {
         assert!(row.contains("42"), "record id: {row}");
         assert!(row.contains("Author A"), "author: {row}");
         assert!(row.contains("attack.t1059"), "mitre: {row}");
+    }
+
+    /// The manual CSV fallback (used only if the csv writer ever errs) produces the
+    /// same header and quotes a field containing a comma (RFC 4180), so timeline_csv is
+    /// total — it never panics on the output path.
+    #[test]
+    fn manual_csv_fallback_quotes_and_matches_header() {
+        // A finding whose author contains a comma (real SigmaHQ authors do, e.g.
+        // "Name, oscd.community") — must be quoted in the fallback path.
+        let mut f = finding(100, "t", 1);
+        f.rule_author = Some("Alice, Bob".into());
+        let rows: Vec<[String; 10]> = std::iter::once(&f).map(timeline_row).collect();
+        let csv = manual_csv(&rows);
+
+        let mut lines = csv.lines();
+        assert_eq!(lines.next().unwrap(), TIMELINE_COLS.join(","));
+        let row = lines.next().unwrap();
+        assert!(
+            row.contains("\"Alice, Bob\""),
+            "comma field must be quoted: {row}"
+        );
     }
 
     /// Rows are sorted by (ts, record_id) for deterministic, reproducible output (NFR4).
