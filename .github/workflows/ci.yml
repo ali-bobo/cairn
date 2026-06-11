@@ -43,6 +43,25 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+  # Cairn is a Windows-targeted tool: build + test on Windows so the PE version-resource
+  # embed (build.rs/winresource) and the Windows-only output-path-safety test
+  # (DirSink symlink guard) are actually exercised — the ubuntu job can't run either.
+  windows:
+    name: windows build / test
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show toolchain
+        run: rustc --version; cargo --version
+      - name: Build (release — exercises the version-resource embed)
+        run: cargo build --workspace --release --locked
+      - name: Test
+        # Require the symlink output-path-safety test to actually run (the windows-latest
+        # runner can create symlinks); a silent skip would hide a broken guard.
+        env:
+          CAIRN_REQUIRE_SYMLINK_TESTS: "1"
+        run: cargo test --workspace --locked
+
   audit:
     name: cargo audit (advisory scan)
     runs-on: ubuntu-latest

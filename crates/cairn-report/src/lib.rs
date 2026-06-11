@@ -515,6 +515,15 @@ mod tests {
         std::fs::write(&victim, b"do not touch").unwrap();
         let link = base.join("timeline.csv");
         if std::os::windows::fs::symlink_file(&victim, &link).is_err() {
+            // Creating a symlink needs Developer Mode / admin. On a dev box without it we
+            // skip — but CI sets CAIRN_REQUIRE_SYMLINK_TESTS=1 so the guard is genuinely
+            // exercised there; a silent skip in CI would hide a broken guard.
+            if std::env::var_os("CAIRN_REQUIRE_SYMLINK_TESTS").is_some() {
+                panic!(
+                    "CAIRN_REQUIRE_SYMLINK_TESTS set but symlink creation failed — \
+                        the output-path-safety guard was not exercised"
+                );
+            }
             eprintln!("skipping: no privilege to create symlinks on this host");
             return;
         }
