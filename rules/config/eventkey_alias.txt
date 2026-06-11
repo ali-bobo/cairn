@@ -1,0 +1,10 @@
+# Sigma field -> EVTX field path (TAB-separated). Mirrors Hayabusa eventkey_alias.
+# Used to map a rule's Sigma field name onto the flattened EventRecord.data key.
+# SRS §9; see LogsourceMap field_aliases for per-logsource overrides.
+Image	NewProcessName
+ParentImage	ParentProcessName
+User	SubjectUserName
+LogonId	SubjectLogonId
+CommandLine	CommandLine
+ProcessId	NewProcessId
+ParentProcessId	ProcessId

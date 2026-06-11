@@ -1,0 +1,11 @@
+# Channel -> short label for compact timeline output (TAB-separated). SRS §9.
+Security	Sec
+System	Sys
+Application	App
+Microsoft-Windows-Sysmon/Operational	Sysmon
+Microsoft-Windows-PowerShell/Operational	PwSh
+Windows PowerShell	PwShClassic
+Microsoft-Windows-TaskScheduler/Operational	TaskSch
+Microsoft-Windows-WMI-Activity/Operational	WMI
+Microsoft-Windows-Windows Defender/Operational	Defender
+Microsoft-Windows-NTLM/Operational	NTLM
