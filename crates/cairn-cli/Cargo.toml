@@ -20,3 +20,9 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 rayon.workspace = true
+
+# Windows-only: embed PE version/manifest resource (ProductName, FileDescription,
+# version) so the binary self-identifies in file properties + to EDR/SOC (legitimacy,
+# SRS §13). No effect on non-Windows builds.
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true
