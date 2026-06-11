@@ -65,6 +65,7 @@ impl Engine {
         f.ts = ev.ts;
         f.host = ev.computer.clone();
         f.artifact = format!("evtx:{}", ev.channel);
+        f.event_id = Some(ev.event_id);
         f.evidence_ref = Some(ev.record_id.to_string());
         f
     }

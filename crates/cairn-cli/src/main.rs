@@ -4,7 +4,12 @@
 //! designed to be SEEN and recognized as benign by EDR — never to evade it.
 //! See README.md and docs/threat-model.md.
 
+use cairn_core::finding::Finding;
+use cairn_core::manifest::{Counts, HostInfo, Manifest, Privileges, RunInfo, ToolInfo};
+use cairn_core::traits::OutputSink;
 use cairn_core::{Config, OutputKind, Target};
+use cairn_report::DirSink;
+use cairn_sigma::{engine::Engine, SigmaMatcher};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -123,6 +128,48 @@ fn output_dir(cfg: &Config) -> PathBuf {
     }
 }
 
+/// Assemble the run manifest (SRS §5.3). Stage-1 evtx run: user-space, no privileges,
+/// sources hashing is added when the collector reports provenance (T8+); for now the
+/// manifest carries tool identity, the command, host, and detection counts.
+fn build_manifest(cfg: &Config, hostname: &str, records: u64, findings: &[Finding]) -> Manifest {
+    // Reuse the report crate's severity tally instead of recomputing it here.
+    let by_sev = cairn_report::Summary::from_findings(findings, records).by_severity;
+    Manifest {
+        schema: cairn_core::schema::MANIFEST.to_string(),
+        tool: ToolInfo {
+            name: "cairn".into(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            build_sha: BUILD_SHA.into(),
+            sigma_ruleset_ver: String::new(), // set when rules are pinned (ADR-0003)
+        },
+        run: RunInfo {
+            started_utc: chrono::Utc::now(),
+            finished_utc: Some(chrono::Utc::now()),
+            cmdline: std::env::args().collect::<Vec<_>>().join(" "),
+            operator: cfg.operator.clone(),
+            case_id: cfg.case_id.clone(),
+        },
+        host: HostInfo {
+            hostname: hostname.to_string(),
+            os_build: String::new(),
+            timezone: "UTC".into(),
+            wall_clock_utc_skew: "unknown".into(),
+        },
+        privileges: Privileges {
+            admin: false,
+            se_backup: false,
+            se_debug: false,
+        },
+        sources: vec![],
+        outputs: vec![], // filled by verify against the on-disk files (T9)
+        counts: Counts {
+            records,
+            findings_by_sev: by_sev,
+        },
+        integrity_note: "All hashes SHA-256 over bytes as collected.".into(),
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
@@ -152,28 +199,63 @@ fn main() -> anyhow::Result<()> {
 
             // T3/T4: open each input, parse it, and log the read with a UTC timestamp
             // and record count. A failed file is logged and skipped, never fatal
-            // (graceful degrade, golden rule 8). Sigma + timeline come in T6/T7.
+            // (graceful degrade, golden rule 8).
             let files: &[PathBuf] = match &cfg.target {
                 Target::Files(f) => f,
                 _ => &[],
             };
-            let mut total = 0usize;
+            let mut records = Vec::new();
             for path in files {
                 match cairn_collectors::evtx::parse_evtx(path) {
-                    Ok(records) => {
-                        tracing::info!(file = %path.display(), records = records.len(), "parsed evtx");
-                        total += records.len();
+                    Ok(recs) => {
+                        tracing::info!(file = %path.display(), records = recs.len(), "parsed evtx");
+                        records.extend(recs);
                     }
                     Err(e) => {
                         tracing::warn!(file = %path.display(), error = %e, "skipped (parse failed)");
                     }
                 }
             }
-            tracing::info!(
-                files = files.len(),
-                records = total,
-                "evtx parse complete (TODO T6/T7: Sigma + timeline)"
-            );
+            tracing::info!(records = records.len(), "evtx parse complete");
+
+            // T6: run Sigma over the parsed events (if a rules dir was given).
+            let mut findings = Vec::new();
+            if let Some(rules_dir) = cfg.rules_dir.as_deref() {
+                let mut engine = Engine::default();
+                match engine.load(rules_dir) {
+                    Ok(n) => {
+                        tracing::info!(rules = n, dir = %rules_dir.display(), "loaded sigma rules");
+                        for ev in &records {
+                            match engine.match_event(ev) {
+                                Ok(mut fs) => findings.append(&mut fs),
+                                Err(e) => tracing::warn!(error = %e, "match error"),
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, dir = %rules_dir.display(), "rule load failed")
+                    }
+                }
+            } else {
+                tracing::info!("no --rules dir; skipping Sigma (parse-only run)");
+            }
+            tracing::info!(findings = findings.len(), "analysis complete");
+
+            // T7: write timeline.csv + findings.jsonl + manifest.json.
+            let hostname = records
+                .first()
+                .map(|r| r.computer.clone())
+                .unwrap_or_default();
+            let manifest = build_manifest(&cfg, &hostname, records.len() as u64, &findings);
+            let mut sink = DirSink::new(dir.clone());
+            sink.write_timeline_csv(&findings)?;
+            sink.write_findings_jsonl(&findings)?;
+            sink.write_manifest(&manifest)?;
+            let outputs = sink.finalize()?;
+            for o in &outputs {
+                tracing::info!(file = %o.file, sha256 = %o.sha256, "wrote output");
+            }
+            tracing::info!(dir = %dir.display(), "report complete");
             // _guard must live until logging is done; non-blocking writer flushes on drop.
             drop(_guard);
         }

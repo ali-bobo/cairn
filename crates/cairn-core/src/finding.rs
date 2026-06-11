@@ -86,6 +86,9 @@ pub struct Finding {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     pub artifact: String, // e.g. "evtx:Security" | "process" | "hive:..."
+    /// Source EVTX EventID, when the finding came from an event (timeline column).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<u32>,
     pub entity: Entity,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evidence_ref: Option<String>, // sha256 of raw blob in archive | record id
@@ -115,6 +118,7 @@ impl Finding {
             host: String::new(),
             user: None,
             artifact: String::new(),
+            event_id: None,
             entity: Entity::default(),
             evidence_ref: None,
             details: String::new(),
