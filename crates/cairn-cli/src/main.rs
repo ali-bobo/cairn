@@ -133,6 +133,19 @@ fn output_dir(cfg: &Config) -> PathBuf {
     }
 }
 
+/// The manifest's `sigma_ruleset_ver` for this run (ADR-0003): `"<pin>+<aggregate>"`
+/// computed over the rules dir actually used, or empty when no rules ran. A hash
+/// failure degrades to empty rather than aborting the manifest (golden rule 8); the
+/// rule-load path already surfaces real load errors to run.log.
+fn ruleset_ver(cfg: &Config) -> String {
+    match cfg.rules_dir.as_deref() {
+        Some(dir) => {
+            cairn_sigma::ruleset::ruleset_version(dir, cfg.rules_plain).unwrap_or_default()
+        }
+        None => String::new(),
+    }
+}
+
 /// Assemble the run manifest (SRS §5.3). Stage-1 evtx run: user-space, no privileges,
 /// sources hashing is added when the collector reports provenance (T8+); for now the
 /// manifest carries tool identity, the command, host, and detection counts.
@@ -145,7 +158,7 @@ fn build_manifest(cfg: &Config, hostname: &str, records: u64, findings: &[Findin
             name: "cairn".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             build_sha: BUILD_SHA.into(),
-            sigma_ruleset_ver: String::new(), // set when rules are pinned (ADR-0003)
+            sigma_ruleset_ver: ruleset_ver(cfg), // "<pin>+<aggregate>" (ADR-0003)
         },
         run: RunInfo {
             started_utc: chrono::Utc::now(),
@@ -319,5 +332,29 @@ mod tests {
         );
         let cfg = cfg.with_rules_plain(true);
         assert!(evtx_plan(&cfg).contains("encoding=plain"));
+    }
+
+    /// With no rules dir the manifest's sigma_ruleset_ver is empty (no rules ran).
+    #[test]
+    fn ruleset_ver_is_empty_without_rules() {
+        let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], None);
+        assert_eq!(ruleset_ver(&cfg), "");
+    }
+
+    /// With the bundled (encoded) rules dir, sigma_ruleset_ver is "<pin>+<aggregate>"
+    /// (ADR-0003): the pin from PROVENANCE and a 64-char aggregate, computed over the
+    /// real bundled rules this binary ships.
+    #[test]
+    fn ruleset_ver_is_pin_plus_aggregate_for_bundled_rules() {
+        let bundled = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../rules/sigma");
+        let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], Some(bundled));
+        let ver = ruleset_ver(&cfg);
+        let (pin, agg) = ver.split_once('+').expect("ver must be pin+aggregate");
+        assert_eq!(
+            pin, "98781da19cf60c48ce6e7f2d3ad11c9ba389191a",
+            "ADR-0003 pin"
+        );
+        assert_eq!(agg.len(), 64, "aggregate is a SHA-256 hex");
+        assert!(agg.bytes().all(|b| b.is_ascii_hexdigit()));
     }
 }

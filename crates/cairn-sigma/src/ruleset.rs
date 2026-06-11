@@ -81,6 +81,31 @@ pub fn aggregate_hash(dir: &Path, plain: bool) -> Result<String> {
     Ok(hex(&agg.finalize()))
 }
 
+/// Read the pinned upstream commit from a `PROVENANCE` file in the rules dir (a line
+/// `pin = <sha>`, ADR-0003). Returns `"unpinned"` if the file or line is absent — a
+/// hand-assembled rules dir is valid, just not provenance-tracked.
+fn read_pin(dir: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(dir.join("PROVENANCE")) else {
+        return "unpinned".to_string();
+    };
+    text.lines()
+        .filter_map(|l| l.split_once('='))
+        .find(|(k, _)| k.trim() == "pin")
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "unpinned".to_string())
+}
+
+/// The manifest's `sigma_ruleset_ver` (ADR-0003): `"<commit-sha>+<aggregate-sha256>"`.
+/// The commit-sha is the upstream pin (provenance: *where rules came from*); the
+/// aggregate is computed over the actual rules used (integrity: *they haven't changed*).
+/// `cairn verify` (T9) recomputes the aggregate to catch a swapped/edited ruleset.
+pub fn ruleset_version(dir: &Path, plain: bool) -> Result<String> {
+    let pin = read_pin(dir);
+    let aggregate = aggregate_hash(dir, plain)?;
+    Ok(format!("{pin}+{aggregate}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -181,5 +206,33 @@ mod tests {
             h,
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
         );
+    }
+
+    /// `ruleset_version` returns "<commit-sha>+<aggregate-sha256>" (the manifest's
+    /// `sigma_ruleset_ver`, ADR-0003). The commit comes from a `PROVENANCE` file in the
+    /// rules dir; the aggregate is computed over the rules.
+    #[test]
+    fn ruleset_version_combines_pin_and_aggregate() {
+        let dir = std::env::temp_dir().join("cairn_ruleset_version_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "a.yml", b"title: a\n");
+        std::fs::write(dir.join("PROVENANCE"), "pin = deadbeefcafe\n").unwrap();
+
+        let agg = aggregate_hash(&dir, true).unwrap();
+        let ver = ruleset_version(&dir, true).unwrap();
+        assert_eq!(ver, format!("deadbeefcafe+{agg}"));
+    }
+
+    /// With no PROVENANCE file the version still resolves, marking the pin "unpinned"
+    /// (graceful — a hand-assembled rules dir is valid, just not provenance-tracked).
+    #[test]
+    fn ruleset_version_marks_unpinned_when_no_provenance() {
+        let dir = std::env::temp_dir().join("cairn_ruleset_unpinned_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        write(&dir, "a.yml", b"title: a\n");
+
+        let agg = aggregate_hash(&dir, true).unwrap();
+        let ver = ruleset_version(&dir, true).unwrap();
+        assert_eq!(ver, format!("unpinned+{agg}"));
     }
 }
