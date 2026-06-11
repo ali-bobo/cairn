@@ -33,8 +33,8 @@ csv = "1.4.0"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 tracing-appender = "0.2.5"
-evtx = "0.11.2" # T4: EVTX parsing (cairn-collectors)
-# sigma engine           # T6 (see docs/sigma-engine-benchmark-plan.md)
+evtx = "0.11.2"       # T4: EVTX parsing (cairn-collectors)
+sigma-rust = "0.7.0"  # T6: Sigma 2.0 engine (cairn-sigma; ADR-0001)
 
 [profile.release]
 # legitimacy: NO strip, NO panic=abort tricks for "small/low-entropy" binary.

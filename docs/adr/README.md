@@ -14,6 +14,6 @@ auditable — which is part of "specs are managed and controlled," not an aftert
 
 | ADR | Title | Status | SRS link |
 |-----|-------|--------|----------|
-| [0001](adr-0001-sigma-engine.md) | Sigma engine selection | Proposed | §9 D1 |
+| [0001](adr-0001-sigma-engine.md) | Sigma engine selection (sigma-rust) | Accepted | §9 D1 |
 | [0002](adr-0002-rule-encoding.md) | On-disk rule encoding (XOR) | Accepted | §8 NFR1, §17 D4 |
 | [0003](adr-0003-rule-supply-chain.md) | Sigma ruleset supply-chain integrity | Proposed | §6, §9 |

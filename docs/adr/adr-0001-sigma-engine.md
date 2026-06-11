@@ -1,7 +1,7 @@
 # ADR-0001: Sigma engine selection
 
-- **Status:** Proposed (pending the parity benchmark in docs/sigma-engine-benchmark-plan.md)
-- **Date:** 2026-06-10 (UTC)
+- **Status:** Accepted — `sigma-rust` (jopohl) v0.7.x
+- **Date:** 2026-06-11 (UTC)
 - **Deciders:** project owner
 - **SRS / spec link:** §9 (Sigma integration), §17 D1; benchmark plan in
   `docs/sigma-engine-benchmark-plan.md`
@@ -31,20 +31,35 @@ pinned down by the Sigma spec itself.
 
 ## Decision
 
-**Proposed: evaluate `sigma_engine` and `sigmars` head-to-head first**, scoring both
-against the five criteria in the benchmark plan (parity, spec coverage, author/metadata
-access, performance, ergonomics/license). Promote whichever wins to **Accepted** and
-record the scores here. Keep `tau-engine` as the documented fallback if neither gives
-acceptable Sigma-2 correlation, per the benchmark plan's fallback clause.
+**Accepted: `sigma-rust` (jopohl), MIT OR Apache-2.0.**
 
-**Evidence required to accept:** a parity diff on the EVTX-ATTACK-SAMPLES labeled subset
-(false pos/neg counts), throughput numbers, and confirmation that `rule_author` is
-reachable from the matched rule.
+A candidate survey (2026-06-11) decided it on the hard criteria, deferring the heavy
+parity-diff to T8 (which is itself the parity/perf harness task — running it twice is
+wasteful):
+
+- **`sigma_engine`** — not published on crates.io; not a usable dependency. Eliminated.
+- **`tau-engine` 1.15** — mature (Chainsaw's engine) but a generic document-tagging
+  engine, not a native Sigma parser; would need a Sigma→tau conversion layer. Heavier
+  than warranted for Stage 1. Kept as the documented fallback if sigma-rust's spec
+  coverage proves insufficient at T8.
+- **`sigmars` 0.2.2** — early (0.2.x); author-metadata access unverified. Passed over.
+- **`sigma-rust` 0.7** — native Sigma 2.0; the `Rule` struct publicly exposes
+  `author: Option<String>` (satisfies DRL 1.1 directly), plus `id`, `title`,
+  `level: Option<Level>`, `tags: Option<Vec<String>>` (MITRE `attack.t*`), and
+  `logsource: Logsource`. Events are built from JSON (`event_from_json`) and matched
+  with `Rule::is_match(&Event) -> bool` — our `EventRecord.data` is already a JSON map,
+  so the integration is direct. Best fit; chosen.
+
+**Residual risk (revisit at T8):** sigma-rust's correlation/aggregation and exact
+regex/modifier semantics vs the SigmaHQ reference are not yet parity-tested. T8 must
+diff against the labeled corpus and, if coverage gaps appear, either contribute upstream
+or fall back to tau-engine behind the unchanged `SigmaMatcher` trait.
 
 ## Consequences
 
-- T6 is blocked until this ADR is `Accepted`; T5 (de-abstraction map) can proceed in
-  parallel since it is engine-agnostic by design.
-- License must be MIT/Apache-compatible (NFR8); a copyleft engine is disqualifying.
-- Whatever is chosen, `SigmaMatcher::match_event` must populate `Finding.rule_author`
-  or T6's acceptance gate fails.
+- T6 implements `SigmaMatcher` over sigma-rust: load rules (decode via codec, ADR-0002),
+  apply LogsourceMap field aliasing, match `EventRecord` → `Finding`, mapping
+  `author`→`rule_author` (DRL 1.1), `level`→severity, `tags`→mitre.
+- License is MIT/Apache (NFR8 satisfied).
+- The `SigmaMatcher` trait keeps the engine swappable, so the T8 fallback to tau-engine
+  stays cheap if needed.

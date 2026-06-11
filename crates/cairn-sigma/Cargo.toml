@@ -9,5 +9,5 @@ cairn-core = { path = "../cairn-core" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-# Decide engine in T6 (docs/sigma-engine-benchmark-plan.md), then add ONE of:
-# sigma-engine = "..."   |   sigmars = "..."   |   tau-engine = "..."
+chrono.workspace = true
+sigma-rust.workspace = true # Sigma 2.0 engine (ADR-0001)
