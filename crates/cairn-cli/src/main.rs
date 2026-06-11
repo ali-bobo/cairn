@@ -7,6 +7,22 @@
 use cairn_core::{Config, OutputKind, Target};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use tracing_subscriber::EnvFilter;
+
+/// run.log should record Cairn's own actions only — not the internal trace/info of
+/// dependencies like the `evtx` parser. Keep cairn crates at info; everything else
+/// must reach warn to be logged. RUST_LOG overrides this for debugging.
+///
+/// NOTE: the binary's tracing target is `cairn` (from `[[bin]] name`), not the
+/// package name `cairn_cli` — events from main.rs are tagged `cairn`.
+fn log_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "warn,cairn=info,cairn_collectors=info,cairn_core=info,\
+             cairn_sigma=info,cairn_report=info",
+        )
+    })
+}
 
 /// Git commit this binary was built from (stamped by build.rs). Recorded in the run
 /// manifest as `tool.build_sha` (SRS §5.3 / §13 legitimacy & transparency).
@@ -121,6 +137,7 @@ fn main() -> anyhow::Result<()> {
             let file_appender = tracing_appender::rolling::never(&dir, "run.log");
             let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
             tracing_subscriber::fmt()
+                .with_env_filter(log_filter())
                 .with_target(false)
                 .with_ansi(false)
                 .with_writer(file_writer)
@@ -132,12 +149,39 @@ fn main() -> anyhow::Result<()> {
                 BUILD_SHA
             );
             tracing::info!("{}", evtx_plan(&cfg));
-            tracing::info!("TODO T4-T7: parse EVTX, run Sigma, write timeline");
+
+            // T3/T4: open each input, parse it, and log the read with a UTC timestamp
+            // and record count. A failed file is logged and skipped, never fatal
+            // (graceful degrade, golden rule 8). Sigma + timeline come in T6/T7.
+            let files: &[PathBuf] = match &cfg.target {
+                Target::Files(f) => f,
+                _ => &[],
+            };
+            let mut total = 0usize;
+            for path in files {
+                match cairn_collectors::evtx::parse_evtx(path) {
+                    Ok(records) => {
+                        tracing::info!(file = %path.display(), records = records.len(), "parsed evtx");
+                        total += records.len();
+                    }
+                    Err(e) => {
+                        tracing::warn!(file = %path.display(), error = %e, "skipped (parse failed)");
+                    }
+                }
+            }
+            tracing::info!(
+                files = files.len(),
+                records = total,
+                "evtx parse complete (TODO T6/T7: Sigma + timeline)"
+            );
             // _guard must live until logging is done; non-blocking writer flushes on drop.
             drop(_guard);
         }
         other => {
-            tracing_subscriber::fmt().with_target(false).init();
+            tracing_subscriber::fmt()
+                .with_env_filter(log_filter())
+                .with_target(false)
+                .init();
             match other {
                 Cmd::Run(_args) => {
                     tracing::info!("TODO S2+: orchestrate collectors + analyzers + report");

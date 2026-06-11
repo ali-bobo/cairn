@@ -1,0 +1,14 @@
+# cargo-audit configuration (committed — this is a security decision record).
+#
+# Documented advisory exceptions. Each entry is an INFORMATIONAL advisory we have
+# reviewed and accepted, not a vulnerability we are ignoring.
+
+[advisories]
+ignore = [
+  # RUSTSEC-2021-0153: the `encoding` crate is unmaintained. It is a transitive
+  # dependency of `evtx` 0.11 (our EVTX parser, the de-facto standard used by
+  # Hayabusa/Chainsaw). It is NOT a vulnerability — only an unmaintained flag — and
+  # we cannot drop it without replacing the EVTX parser. Re-evaluate if evtx removes
+  # the dependency or a real CVE is filed against `encoding`.
+  "RUSTSEC-2021-0153",
+]

@@ -15,7 +15,9 @@
 *.zip
 *.hve
 *.dat
+*.bad
 /tests/samples/
+/tests/fixtures/
 /tests/EVTX-ATTACK-SAMPLES/
 
 # Decoded plain rules (the encoded form is the bundled one; ADR-0002)

@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 cairn-core = { path = "../cairn-core" }
+cairn-collectors = { path = "../cairn-collectors" }
 cairn-sigma = { path = "../cairn-sigma" }
 cairn-report = { path = "../cairn-report" }
 clap.workspace = true
