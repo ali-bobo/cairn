@@ -54,6 +54,10 @@ enum Cmd {
         files: Vec<PathBuf>,
         #[arg(long)]
         rules: Option<PathBuf>,
+        /// Load un-encoded `.yml` rules instead of the XOR-encoded bundle (ADR-0002).
+        /// Lets a SOC audit exactly what runs; off by default (bundle is encoded).
+        #[arg(long)]
+        rules_plain: bool,
     },
     /// Fetch + pin the Sigma ruleset (S4).
     UpdateRules {
@@ -115,7 +119,8 @@ fn evtx_plan(cfg: &Config) -> String {
         OutputKind::EncryptedZip { path, .. } => format!("{} (encrypted)", path.display()),
         OutputKind::DryRun => "<dry-run, no writes>".to_string(),
     };
-    format!("plan: evtx triage of {n} file(s); rules={rules}; output={out}")
+    let encoding = if cfg.rules_plain { "plain" } else { "xor" };
+    format!("plan: evtx triage of {n} file(s); rules={rules} (encoding={encoding}); output={out}")
 }
 
 /// Off-target output directory for a Stage-1 evtx run (golden rule 4). Resolved from
@@ -173,8 +178,12 @@ fn build_manifest(cfg: &Config, hostname: &str, records: u64, findings: &[Findin
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Evtx { files, rules } => {
-            let cfg = Config::for_evtx(files, rules);
+        Cmd::Evtx {
+            files,
+            rules,
+            rules_plain,
+        } => {
+            let cfg = Config::for_evtx(files, rules).with_rules_plain(rules_plain);
             let dir = output_dir(&cfg);
             std::fs::create_dir_all(&dir)?;
 
@@ -222,9 +231,9 @@ fn main() -> anyhow::Result<()> {
             let mut findings = Vec::new();
             if let Some(rules_dir) = cfg.rules_dir.as_deref() {
                 let mut engine = Engine::default();
-                match engine.load(rules_dir) {
+                match engine.load(rules_dir, cfg.rules_plain) {
                     Ok(n) => {
-                        tracing::info!(rules = n, dir = %rules_dir.display(), "loaded sigma rules");
+                        tracing::info!(rules = n, dir = %rules_dir.display(), plain = cfg.rules_plain, "loaded sigma rules");
                         for ev in &records {
                             match engine.match_event(ev) {
                                 Ok(mut fs) => findings.append(&mut fs),
@@ -297,5 +306,18 @@ mod tests {
     fn evtx_plan_shows_bundled_rules_when_none() {
         let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], None);
         assert!(evtx_plan(&cfg).contains("rules=<bundled>"));
+    }
+
+    /// The plan records the rule-encoding mode so run.log shows whether `--rules-plain`
+    /// was used (transparency: a SOC reading the log knows if rules were decoded).
+    #[test]
+    fn evtx_plan_records_rules_plain_mode() {
+        let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], Some(PathBuf::from("./r")));
+        assert!(
+            evtx_plan(&cfg).contains("encoding=xor"),
+            "default is encoded"
+        );
+        let cfg = cfg.with_rules_plain(true);
+        assert!(evtx_plan(&cfg).contains("encoding=plain"));
     }
 }

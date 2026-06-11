@@ -206,6 +206,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
+ "sha2",
  "sigma-rust",
  "thiserror 2.0.18",
 ]

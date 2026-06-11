@@ -12,11 +12,14 @@ use cairn_core::{finding::Finding, record::EventRecord, Result};
 
 pub mod codec;
 pub mod engine;
+pub mod ruleset;
 
 /// Swappable engine seam. Implement once an engine is chosen in T6.
 pub trait SigmaMatcher: Send + Sync {
-    /// Load + compile rules from a directory of (possibly XOR-encoded) .yml.
-    fn load(&mut self, rules_dir: &std::path::Path) -> Result<usize>;
+    /// Load + compile rules from a directory of `.yml`. `plain = false` XOR-decodes the
+    /// bundled rules (ADR-0002); `plain = true` reads un-encoded `.yml` as-is, the
+    /// `--rules-plain` bypass a SOC uses to audit exactly what runs.
+    fn load(&mut self, rules_dir: &std::path::Path, plain: bool) -> Result<usize>;
     /// Match a single event; return zero or more Findings (author surfaced per DRL).
     fn match_event(&self, ev: &EventRecord) -> Result<Vec<Finding>>;
     /// Channels referenced by loaded rules (for load-optimization: skip absent channels).

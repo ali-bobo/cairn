@@ -34,6 +34,9 @@ pub struct Config {
     pub output: OutputKind,
     pub profile: Profile,
     pub rules_dir: Option<PathBuf>,
+    /// Load rules as un-encoded `.yml` (the `--rules-plain` SOC-audit bypass, ADR-0002).
+    /// Default false: bundled rules are XOR-encoded and decoded on load.
+    pub rules_plain: bool,
     /// module allow-list (e.g. ["evtx","process","persist"]); empty == default set.
     pub only: Vec<String>,
     pub admin_features: bool,
@@ -50,6 +53,7 @@ impl Default for Config {
             output: OutputKind::Dir(PathBuf::from("./out")),
             profile: Profile::Standard,
             rules_dir: None,
+            rules_plain: false,
             only: vec![],
             admin_features: false,
             case_id: String::new(),
@@ -69,6 +73,12 @@ impl Config {
             rules_dir,
             ..Config::default()
         }
+    }
+
+    /// Builder: set the `--rules-plain` bypass (load un-encoded `.yml`, ADR-0002).
+    pub fn with_rules_plain(mut self, plain: bool) -> Self {
+        self.rules_plain = plain;
+        self
     }
 }
 
@@ -99,5 +109,18 @@ mod tests {
     fn for_evtx_allows_no_rules_dir() {
         let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], None);
         assert_eq!(cfg.rules_dir, None);
+    }
+
+    /// `--rules-plain` (ADR-0002 SOC-audit bypass) defaults OFF: bundled rules are
+    /// XOR-encoded, so the default run decodes. `with_rules_plain(true)` flips it.
+    #[test]
+    fn rules_plain_defaults_off_and_is_settable() {
+        let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], None);
+        assert!(
+            !cfg.rules_plain,
+            "default must decode (encoded bundled rules)"
+        );
+        let cfg = cfg.with_rules_plain(true);
+        assert!(cfg.rules_plain);
     }
 }

@@ -89,13 +89,14 @@ fn level_to_severity<L: std::fmt::Debug>(level: &Option<L>) -> Severity {
 }
 
 impl SigmaMatcher for Engine {
-    fn load(&mut self, rules_dir: &Path) -> Result<usize> {
+    fn load(&mut self, rules_dir: &Path, plain: bool) -> Result<usize> {
         let mut yamls: Vec<String> = Vec::new();
         for entry in std::fs::read_dir(rules_dir)? {
             let path = entry?.path();
             if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
-                // Bundled rules are XOR-encoded by default; load_rule_bytes decodes.
-                let bytes = crate::codec::load_rule_bytes(&path, false)?;
+                // Bundled rules are XOR-encoded (plain=false); --rules-plain passes
+                // plain=true to read un-encoded `.yml`. load_rule_bytes honors both.
+                let bytes = crate::codec::load_rule_bytes(&path, plain)?;
                 yamls.push(String::from_utf8_lossy(&bytes).into_owned());
             }
         }
@@ -194,5 +195,37 @@ detection:
     fn referenced_channels_is_available() {
         let engine = Engine::from_rules(&[RULE]).unwrap();
         let _ = engine.referenced_channels();
+    }
+
+    /// `--rules-plain` parity (ADR-0002 / T8b): loading the SAME rule from a plain `.yml`
+    /// dir (plain=true) and from an XOR-encoded dir (plain=false) yields an engine that
+    /// matches identically — the codec layer is invisible to detection results.
+    #[test]
+    fn load_plain_and_encoded_dirs_match_identically() {
+        let root = std::env::temp_dir().join("cairn_engine_plain_test");
+        let _ = std::fs::remove_dir_all(&root);
+        let plain_dir = root.join("plain");
+        let enc_dir = root.join("encoded");
+        std::fs::create_dir_all(&plain_dir).unwrap();
+        std::fs::create_dir_all(&enc_dir).unwrap();
+
+        std::fs::write(plain_dir.join("r.yml"), RULE).unwrap();
+        std::fs::write(enc_dir.join("r.yml"), crate::codec::xor(RULE.as_bytes())).unwrap();
+
+        let mut plain_engine = Engine::default();
+        let n_plain = plain_engine.load(&plain_dir, true).unwrap();
+        let mut enc_engine = Engine::default();
+        let n_enc = enc_engine.load(&enc_dir, false).unwrap();
+        assert_eq!(n_plain, 1);
+        assert_eq!(n_enc, 1);
+
+        let ev = event(r"C:\Windows\System32\cmd.exe");
+        let p = plain_engine.match_event(&ev).unwrap();
+        let e = enc_engine.match_event(&ev).unwrap();
+        assert_eq!(p.len(), 1);
+        assert_eq!(e.len(), 1);
+        assert_eq!(p[0].rule_id, e[0].rule_id);
+        assert_eq!(p[0].rule_author, e[0].rule_author);
+        assert_eq!(p[0].severity, e[0].severity);
     }
 }
