@@ -263,15 +263,19 @@ fn main() -> anyhow::Result<()> {
             }
             tracing::info!(findings = findings.len(), "analysis complete");
 
-            // T7: write timeline.csv + findings.jsonl + manifest.json.
+            // T7: write timeline.csv + findings.jsonl, then the manifest. The data
+            // outputs are written first so their SHA-256s can be embedded into the
+            // manifest's `outputs` (chain-of-custody; `cairn verify` re-checks them, T9).
+            // The manifest records the *data* outputs' integrity, not its own.
             let hostname = records
                 .first()
                 .map(|r| r.computer.clone())
                 .unwrap_or_default();
-            let manifest = build_manifest(&cfg, &hostname, records.len() as u64, &findings);
+            let mut manifest = build_manifest(&cfg, &hostname, records.len() as u64, &findings);
             let mut sink = DirSink::new(dir.clone());
             sink.write_timeline_csv(&findings)?;
             sink.write_findings_jsonl(&findings)?;
+            manifest.outputs = sink.outputs_so_far();
             sink.write_manifest(&manifest)?;
             let outputs = sink.finalize()?;
             for o in &outputs {

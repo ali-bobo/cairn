@@ -122,6 +122,14 @@ impl DirSink {
         }
     }
 
+    /// The output entries recorded so far (file + SHA-256), without consuming them.
+    /// Lets the caller hash the data outputs (timeline, findings) and embed those
+    /// hashes in the manifest *before* writing the manifest itself — the manifest
+    /// records the data outputs' integrity, not its own (chain-of-custody, SRS §12).
+    pub fn outputs_so_far(&self) -> Vec<OutputEntry> {
+        self.outputs.clone()
+    }
+
     /// Write `bytes` to `name` in the output dir and record its SHA-256.
     ///
     /// Output-path safety (threat-model #3): refuse to write if the target name is
@@ -300,6 +308,35 @@ mod tests {
         let je = outputs.iter().find(|o| o.file == "findings.jsonl").unwrap();
         assert_eq!(je.sha256, sha256_hex(jsonl.as_bytes()));
         assert_eq!(je.sha256.len(), 64);
+    }
+
+    /// `outputs_so_far` returns the data outputs' hashes without consuming them, so the
+    /// caller can embed them in the manifest before writing the manifest. The hashes
+    /// match the files on disk, and finalize() still works afterward.
+    #[test]
+    fn outputs_so_far_returns_data_hashes_without_consuming() {
+        let dir = std::env::temp_dir().join("cairn_outputs_so_far_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(dir.clone());
+
+        let findings = vec![finding(100, "f1", 1)];
+        sink.write_timeline_csv(&findings).unwrap();
+        sink.write_findings_jsonl(&findings).unwrap();
+
+        let snapshot = sink.outputs_so_far();
+        assert_eq!(snapshot.len(), 2, "two data outputs recorded");
+        assert!(snapshot.iter().any(|o| o.file == "timeline.csv"));
+        let jsonl = std::fs::read_to_string(dir.join("findings.jsonl")).unwrap();
+        let je = snapshot
+            .iter()
+            .find(|o| o.file == "findings.jsonl")
+            .unwrap();
+        assert_eq!(je.sha256, sha256_hex(jsonl.as_bytes()));
+
+        // Non-consuming: writing the manifest then finalize still lists all three.
+        sink.write_manifest(&minimal_manifest()).unwrap();
+        let outputs = sink.finalize().unwrap();
+        assert_eq!(outputs.len(), 3);
     }
 
     /// Output-path safety (threat-model #3): if an output name is a pre-planted symlink,
