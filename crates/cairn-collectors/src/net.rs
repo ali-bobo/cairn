@@ -1,6 +1,33 @@
 //! Pure mapping: raw TCP/UDP rows -> Record::NetConn. No OS access here.
 use cairn_collectors_win::net::{RawTcpRow, RawUdpRow};
+use cairn_core::manifest::SourceEntry;
 use cairn_core::record::{NetConnRecord, Record};
+use cairn_core::traits::{CollectCtx, Collector};
+use cairn_core::Result;
+
+/// Collector for live TCP/UDP tables with owning PID (SRS §4 net_collector).
+pub struct NetCollector;
+
+impl Collector for NetCollector {
+    fn name(&self) -> &str {
+        "net"
+    }
+    fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
+        let tcp = cairn_collectors_win::net::tcp_table()?;
+        let udp = cairn_collectors_win::net::udp_table()?;
+        Ok(build_netconn_records(&tcp, &udp))
+    }
+    fn sources(&self) -> Vec<SourceEntry> {
+        vec![SourceEntry {
+            artifact: "netconn".into(),
+            path: "live:net".into(),
+            method: "api".into(),
+            size: 0,
+            sha256: String::new(),
+            errors: vec![],
+        }]
+    }
+}
 
 /// Map raw rows to NetConn records. Pure + total. TCP carries remote addr/port + state;
 /// UDP is connectionless (no remote, no state). state_raw maps to a label.
@@ -92,5 +119,25 @@ mod tests {
         assert_eq!(u.raddr, None);
         assert_eq!(u.state, None);
         assert_eq!(u.pid, Some(900));
+    }
+
+    use cairn_core::traits::{CollectCtx, Collector};
+    use cairn_core::Config;
+
+    /// NetCollector.collect returns only NetConn records, never panics, name() is "net".
+    #[test]
+    fn net_collector_collects_without_panicking() {
+        let c = NetCollector;
+        assert_eq!(c.name(), "net");
+        let cfg = Config::default();
+        let ctx = CollectCtx {
+            config: &cfg,
+            admin: false,
+            se_backup: false,
+            se_debug: false,
+        };
+        let recs = c.collect(&ctx).expect("collect");
+        assert!(recs.iter().all(|r| matches!(r, Record::NetConn(_))));
+        assert_eq!(c.sources()[0].artifact, "netconn");
     }
 }
