@@ -1,0 +1,10 @@
+Cairn
+Copyright 2026 Cairn project (ali-bobo)
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Cairn bundles a small subset of Sigma detection rules from the SigmaHQ project
+(https://github.com/SigmaHQ/sigma), pinned by commit and stored XOR-encoded under
+rules/sigma/ (see docs/adr/adr-0002-rule-encoding.md and rules/sigma/PROVENANCE).
+Those rules retain their own authorship (DRL 1.1 `author` field) and are governed by
+the Detection Rule License (DRL) 1.1 of their upstream project, not by this LICENSE.
