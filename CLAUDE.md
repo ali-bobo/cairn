@@ -30,7 +30,9 @@ split)+Velociraptor offline-collector(packaging), fused in one process.
    manifest, continue. Never abort the whole run for one collector.
 
 ## Workspace map
-- `crates/cairn-core`  — typed contracts: Record, Finding, Manifest, traits, Config. Depend-on-only crate; no host or external-forensic deps.
+- `crates/cairn-core`  — typed contracts: Record, Finding, Manifest, traits, Config, orchestrator. Depend-on-only crate; no host or external-forensic deps.
+- `crates/cairn-collectors` — artifact->Record collectors (evtx; S2+ proc/net pure logic). `#![forbid(unsafe_code)]`.
+- `crates/cairn-collectors-win` — Windows unsafe FFI ONLY (proc/net/host/privilege; later raw-NTFS). The single `#![allow(unsafe_code)]` crate; `cfg(windows)`, empty shell elsewhere (S2-A).
 - `crates/cairn-sigma` — SigmaMatcher trait + chosen engine + LogsourceMap (de-abstraction).
 - `crates/cairn-report`— timeline(csv)/findings(jsonl)/manifest, sha256, output sinks.
 - `crates/cairn-cli`   — `cairn` binary, clap CLI (SRS §6).
