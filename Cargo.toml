@@ -4,6 +4,7 @@ resolver = "2"
 members = [
     "crates/cairn-core",
     "crates/cairn-collectors",
+    "crates/cairn-collectors-win",
     "crates/cairn-sigma",
     "crates/cairn-report",
     "crates/cairn-cli",
@@ -35,6 +36,7 @@ tracing-appender = "0.2.5"
 evtx = "0.11.2"       # T4: EVTX parsing (cairn-collectors)
 sigma-rust = "0.7.0"  # T6: Sigma 2.0 engine (cairn-sigma; ADR-0001)
 winresource = "0.1.31" # embed PE version/manifest resource (legitimacy; Windows-only build-dep)
+windows = "0.62.2"    # native WinAPI for live collectors (cairn-collectors-win only; S2)
 
 [profile.release]
 # legitimacy: NO strip, NO panic=abort tricks for "small/low-entropy" binary.
