@@ -16,14 +16,14 @@ jobs:
     name: fmt / clippy / check / test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # rust-toolchain.toml drives the version + components (rustfmt, clippy).
       - name: Show toolchain
         run: rustc --version && cargo --version
 
       - name: Cache cargo registry + target
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -50,7 +50,7 @@ jobs:
     name: windows build / test
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Show toolchain
         run: rustc --version; cargo --version
       - name: Build (release — exercises the version-resource embed)
@@ -66,7 +66,7 @@ jobs:
     name: cargo audit (advisory scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       - name: Audit

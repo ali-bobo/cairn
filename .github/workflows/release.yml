@@ -16,7 +16,7 @@ jobs:
   windows-release:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build release (normal profile — no strip/abort; golden rule 2)
         run: cargo build --release --locked --bin cairn
@@ -53,7 +53,7 @@ jobs:
           Write-Host "SHA-256: $hash"
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cairn-windows
           path: |
