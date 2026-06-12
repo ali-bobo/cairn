@@ -16,6 +16,7 @@
 pub mod config;
 pub mod finding;
 pub mod manifest;
+pub mod orchestrator;
 pub mod record;
 pub mod traits;
 
