@@ -1,6 +1,32 @@
 //! Pure mapping: RawProc -> Record::Process. No OS access here (that's cairn-collectors-win).
 use cairn_collectors_win::proc::RawProc;
+use cairn_core::manifest::SourceEntry;
 use cairn_core::record::{ProcessRecord, Record};
+use cairn_core::traits::{CollectCtx, Collector};
+use cairn_core::Result;
+
+/// Collector that enumerates live processes (SRS §4 proc_collector).
+pub struct ProcCollector;
+
+impl Collector for ProcCollector {
+    fn name(&self) -> &str {
+        "proc"
+    }
+    fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
+        let raw = cairn_collectors_win::proc::enumerate()?;
+        Ok(build_process_records(&raw))
+    }
+    fn sources(&self) -> Vec<SourceEntry> {
+        vec![SourceEntry {
+            artifact: "process".into(),
+            path: "live:process".into(),
+            method: "api".into(),
+            size: 0,
+            sha256: String::new(), // a live table is not a byte stream (spec §5)
+            errors: vec![],
+        }]
+    }
+}
 
 /// Map raw processes to normalized Records. Pure + total (never panics). A None cmdline
 /// becomes "" (ProcessRecord.cmdline is String). integrity_raw maps to a label.
@@ -77,5 +103,29 @@ mod tests {
             panic!()
         };
         assert_eq!(p.integrity.as_deref(), Some("high"));
+    }
+
+    use cairn_core::traits::{CollectCtx, Collector};
+    use cairn_core::Config;
+
+    /// ProcCollector.collect returns Process records (>=1 on a real OS; >=0 if the
+    /// platform stub returns empty) and never panics; its name() is "proc".
+    #[test]
+    fn proc_collector_collects_without_panicking() {
+        let collector = ProcCollector;
+        assert_eq!(collector.name(), "proc");
+        let cfg = Config::default();
+        let ctx = CollectCtx {
+            config: &cfg,
+            admin: false,
+            se_backup: false,
+            se_debug: false,
+        };
+        let recs = collector.collect(&ctx).expect("collect");
+        // Every record must be a Process variant.
+        assert!(recs.iter().all(|r| matches!(r, Record::Process(_))));
+        // sources() advertises the live process source.
+        assert_eq!(collector.sources().len(), 1);
+        assert_eq!(collector.sources()[0].method, "api");
     }
 }
