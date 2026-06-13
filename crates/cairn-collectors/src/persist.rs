@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 /// (`"C:\p a\app.exe" -x` -> `C:\p a\app.exe`) and a bare first token
 /// (`C:\p\app.exe -x` -> `C:\p\app.exe`), then expands %ENV% variables using the process
 /// environment. Returns None if the input is empty or yields nothing usable (never panics).
+#[allow(dead_code)]
 pub(crate) fn extract_binary_path(cmdline: &str) -> Option<String> {
     extract_binary_path_with(cmdline, |name| std::env::var(name).ok())
 }
@@ -20,6 +21,7 @@ pub(crate) fn extract_binary_path(cmdline: &str) -> Option<String> {
 /// Pure core: like `extract_binary_path` but the env lookup is injected, so it is
 /// deterministic and testable without mutating the process environment. `lookup` returns
 /// the value for an env var name, or None if undefined.
+#[allow(dead_code)]
 fn extract_binary_path_with(
     cmdline: &str,
     lookup: impl Fn(&str) -> Option<String>,
@@ -45,6 +47,7 @@ fn extract_binary_path_with(
 /// are left as the literal `%NAME%`. An unterminated `%` emits the rest verbatim. An empty
 /// var name (`%%`) is treated as unknown and kept literal. Never panics (the `%` byte is
 /// ASCII, so all slice indices are char-boundary-safe).
+#[allow(dead_code)]
 fn expand_env_vars(s: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
@@ -75,6 +78,7 @@ fn expand_env_vars(s: &str, lookup: &impl Fn(&str) -> Option<String>) -> String 
 }
 
 /// Build a PersistenceRecord with the deferred fields (signed/sha256) as None.
+#[allow(dead_code)]
 fn make_record(
     mechanism: &str,
     location: String,
