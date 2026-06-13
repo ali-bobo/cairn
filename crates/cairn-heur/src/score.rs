@@ -10,10 +10,11 @@ pub const SUSPICIOUS_DIRS: &[&str] = &[
     r"\appdata\",
     r"\programdata\",
     r"\downloads\",
-    r"\public\",
+    r"\public\", // matches C:\Users\Public (world-readable shared dir) too
 ];
 
 /// Remote ports considered ordinary egress; anything else is the "rare port" signal.
+// Tunable allowlist; ports outside this set raise the "rare port" signal. Tune per environment (e.g. 8080/636 may be common internally).
 pub const COMMON_PORTS: &[u16] = &[
     80, 443, 53, 22, 3389, 445, 135, 139, 21, 25, 587, 993, 143, 110,
 ];
@@ -29,8 +30,12 @@ pub fn is_rare_port(port: u16) -> bool {
     !COMMON_PORTS.contains(&port)
 }
 
-/// True if `addr` is a routable public IPv4 (not RFC1918/loopback/link-local/unspecified).
-/// A string that does not parse as IPv4 returns false (signal simply does not fire).
+/// True if `addr` is a routable public IPv4 (not RFC1918/loopback/link-local/unspecified,
+/// nor CGNAT/benchmarking/IETF-protocol/reserved). A string that does not parse as IPv4
+/// returns false (the signal simply does not fire).
+///
+/// TODO: replace the manual reserved-range guards with `Ipv4Addr::is_global()` once that
+/// method stabilises (currently nightly-only behind `feature(ip)`).
 pub fn is_public_ipv4(addr: &str) -> bool {
     match addr.parse::<Ipv4Addr>() {
         Ok(ip) => {
@@ -41,15 +46,29 @@ pub fn is_public_ipv4(addr: &str) -> bool {
                 && !ip.is_broadcast()
                 && !ip.is_documentation()
                 && !ip.is_multicast()
+                && !is_reserved_nonpublic(ip)
         }
         Err(_) => false,
     }
+}
+
+/// Ranges that std's `is_private`/etc. do not cover but are still non-routable:
+/// CGNAT (100.64.0.0/10), IETF protocol assignments (192.0.0.0/24),
+/// benchmarking (198.18.0.0/15), reserved class E (240.0.0.0/4).
+fn is_reserved_nonpublic(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    let cgnat = o[0] == 100 && (o[1] & 0xC0) == 64; // 100.64.0.0/10
+    let ietf_protocol = o[0] == 192 && o[1] == 0 && o[2] == 0; // 192.0.0.0/24
+    let benchmarking = o[0] == 198 && (o[1] & 0xFE) == 18; // 198.18.0.0/15
+    let class_e = o[0] >= 240; // 240.0.0.0/4
+    cgnat || ietf_protocol || benchmarking || class_e
 }
 
 /// Accumulates weighted signals + human-readable reasons + ATT&CK tags for one finding.
 #[derive(Debug, Default)]
 pub struct Score {
     pub weight: u32,
+    /// Reasons are appended in signal-fire order (do not reorder; preserves the narrative).
     pub reasons: Vec<String>,
     pub mitre: Vec<String>,
 }
@@ -57,7 +76,8 @@ pub struct Score {
 impl Score {
     /// Add a signal: its weight, a plain-English reason, and optional ATT&CK ids.
     pub fn add(&mut self, weight: u32, reason: impl Into<String>, mitre: &[&str]) {
-        self.weight += weight;
+        // saturating: a finding's weight must never panic on overflow (clamps at Critical)
+        self.weight = self.weight.saturating_add(weight);
         self.reasons.push(reason.into());
         for m in mitre {
             let m = m.to_string();
@@ -112,6 +132,10 @@ mod tests {
         assert!(!is_public_ipv4("169.254.1.1")); // link-local
         assert!(!is_public_ipv4("0.0.0.0")); // unspecified
         assert!(!is_public_ipv4("not-an-ip")); // unparseable -> false
+        assert!(!is_public_ipv4("100.64.0.1")); // CGNAT (RFC6598)
+        assert!(!is_public_ipv4("198.18.0.1")); // benchmarking (RFC2544)
+        assert!(!is_public_ipv4("240.0.0.1")); // reserved class E
+        assert!(!is_public_ipv4("192.0.0.1")); // IETF protocol (RFC6890)
     }
 
     #[test]
