@@ -120,6 +120,16 @@ fn read_ifeo() -> Vec<PersistenceRecord> {
     win::read_ifeo()
 }
 
+/// Non-Windows stub for services reader.
+#[cfg(not(windows))]
+fn read_services() -> Vec<PersistenceRecord> {
+    vec![]
+}
+#[cfg(windows)]
+fn read_services() -> Vec<PersistenceRecord> {
+    win::read_services()
+}
+
 /// Windows registry readers for persistence mechanisms.
 ///
 /// winreg 0.56.0 API used:
@@ -241,6 +251,44 @@ mod win {
                     lw,
                 ));
             }
+        }
+        out
+    }
+
+    /// Autostart services: HKLM\SYSTEM\CurrentControlSet\Services\* with Start in {0,1,2}
+    /// (boot/system/auto) and an ImagePath. Manual/disabled services (Start 3/4) are skipped
+    /// (not a persistence focus). Best-effort: unreadable subkeys are skipped (non-admin).
+    pub fn read_services() -> Vec<PersistenceRecord> {
+        let mut out = Vec::new();
+        let sub = r"SYSTEM\CurrentControlSet\Services";
+        let root = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let Ok(services) = root.open_subkey(sub) else {
+            return out;
+        };
+        for name in services.enum_keys().flatten() {
+            let Ok(svc) = services.open_subkey(&name) else {
+                continue;
+            };
+            // Start is a REG_DWORD; only 0/1/2 are autostart.
+            let start: u32 = match svc.get_value::<u32, _>("Start") {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if start > 2 {
+                continue;
+            }
+            let Ok(image) = svc.get_value::<String, _>("ImagePath") else {
+                continue;
+            };
+            let lw = key_last_write(&svc);
+            let location = format!("HKLM\\{sub}\\{name}");
+            out.push(make_record(
+                "service",
+                location,
+                Some(name.clone()),
+                Some(image),
+                lw,
+            ));
         }
         out
     }
