@@ -243,13 +243,7 @@ mod win {
             if let Ok(dbg) = img.get_value::<String, _>("Debugger") {
                 let lw = key_last_write(&img);
                 let location = format!("HKLM\\{sub}\\{name}");
-                out.push(make_record(
-                    "ifeo",
-                    location,
-                    Some(name.clone()),
-                    Some(dbg),
-                    lw,
-                ));
+                out.push(make_record("ifeo", location, Some(name), Some(dbg), lw));
             }
         }
         out
@@ -285,7 +279,7 @@ mod win {
             out.push(make_record(
                 "service",
                 location,
-                Some(name.clone()),
+                Some(name),
                 Some(image),
                 lw,
             ));
