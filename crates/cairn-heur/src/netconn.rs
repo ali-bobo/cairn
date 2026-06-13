@@ -60,6 +60,9 @@ impl Analyzer for NetConnHeuristic {
     }
 
     fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+        // Index processes by pid for owner lookup. As in parentchild: on pid reuse the
+        // last Process record wins; a live-state snapshot almost never reuses pids, so
+        // this only affects owner attribution accuracy, never correctness/panics.
         let by_pid: HashMap<u32, &ProcessRecord> = records
             .iter()
             .filter_map(|r| match r {
