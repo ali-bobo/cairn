@@ -2,9 +2,11 @@
 //! (Run/RunOnce, Services, Winlogon, IFEO, Startup folders) via the safe `winreg` wrapper
 //! and std::fs, mapping each to a PersistenceRecord. Read-only; never modifies the host.
 //! `signed`/`binary_sha256` are left None (S2-D / FR14).
-#![allow(dead_code)] // Task 4: pure helper only; readers + Collector land in Tasks 5-8.
 
-use cairn_core::record::PersistenceRecord;
+use cairn_core::manifest::SourceEntry;
+use cairn_core::record::{PersistenceRecord, Record};
+use cairn_core::traits::{CollectCtx, Collector};
+use cairn_core::Result;
 use chrono::{DateTime, Utc};
 
 /// Extract the executable path from a command line. Handles a quoted first token
@@ -339,6 +341,37 @@ mod win {
     }
 }
 
+/// Collector for live persistence mechanisms (SRS §4 persist_collector). Read-only.
+/// Fans in the five mechanism readers; each is best-effort (returns what it can read).
+pub struct PersistCollector;
+
+impl Collector for PersistCollector {
+    fn name(&self) -> &str {
+        "persist"
+    }
+
+    fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
+        let mut records: Vec<PersistenceRecord> = Vec::new();
+        records.extend(read_run_keys());
+        records.extend(read_services());
+        records.extend(read_winlogon());
+        records.extend(read_ifeo());
+        records.extend(read_startup_folders());
+        Ok(records.into_iter().map(Record::Persistence).collect())
+    }
+
+    fn sources(&self) -> Vec<SourceEntry> {
+        vec![SourceEntry {
+            artifact: "persistence".into(),
+            path: "live:registry+startup".into(),
+            method: "api".into(),
+            size: 0,
+            sha256: String::new(), // a live registry/folder read is not a byte stream (spec §5)
+            errors: vec![],
+        }]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +477,30 @@ mod tests {
         );
         // a nonexistent dir is best-effort skipped, no panic
         assert!(read_startup_dirs(&["C:\\does\\not\\exist\\cairn".into()]).is_empty());
+    }
+
+    use cairn_core::record::Record;
+    use cairn_core::traits::{CollectCtx, Collector};
+    use cairn_core::Config;
+
+    /// PersistCollector.collect returns only Persistence records, never panics, name="persist".
+    /// On Windows it exercises the real readers; on non-Windows it gets the startup reader +
+    /// empty registry stubs. Either way every record is a Persistence variant.
+    #[test]
+    fn persist_collector_collects_without_panicking() {
+        let c = PersistCollector;
+        assert_eq!(c.name(), "persist");
+        let cfg = Config::default();
+        let ctx = CollectCtx {
+            config: &cfg,
+            admin: false,
+            se_backup: false,
+            se_debug: false,
+        };
+        let recs = c.collect(&ctx).expect("collect");
+        assert!(recs.iter().all(|r| matches!(r, Record::Persistence(_))));
+        assert_eq!(c.sources().len(), 1);
+        assert_eq!(c.sources()[0].artifact, "persistence");
+        assert_eq!(c.sources()[0].method, "api");
     }
 }
