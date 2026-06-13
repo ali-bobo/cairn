@@ -34,7 +34,7 @@ pub fn is_rare_port(port: u16) -> bool {
 /// nor CGNAT/benchmarking/IETF-protocol/reserved). A string that does not parse as IPv4
 /// returns false (the signal simply does not fire).
 ///
-/// TODO: replace the manual reserved-range guards with `Ipv4Addr::is_global()` once that
+/// FUTURE: replace the manual reserved-range guards with `Ipv4Addr::is_global()` once that
 /// method stabilises (currently nightly-only behind `feature(ip)`).
 pub fn is_public_ipv4(addr: &str) -> bool {
     match addr.parse::<Ipv4Addr>() {

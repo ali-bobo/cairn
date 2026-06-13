@@ -42,6 +42,9 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
         if o.signed == Some(false) {
             s.add(20, "owning process is unsigned", &[]);
         }
+        // Compound signal: this fires IN ADDITION to the plain "unsigned" (+20) above —
+        // an unsigned process that is also listening on a high port is worse than either
+        // alone, so the +20 and this +25 are intentionally independent (not double-counted).
         if c.state.as_deref() == Some("listen") && c.lport > 1024 && o.signed == Some(false) {
             s.add(
                 25,
@@ -90,6 +93,9 @@ impl Analyzer for NetConnHeuristic {
             f.reason = Some(score.reasons.join("; "));
             f.mitre = score.mitre;
             f.artifact = "netconn".into();
+            // f.ts intentionally left at Finding::new's default (collection time):
+            // NetConnRecord carries no connection-establishment timestamp, and the OS API
+            // does not reliably expose one. (parentchild uses process start_time instead.)
             f.details = format!(
                 "{} {}:{} -> {}:{} pid={:?}",
                 c.proto,

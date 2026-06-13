@@ -7,6 +7,6 @@ pub mod netconn;
 pub mod parentchild;
 pub mod score;
 
-// Re-exports enabled as the analyzers land (Task 4 / Task 6).
+// Public API: the analyzers wired into the CLI live run (and reusable elsewhere).
 pub use netconn::NetConnHeuristic;
 pub use parentchild::ParentChildHeuristic;
