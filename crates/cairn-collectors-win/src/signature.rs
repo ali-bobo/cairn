@@ -123,7 +123,10 @@ mod tests {
 
     #[test]
     fn known_os_binary_does_not_panic() {
-        let candidates = [r"C:\Windows\System32\notepad.exe", r"C:\Windows\notepad.exe"];
+        let candidates = [
+            r"C:\Windows\System32\notepad.exe",
+            r"C:\Windows\notepad.exe",
+        ];
         for c in candidates {
             if std::path::Path::new(c).exists() {
                 let _ = verify_file(c);
