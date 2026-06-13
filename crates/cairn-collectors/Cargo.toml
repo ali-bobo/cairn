@@ -11,3 +11,6 @@ evtx.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg.workspace = true
