@@ -250,5 +250,8 @@ mod tests {
         ];
         let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
         assert_eq!(out.findings.len(), 1, "good analyzer still ran");
+        // The failing analyzer must NOT pollute provenance: sources holds only the
+        // collector's entry (analyzer failures are logged, not recorded as sources).
+        assert_eq!(out.sources.len(), 1, "analyzer failure must not add a source");
     }
 }
