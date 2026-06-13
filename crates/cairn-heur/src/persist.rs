@@ -147,4 +147,30 @@ mod tests {
         let s = score_persistence(&p, now);
         assert_eq!(s.weight, 45); // mechanism only
     }
+
+    /// An unknown mechanism (e.g. one not yet implemented, like wmi_subscription) scores 0
+    /// from the mechanism match — guards the wildcard arm against accidental scoring.
+    #[test]
+    fn unknown_mechanism_scores_zero() {
+        let now = Utc::now();
+        let p = rec("wmi_subscription", None, None);
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 0);
+    }
+
+    /// The startup mechanism scores its base (+10, T1547.001) and stacks path + recency —
+    /// guards the startup arm (otherwise only run_key exercises the +10/T1547.001 path).
+    #[test]
+    fn startup_in_appdata_recent_scores() {
+        let now = Utc::now();
+        let p = rec(
+            "startup",
+            Some(r"C:\Users\a\AppData\Roaming\x.exe"),
+            Some(now),
+        );
+        let s = score_persistence(&p, now);
+        // startup 10 + suspicious path 30 + recent 15 = 55
+        assert!(s.weight >= 50, "weight {}", s.weight);
+        assert!(s.mitre.contains(&"T1547.001".to_string()));
+    }
 }
