@@ -7,4 +7,5 @@
 
 pub mod evtx;
 pub mod net;
+pub mod persist;
 pub mod proc;
