@@ -452,10 +452,12 @@ fn main() -> anyhow::Result<()> {
             let collectors: Vec<Box<dyn Collector>> = vec![
                 Box::new(cairn_collectors::proc::ProcCollector),
                 Box::new(cairn_collectors::net::NetCollector),
+                Box::new(cairn_collectors::persist::PersistCollector),
             ];
             let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
                 Box::new(cairn_heur::NetConnHeuristic),
+                Box::new(cairn_heur::PersistHeuristic),
             ];
             let mut outcome = run_live(&cfg, privileges, hostname, &collectors, &analyzers);
             // Stamp the host onto each finding (analyzers don't know the hostname), then
