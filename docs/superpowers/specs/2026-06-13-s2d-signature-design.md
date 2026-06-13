@@ -190,24 +190,39 @@ a future host shows pathological counts, the loop is the obvious parallelization
 ## Rules — the unsigned amplifier (persist heuristic, SRS §10)
 
 Added to `score_persistence`, AFTER the existing mechanism / suspicious-path / recency
-signals, so it can observe whether any other signal already fired.
+signals, so it can observe whether the suspicious-path signal fired.
 
 | Signal | Condition | Weight | ATT&CK |
 |---|---|---|---|
-| Unsigned amplifier | `signed == Some(false)` AND (the suspicious-path signal fired OR the recency signal fired) | +20 | T1036 |
+| Unsigned amplifier | `signed == Some(false)` AND the **suspicious-path** signal fired | +20 | T1036 |
 
 It is an **amplifier, not a base signal**: an unsigned binary on its own does not raise a
 finding (legitimately unsigned tools in normal paths stay quiet). It only adds weight when
-another suspicion is already present. Worked cases (validated against the weight table —
-mechanism bases ifeo 45 / winlogon 35 / service 20 / run_key 10 / startup 10; path +30;
-recent +15):
+the binary sits in a suspicious path.
 
-- Legit unsigned run_key, normal path, old → `10` (no other signal → amplifier off) → **quiet**.
-- Legit unsigned service, normal path, old → `20` (no other signal → amplifier off) → Low (an autostart service is worth one glance; reasonable).
+**Why suspicious-path ONLY, not recency (revised 2026-06-13 after S2-D e2e):** the first
+revision allowed recency ("written in the last 7 days") to be the corroborating signal too.
+A live run proved that wrong: legitimate inbox Windows **drivers** (BasicDisplay,
+BasicRender, uiomap, …) live under `\SystemRoot\System32\DriverStore\`, their `last_write`
+tracks **Windows Update**, not an attacker, and they are **catalog-signed** — which
+`WTD_CHOICE_FILE` reports as unsigned (the documented catalog limitation). The combination
+service(20) + recency(15) + unsigned(20) = 55 falsely flagged four legitimate drivers as
+**High**. Recency is too easily tripped by ordinary system servicing to license the
+unsigned amplifier on its own. A genuinely planted unsigned service almost always also
+sits in a non-system path (Temp/AppData/ProgramData), which the suspicious-path signal
+catches. So the amplifier now requires the suspicious-PATH signal specifically. Recency
+remains a standalone +15 scoring signal; it just no longer gates the unsigned amplifier.
+
+Worked cases (mechanism bases ifeo 45 / winlogon 35 / service 20 / run_key 10 / startup 10;
+path +30; recent +15):
+
+- Legit unsigned run_key, normal path, old → `10` (no path signal → amplifier off) → **quiet**.
+- Legit unsigned service, normal path, old → `20` → Low.
+- Legit catalog-signed driver service, normal path, recent → `20 + 15 = 35` → Medium; amplifier OFF (no suspicious path) — NOT High. (This is the e2e false-positive, now fixed.)
 - Unsigned run_key in Temp → `10 + 30(path) + 20(unsigned) = 60` → **High**.
 - Unsigned IFEO in Temp, recent → `45 + 30 + 15 + 20 = 110` → **Critical**.
-- **Signed** IFEO in Temp → amplifier off (`signed == Some(true)`); `45 + 30 = 75` still **Critical** (a Debugger value is wrong even if signed — correct).
-- Unknown-signature (None) run_key in Temp → `10 + 30 = 40` → Medium; amplifier off (we never penalize what we could not verify).
+- **Signed** IFEO in Temp → amplifier off (`signed == Some(true)`); `45 + 30 = 75` still **Critical**.
+- Unknown-signature (None) run_key in Temp → `10 + 30 = 40` → Medium; amplifier off (never penalize the unverifiable).
 
 `reason` gains "binary is unsigned (amplifies the above)" when the signal fires (golden
 rule 6 — explainable).

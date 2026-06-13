@@ -29,14 +29,11 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
         _ => {}
     }
 
-    // Weight from the mechanism alone, captured before path/recency so the unsigned
-    // amplifier can tell whether ANOTHER signal (path or recency) fired.
-    let mechanism_weight = s.weight;
-
     // Suspicious binary path — but NOT for the startup mechanism: the Startup folder is
     // itself the canonical persistence location, so its own path is not a suspicion
     // signal (the mechanism base weight already accounts for it). Other mechanisms point
     // at an arbitrary binary path, where Temp/AppData/etc. IS suspicious.
+    let mut suspicious_path_fired = false;
     if p.mechanism != "startup" {
         if let Some(path) = p.binary_path.as_deref() {
             if is_suspicious_path(path) {
@@ -45,6 +42,7 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
                     format!("binary in a suspicious path: {path}"),
                     &["T1036"],
                 );
+                suspicious_path_fired = true;
             }
         }
     }
@@ -57,13 +55,15 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
         }
     }
 
-    // Unsigned amplifier: an unsigned binary is a signal only when ANOTHER suspicion is
-    // already present (a suspicious path or a recent write added weight beyond the mechanism
-    // base). Many legitimate tools are unsigned in normal locations — penalizing that alone
-    // floods false positives. We never penalize what we could not verify (None) nor what is
-    // trusted (Some(true)). `signed` is backfilled by the persist collector via WinVerifyTrust.
-    let another_signal_fired = s.weight > mechanism_weight;
-    if p.signed == Some(false) && another_signal_fired {
+    // Unsigned amplifier: an unsigned binary is a signal only when it also sits in a
+    // SUSPICIOUS PATH. We deliberately do NOT let recency alone license this: legitimate
+    // inbox Windows drivers (catalog-signed, so WTD_CHOICE_FILE reports them unsigned) get
+    // their last_write bumped by Windows Update, and service(20)+recency(15)+unsigned(20)
+    // would falsely flag them High (observed in S2-D e2e). A genuinely planted unsigned
+    // payload almost always also lives in a non-system path, which the path signal catches.
+    // We never penalize the unverifiable (None) nor the trusted (Some(true)). `signed` is
+    // backfilled by the persist collector via WinVerifyTrust (S2-D).
+    if p.signed == Some(false) && suspicious_path_fired {
         s.add(20, "binary is unsigned (amplifies the above)", &["T1036"]);
     }
 
@@ -354,19 +354,30 @@ mod tests {
         assert_eq!(s.weight, 40, "run_key 10 + path 30; None -> no amplifier");
     }
 
-    /// Unsigned + recent (no suspicious path): recency is the other signal, amplifier fires.
+    /// Unsigned + recent but NORMAL path: amplifier does NOT fire — recency alone must not
+    /// license it. Regression for the S2-D e2e false positive: legitimate catalog-signed
+    /// inbox drivers (reported unsigned by WTD_CHOICE_FILE) get their last_write bumped by
+    /// Windows Update; service(20)+recency(15)+unsigned(20)=55 would have wrongly flagged
+    /// them High. With the amplifier gated on suspicious-path only, this stays Medium (35).
     #[test]
-    fn unsigned_amplifies_recency() {
+    fn unsigned_recent_normal_path_does_not_amplify() {
         let now = Utc::now();
         let p = rec_signed(
             "service",
-            Some(r"C:\Windows\System32\svc.exe"),
-            Some(now),
-            Some(false),
+            Some(r"C:\Windows\System32\DriverStore\drv.sys"), // legit driver location
+            Some(now),                                        // recently serviced
+            Some(false),                                      // catalog-signed -> reported unsigned
         );
         let s = score_persistence(&p, now);
-        assert_eq!(s.weight, 55, "service 20 + recent 15 + unsigned 20");
-        assert!(s.reasons.iter().any(|r| r.contains("unsigned")));
+        // service 20 + recent 15 = 35 (Medium); NO unsigned amplifier (no suspicious path)
+        assert_eq!(
+            s.weight, 35,
+            "service 20 + recent 15; amplifier OFF without a suspicious path"
+        );
+        assert!(
+            !s.reasons.iter().any(|r| r.contains("unsigned")),
+            "recency alone must not trigger the unsigned amplifier"
+        );
     }
 
     use cairn_core::record::Record;

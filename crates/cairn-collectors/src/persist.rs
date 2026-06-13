@@ -395,8 +395,7 @@ mod win {
             let windir = std::env::var("SystemRoot")
                 .or_else(|_| std::env::var("windir"))
                 .unwrap_or_else(|_| r"C:\Windows".to_string());
-            let bin = extract_binary_path(&image)
-                .map(|p| normalize_service_path(&p, &windir));
+            let bin = extract_binary_path(&image).map(|p| normalize_service_path(&p, &windir));
             out.push(PersistenceRecord {
                 mechanism: "service".to_string(),
                 location,
@@ -706,7 +705,10 @@ mod tests {
         assert_eq!(normalize_service_path("", windir), r"C:\Windows\");
         assert_eq!(normalize_service_path(r"\??\", windir), "");
         // a lone backslash-prefixed relative path
-        assert_eq!(normalize_service_path(r"\System32\x.sys", windir), r"C:\Windows\System32\x.sys");
+        assert_eq!(
+            normalize_service_path(r"\System32\x.sys", windir),
+            r"C:\Windows\System32\x.sys"
+        );
     }
 
     /// PersistCollector.collect returns only Persistence records, never panics, name="persist".
