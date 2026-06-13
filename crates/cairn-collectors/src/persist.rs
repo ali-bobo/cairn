@@ -4,6 +4,9 @@
 //! `signed`/`binary_sha256` are left None (S2-D / FR14).
 #![allow(dead_code)] // Task 4: pure helper only; readers + Collector land in Tasks 5-8.
 
+use cairn_core::record::PersistenceRecord;
+use chrono::{DateTime, Utc};
+
 /// Extract the executable path from a command line. Handles a quoted first token
 /// (`"C:\p a\app.exe" -x` -> `C:\p a\app.exe`) and a bare first token
 /// (`C:\p\app.exe -x` -> `C:\p\app.exe`), then expands %ENV% variables using the process
@@ -67,6 +70,180 @@ fn expand_env_vars(s: &str, lookup: &impl Fn(&str) -> Option<String>) -> String 
     }
     out.push_str(rest);
     out
+}
+
+/// Build a PersistenceRecord with the deferred fields (signed/sha256) as None.
+fn make_record(
+    mechanism: &str,
+    location: String,
+    value: Option<String>,
+    command: Option<String>,
+    last_write: Option<DateTime<Utc>>,
+) -> PersistenceRecord {
+    let binary_path = command.as_deref().and_then(extract_binary_path);
+    PersistenceRecord {
+        mechanism: mechanism.to_string(),
+        location,
+        value,
+        command,
+        binary_path,
+        binary_sha256: None,
+        signed: None,
+        last_write,
+    }
+}
+
+/// Non-Windows: persistence reads are Windows-only; return empty so the workspace builds.
+#[cfg(not(windows))]
+fn read_run_keys() -> Vec<PersistenceRecord> {
+    vec![]
+}
+#[cfg(not(windows))]
+fn read_winlogon() -> Vec<PersistenceRecord> {
+    vec![]
+}
+#[cfg(not(windows))]
+fn read_ifeo() -> Vec<PersistenceRecord> {
+    vec![]
+}
+
+#[cfg(windows)]
+fn read_run_keys() -> Vec<PersistenceRecord> {
+    win::read_run_keys()
+}
+#[cfg(windows)]
+fn read_winlogon() -> Vec<PersistenceRecord> {
+    win::read_winlogon()
+}
+#[cfg(windows)]
+fn read_ifeo() -> Vec<PersistenceRecord> {
+    win::read_ifeo()
+}
+
+/// Windows registry readers for persistence mechanisms.
+///
+/// winreg 0.56.0 API used:
+///   - `RegKey::predef(HKEY)` — open a root hive handle (const fn, no allocation)
+///   - `regkey.open_subkey(path)` — read-only open; returns `io::Result<RegKey>`
+///   - `regkey.enum_values()` — yields `io::Result<(String, RegValue)>`; `RegValue` impls
+///     `Display` so `val.to_string()` produces the human-readable data string
+///   - `regkey.enum_keys()` — yields `io::Result<String>`
+///   - `regkey.get_value::<String, _>(name)` — typed single-value read
+///   - `regkey.query_info()` — returns `io::Result<RegKeyMetadata>`
+///   - `RegKeyMetadata::get_last_write_time_system()` — returns `SYSTEMTIME` (wYear/wMonth/
+///     wDay/wHour/wMinute/wSecond all as u16; no expect/panic). We convert via
+///     `Utc.with_ymd_and_hms(...).single()` — NOT the chrono feature helper which calls
+///     `.expect()` internally and would panic on a malformed timestamp.
+#[cfg(windows)]
+mod win {
+    use super::{make_record, PersistenceRecord};
+    use chrono::{DateTime, TimeZone, Utc};
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    /// Best-effort last-write of a key as UTC; None if unavailable or out of range.
+    /// PANIC-FREE: uses with_ymd_and_hms(...).single(), not winreg's expect()-based helper.
+    fn key_last_write(key: &RegKey) -> Option<DateTime<Utc>> {
+        let info = key.query_info().ok()?;
+        let st = info.get_last_write_time_system();
+        Utc.with_ymd_and_hms(
+            st.wYear as i32,
+            st.wMonth as u32,
+            st.wDay as u32,
+            st.wHour as u32,
+            st.wMinute as u32,
+            st.wSecond as u32,
+        )
+        .single()
+    }
+
+    /// Run + RunOnce under both HKLM and HKCU.
+    pub fn read_run_keys() -> Vec<PersistenceRecord> {
+        let mut out = Vec::new();
+        let bases = [(HKEY_LOCAL_MACHINE, "HKLM"), (HKEY_CURRENT_USER, "HKCU")];
+        let subs = [
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+        ];
+        for (hkey, hname) in bases {
+            for sub in subs {
+                let root = RegKey::predef(hkey);
+                let Ok(key) = root.open_subkey(sub) else {
+                    continue;
+                };
+                let lw = key_last_write(&key);
+                let location = format!("{hname}\\{sub}");
+                for item in key.enum_values() {
+                    let Ok((name, val)) = item else {
+                        continue;
+                    };
+                    // RegValue implements Display; to_string() yields the human-readable
+                    // data (REG_SZ/REG_EXPAND_SZ/REG_MULTI_SZ as string, DWORD/QWORD as
+                    // decimal, binary as debug byte array).
+                    let data = val.to_string();
+                    out.push(make_record(
+                        "run_key",
+                        location.clone(),
+                        Some(name),
+                        Some(data),
+                        lw,
+                    ));
+                }
+            }
+        }
+        out
+    }
+
+    /// Winlogon Shell + Userinit (HKLM).
+    pub fn read_winlogon() -> Vec<PersistenceRecord> {
+        let mut out = Vec::new();
+        let sub = r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon";
+        let root = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let Ok(key) = root.open_subkey(sub) else {
+            return out;
+        };
+        let lw = key_last_write(&key);
+        let location = format!("HKLM\\{sub}");
+        for name in ["Shell", "Userinit"] {
+            if let Ok(data) = key.get_value::<String, _>(name) {
+                out.push(make_record(
+                    "winlogon",
+                    location.clone(),
+                    Some(name.to_string()),
+                    Some(data),
+                    lw,
+                ));
+            }
+        }
+        out
+    }
+
+    /// IFEO subkeys that carry a Debugger value (the hijack vector).
+    pub fn read_ifeo() -> Vec<PersistenceRecord> {
+        let mut out = Vec::new();
+        let sub = r"Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
+        let root = RegKey::predef(HKEY_LOCAL_MACHINE);
+        let Ok(ifeo) = root.open_subkey(sub) else {
+            return out;
+        };
+        for name in ifeo.enum_keys().flatten() {
+            let Ok(img) = ifeo.open_subkey(&name) else {
+                continue;
+            };
+            if let Ok(dbg) = img.get_value::<String, _>("Debugger") {
+                let lw = key_last_write(&img);
+                let location = format!("HKLM\\{sub}\\{name}");
+                out.push(make_record(
+                    "ifeo",
+                    location,
+                    Some(name.clone()),
+                    Some(dbg),
+                    lw,
+                ));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
