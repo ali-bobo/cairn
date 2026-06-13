@@ -5,6 +5,7 @@
 
 pub mod netconn;
 pub mod parentchild;
+pub mod persist;
 pub mod score;
 
 // Public API: the analyzers wired into the CLI live run (and reusable elsewhere).
