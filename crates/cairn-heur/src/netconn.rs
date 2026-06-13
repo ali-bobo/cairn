@@ -1,10 +1,11 @@
 //! heur_netconn (FR11, SRS §10): bare public-IP remote, rare remote port, owning-proc
-//! in temp, unsigned owner, suspicious high-port listener. Pure scoring (analyzer is Task 6).
-// Task 5: pure scoring only. Task 6 adds the Analyzer impl that consumes score_conn;
-// until then, suppress dead_code for the staging items.
-#![allow(dead_code)]
-use crate::score::{is_public_ipv4, is_rare_port, is_suspicious_path, Score};
-use cairn_core::record::{NetConnRecord, ProcessRecord};
+//! in temp, unsigned owner, suspicious high-port listener. Pure scoring + Analyzer impl.
+use crate::score::{is_public_ipv4, is_rare_port, is_suspicious_path, severity_for, Score};
+use cairn_core::finding::EntityNetConn;
+use cairn_core::record::{NetConnRecord, ProcessRecord, Record};
+use cairn_core::traits::Analyzer;
+use cairn_core::{Entity, Finding, FindingSource, Result};
+use std::collections::HashMap;
 
 /// Score one connection against its (optional) owning process.
 fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
@@ -48,6 +49,65 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
         }
     }
     s
+}
+
+/// Analyzer: scores every connection against its owning process.
+pub struct NetConnHeuristic;
+
+impl Analyzer for NetConnHeuristic {
+    fn name(&self) -> &str {
+        "heur_netconn"
+    }
+
+    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+        let by_pid: HashMap<u32, &ProcessRecord> = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Process(p) => Some((p.pid, p)),
+                _ => None,
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        for r in records {
+            let Record::NetConn(c) = r else { continue };
+            let owner = c.pid.and_then(|pid| by_pid.get(&pid).copied());
+            let score = score_conn(c, owner);
+            let Some(severity) = severity_for(score.weight) else {
+                continue;
+            };
+
+            let mut f = Finding::new(
+                severity,
+                format!("Suspicious {} connection", c.proto),
+                FindingSource::Heuristic,
+            );
+            f.reason = Some(score.reasons.join("; "));
+            f.mitre = score.mitre;
+            f.artifact = "netconn".into();
+            f.details = format!(
+                "{} {}:{} -> {}:{} pid={:?}",
+                c.proto,
+                c.laddr,
+                c.lport,
+                c.raddr.as_deref().unwrap_or("-"),
+                c.rport.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                c.pid
+            );
+            f.entity = Entity {
+                netconn: Some(EntityNetConn {
+                    laddr: c.laddr.clone(),
+                    lport: c.lport,
+                    raddr: c.raddr.clone(),
+                    rport: c.rport,
+                    pid: c.pid,
+                }),
+                ..Entity::default()
+            };
+            out.push(f);
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
@@ -192,5 +252,43 @@ mod tests {
             "only the rare-port signal should fire for a private dest"
         );
         assert!(!s.reasons.iter().any(|r| r.contains("public IP")));
+    }
+
+    use cairn_core::record::Record;
+    use cairn_core::traits::Analyzer;
+
+    /// The analyzer emits one Heuristic NetConn finding for the malicious conn, with
+    /// reason + netconn entity, and nothing for loopback.
+    #[test]
+    fn analyzer_emits_finding_for_malicious_conn() {
+        let bad = Record::NetConn(conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        ));
+        let good = Record::NetConn(conn(
+            "tcp",
+            445,
+            Some("127.0.0.1"),
+            Some(445),
+            None,
+            Some(4),
+        ));
+        let proc = Record::Process(owner(
+            r"C:\Users\a\AppData\Local\Temp\evil.exe",
+            Some(false),
+        ));
+        // owner pid must match the bad conn's pid (1); the owner() helper sets pid=1
+        let recs = vec![bad, good, proc];
+
+        let findings = NetConnHeuristic.analyze(&recs).expect("analyze");
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert!(matches!(f.source, cairn_core::FindingSource::Heuristic));
+        assert!(f.reason.is_some());
+        assert!(f.entity.netconn.is_some());
     }
 }
