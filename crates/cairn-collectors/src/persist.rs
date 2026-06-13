@@ -130,6 +130,54 @@ fn read_services() -> Vec<PersistenceRecord> {
     win::read_services()
 }
 
+/// Startup folders: per-user (%APPDATA%) and All Users (%PROGRAMDATA%) Startup dirs.
+/// Reads the real process env; delegates to the testable core. Read-only.
+fn read_startup_folders() -> Vec<PersistenceRecord> {
+    let rel = r"Microsoft\Windows\Start Menu\Programs\Startup";
+    let dirs: Vec<String> = ["APPDATA", "PROGRAMDATA"]
+        .iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .map(|base| format!(r"{base}\{rel}"))
+        .collect();
+    read_startup_dirs(&dirs)
+}
+
+/// Pure core: scan the given Startup directories for files, each -> a `startup`
+/// PersistenceRecord. Injectable for testing (no env, no fixed paths). Best-effort:
+/// an unreadable dir is skipped; `desktop.ini` (folder metadata) is ignored. Never panics.
+fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
+    let mut out = Vec::new();
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.eq_ignore_ascii_case("desktop.ini") {
+                continue;
+            }
+            let last_write = entry
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(chrono::DateTime::<chrono::Utc>::from);
+            let full = path.to_string_lossy().to_string();
+            out.push(make_record(
+                "startup",
+                dir.clone(),
+                Some(name),
+                Some(full),
+                last_write,
+            ));
+        }
+    }
+    out
+}
+
 /// Windows registry readers for persistence mechanisms.
 ///
 /// winreg 0.56.0 API used:
@@ -365,5 +413,33 @@ mod tests {
             extract_binary_path(r"C:\Windows\notepad.exe").as_deref(),
             Some(r"C:\Windows\notepad.exe")
         );
+    }
+
+    #[test]
+    fn startup_dirs_reads_files_and_skips_desktop_ini() {
+        // Lay out a temp dir like a Startup folder; pass it explicitly (no env mutation).
+        let tmp = std::env::temp_dir().join(format!("cairn_s2c_startup_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("evil.lnk"), b"x").unwrap();
+        std::fs::write(tmp.join("desktop.ini"), b"x").unwrap();
+
+        let dirs = vec![tmp.to_string_lossy().to_string()];
+        let recs = read_startup_dirs(&dirs);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+
+        assert!(
+            recs.iter()
+                .any(|r| r.value.as_deref() == Some("evil.lnk") && r.mechanism == "startup"),
+            "evil.lnk should be a startup record"
+        );
+        assert!(
+            !recs
+                .iter()
+                .any(|r| r.value.as_deref() == Some("desktop.ini")),
+            "desktop.ini must be skipped"
+        );
+        // a nonexistent dir is best-effort skipped, no panic
+        assert!(read_startup_dirs(&["C:\\does\\not\\exist\\cairn".into()]).is_empty());
     }
 }
