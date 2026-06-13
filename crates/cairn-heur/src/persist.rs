@@ -29,6 +29,10 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
         _ => {}
     }
 
+    // Weight from the mechanism alone, captured before path/recency so the unsigned
+    // amplifier can tell whether ANOTHER signal (path or recency) fired.
+    let mechanism_weight = s.weight;
+
     // Suspicious binary path — but NOT for the startup mechanism: the Startup folder is
     // itself the canonical persistence location, so its own path is not a suspicion
     // signal (the mechanism base weight already accounts for it). Other mechanisms point
@@ -51,6 +55,16 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
         {
             s.add(15, "recently created/modified (last 7 days)", &[]);
         }
+    }
+
+    // Unsigned amplifier: an unsigned binary is a signal only when ANOTHER suspicion is
+    // already present (a suspicious path or a recent write added weight beyond the mechanism
+    // base). Many legitimate tools are unsigned in normal locations — penalizing that alone
+    // floods false positives. We never penalize what we could not verify (None) nor what is
+    // trusted (Some(true)). `signed` is backfilled by the persist collector via WinVerifyTrust.
+    let another_signal_fired = s.weight > mechanism_weight;
+    if p.signed == Some(false) && another_signal_fired {
+        s.add(20, "binary is unsigned (amplifies the above)", &["T1036"]);
     }
 
     s
@@ -262,6 +276,97 @@ mod tests {
             !s.reasons.iter().any(|r| r.contains("suspicious path")),
             "startup folder path must not trigger the suspicious-path signal"
         );
+    }
+
+    /// Like `rec` but with an explicit `signed` value (for amplifier tests).
+    fn rec_signed(
+        mechanism: &str,
+        binary_path: Option<&str>,
+        last_write: Option<DateTime<Utc>>,
+        signed: Option<bool>,
+    ) -> PersistenceRecord {
+        let mut r = rec(mechanism, binary_path, last_write);
+        r.signed = signed;
+        r
+    }
+
+    /// Unsigned + suspicious path: amplifier fires (+20), reason mentions unsigned.
+    #[test]
+    fn unsigned_amplifies_suspicious_path() {
+        let now = Utc::now();
+        let old = now - Duration::days(400); // no recency, isolate the path signal
+        let p = rec_signed(
+            "run_key",
+            Some(r"C:\Users\a\AppData\Local\Temp\x.exe"),
+            Some(old),
+            Some(false),
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 60, "run_key 10 + path 30 + unsigned 20"); // weight {}
+        assert!(s.reasons.iter().any(|r| r.contains("unsigned")));
+        assert!(s.mitre.contains(&"T1036".to_string()));
+    }
+
+    /// Unsigned in a NORMAL path, old: amplifier does NOT fire (no other signal).
+    #[test]
+    fn unsigned_alone_does_not_amplify() {
+        let now = Utc::now();
+        let old = now - Duration::days(400);
+        let p = rec_signed(
+            "run_key",
+            Some(r"C:\Program Files\Vendor\app.exe"),
+            Some(old),
+            Some(false),
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 10, "run_key only; amplifier off");
+        assert!(!s.reasons.iter().any(|r| r.contains("unsigned")));
+    }
+
+    /// Signed (Some(true)) in a suspicious path: amplifier does NOT fire.
+    #[test]
+    fn signed_does_not_amplify() {
+        let now = Utc::now();
+        let old = now - Duration::days(400);
+        let p = rec_signed(
+            "run_key",
+            Some(r"C:\Users\a\AppData\Local\Temp\x.exe"),
+            Some(old),
+            Some(true),
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 40, "run_key 10 + path 30; signed -> no amplifier");
+        assert!(!s.reasons.iter().any(|r| r.contains("unsigned")));
+    }
+
+    /// Unknown signature (None) in a suspicious path: amplifier does NOT fire.
+    #[test]
+    fn unknown_signature_does_not_amplify() {
+        let now = Utc::now();
+        let old = now - Duration::days(400);
+        let p = rec_signed(
+            "run_key",
+            Some(r"C:\Users\a\AppData\Local\Temp\x.exe"),
+            Some(old),
+            None,
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 40, "run_key 10 + path 30; None -> no amplifier");
+    }
+
+    /// Unsigned + recent (no suspicious path): recency is the other signal, amplifier fires.
+    #[test]
+    fn unsigned_amplifies_recency() {
+        let now = Utc::now();
+        let p = rec_signed(
+            "service",
+            Some(r"C:\Windows\System32\svc.exe"),
+            Some(now),
+            Some(false),
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 55, "service 20 + recent 15 + unsigned 20");
+        assert!(s.reasons.iter().any(|r| r.contains("unsigned")));
     }
 
     use cairn_core::record::Record;
