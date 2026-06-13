@@ -55,3 +55,16 @@ pub trait OutputSink: Send {
     /// Finalize (e.g. zip + hash). Returns output file list with hashes.
     fn finalize(&mut self) -> Result<Vec<crate::manifest::OutputEntry>>;
 }
+
+/// Verifies a file's code signature. The seam between the safe collectors and the
+/// unsafe WinTrust FFI (cairn-collectors-win): collectors depend only on this trait, so
+/// they stay `#![forbid(unsafe_code)]`. `verify` is total — it never panics and never
+/// errors; an unverifiable file (missing, unreadable, off-platform) yields `None`.
+///
+/// Contract:
+/// - `Some(true)`  = signature present and trusted.
+/// - `Some(false)` = unsigned or signature invalid/untrusted.
+/// - `None`        = could not verify (file absent, path not convertible, off-platform).
+pub trait FileVerifier: Send + Sync {
+    fn verify(&self, path: &str) -> Option<bool>;
+}
