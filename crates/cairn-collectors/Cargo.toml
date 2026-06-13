@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 cairn-core = { path = "../cairn-core" }
+cairn-collectors-win = { path = "../cairn-collectors-win" }
 evtx.workspace = true
 chrono.workspace = true
 serde_json.workspace = true

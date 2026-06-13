@@ -56,7 +56,7 @@ Each: responsibility | input | output | key crates | privilege | stage.
 | `evtx_collector` | parse EVTX → JSON records | .evtx files / live winevt dir | Record::Event | evtx | user* | 1 |
 | `sigma_engine` | compile+match Sigma over Event records | Record::Event + ruleset | Finding | sigma_engine/sigmars/tau-engine | - | 1 |
 | `reporter` | timeline, summary, findings, manifest | Records+Findings | files | serde_json, csv, sha2, zip | - | 1 |
-| `proc_collector` | process tree, cmdline, image path, signer, integrity | live OS | Record::Process | windows-rs, sysinfo | admin for others | 2 |
+| `proc_collector` | process tree, cmdline, image path, signer, integrity | live OS | Record::Process | windows-rs | admin for others | 2 |
 | `net_collector` | TCP/UDP tables, listen ports, conn→PID | live OS | Record::NetConn | windows-rs (IpHelper) | user | 2 |
 | `persist_collector` | Run/RunOnce, services, sched tasks, WMI subs, IFEO, startup, winlogon | hives+tasks+wmi repo | Record::Persistence | notatin/frnsc-hive, evtx, wmi repo parser | admin | 2 |
 | `mft_collector` | $MFT MACB, timestomp delta, path map | raw \\.\C: | Record::FileMeta | ntfs/ntfs-reader | admin+SeBackup | 2 |
@@ -141,6 +141,10 @@ do not add a `schema` field to `Record`.
   "integrity_note": "All hashes SHA-256 over bytes as collected."
 }
 ```
+- `host.hostname` source: an EVTX run borrows the parsed `Computer` field; a live run
+  (`--target live`) has none, so it is read via `GetComputerNameExW` (in
+  `cairn-collectors-win`). A live source (process/net table) is not a byte stream, so its
+  `sources[].sha256` is empty and `method="api"` — SHA-256 applies to file-backed sources.
 
 ## 6. CLI surface
 ```
@@ -259,10 +263,12 @@ Stage 4 (operationalize):
 cairn/
   Cargo.toml (workspace)
   crates/
-    cairn-cli/         # bin
-    cairn-core/        # Record/Finding types, orchestrator, traits
-    cairn-collectors/  # evtx,proc,net,persist,mft,usn,hive,prefetch,...
-    cairn-sigma/       # SigmaMatcher trait + chosen backend + mapping
+    cairn-cli/             # bin
+    cairn-core/            # Record/Finding types, orchestrator, traits
+    cairn-collectors/      # evtx,proc,net,persist,prefetch,... (forbid(unsafe_code))
+    cairn-collectors-win/  # Windows unsafe FFI ONLY (proc/net/host/privilege probe;
+                           #   later raw-NTFS). The single allow(unsafe_code) crate (NFR3).
+    cairn-sigma/           # SigmaMatcher trait + chosen backend + mapping
     cairn-heur/        # parentchild,persist,netconn
     cairn-report/      # timeline,summary,manifest,output_sink
     cairn-integrity/   # hashing,manifest,verify

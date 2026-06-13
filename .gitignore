@@ -5,8 +5,10 @@
 # Cargo.lock IS committed for this workspace (reproducible builds, NFR7).
 # Do NOT add Cargo.lock here.
 
-# Tool output — never commit triage results
+# Tool output — never commit triage results (incl. live-run dirs like out-live/).
+# Live runs capture real host process/network state; these must never be committed.
 /out
+/out-*
 /test-data
 
 # Forensic fixtures & sample evidence — kept out of git (size + sensitivity).

@@ -304,9 +304,13 @@ pub fn verify_manifest(manifest: &Manifest, base_dir: &std::path::Path) -> Verif
             .iter()
             .map(|o| check(&o.file, base_dir.join(&o.file), &o.sha256))
             .collect(),
+        // Only file-backed sources can be re-hashed. A live/API source (process or net
+        // table) has an empty sha256 and a `live:` pseudo-path — there are no bytes to
+        // re-read, so it is not a verifiable artifact. Skip those (don't flag Missing).
         sources: manifest
             .sources
             .iter()
+            .filter(|s| !s.sha256.is_empty())
             .map(|s| check(&s.path, std::path::PathBuf::from(&s.path), &s.sha256))
             .collect(),
     }
@@ -512,6 +516,42 @@ mod tests {
             report.failures()
         );
         assert_eq!(report.outputs.len(), 2);
+    }
+
+    /// A live/API source (empty sha256, `live:` pseudo-path — e.g. a process or net
+    /// table) is NOT a file and must be skipped by verify, not flagged Missing. This is
+    /// the fix surfaced by the S2-A `cairn run --target live` end-to-end run.
+    #[test]
+    fn verify_skips_live_sources_without_bytes() {
+        use cairn_core::manifest::SourceEntry;
+        let dir = std::env::temp_dir().join("cairn_verify_live_src_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(dir.clone());
+        sink.write_timeline_csv(&[]).unwrap();
+        sink.write_findings_jsonl(&[]).unwrap();
+
+        let mut manifest = minimal_manifest();
+        manifest.outputs = sink.outputs_so_far();
+        manifest.sources = vec![SourceEntry {
+            artifact: "process".into(),
+            path: "live:process".into(),
+            method: "api".into(),
+            size: 0,
+            sha256: String::new(), // no bytes to hash
+            errors: vec![],
+        }];
+
+        let report = verify_manifest(&manifest, &dir);
+        assert!(
+            report.ok(),
+            "live source must be skipped, not flagged: {:?}",
+            report.failures()
+        );
+        assert_eq!(
+            report.sources.len(),
+            0,
+            "live source is not a verifiable file"
+        );
     }
 
     /// verify fails loudly when a single output byte is tampered after the manifest was

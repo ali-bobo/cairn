@@ -134,6 +134,36 @@ fn evtx_plan(cfg: &Config) -> String {
     format!("plan: evtx triage of {n} file(s); rules={rules} (encoding={encoding}); output={out}")
 }
 
+/// True if the run target selects the live host (vs an offline artifact dir).
+fn is_live_target(target: &str) -> bool {
+    target.eq_ignore_ascii_case("live")
+}
+
+/// Dump collected Records as JSONL so a live run produces usable data even before
+/// analyzers exist. One Record per line (the internal bus type; versioned by schema::RECORD).
+fn write_records_jsonl(
+    dir: &std::path::Path,
+    records: &[cairn_core::record::Record],
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(dir.join("records.jsonl"))?;
+    for r in records {
+        writeln!(f, "{}", serde_json::to_string(r)?)?;
+    }
+    Ok(())
+}
+
+/// Set manifest.outputs from the data files written so far, then write the manifest.
+fn manifest_outputs_then_write(sink: &mut DirSink, mut manifest: Manifest) -> anyhow::Result<()> {
+    manifest.outputs = sink.outputs_so_far();
+    sink.write_manifest(&manifest)?;
+    let outputs = sink.finalize()?;
+    for o in &outputs {
+        tracing::info!(file = %o.file, sha256 = %o.sha256, "wrote output");
+    }
+    Ok(())
+}
+
 /// Off-target output directory for a Stage-1 evtx run (golden rule 4). Resolved from
 /// the Config; run.log is written here.
 fn output_dir(cfg: &Config) -> PathBuf {
@@ -354,15 +384,103 @@ fn main() -> anyhow::Result<()> {
             // _guard must live until logging is done; non-blocking writer flushes on drop.
             drop(_guard);
         }
+        Cmd::Run(args) => {
+            use cairn_core::orchestrator::run_live;
+            use cairn_core::traits::Collector;
+
+            if !is_live_target(&args.target) {
+                // Offline-artifact orchestration is the raw-NTFS sub-segment; be honest.
+                eprintln!(
+                    "cairn run --target <dir> is not implemented yet (raw-NTFS sub-segment); \
+                     use --target live, or `cairn evtx` for EVTX files."
+                );
+                std::process::exit(2);
+            }
+
+            let dir = args.output.clone();
+            std::fs::create_dir_all(&dir)?;
+            let file_appender = tracing_appender::rolling::never(&dir, "run.log");
+            let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
+            tracing_subscriber::fmt()
+                .with_env_filter(log_filter())
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(file_writer)
+                .init();
+
+            tracing::info!(
+                "cairn {} ({}) starting (live)",
+                env!("CARGO_PKG_VERSION"),
+                BUILD_SHA
+            );
+
+            let privileges = cairn_collectors_win::privilege::probe();
+            tracing::info!(
+                admin = privileges.admin,
+                se_backup = privileges.se_backup,
+                se_debug = privileges.se_debug,
+                "privilege probe"
+            );
+            let hostname = cairn_collectors_win::host::hostname().unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "hostname probe failed; using 'unknown'");
+                "unknown".into()
+            });
+
+            let cfg = Config::default();
+            let collectors: Vec<Box<dyn Collector>> = vec![
+                Box::new(cairn_collectors::proc::ProcCollector),
+                Box::new(cairn_collectors::net::NetCollector),
+            ];
+            let outcome = run_live(&cfg, privileges, hostname, &collectors);
+            tracing::info!(records = outcome.records.len(), "live collection complete");
+
+            let by_sev =
+                cairn_report::Summary::from_findings(&[], outcome.records.len() as u64).by_severity;
+            let manifest = Manifest {
+                schema: cairn_core::schema::MANIFEST.to_string(),
+                tool: ToolInfo {
+                    name: "cairn".into(),
+                    version: env!("CARGO_PKG_VERSION").into(),
+                    build_sha: BUILD_SHA.into(),
+                    sigma_ruleset_ver: String::new(),
+                },
+                run: RunInfo {
+                    started_utc: chrono::Utc::now(),
+                    finished_utc: Some(chrono::Utc::now()),
+                    cmdline: std::env::args().collect::<Vec<_>>().join(" "),
+                    operator: String::new(),
+                    case_id: String::new(),
+                },
+                host: HostInfo {
+                    hostname: outcome.hostname.clone(),
+                    os_build: String::new(),
+                    timezone: "UTC".into(),
+                    wall_clock_utc_skew: "unknown".into(),
+                },
+                privileges: outcome.privileges.clone(),
+                sources: outcome.sources.clone(),
+                outputs: vec![],
+                counts: Counts {
+                    records: outcome.records.len() as u64,
+                    findings_by_sev: by_sev,
+                },
+                integrity_note: "All hashes SHA-256 over bytes as collected.".into(),
+            };
+
+            let mut sink = DirSink::new(dir.clone());
+            sink.write_timeline_csv(&[])?; // no findings yet (no analyzers this sub-segment)
+            sink.write_findings_jsonl(&[])?;
+            write_records_jsonl(&dir, &outcome.records)?;
+            manifest_outputs_then_write(&mut sink, manifest)?;
+            tracing::info!(dir = %dir.display(), "live run complete");
+            drop(_guard);
+        }
         other => {
             tracing_subscriber::fmt()
                 .with_env_filter(log_filter())
                 .with_target(false)
                 .init();
             match other {
-                Cmd::Run(_args) => {
-                    tracing::info!("TODO S2+: orchestrate collectors + analyzers + report");
-                }
                 Cmd::UpdateRules { .. } => tracing::info!("TODO S4"),
                 Cmd::Verify {
                     manifest,
@@ -375,7 +493,7 @@ fn main() -> anyhow::Result<()> {
                         std::process::exit(1);
                     }
                 }
-                Cmd::Evtx { .. } => unreachable!(),
+                Cmd::Evtx { .. } | Cmd::Run(_) => unreachable!(),
             }
         }
     }
@@ -385,6 +503,13 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_target_live_is_recognized() {
+        assert!(is_live_target("live"));
+        assert!(is_live_target("LIVE"));
+        assert!(!is_live_target("C:\\evidence"));
+    }
 
     #[test]
     fn evtx_plan_reports_file_count_rules_and_output() {

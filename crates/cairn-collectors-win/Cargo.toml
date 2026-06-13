@@ -1,0 +1,23 @@
+[package]
+name = "cairn-collectors-win"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cairn-core = { path = "../cairn-core" }
+chrono.workspace = true
+
+# Windows-only: native WinAPI. Minimal feature set; expand only as collectors need it.
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+features = [
+  "Win32_Foundation",
+  "Win32_System_Threading",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_Security",
+  "Win32_System_SystemInformation",
+  "Win32_NetworkManagement_IpHelper",
+  "Win32_Networking_WinSock",
+]
