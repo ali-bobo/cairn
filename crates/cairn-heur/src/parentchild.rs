@@ -142,7 +142,10 @@ impl Analyzer for ParentChildHeuristic {
     }
 
     fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
-        // Index processes by pid for parent lookup.
+        // Index processes by pid for parent lookup. Known limitation: if a snapshot
+        // contains two processes with the same pid (OS pid reuse), the last one wins;
+        // a live triage snapshot almost never reuses pids, so this only affects parent
+        // attribution accuracy, never correctness/panics.
         let by_pid: HashMap<u32, &ProcessRecord> = records
             .iter()
             .filter_map(|r| match r {
