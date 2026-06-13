@@ -330,6 +330,29 @@ cairn/
   manifest as `tool.sigma_ruleset_ver` and re-checked by `cairn verify` (T9).
 - D5 codename/binary name — `cairn` confirmed for S1 (was placeholder; now the shipped
   binary name).
+- D6 binary_path quality / `signed` coverage — **OPEN (owning stage: S2, a "binary_path
+  normalization" sub-segment after S2-E).** S2-D's live run showed `extract_binary_path`
+  truncates UNQUOTED command lines containing spaces (`C:\Program Files\Docker\Docker\Docker
+  Desktop.exe` → `C:\Program`), so verification can't find the file → `signed = None`.
+  Correct resolution = the Windows CreateProcess "probe each successive `<prefix>.exe`"
+  search, which forces a design choice: keep `extract_binary_path_with` PURE and return
+  candidate paths for the collector to probe, vs. let it touch the filesystem (losing the
+  current Linux-CI-testable purity). Bundle with: catalog-signed false reports (needs
+  signer-identity extraction, see below) and the S2-D service-ImagePath normalization
+  already landed. Impact today is bounded — a missing/clipped path yields `None`, never a
+  false positive (the unsigned amplifier requires a suspicious PATH, which `None` cannot
+  satisfy).
+- D7 heuristic calibration / known-good baselines — **OPEN (owning stage: a dedicated
+  heuristic-tuning sub-segment, after proc `signed` lands in S2-E).** S2-C/S2-D scoring is
+  intentionally sensitivity-biased; a live run produces a few expected-but-noisy High
+  findings (per-user apps in `AppData\Local\Programs` like Notion/Warp; Winlogon entries
+  carrying their default `explorer.exe`/`userinit.exe` values). These are not bugs — they
+  are the cost of not yet having known-good baselines. Lowering them needs: a Winlogon
+  default-value allowlist, AppData publisher/signer trust (depends on signer-identity from
+  S2-E+), and a representative benign corpus to calibrate against — done carelessly, an
+  allowlist creates FALSE NEGATIVES (an attacker swapping the Winlogon Shell is the classic
+  attack). Deliberately deferred to a focused tuning pass with real calibration data, not
+  hand-tuned inline.
 
 ## 18. Risks
 - Crowded space (Hayabusa/Chainsaw/Velociraptor already strong) → value is integration+workflow fit, not raw engine novelty.
