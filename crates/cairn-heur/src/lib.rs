@@ -11,3 +11,4 @@ pub mod score;
 // Public API: the analyzers wired into the CLI live run (and reusable elsewhere).
 pub use netconn::NetConnHeuristic;
 pub use parentchild::ParentChildHeuristic;
+pub use persist::PersistHeuristic;

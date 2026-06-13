@@ -1,11 +1,11 @@
 //! heur_persist (FR9 ranking, SRS §10): rank persistence records by mechanism stealth +
-//! suspicious binary path + recent LastWrite. Pure scoring (Analyzer impl is Task 3).
-//! `signed` is not yet available (S2-D); weights compensate so malicious persistence still
-//! surfaces without it.
-// Task 2: pure scoring only; Task 3 adds the Analyzer that consumes score_persistence.
-#![allow(dead_code)]
-use crate::score::{is_suspicious_path, Score};
-use cairn_core::record::PersistenceRecord;
+//! suspicious binary path + recent LastWrite. Emits a Finding per record that clears the
+//! noise floor (weight >= 15). See score.rs for severity thresholds.
+use crate::score::{is_suspicious_path, severity_for, Score};
+use cairn_core::finding::{EntityFile, EntityRegistry};
+use cairn_core::record::{PersistenceRecord, Record};
+use cairn_core::traits::Analyzer;
+use cairn_core::{Entity, Finding, FindingSource, Result};
 use chrono::{DateTime, Duration, Utc};
 
 /// Days within which a LastWrite counts as "recent" (a freshly-planted persistence entry).
@@ -48,6 +48,88 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
     }
 
     s
+}
+
+/// Analyzer: ranks persistence records, emitting findings above the noise floor.
+pub struct PersistHeuristic;
+
+impl Analyzer for PersistHeuristic {
+    fn name(&self) -> &str {
+        "heur_persist"
+    }
+
+    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+        let now = Utc::now();
+        let mut out = Vec::new();
+        for r in records {
+            let Record::Persistence(p) = r else { continue };
+            let score = score_persistence(p, now);
+            let Some(severity) = severity_for(score.weight) else {
+                continue;
+            };
+
+            let mut f = Finding::new(
+                severity,
+                format!("Suspicious persistence: {}", p.mechanism),
+                FindingSource::Heuristic,
+            );
+            f.reason = Some(score.reasons.join("; "));
+            f.mitre = score.mitre;
+            f.artifact = "persistence".into();
+            f.details = format!(
+                "mechanism={} location={} command={}",
+                p.mechanism,
+                p.location,
+                p.command.as_deref().unwrap_or("-")
+            );
+            f.ts = p.last_write.unwrap_or(now);
+            f.entity = persistence_entity(p);
+            out.push(f);
+        }
+        Ok(out)
+    }
+}
+
+/// Build the entity: registry-backed mechanisms -> entity.registry; the file-backed
+/// `startup` mechanism -> entity.file (SRS §5.1 mapping in the design spec).
+fn persistence_entity(p: &PersistenceRecord) -> Entity {
+    if p.mechanism == "startup" {
+        Entity {
+            file: Some(EntityFile {
+                path: p
+                    .binary_path
+                    .clone()
+                    .or_else(|| p.value.clone())
+                    .unwrap_or_default(),
+                sha256: None,
+                mtime: p.last_write,
+                si_btime: None,
+                fn_btime: None,
+            }),
+            ..Entity::default()
+        }
+    } else {
+        Entity {
+            registry: Some(EntityRegistry {
+                hive: hive_prefix(&p.location),
+                key: p.location.clone(),
+                value: p.value.clone().unwrap_or_default(),
+                data: p.command.clone().unwrap_or_default(),
+                last_write: p.last_write,
+            }),
+            ..Entity::default()
+        }
+    }
+}
+
+/// Parse the hive prefix ("HKLM"/"HKCU"/...) from a registry location string; "" if none.
+fn hive_prefix(location: &str) -> String {
+    location
+        .split(['\\', '/'])
+        .next()
+        .filter(|h| h.starts_with("HK"))
+        .unwrap_or("")
+        .to_string()
 }
 
 #[cfg(test)]
@@ -172,5 +254,52 @@ mod tests {
         // startup 10 + suspicious path 30 + recent 15 = 55
         assert!(s.weight >= 50, "weight {}", s.weight);
         assert!(s.mitre.contains(&"T1547.001".to_string()));
+    }
+
+    use cairn_core::record::Record;
+    use cairn_core::traits::Analyzer;
+
+    /// The analyzer emits one Heuristic finding for a malicious IFEO record (reason +
+    /// registry entity) and nothing for a quiet old Run key.
+    #[test]
+    fn analyzer_emits_finding_for_malicious_only() {
+        let now = Utc::now();
+        let bad = Record::Persistence(rec(
+            "ifeo",
+            Some(r"C:\Users\a\AppData\Local\Temp\dbg.exe"),
+            Some(now),
+        ));
+        let quiet = Record::Persistence(rec(
+            "run_key",
+            Some(r"C:\Program Files\V\a.exe"),
+            Some(now - Duration::days(400)),
+        ));
+        let findings = PersistHeuristic.analyze(&[bad, quiet]).expect("analyze");
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert!(matches!(f.source, cairn_core::FindingSource::Heuristic));
+        assert!(f.reason.is_some());
+        assert_eq!(f.artifact, "persistence");
+        assert!(f.entity.registry.is_some(), "ifeo is registry-backed");
+        assert!(f.mitre.contains(&"T1546.012".to_string()));
+    }
+
+    /// A startup (file) mechanism populates entity.file, not entity.registry.
+    #[test]
+    fn startup_mechanism_uses_file_entity() {
+        let now = Utc::now();
+        let mut r = rec(
+            "startup",
+            Some(r"C:\Users\a\AppData\Roaming\...\Startup\x.exe"),
+            Some(now),
+        );
+        r.location = r"C:\Users\a\...\Startup".into();
+        let findings = PersistHeuristic
+            .analyze(&[Record::Persistence(r)])
+            .expect("analyze");
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert!(f.entity.file.is_some());
+        assert!(f.entity.registry.is_none());
     }
 }
