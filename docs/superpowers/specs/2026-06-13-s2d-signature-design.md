@@ -295,3 +295,13 @@ Pure logic → full TDD; the WinTrust FFI → a thin smoke test (as S2-A/S2-C di
   (`WTD_CHOICE_CATALOG`), binary hashing (FR14), `.lnk` target resolution for startup.
 - The unsigned weight (`+20`) and the "amplifier requires another signal" rule are the
   config-loader seam — tunable without touching matching logic.
+
+## Note: relationship to operational-resilience requirements (SRS §19)
+
+A 2026-06-13 design review added NFR9–NFR12 / §19 (resource governance, output discipline,
+OS-build confidence, EDR first-run window). S2-D does NOT implement any of them — it is a
+small, read-only verification addition. One adjacency worth recording so a later stage
+does not miss it: NFR9's "lower process/IO priority on a live target" lands in the SAME
+crate this sub-segment touches (`cairn-collectors-win`), as another benign WinAPI behind a
+safe wrapper. It is intentionally out of scope here (owning stage: S2 raw-NTFS / S3
+hardening) and listed only so the seam is known.
