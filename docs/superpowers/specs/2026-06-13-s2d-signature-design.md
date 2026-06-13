@@ -293,6 +293,36 @@ Pure logic → full TDD; the WinTrust FFI → a thin smoke test (as S2-A/S2-C di
   heuristic and re-tune.
 - Later: signer-identity extraction (Microsoft vs third-party), catalog-signature support
   (`WTD_CHOICE_CATALOG`), binary hashing (FR14), `.lnk` target resolution for startup.
+
+### Known issues surfaced by S2-D e2e (2026-06-13), deferred with rationale
+
+The first live run with real signature verification exposed two `binary_path` quality
+issues in the EXISTING (S2-C) `extract_binary_path` / service-ImagePath handling. Neither
+is introduced by S2-D, but S2-D made them visible (a wrong/missing path now yields
+`signed = None` instead of being silently ignored). Both are deferred — they are
+binary-path-extraction defects, not verification defects, and fixing them well needs its
+own design pass:
+
+1. **Unquoted command lines with spaces are truncated.** A Run key like
+   `C:\Program Files\Docker\Docker\Docker Desktop.exe` (no surrounding quotes) is clipped at
+   the first space to `C:\Program`, so verification can't find the file → `signed = None`.
+   Same root cause as the S2-C startup clip, but in the unquoted-cmdline branch. Correct
+   resolution requires the Windows CreateProcess "try each successive `<prefix>.exe`"
+   probe, which would make the currently-pure, FS-free `extract_binary_path_with`
+   touch the filesystem — a real design decision (keep it pure and return candidates, vs.
+   move probing to the collector). Impact is bounded: most legitimate apps quote their
+   path (verified: Chrome/Edge/Trend Micro all resolved correctly); the gap is missing
+   coverage (`None`), never a false positive (the amplifier does not fire on `None`).
+2. **Service ImagePath relative/driver paths.** Driver services store ImagePath like
+   `System32\drivers\ACPI.sys` (relative to `%SystemRoot%`) or `\SystemRoot\System32\...`.
+   These don't resolve as-is → `signed = None`. Normalizing them (prepend the Windows dir,
+   strip the `\SystemRoot\` prefix) is a service-collector enhancement, not a verification
+   concern. Same bounded impact: missing coverage, no false positive.
+
+Both are tracked for a follow-up "binary_path normalization" sub-segment. Until then, a
+catalog-signed OS file or an unresolvable path simply reports `signed = None`/`false`
+conservatively, and the unsigned amplifier's "requires another signal" gate prevents any
+false alarm from the imperfect signal.
 - The unsigned weight (`+20`) and the "amplifier requires another signal" rule are the
   config-loader seam — tunable without touching matching logic.
 
