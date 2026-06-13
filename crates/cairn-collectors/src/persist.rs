@@ -1,7 +1,8 @@
 //! PersistCollector (FR9 subset, SRS §4): reads high-value live persistence mechanisms
 //! (Run/RunOnce, Services, Winlogon, IFEO, Startup folders) via the safe `winreg` wrapper
 //! and std::fs, mapping each to a PersistenceRecord. Read-only; never modifies the host.
-//! `signed`/`binary_sha256` are left None (S2-D / FR14).
+//! `binary_sha256` is left None (FR14 deferred); `signed` is backfilled by `apply_signatures`
+//! via the injected `FileVerifier` (S2-D, WinVerifyTrust behind the cairn-collectors-win seam).
 
 use cairn_core::manifest::SourceEntry;
 use cairn_core::record::{PersistenceRecord, Record};

@@ -302,7 +302,7 @@ mod tests {
             Some(false),
         );
         let s = score_persistence(&p, now);
-        assert_eq!(s.weight, 60, "run_key 10 + path 30 + unsigned 20"); // weight {}
+        assert_eq!(s.weight, 60, "run_key 10 + path 30 + unsigned 20");
         assert!(s.reasons.iter().any(|r| r.contains("unsigned")));
         assert!(s.mitre.contains(&"T1036".to_string()));
     }

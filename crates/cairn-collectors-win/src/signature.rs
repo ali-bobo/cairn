@@ -70,8 +70,8 @@ mod win {
             dwStateAction: WTD_STATEACTION_VERIFY,
             ..Default::default()
         };
-        // SAFETY: Assigning a union variant is safe in Rust (only reading union fields is unsafe).
-        // pFile points to `file_info` which lives for the duration of this function.
+        // Writing a union variant is safe in Rust (only READING union fields is unsafe). The
+        // pointer-lifetime guarantee for pFile is stated in the SAFETY comment on the call below.
         wtd.Anonymous.pFile = &mut file_info;
 
         let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
