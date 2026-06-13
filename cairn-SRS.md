@@ -197,6 +197,39 @@ Stage 4 (operationalize):
 - NFR6 no network at runtime except explicit `update-rules`.
 - NFR7 cross-compile via `cargo` for x64; CI builds reproducible; release artifacts hashed + signed.
 - NFR8 licensing clean: code MIT/Apache-2.0; bundled Sigma under DRL 1.1 with attribution surfaced in output.
+- NFR9 **resource governance** (production-host safety): the tool MUST be able to bound its
+  own CPU/IO footprint so it never takes a live production host down (the "the IR team
+  caused more damage than the attacker" failure). Levers, smallest-blast-radius first:
+  (a) a `--max-threads N` cap on the rayon pool (default = min(cores, a sane ceiling), not
+  "all cores"); (b) a below-normal process/IO priority by default on a live target
+  (`SetPriorityClass` BELOW_NORMAL + `PROCESS_MODE_BACKGROUND_BEGIN` where available),
+  overridable with `--full-speed`; (c) `--profile minimal` has DEFINED light-mode
+  semantics (skip the heaviest collectors — raw-NTFS $MFT/$J full parse — and run only
+  live state + EVTX + persistence). Acceptance: a `--profile minimal` live run on a large
+  host stays materially below a `standard` run in peak CPU and RAM (measured, not claimed).
+- NFR10 **resource ceilings / circuit breaker**: even on well-formed but huge inputs (a
+  multi-GB $MFT, an enormous $J on a long-uptime server), peak RAM MUST stay bounded.
+  Streaming iteration (SRS §3) is necessary but not sufficient — analyzers that accumulate
+  state MUST have a documented bound. Define configurable ceilings (max records held,
+  max per-artifact bytes processed) that, when hit, degrade gracefully (record the
+  truncation in `manifest.sources[].errors`, continue) rather than OOM-killing the run.
+  This generalizes the threat-model's malformed-input caps to "large-but-honest" inputs.
+- NFR11 **output size discipline** (single-host footprint, not fleet orchestration): Cairn
+  is agentless single-host triage — it is explicitly NOT a fleet collector. But its archive
+  MUST stay small by default: package findings + manifest + run.log + *targeted evidence
+  fragments* referenced by `evidence_ref`, NOT whole source artifacts ($MFT/$J/full hives)
+  unless explicitly requested (`--collect-raw`). Default archive size SHOULD be on the
+  order of MB, not GB. Fleet-scale collection/transport (the "500 endpoints over VPN"
+  case) is out of scope by design — delegate to Velociraptor/EDR; Cairn feeds them small,
+  typed output.
+- NFR12 **OS-version artifact confidence**: offline-artifact parsers (Amcache, Shimcache,
+  BAM, UserAssist, SRUM) read undocumented structures that Microsoft changes across builds
+  (e.g. 23H2/24H2). A parser that silently misreads a changed structure is worse than one
+  that abstains. Each such collector MUST detect when it cannot confidently parse the
+  structure for the observed `host.os_build` and record a confidence/abstain note in
+  `manifest.sources[].errors` rather than emit wrong data (graceful degrade, golden rule
+  8). Wrong forensic data is a defect; "I don't recognize this build's structure" is
+  acceptable.
 
 ## 9. Sigma engine integration
 - Source ruleset: `SigmaHQ/sigma` (+ optionally `hayabusa-rules`), DRL 1.1.
@@ -304,3 +337,65 @@ cairn/
 - Sigma match parity is non-trivial → budget testing.
 - Live-host perturbation is unavoidable → document, minimize, never claim zero-impact.
 - Scope is large → MVP-first is mandatory; S1 must stand alone as useful.
+- **Resource exhaustion on production hosts** → an uncapped rayon pool + Sigma over huge
+  EVTX, or a multi-GB $MFT/$J parse, can spike a live server to 100% CPU/RAM and cause an
+  outage. Mitigation: NFR9 (thread/priority caps, defined `--profile minimal`) + NFR10
+  (bounded peak RAM / circuit breaker). The triage tool must not become the incident.
+- **EDR first-run window (reputation gap)** → before SOC allow-listing takes effect, a
+  never-seen signed binary that reads low-level artifacts may be blocked/quarantined on
+  first run (post-Aug-2024 EV no longer auto-clears SmartScreen; reputation is historical).
+  Mitigation is procedural, not technical: SOC pre-allow-list by hash + signing cert BEFORE
+  deployment (docs/SOC-runbook-template.md), submit to MS WDSI. Documented as a known
+  operational precondition, not something the tool can self-solve without becoming evasive
+  (which is forbidden, §13). See §19.
+- **OS-build artifact drift** → Microsoft changes undocumented artifact structures
+  (Amcache/Shimcache/BAM/SRUM) across Windows builds; a parser that silently misreads is
+  worse than one that abstains. Mitigation: NFR12 (per-build confidence/abstain). Ongoing
+  maintenance burden (FR19 tuning) is expected, not a defect.
+
+## 19. Operational resilience (production-deployment design notes)
+
+These notes consolidate the production-field concerns surfaced during design review
+(2026-06-13) into one place, each mapped to the requirement that governs it and the stage
+that implements it. They are DESIGN RECORD: no current sub-segment is blocked on them, but
+they MUST be honored when the owning stage is built.
+
+### 19.1 Don't take the host down (NFR9, NFR10) — owning stage: S2 (raw-NTFS) / S3 hardening
+- Default the rayon pool to a capped size, not all cores; expose `--max-threads`.
+- On a live target, lower process + IO priority by default (`SetPriorityClass`
+  BELOW_NORMAL_PRIORITY_CLASS, `PROCESS_MODE_BACKGROUND_BEGIN`); `--full-speed` opts out.
+  These WinAPI calls go in `cairn-collectors-win` (the unsafe-FFI crate), behind a safe
+  wrapper, and are themselves benign (a forensic tool yielding CPU is not evasion).
+- `--profile minimal` = live state + EVTX + persistence only; SKIP raw-NTFS $MFT/$J full
+  parse and the heaviest offline collectors. `standard` = + offline artifacts.
+  `verbose` = everything.
+- Analyzer state bounds (NFR10): document each analyzer's peak-memory behavior; where an
+  analyzer accumulates (e.g. correlation), cap held records and record truncation in the
+  manifest rather than growing unbounded.
+
+### 19.2 Keep output small (NFR11) — owning stage: S3 (archive/output_sink)
+- Default archive = findings + manifest + run.log + evidence fragments referenced by
+  `evidence_ref` (small carved slices, hashed). NOT whole $MFT/$J/hives.
+- `--collect-raw` is the explicit opt-in for full raw artifacts (the GB case), for when an
+  analyst truly needs the source bytes; off by default.
+- Fleet-scale collection/transport is OUT OF SCOPE: Cairn emits small typed output for a
+  fleet tool (Velociraptor/EDR) to carry. The SRS §1 "agentless single-host" identity is
+  the boundary; do not grow Cairn into a fleet collector.
+
+### 19.3 Survive EDR first contact (§13, §18) — owning stage: legitimacy work (any stage)
+- Technical posture is fixed: be visible + benign (golden rule 1). The tool will NOT add
+  any evasion to get past an EDR — that is auto-reject.
+- The first-run reputation gap is solved PROCEDURALLY: SOC pre-allow-list by file hash +
+  signing certificate before deployment (docs/SOC-runbook-template.md), submit binary to
+  MS WDSI FP portal, build publisher/hash history over time. This is a deployment
+  precondition documented for the operator, not a code feature.
+- Even the S3 encrypt-and-archive step (which superficially resembles exfil staging) stays
+  transparent: it is logged in run.log, the public key is embedded (no key exchange), and
+  the behavior is predictable and documented in the runbook so a SOC can recognize it.
+
+### 19.4 Don't emit wrong forensic data on new Windows builds (NFR12) — owning stage: S2/S3 offline collectors
+- Each offline-artifact collector validates it can parse the structure for the observed
+  `host.os_build`; on an unrecognized layout it ABSTAINS (records a confidence note in
+  `manifest.sources[].errors`) instead of emitting guessed values.
+- The `update-rules` channel (FR19) is the maintenance lever for keeping parsers and
+  tuning current as Microsoft ships new builds; ongoing tracking is an accepted cost.

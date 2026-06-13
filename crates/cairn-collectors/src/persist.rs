@@ -1,11 +1,12 @@
 //! PersistCollector (FR9 subset, SRS §4): reads high-value live persistence mechanisms
 //! (Run/RunOnce, Services, Winlogon, IFEO, Startup folders) via the safe `winreg` wrapper
 //! and std::fs, mapping each to a PersistenceRecord. Read-only; never modifies the host.
-//! `signed`/`binary_sha256` are left None (S2-D / FR14).
+//! `binary_sha256` is left None (FR14 deferred); `signed` is backfilled by `apply_signatures`
+//! via the injected `FileVerifier` (S2-D, WinVerifyTrust behind the cairn-collectors-win seam).
 
 use cairn_core::manifest::SourceEntry;
 use cairn_core::record::{PersistenceRecord, Record};
-use cairn_core::traits::{CollectCtx, Collector};
+use cairn_core::traits::{CollectCtx, Collector, FileVerifier};
 use cairn_core::Result;
 use chrono::{DateTime, Utc};
 
@@ -75,6 +76,54 @@ fn expand_env_vars(s: &str, lookup: &impl Fn(&str) -> Option<String>) -> String 
     }
     out.push_str(rest);
     out
+}
+
+/// Normalize a Windows service binary path to an absolute drive path so it can be located
+/// on disk for signature verification. Handles the non-absolute ImagePath formats that
+/// Windows services use:
+/// - `\SystemRoot\system32\x.sys`  -> `<windir>\system32\x.sys`
+/// - `System32\drivers\x.sys`      -> `<windir>\System32\drivers\x.sys` (relative to windir)
+/// - `\??\C:\Windows\...\x.sys`    -> `C:\Windows\...\x.sys` (strip the NT object-manager prefix)
+/// - `C:\already\absolute.exe`     -> unchanged
+///
+/// `windir` is injected (e.g. `C:\Windows`) so this is deterministic and Linux-testable.
+/// Matching is case-insensitive for the known prefixes. Never panics.
+#[allow(dead_code)]
+fn normalize_service_path(path: &str, windir: &str) -> String {
+    let windir = windir.trim_end_matches(['\\', '/']);
+    // \??\  NT object path prefix -> strip it (rest is already an absolute drive path)
+    if let Some(rest) = strip_prefix_ci(path, r"\??\") {
+        return rest.to_string();
+    }
+    // \SystemRoot\...  -> <windir>\...
+    if let Some(rest) = strip_prefix_ci(path, r"\SystemRoot\") {
+        return format!(r"{windir}\{rest}");
+    }
+    // %SystemRoot%\... (occasionally seen) -> <windir>\...
+    if let Some(rest) = strip_prefix_ci(path, r"%SystemRoot%\") {
+        return format!(r"{windir}\{rest}");
+    }
+    // Already absolute (drive letter like C:\ or a UNC \\server\) -> unchanged
+    let is_drive_abs = path.len() >= 2 && path.as_bytes()[1] == b':';
+    let is_unc = path.starts_with(r"\\");
+    if is_drive_abs || is_unc {
+        return path.to_string();
+    }
+    // Otherwise treat as relative to windir (e.g. System32\drivers\x.sys).
+    // Strip any leading backslash so we don't produce a double backslash.
+    let rel = path.trim_start_matches(['\\', '/']);
+    format!(r"{windir}\{rel}")
+}
+
+/// Case-insensitive prefix strip: if `s` starts with `prefix` ignoring ASCII case, return
+/// the remainder; else None.
+#[allow(dead_code)]
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
 }
 
 /// Build a PersistenceRecord with the deferred fields (signed/sha256) as None.
@@ -210,7 +259,7 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
 ///     `.expect()` internally and would panic on a malformed timestamp.
 #[cfg(windows)]
 mod win {
-    use super::{make_record, PersistenceRecord};
+    use super::{extract_binary_path, make_record, normalize_service_path, PersistenceRecord};
     use chrono::{DateTime, TimeZone, Utc};
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
     use winreg::RegKey;
@@ -340,21 +389,73 @@ mod win {
             };
             let lw = key_last_write(&svc);
             let location = format!("HKLM\\{sub}\\{name}");
-            out.push(make_record(
-                "service",
+            // Preserve the raw ImagePath as `command` (forensic fidelity); derive a normalized
+            // binary_path so service paths like `System32\drivers\x.sys` or `\SystemRoot\...`
+            // resolve to a real file for signature verification.
+            let windir = std::env::var("SystemRoot")
+                .or_else(|_| std::env::var("windir"))
+                .unwrap_or_else(|_| r"C:\Windows".to_string());
+            let bin = extract_binary_path(&image).map(|p| normalize_service_path(&p, &windir));
+            out.push(PersistenceRecord {
+                mechanism: "service".to_string(),
                 location,
-                Some(name),
-                Some(image),
-                lw,
-            ));
+                value: Some(name),
+                command: Some(image),
+                binary_path: bin,
+                binary_sha256: None,
+                signed: None,
+                last_write: lw,
+            });
         }
         out
     }
 }
 
+/// A verifier that never verifies (always None). Cross-platform default + test default; on
+/// non-Windows it is also what the real collector uses (no WinTrust off-Windows).
+#[allow(dead_code)]
+pub struct NoopVerifier;
+impl FileVerifier for NoopVerifier {
+    fn verify(&self, _path: &str) -> Option<bool> {
+        None
+    }
+}
+
+/// Fill each record's `signed` from the verifier, for records that have a binary_path.
+/// Pure wiring (no OS code); the verifier abstracts the platform. A binary_path of None is
+/// left untouched (signed stays None).
+fn apply_signatures(records: &mut [PersistenceRecord], verifier: &dyn FileVerifier) {
+    for r in records.iter_mut() {
+        if let Some(p) = r.binary_path.as_deref() {
+            r.signed = verifier.verify(p);
+        }
+    }
+}
+
 /// Collector for live persistence mechanisms (SRS §4 persist_collector). Read-only.
-/// Fans in the five mechanism readers; each is best-effort (returns what it can read).
-pub struct PersistCollector;
+/// Fans in the five mechanism readers; each is best-effort. Fills `signed` via the
+/// injected verifier (the WinTrust seam stays in cairn-collectors-win).
+pub struct PersistCollector {
+    verifier: Box<dyn FileVerifier + Send + Sync>,
+}
+
+impl Default for PersistCollector {
+    fn default() -> Self {
+        #[cfg(windows)]
+        let verifier: Box<dyn FileVerifier + Send + Sync> =
+            Box::new(cairn_collectors_win::signature::WinSigVerifier);
+        #[cfg(not(windows))]
+        let verifier: Box<dyn FileVerifier + Send + Sync> = Box::new(NoopVerifier);
+        Self { verifier }
+    }
+}
+
+impl PersistCollector {
+    /// Construct with a specific verifier (tests inject a fake; non-default callers).
+    pub fn with_verifier(verifier: Box<dyn FileVerifier + Send + Sync>) -> Self {
+        Self { verifier }
+    }
+}
 
 impl Collector for PersistCollector {
     fn name(&self) -> &str {
@@ -368,6 +469,7 @@ impl Collector for PersistCollector {
         records.extend(read_winlogon());
         records.extend(read_ifeo());
         records.extend(read_startup_folders());
+        apply_signatures(&mut records, self.verifier.as_ref());
         Ok(records.into_iter().map(Record::Persistence).collect())
     }
 
@@ -516,15 +618,105 @@ mod tests {
     }
 
     use cairn_core::record::Record;
-    use cairn_core::traits::{CollectCtx, Collector};
+    use cairn_core::traits::{CollectCtx, Collector, FileVerifier};
     use cairn_core::Config;
+
+    /// A verifier that maps known paths to a fixed result; unknown -> None.
+    struct FakeVerifier(std::collections::HashMap<String, bool>);
+    impl FileVerifier for FakeVerifier {
+        fn verify(&self, path: &str) -> Option<bool> {
+            self.0.get(path).copied()
+        }
+    }
+
+    /// apply_signatures fills `signed` from the verifier for records that have a binary_path.
+    #[test]
+    fn collect_fills_signed_from_verifier() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(r"C:\trusted\a.exe".to_string(), true);
+        map.insert(r"C:\evil\b.exe".to_string(), false);
+        let verifier = FakeVerifier(map);
+
+        let mk = |name: &str, bin: Option<&str>| PersistenceRecord {
+            mechanism: "run_key".into(),
+            location: "HKLM\\...\\Run".into(),
+            value: Some(name.into()),
+            command: bin.map(|b| b.to_string()),
+            binary_path: bin.map(|b| b.to_string()),
+            binary_sha256: None,
+            signed: None,
+            last_write: None,
+        };
+        let mut records = vec![
+            mk("a", Some(r"C:\trusted\a.exe")),
+            mk("b", Some(r"C:\evil\b.exe")),
+            mk("c", Some(r"C:\unknown\c.exe")),
+            mk("d", None),
+        ];
+        apply_signatures(&mut records, &verifier);
+        assert_eq!(records[0].signed, Some(true));
+        assert_eq!(records[1].signed, Some(false));
+        assert_eq!(records[2].signed, None); // verifier didn't know it
+        assert_eq!(records[3].signed, None); // no binary_path -> not queried
+    }
+
+    #[test]
+    fn normalize_service_path_handles_all_formats() {
+        let windir = r"C:\Windows";
+        // already absolute -> unchanged
+        assert_eq!(
+            normalize_service_path(r"C:\Program Files\App\app.exe", windir),
+            r"C:\Program Files\App\app.exe"
+        );
+        // relative to windir
+        assert_eq!(
+            normalize_service_path(r"System32\drivers\3ware.sys", windir),
+            r"C:\Windows\System32\drivers\3ware.sys"
+        );
+        // \SystemRoot\ prefix (case-insensitive)
+        assert_eq!(
+            normalize_service_path(r"\SystemRoot\system32\DRIVERS\aehd.sys", windir),
+            r"C:\Windows\system32\DRIVERS\aehd.sys"
+        );
+        assert_eq!(
+            normalize_service_path(r"\systemroot\System32\x.sys", windir),
+            r"C:\Windows\System32\x.sys"
+        );
+        // \??\ NT path prefix -> stripped
+        assert_eq!(
+            normalize_service_path(r"\??\C:\WINDOWS\system32\drivers\AsIO3.sys", windir),
+            r"C:\WINDOWS\system32\drivers\AsIO3.sys"
+        );
+        // %SystemRoot% variable form
+        assert_eq!(
+            normalize_service_path(r"%SystemRoot%\system32\svc.exe", windir),
+            r"C:\Windows\system32\svc.exe"
+        );
+        // windir with trailing slash is handled (no double slash)
+        assert_eq!(
+            normalize_service_path(r"System32\x.sys", r"C:\Windows\"),
+            r"C:\Windows\System32\x.sys"
+        );
+    }
+
+    #[test]
+    fn normalize_service_path_never_panics_on_edge_cases() {
+        let windir = r"C:\Windows";
+        assert_eq!(normalize_service_path("", windir), r"C:\Windows\");
+        assert_eq!(normalize_service_path(r"\??\", windir), "");
+        // a lone backslash-prefixed relative path
+        assert_eq!(
+            normalize_service_path(r"\System32\x.sys", windir),
+            r"C:\Windows\System32\x.sys"
+        );
+    }
 
     /// PersistCollector.collect returns only Persistence records, never panics, name="persist".
     /// On Windows it exercises the real readers; on non-Windows it gets the startup reader +
     /// empty registry stubs. Either way every record is a Persistence variant.
     #[test]
     fn persist_collector_collects_without_panicking() {
-        let c = PersistCollector;
+        let c = PersistCollector::default();
         assert_eq!(c.name(), "persist");
         let cfg = Config::default();
         let ctx = CollectCtx {

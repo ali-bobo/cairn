@@ -452,7 +452,7 @@ fn main() -> anyhow::Result<()> {
             let collectors: Vec<Box<dyn Collector>> = vec![
                 Box::new(cairn_collectors::proc::ProcCollector),
                 Box::new(cairn_collectors::net::NetCollector),
-                Box::new(cairn_collectors::persist::PersistCollector),
+                Box::new(cairn_collectors::persist::PersistCollector::default()),
             ];
             let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
