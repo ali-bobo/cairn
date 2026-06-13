@@ -14,7 +14,9 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
     // "Bare public IP" is approximated as a public destination on an uncommon port
     // (no DNS lookup at runtime, NFR6). Public IP on a common port (normal browsing)
     // stays quiet.
-    let rare = c.rport.map(is_rare_port).unwrap_or(false);
+    // A remote port of 0 (or None) means "no remote endpoint" — a listening socket, not
+    // egress. Only a real (non-zero) remote port can be a rare-egress signal.
+    let rare = c.rport.is_some_and(|p| p != 0 && is_rare_port(p));
     if let Some(raddr) = c.raddr.as_deref() {
         if is_public_ipv4(raddr) && rare {
             s.add(
@@ -24,8 +26,8 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
             );
         }
     }
-    if let Some(rport) = c.rport {
-        if is_rare_port(rport) {
+    if rare {
+        if let Some(rport) = c.rport {
             s.add(20, format!("uncommon remote port {rport}"), &[]);
         }
     }
@@ -255,6 +257,52 @@ mod tests {
             "only the rare-port signal should fire for a private dest"
         );
         assert!(!s.reasons.iter().any(|r| r.contains("public IP")));
+    }
+
+    /// A listening socket reports remote port 0 / no remote — it must NOT fire the
+    /// rare-port signal (regression: live runs flagged every listener as rare egress).
+    #[test]
+    fn listening_socket_rport_zero_is_not_rare() {
+        // rport = Some(0): a listener with the API's placeholder remote port
+        let c0 = conn(
+            "tcp",
+            445,
+            Some("0.0.0.0"),
+            Some(0),
+            Some("listen"),
+            Some(4),
+        );
+        let s0 = score_conn(&c0, None);
+        assert!(
+            !s0.reasons
+                .iter()
+                .any(|r| r.contains("uncommon remote port")),
+            "rport 0 must not be a rare-port signal"
+        );
+
+        // rport = None: same — no remote port at all
+        let cn = conn("tcp", 445, None, None, Some("listen"), Some(4));
+        let sn = score_conn(&cn, None);
+        assert!(!sn
+            .reasons
+            .iter()
+            .any(|r| r.contains("uncommon remote port")));
+    }
+
+    /// A public IP paired with rport 0 must NOT fire the bare-public-IP signal either
+    /// (the gate requires a real rare remote port).
+    #[test]
+    fn public_ip_with_rport_zero_does_not_fire() {
+        let c = conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(0),
+            Some("established"),
+            None,
+        );
+        let s = score_conn(&c, None);
+        assert_eq!(s.weight, 0, "public IP with rport 0 should score nothing");
     }
 
     use cairn_core::record::Record;
