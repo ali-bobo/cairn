@@ -5,7 +5,7 @@
 
 use cairn_core::manifest::SourceEntry;
 use cairn_core::record::{PersistenceRecord, Record};
-use cairn_core::traits::{CollectCtx, Collector};
+use cairn_core::traits::{CollectCtx, Collector, FileVerifier};
 use cairn_core::Result;
 use chrono::{DateTime, Utc};
 
@@ -352,9 +352,51 @@ mod win {
     }
 }
 
+/// A verifier that never verifies (always None). Cross-platform default + test default; on
+/// non-Windows it is also what the real collector uses (no WinTrust off-Windows).
+#[allow(dead_code)]
+pub struct NoopVerifier;
+impl FileVerifier for NoopVerifier {
+    fn verify(&self, _path: &str) -> Option<bool> {
+        None
+    }
+}
+
+/// Fill each record's `signed` from the verifier, for records that have a binary_path.
+/// Pure wiring (no OS code); the verifier abstracts the platform. A binary_path of None is
+/// left untouched (signed stays None).
+fn apply_signatures(records: &mut [PersistenceRecord], verifier: &dyn FileVerifier) {
+    for r in records.iter_mut() {
+        if let Some(p) = r.binary_path.as_deref() {
+            r.signed = verifier.verify(p);
+        }
+    }
+}
+
 /// Collector for live persistence mechanisms (SRS §4 persist_collector). Read-only.
-/// Fans in the five mechanism readers; each is best-effort (returns what it can read).
-pub struct PersistCollector;
+/// Fans in the five mechanism readers; each is best-effort. Fills `signed` via the
+/// injected verifier (the WinTrust seam stays in cairn-collectors-win).
+pub struct PersistCollector {
+    verifier: Box<dyn FileVerifier + Send + Sync>,
+}
+
+impl Default for PersistCollector {
+    fn default() -> Self {
+        #[cfg(windows)]
+        let verifier: Box<dyn FileVerifier + Send + Sync> =
+            Box::new(cairn_collectors_win::signature::WinSigVerifier);
+        #[cfg(not(windows))]
+        let verifier: Box<dyn FileVerifier + Send + Sync> = Box::new(NoopVerifier);
+        Self { verifier }
+    }
+}
+
+impl PersistCollector {
+    /// Construct with a specific verifier (tests inject a fake; non-default callers).
+    pub fn with_verifier(verifier: Box<dyn FileVerifier + Send + Sync>) -> Self {
+        Self { verifier }
+    }
+}
 
 impl Collector for PersistCollector {
     fn name(&self) -> &str {
@@ -368,6 +410,7 @@ impl Collector for PersistCollector {
         records.extend(read_winlogon());
         records.extend(read_ifeo());
         records.extend(read_startup_folders());
+        apply_signatures(&mut records, self.verifier.as_ref());
         Ok(records.into_iter().map(Record::Persistence).collect())
     }
 
@@ -516,15 +559,54 @@ mod tests {
     }
 
     use cairn_core::record::Record;
-    use cairn_core::traits::{CollectCtx, Collector};
+    use cairn_core::traits::{CollectCtx, Collector, FileVerifier};
     use cairn_core::Config;
+
+    /// A verifier that maps known paths to a fixed result; unknown -> None.
+    struct FakeVerifier(std::collections::HashMap<String, bool>);
+    impl FileVerifier for FakeVerifier {
+        fn verify(&self, path: &str) -> Option<bool> {
+            self.0.get(path).copied()
+        }
+    }
+
+    /// apply_signatures fills `signed` from the verifier for records that have a binary_path.
+    #[test]
+    fn collect_fills_signed_from_verifier() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(r"C:\trusted\a.exe".to_string(), true);
+        map.insert(r"C:\evil\b.exe".to_string(), false);
+        let verifier = FakeVerifier(map);
+
+        let mk = |name: &str, bin: Option<&str>| PersistenceRecord {
+            mechanism: "run_key".into(),
+            location: "HKLM\\...\\Run".into(),
+            value: Some(name.into()),
+            command: bin.map(|b| b.to_string()),
+            binary_path: bin.map(|b| b.to_string()),
+            binary_sha256: None,
+            signed: None,
+            last_write: None,
+        };
+        let mut records = vec![
+            mk("a", Some(r"C:\trusted\a.exe")),
+            mk("b", Some(r"C:\evil\b.exe")),
+            mk("c", Some(r"C:\unknown\c.exe")),
+            mk("d", None),
+        ];
+        apply_signatures(&mut records, &verifier);
+        assert_eq!(records[0].signed, Some(true));
+        assert_eq!(records[1].signed, Some(false));
+        assert_eq!(records[2].signed, None); // verifier didn't know it
+        assert_eq!(records[3].signed, None); // no binary_path -> not queried
+    }
 
     /// PersistCollector.collect returns only Persistence records, never panics, name="persist".
     /// On Windows it exercises the real readers; on non-Windows it gets the startup reader +
     /// empty registry stubs. Either way every record is a Persistence variant.
     #[test]
     fn persist_collector_collects_without_panicking() {
-        let c = PersistCollector;
+        let c = PersistCollector::default();
         assert_eq!(c.name(), "persist");
         let cfg = Config::default();
         let ctx = CollectCtx {
