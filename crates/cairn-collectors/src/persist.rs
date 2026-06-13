@@ -153,6 +153,9 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
+            // is_file() follows symlinks: a shortcut to a real file counts; a broken
+            // symlink (missing target) returns false and is skipped — correct, since a
+            // dangling shortcut cannot execute as persistence.
             if !path.is_file() {
                 continue;
             }
