@@ -78,6 +78,54 @@ fn expand_env_vars(s: &str, lookup: &impl Fn(&str) -> Option<String>) -> String 
     out
 }
 
+/// Normalize a Windows service binary path to an absolute drive path so it can be located
+/// on disk for signature verification. Handles the non-absolute ImagePath formats that
+/// Windows services use:
+/// - `\SystemRoot\system32\x.sys`  -> `<windir>\system32\x.sys`
+/// - `System32\drivers\x.sys`      -> `<windir>\System32\drivers\x.sys` (relative to windir)
+/// - `\??\C:\Windows\...\x.sys`    -> `C:\Windows\...\x.sys` (strip the NT object-manager prefix)
+/// - `C:\already\absolute.exe`     -> unchanged
+///
+/// `windir` is injected (e.g. `C:\Windows`) so this is deterministic and Linux-testable.
+/// Matching is case-insensitive for the known prefixes. Never panics.
+#[allow(dead_code)]
+fn normalize_service_path(path: &str, windir: &str) -> String {
+    let windir = windir.trim_end_matches(['\\', '/']);
+    // \??\  NT object path prefix -> strip it (rest is already an absolute drive path)
+    if let Some(rest) = strip_prefix_ci(path, r"\??\") {
+        return rest.to_string();
+    }
+    // \SystemRoot\...  -> <windir>\...
+    if let Some(rest) = strip_prefix_ci(path, r"\SystemRoot\") {
+        return format!(r"{windir}\{rest}");
+    }
+    // %SystemRoot%\... (occasionally seen) -> <windir>\...
+    if let Some(rest) = strip_prefix_ci(path, r"%SystemRoot%\") {
+        return format!(r"{windir}\{rest}");
+    }
+    // Already absolute (drive letter like C:\ or a UNC \\server\) -> unchanged
+    let is_drive_abs = path.len() >= 2 && path.as_bytes()[1] == b':';
+    let is_unc = path.starts_with(r"\\");
+    if is_drive_abs || is_unc {
+        return path.to_string();
+    }
+    // Otherwise treat as relative to windir (e.g. System32\drivers\x.sys).
+    // Strip any leading backslash so we don't produce a double backslash.
+    let rel = path.trim_start_matches(['\\', '/']);
+    format!(r"{windir}\{rel}")
+}
+
+/// Case-insensitive prefix strip: if `s` starts with `prefix` ignoring ASCII case, return
+/// the remainder; else None.
+#[allow(dead_code)]
+fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
 /// Build a PersistenceRecord with the deferred fields (signed/sha256) as None.
 #[allow(dead_code)]
 fn make_record(
@@ -211,7 +259,7 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
 ///     `.expect()` internally and would panic on a malformed timestamp.
 #[cfg(windows)]
 mod win {
-    use super::{make_record, PersistenceRecord};
+    use super::{extract_binary_path, make_record, normalize_service_path, PersistenceRecord};
     use chrono::{DateTime, TimeZone, Utc};
     use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
     use winreg::RegKey;
@@ -341,13 +389,24 @@ mod win {
             };
             let lw = key_last_write(&svc);
             let location = format!("HKLM\\{sub}\\{name}");
-            out.push(make_record(
-                "service",
+            // Preserve the raw ImagePath as `command` (forensic fidelity); derive a normalized
+            // binary_path so service paths like `System32\drivers\x.sys` or `\SystemRoot\...`
+            // resolve to a real file for signature verification.
+            let windir = std::env::var("SystemRoot")
+                .or_else(|_| std::env::var("windir"))
+                .unwrap_or_else(|_| r"C:\Windows".to_string());
+            let bin = extract_binary_path(&image)
+                .map(|p| normalize_service_path(&p, &windir));
+            out.push(PersistenceRecord {
+                mechanism: "service".to_string(),
                 location,
-                Some(name),
-                Some(image),
-                lw,
-            ));
+                value: Some(name),
+                command: Some(image),
+                binary_path: bin,
+                binary_sha256: None,
+                signed: None,
+                last_write: lw,
+            });
         }
         out
     }
@@ -600,6 +659,54 @@ mod tests {
         assert_eq!(records[1].signed, Some(false));
         assert_eq!(records[2].signed, None); // verifier didn't know it
         assert_eq!(records[3].signed, None); // no binary_path -> not queried
+    }
+
+    #[test]
+    fn normalize_service_path_handles_all_formats() {
+        let windir = r"C:\Windows";
+        // already absolute -> unchanged
+        assert_eq!(
+            normalize_service_path(r"C:\Program Files\App\app.exe", windir),
+            r"C:\Program Files\App\app.exe"
+        );
+        // relative to windir
+        assert_eq!(
+            normalize_service_path(r"System32\drivers\3ware.sys", windir),
+            r"C:\Windows\System32\drivers\3ware.sys"
+        );
+        // \SystemRoot\ prefix (case-insensitive)
+        assert_eq!(
+            normalize_service_path(r"\SystemRoot\system32\DRIVERS\aehd.sys", windir),
+            r"C:\Windows\system32\DRIVERS\aehd.sys"
+        );
+        assert_eq!(
+            normalize_service_path(r"\systemroot\System32\x.sys", windir),
+            r"C:\Windows\System32\x.sys"
+        );
+        // \??\ NT path prefix -> stripped
+        assert_eq!(
+            normalize_service_path(r"\??\C:\WINDOWS\system32\drivers\AsIO3.sys", windir),
+            r"C:\WINDOWS\system32\drivers\AsIO3.sys"
+        );
+        // %SystemRoot% variable form
+        assert_eq!(
+            normalize_service_path(r"%SystemRoot%\system32\svc.exe", windir),
+            r"C:\Windows\system32\svc.exe"
+        );
+        // windir with trailing slash is handled (no double slash)
+        assert_eq!(
+            normalize_service_path(r"System32\x.sys", r"C:\Windows\"),
+            r"C:\Windows\System32\x.sys"
+        );
+    }
+
+    #[test]
+    fn normalize_service_path_never_panics_on_edge_cases() {
+        let windir = r"C:\Windows";
+        assert_eq!(normalize_service_path("", windir), r"C:\Windows\");
+        assert_eq!(normalize_service_path(r"\??\", windir), "");
+        // a lone backslash-prefixed relative path
+        assert_eq!(normalize_service_path(r"\System32\x.sys", windir), r"C:\Windows\System32\x.sys");
     }
 
     /// PersistCollector.collect returns only Persistence records, never panics, name="persist".
