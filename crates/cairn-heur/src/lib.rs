@@ -9,4 +9,4 @@ pub mod score;
 
 // Re-exports enabled as the analyzers land (Task 4 / Task 6).
 // pub use netconn::NetConnHeuristic;
-// pub use parentchild::ParentChildHeuristic;
+pub use parentchild::ParentChildHeuristic;

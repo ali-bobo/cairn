@@ -1,10 +1,11 @@
 //! heur_parentchild (FR10, SRS §10): anomalous parent->child, encoded PowerShell,
 //! suspicious exec path, unsigned + integrity weighting, built-in LOLBAS-flavored list.
-// Task 3: pure scoring only. Task 4 will add the Analyzer impl that consumes these items;
-// until then, suppress dead_code for the staging items.
-#![allow(dead_code)]
-use crate::score::{is_suspicious_path, Score};
-use cairn_core::record::ProcessRecord;
+use crate::score::{is_suspicious_path, severity_for, Score};
+use cairn_core::finding::EntityProcess;
+use cairn_core::record::{ProcessRecord, Record};
+use cairn_core::traits::Analyzer;
+use cairn_core::{Entity, Finding, FindingSource, Result};
+use std::collections::HashMap;
 
 // --- Named rule tables (config-loader seam; see spec) -------------------------
 
@@ -132,6 +133,65 @@ pub(crate) fn lolbas_suspicious(cmdline: &str) -> bool {
     lc.contains("http") || lc.contains("scrobj") || lc.contains("/i:") || has_base64_token(cmdline)
 }
 
+/// Analyzer: scores every process against its parent and emits findings above the floor.
+pub struct ParentChildHeuristic;
+
+impl Analyzer for ParentChildHeuristic {
+    fn name(&self) -> &str {
+        "heur_parentchild"
+    }
+
+    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+        // Index processes by pid for parent lookup.
+        let by_pid: HashMap<u32, &ProcessRecord> = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Process(p) => Some((p.pid, p)),
+                _ => None,
+            })
+            .collect();
+
+        let mut out = Vec::new();
+        for r in records {
+            let Record::Process(p) = r else { continue };
+            let parent = by_pid.get(&p.ppid).copied();
+            let score = score_process(p, parent);
+            let Some(severity) = severity_for(score.weight) else {
+                continue;
+            };
+
+            let mut f = Finding::new(severity, suspicious_title(p), FindingSource::Heuristic);
+            f.reason = Some(score.reasons.join("; "));
+            f.mitre = score.mitre;
+            f.artifact = "process".into();
+            f.details = format!(
+                "pid={} ppid={} image={} cmdline={}",
+                p.pid, p.ppid, p.image, p.cmdline
+            );
+            f.ts = p.start_time.unwrap_or_else(chrono::Utc::now);
+            f.entity = Entity {
+                process: Some(EntityProcess {
+                    pid: p.pid,
+                    ppid: p.ppid,
+                    image: p.image.clone(),
+                    cmdline: p.cmdline.clone(),
+                    signed: p.signed,
+                    integrity: p.integrity.clone(),
+                }),
+                ..Entity::default()
+            };
+            out.push(f);
+        }
+        Ok(out)
+    }
+}
+
+/// A short title for a flagged process.
+fn suspicious_title(p: &ProcessRecord) -> String {
+    let name = file_name(&p.image);
+    format!("Suspicious process: {name}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,5 +298,36 @@ mod tests {
         );
         let s2 = score_process(&ps, None);
         assert!(s2.mitre.contains(&"T1059.001".to_string()));
+    }
+
+    use cairn_core::record::Record;
+    use cairn_core::traits::Analyzer;
+
+    fn rec(p: ProcessRecord) -> Record {
+        Record::Process(p)
+    }
+
+    /// The analyzer emits one Heuristic finding (with reason + entity) for a malicious
+    /// Office->encoded-PS pair, and nothing for a benign process.
+    #[test]
+    fn analyzer_emits_finding_for_malicious_pair_only() {
+        let parent = proc(100, 4, r"C:\...\winword.exe", "");
+        let child = proc(
+            200,
+            100,
+            r"C:\...\powershell.exe",
+            "powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA",
+        );
+        let mut benign = proc(60, 50, r"C:\Windows\System32\notepad.exe", "notepad.exe");
+        benign.signed = Some(true);
+        let recs = vec![rec(parent), rec(child), rec(benign)];
+
+        let findings = ParentChildHeuristic.analyze(&recs).expect("analyze");
+        assert_eq!(findings.len(), 1, "only the malicious child should fire");
+        let f = &findings[0];
+        assert!(matches!(f.source, cairn_core::FindingSource::Heuristic));
+        assert!(f.reason.is_some(), "golden rule 6: reason required");
+        assert!(f.entity.process.is_some());
+        assert!(f.mitre.contains(&"T1059.001".to_string()));
     }
 }
