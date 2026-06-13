@@ -29,13 +29,19 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
         _ => {}
     }
 
-    if let Some(path) = p.binary_path.as_deref() {
-        if is_suspicious_path(path) {
-            s.add(
-                30,
-                format!("binary in a suspicious path: {path}"),
-                &["T1036"],
-            );
+    // Suspicious binary path — but NOT for the startup mechanism: the Startup folder is
+    // itself the canonical persistence location, so its own path is not a suspicion
+    // signal (the mechanism base weight already accounts for it). Other mechanisms point
+    // at an arbitrary binary path, where Temp/AppData/etc. IS suspicious.
+    if p.mechanism != "startup" {
+        if let Some(path) = p.binary_path.as_deref() {
+            if is_suspicious_path(path) {
+                s.add(
+                    30,
+                    format!("binary in a suspicious path: {path}"),
+                    &["T1036"],
+                );
+            }
         }
     }
 
@@ -240,20 +246,22 @@ mod tests {
         assert_eq!(s.weight, 0);
     }
 
-    /// The startup mechanism scores its base (+10, T1547.001) and stacks path + recency —
-    /// guards the startup arm (otherwise only run_key exercises the +10/T1547.001 path).
+    /// A recent startup item scores startup(10) + recent(15) = 25 (Low). The startup folder
+    /// path itself must NOT add the suspicious-path signal (it is the canonical location).
     #[test]
-    fn startup_in_appdata_recent_scores() {
+    fn startup_recent_scores_low_without_path_signal() {
         let now = Utc::now();
         let p = rec(
             "startup",
-            Some(r"C:\Users\a\AppData\Roaming\x.exe"),
+            Some(r"C:\Users\a\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\x.lnk"),
             Some(now),
         );
         let s = score_persistence(&p, now);
-        // startup 10 + suspicious path 30 + recent 15 = 55
-        assert!(s.weight >= 50, "weight {}", s.weight);
-        assert!(s.mitre.contains(&"T1547.001".to_string()));
+        assert_eq!(s.weight, 25, "startup(10)+recent(15), no path signal");
+        assert!(
+            !s.reasons.iter().any(|r| r.contains("suspicious path")),
+            "startup folder path must not trigger the suspicious-path signal"
+        );
     }
 
     use cairn_core::record::Record;

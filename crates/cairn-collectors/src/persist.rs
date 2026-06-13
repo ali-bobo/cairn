@@ -171,13 +171,20 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
                 .and_then(|m| m.modified().ok())
                 .map(chrono::DateTime::<chrono::Utc>::from);
             let full = path.to_string_lossy().to_string();
-            out.push(make_record(
-                "startup",
-                dir.clone(),
-                Some(name),
-                Some(full),
+            // A startup item's path is a FILE path (often a .lnk), not a command line, so
+            // we do NOT run it through extract_binary_path (which would clip at the first
+            // space in "Start Menu"). binary_path is the file path verbatim; resolving a
+            // .lnk to its real target is deferred (S2-D shortcut parsing).
+            out.push(PersistenceRecord {
+                mechanism: "startup".to_string(),
+                location: dir.clone(),
+                value: Some(name),
+                command: Some(full.clone()),
+                binary_path: Some(full),
+                binary_sha256: None,
+                signed: None,
                 last_write,
-            ));
+            });
         }
     }
     out
@@ -477,6 +484,31 @@ mod tests {
         );
         // a nonexistent dir is best-effort skipped, no panic
         assert!(read_startup_dirs(&["C:\\does\\not\\exist\\cairn".into()]).is_empty());
+    }
+
+    #[test]
+    fn startup_binary_path_not_clipped_on_spaces() {
+        // A startup dir whose path contains spaces (like the real "Start Menu" path) must
+        // yield a binary_path equal to the full file path, not a clipped first-token.
+        let tmp = std::env::temp_dir().join(format!("cairn_s2c_spaces_{} dir", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("app.lnk"), b"x").unwrap();
+        let dirs = vec![tmp.to_string_lossy().to_string()];
+        let recs = read_startup_dirs(&dirs);
+        let _ = std::fs::remove_dir_all(&tmp);
+        let r = recs
+            .iter()
+            .find(|r| r.value.as_deref() == Some("app.lnk"))
+            .expect("record");
+        let bp = r.binary_path.as_deref().expect("binary_path");
+        assert!(
+            bp.ends_with("app.lnk"),
+            "binary_path must be the full path, got {bp}"
+        );
+        assert!(
+            bp.contains(' '),
+            "the space in the dir name must be preserved, got {bp}"
+        );
     }
 
     use cairn_core::record::Record;
