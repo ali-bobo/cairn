@@ -200,6 +200,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-heur"
+version = "0.1.0"
+dependencies = [
+ "cairn-core",
+ "chrono",
+]
+
+[[package]]
 name = "cairn-report"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,9 @@
+[package]
+name = "cairn-heur"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+cairn-core = { path = "../cairn-core" }
+chrono.workspace = true
