@@ -139,6 +139,28 @@ fn is_live_target(target: &str) -> bool {
     target.eq_ignore_ascii_case("live")
 }
 
+/// Deterministic output ordering (NFR4): sort by (ts, then a stable tiebreak key).
+/// Heuristic findings have no record_id, so the tiebreak is (title, then entity pid for
+/// process / lport for netconn). Never sort by the random Finding.id (uuid).
+fn sort_findings(findings: &mut [cairn_core::Finding]) {
+    findings.sort_by(|a, b| {
+        a.ts.cmp(&b.ts)
+            .then_with(|| a.title.cmp(&b.title))
+            .then_with(|| finding_tiebreak(a).cmp(&finding_tiebreak(b)))
+    });
+}
+
+/// Stable secondary key: process pid or netconn lport (0 if neither).
+fn finding_tiebreak(f: &cairn_core::Finding) -> u32 {
+    if let Some(p) = &f.entity.process {
+        p.pid
+    } else if let Some(n) = &f.entity.netconn {
+        n.lport as u32
+    } else {
+        0
+    }
+}
+
 /// Dump collected Records as JSONL so a live run produces usable data even before
 /// analyzers exist. One Record per line (the internal bus type; versioned by schema::RECORD).
 fn write_records_jsonl(
@@ -431,11 +453,28 @@ fn main() -> anyhow::Result<()> {
                 Box::new(cairn_collectors::proc::ProcCollector),
                 Box::new(cairn_collectors::net::NetCollector),
             ];
-            let outcome = run_live(&cfg, privileges, hostname, &collectors);
-            tracing::info!(records = outcome.records.len(), "live collection complete");
+            let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
+                Box::new(cairn_heur::ParentChildHeuristic),
+                Box::new(cairn_heur::NetConnHeuristic),
+            ];
+            let mut outcome = run_live(&cfg, privileges, hostname, &collectors, &analyzers);
+            // Stamp the host onto each finding (analyzers don't know the hostname), then
+            // sort for deterministic output (NFR4).
+            for f in &mut outcome.findings {
+                f.host = outcome.hostname.clone();
+            }
+            sort_findings(&mut outcome.findings);
+            tracing::info!(
+                records = outcome.records.len(),
+                findings = outcome.findings.len(),
+                "live collection + analysis complete"
+            );
 
-            let by_sev =
-                cairn_report::Summary::from_findings(&[], outcome.records.len() as u64).by_severity;
+            let by_sev = cairn_report::Summary::from_findings(
+                &outcome.findings,
+                outcome.records.len() as u64,
+            )
+            .by_severity;
             let manifest = Manifest {
                 schema: cairn_core::schema::MANIFEST.to_string(),
                 tool: ToolInfo {
@@ -468,8 +507,8 @@ fn main() -> anyhow::Result<()> {
             };
 
             let mut sink = DirSink::new(dir.clone());
-            sink.write_timeline_csv(&[])?; // no findings yet (no analyzers this sub-segment)
-            sink.write_findings_jsonl(&[])?;
+            sink.write_timeline_csv(&outcome.findings)?;
+            sink.write_findings_jsonl(&outcome.findings)?;
             write_records_jsonl(&dir, &outcome.records)?;
             manifest_outputs_then_write(&mut sink, manifest)?;
             tracing::info!(dir = %dir.display(), "live run complete");
@@ -503,6 +542,20 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn findings_sort_is_deterministic_by_ts_then_title() {
+        use cairn_core::{Finding, FindingSource, Severity};
+        let mut a = Finding::new(Severity::High, "b-title", FindingSource::Heuristic);
+        let mut b = Finding::new(Severity::High, "a-title", FindingSource::Heuristic);
+        let ts = chrono::Utc::now();
+        a.ts = ts;
+        b.ts = ts;
+        let mut v = vec![a, b];
+        sort_findings(&mut v);
+        assert_eq!(v[0].title, "a-title");
+        assert_eq!(v[1].title, "b-title");
+    }
 
     #[test]
     fn run_target_live_is_recognized() {
