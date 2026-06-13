@@ -1,27 +1,31 @@
 //! Minimal live-run orchestrator (SRS §3): probe privileges (injected), sequence the
 //! given collectors in order, accumulate Records + provenance, and degrade gracefully —
 //! a failing collector is logged + recorded but never aborts the run (FR13, golden rule 8).
+use crate::finding::Finding;
 use crate::manifest::{Privileges, SourceEntry};
 use crate::record::Record;
-use crate::traits::{CollectCtx, Collector};
+use crate::traits::{Analyzer, CollectCtx, Collector};
 use crate::Config;
 
 /// Result of a live run, ready to feed the manifest builder + reporter.
 #[derive(Debug)]
 pub struct RunOutcome {
     pub records: Vec<Record>,
+    pub findings: Vec<Finding>,
     pub sources: Vec<SourceEntry>,
     pub privileges: Privileges,
     pub hostname: String,
 }
 
-/// Run the given collectors against the host. `privileges`/`hostname` are provided by the
-/// caller (real probe in the bin; fakes in tests) so this stays pure + testable.
+/// Run the given collectors against the host, then fan-in analyzers over the accumulated
+/// records. `privileges`/`hostname` are provided by the caller (real probe in the bin;
+/// fakes in tests) so this stays pure + testable.
 pub fn run_live(
     cfg: &Config,
     privileges: Privileges,
     hostname: String,
     collectors: &[Box<dyn Collector>],
+    analyzers: &[Box<dyn Analyzer>],
 ) -> RunOutcome {
     let ctx = CollectCtx {
         config: cfg,
@@ -51,8 +55,20 @@ pub fn run_live(
             }
         }
     }
+    // Analyzer fan-in (SRS §3): each analyzer reads the accumulated records and emits
+    // findings. A failing analyzer is logged + skipped (graceful degrade), never aborts.
+    let mut findings = Vec::new();
+    for a in analyzers {
+        match a.analyze(&records) {
+            Ok(mut fs) => findings.append(&mut fs),
+            Err(e) => {
+                tracing::warn!(analyzer = a.name(), error = %e, "analyzer failed; skipping");
+            }
+        }
+    }
     RunOutcome {
         records,
+        findings,
         sources,
         privileges,
         hostname,
@@ -147,7 +163,7 @@ mod tests {
             FakeCollector::ok("proc", vec![proc_rec()]),
             FakeCollector::ok("net", vec![net_rec()]),
         ];
-        let out = run_live(&cfg, privs(), "WS01".into(), &collectors);
+        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &[]);
         assert_eq!(out.records.len(), 2);
         assert_eq!(out.sources.len(), 2);
         assert_eq!(out.hostname, "WS01");
@@ -163,7 +179,7 @@ mod tests {
             FakeCollector::err("proc"),
             FakeCollector::ok("net", vec![net_rec()]),
         ];
-        let out = run_live(&cfg, privs(), "WS01".into(), &collectors);
+        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &[]);
         // net still produced its record.
         assert_eq!(out.records.len(), 1);
         // proc's failure is captured as a source entry carrying the error.
@@ -173,5 +189,73 @@ mod tests {
             .find(|s| s.artifact == "proc")
             .expect("proc source");
         assert!(!failed.errors.is_empty(), "failure must be recorded");
+    }
+
+    use crate::finding::{Finding, FindingSource, Severity};
+    use crate::traits::Analyzer;
+
+    /// A fake analyzer returning a canned result (or an error).
+    struct FakeAnalyzer {
+        name: &'static str,
+        result: std::sync::Mutex<Option<Result<Vec<Finding>, CairnError>>>,
+    }
+    impl FakeAnalyzer {
+        fn ok(name: &'static str, findings: Vec<Finding>) -> Box<dyn Analyzer> {
+            Box::new(FakeAnalyzer {
+                name,
+                result: std::sync::Mutex::new(Some(Ok(findings))),
+            })
+        }
+        fn err(name: &'static str) -> Box<dyn Analyzer> {
+            Box::new(FakeAnalyzer {
+                name,
+                result: std::sync::Mutex::new(Some(Err(CairnError::Analyzer {
+                    analyzer: name.into(),
+                    reason: "boom".into(),
+                }))),
+            })
+        }
+    }
+    impl Analyzer for FakeAnalyzer {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn analyze(&self, _records: &[Record]) -> crate::Result<Vec<Finding>> {
+            self.result.lock().unwrap().take().unwrap()
+        }
+    }
+
+    fn a_finding() -> Finding {
+        Finding::new(Severity::High, "t", FindingSource::Heuristic)
+    }
+
+    /// Analyzer findings land in RunOutcome.findings.
+    #[test]
+    fn analyzers_findings_are_collected() {
+        let cfg = Config::default();
+        let collectors = vec![FakeCollector::ok("proc", vec![proc_rec()])];
+        let analyzers = vec![FakeAnalyzer::ok("h", vec![a_finding()])];
+        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
+        assert_eq!(out.findings.len(), 1);
+    }
+
+    /// A failing analyzer is skipped; the run still returns the other's findings.
+    #[test]
+    fn failing_analyzer_is_skipped_run_continues() {
+        let cfg = Config::default();
+        let collectors = vec![FakeCollector::ok("proc", vec![proc_rec()])];
+        let analyzers = vec![
+            FakeAnalyzer::err("bad"),
+            FakeAnalyzer::ok("good", vec![a_finding()]),
+        ];
+        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
+        assert_eq!(out.findings.len(), 1, "good analyzer still ran");
+        // The failing analyzer must NOT pollute provenance: sources holds only the
+        // collector's entry (analyzer failures are logged, not recorded as sources).
+        assert_eq!(
+            out.sources.len(),
+            1,
+            "analyzer failure must not add a source"
+        );
     }
 }

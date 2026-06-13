@@ -7,6 +7,7 @@ members = [
     "crates/cairn-collectors-win",
     "crates/cairn-sigma",
     "crates/cairn-report",
+    "crates/cairn-heur",
     "crates/cairn-cli",
 ]
 

@@ -154,6 +154,7 @@ dependencies = [
  "cairn-collectors",
  "cairn-collectors-win",
  "cairn-core",
+ "cairn-heur",
  "cairn-report",
  "cairn-sigma",
  "chrono",
@@ -197,6 +198,14 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "cairn-heur"
+version = "0.1.0"
+dependencies = [
+ "cairn-core",
+ "chrono",
 ]
 
 [[package]]

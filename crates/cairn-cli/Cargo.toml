@@ -14,6 +14,7 @@ cairn-collectors = { path = "../cairn-collectors" }
 cairn-collectors-win = { path = "../cairn-collectors-win" }
 cairn-sigma = { path = "../cairn-sigma" }
 cairn-report = { path = "../cairn-report" }
+cairn-heur = { path = "../cairn-heur" }
 clap.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
