@@ -148,4 +148,49 @@ mod tests {
         let s = score_conn(&c, None);
         assert_eq!(s.weight, 45);
     }
+
+    /// Signal 5: an unsigned process listening on a high port (>1024) fires the
+    /// suspicious-listener signal. lport must be strictly > 1024.
+    #[test]
+    fn unsigned_high_port_listener_fires() {
+        // listen, high port, unsigned owner: unsigned(20) + listener(25) = 45
+        let c = conn("tcp", 4444, None, None, Some("listen"), Some(1));
+        let o = owner(r"C:\Users\a\AppData\Local\Temp\svc.exe", Some(false));
+        let s = score_conn(&c, Some(&o));
+        // suspicious path (30) + unsigned (20) + listener (25) = 75
+        assert!(s.weight >= 70, "weight {}", s.weight);
+        assert!(s
+            .reasons
+            .iter()
+            .any(|r| r.contains("listening on high port")));
+
+        // a signed listener on the same high port does NOT fire the listener signal
+        let signed_owner = owner(r"C:\Windows\System32\svchost.exe", Some(true));
+        let s2 = score_conn(&c, Some(&signed_owner));
+        assert!(!s2
+            .reasons
+            .iter()
+            .any(|r| r.contains("listening on high port")));
+    }
+
+    /// Public-IP gating is independent of the rare-port signal: a PRIVATE (RFC1918)
+    /// address on a rare port fires ONLY the rare-port signal (+20), never the
+    /// public-IP signal — proving the public-IP gate works on its own.
+    #[test]
+    fn private_ip_rare_port_fires_rare_port_only() {
+        let c = conn(
+            "tcp",
+            50000,
+            Some("10.0.0.5"),
+            Some(4444),
+            Some("established"),
+            None,
+        );
+        let s = score_conn(&c, None);
+        assert_eq!(
+            s.weight, 20,
+            "only the rare-port signal should fire for a private dest"
+        );
+        assert!(!s.reasons.iter().any(|r| r.contains("public IP")));
+    }
 }
