@@ -216,16 +216,22 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-/// Build a PersistenceRecord with the deferred fields (signed/sha256) as None.
+/// Testable core for building a PersistenceRecord: accepts an injected `exists` probe
+/// for resolving unquoted spaced cmdlines to the real binary path (S2-F candidate model).
+/// `make_record` (below) calls this with the real `Path::exists`.
 #[allow(dead_code)]
-fn make_record(
+fn make_record_with_exists(
     mechanism: &str,
     location: String,
     value: Option<String>,
     command: Option<String>,
     last_write: Option<DateTime<Utc>>,
+    exists: impl Fn(&str) -> bool,
 ) -> PersistenceRecord {
-    let binary_path = command.as_deref().and_then(extract_binary_path);
+    let binary_path = command.as_deref().and_then(|cmd| {
+        let candidates = extract_binary_path_candidates(cmd, |name| std::env::var(name).ok());
+        pick_binary_path(&candidates, &exists)
+    });
     PersistenceRecord {
         mechanism: mechanism.to_string(),
         location,
@@ -236,6 +242,26 @@ fn make_record(
         signed: None,
         last_write,
     }
+}
+
+/// Build a PersistenceRecord with the deferred fields (signed/sha256) as None.
+/// Uses the candidate-list model (S2-F) so unquoted spaced paths resolve correctly.
+#[allow(dead_code)]
+fn make_record(
+    mechanism: &str,
+    location: String,
+    value: Option<String>,
+    command: Option<String>,
+    last_write: Option<DateTime<Utc>>,
+) -> PersistenceRecord {
+    make_record_with_exists(
+        mechanism,
+        location,
+        value,
+        command,
+        last_write,
+        |p| std::path::Path::new(p).exists(),
+    )
 }
 
 /// Non-Windows: persistence reads are Windows-only; return empty so the workspace builds.
@@ -824,7 +850,7 @@ mod tests {
     fn candidates_unquoted_no_spaces() {
         let got = extract_binary_path_candidates(
             r"C:\Windows\system32\svchost.exe",
-            &no_env,
+            no_env,
         );
         assert_eq!(got, vec![r"C:\Windows\system32\svchost.exe"]);
     }
@@ -833,7 +859,7 @@ mod tests {
     #[test]
     fn candidates_unquoted_spaces_longest_first() {
         let cmdline = r"C:\Program Files\Docker\Docker\Docker Desktop.exe";
-        let got = extract_binary_path_candidates(cmdline, &no_env);
+        let got = extract_binary_path_candidates(cmdline, no_env);
         // First candidate must be the full string.
         assert_eq!(got[0], cmdline);
         // Last candidate must be the bare first-space token.
@@ -894,17 +920,17 @@ mod tests {
     /// Empty / whitespace-only -> empty Vec.
     #[test]
     fn candidates_empty_input() {
-        assert!(extract_binary_path_candidates("", &no_env).is_empty());
-        assert!(extract_binary_path_candidates("   ", &no_env).is_empty());
+        assert!(extract_binary_path_candidates("", no_env).is_empty());
+        assert!(extract_binary_path_candidates("   ", no_env).is_empty());
     }
 
     /// Adversarial: lone %, trailing spaces, mismatched quotes -> no panic.
     #[test]
     fn candidates_adversarial_no_panic() {
-        let _ = extract_binary_path_candidates("%", &no_env);
-        let _ = extract_binary_path_candidates("%%", &no_env);
-        let _ = extract_binary_path_candidates(r#""C:\unclosed"#, &no_env);
-        let _ = extract_binary_path_candidates("   leading spaces", &no_env);
+        let _ = extract_binary_path_candidates("%", no_env);
+        let _ = extract_binary_path_candidates("%%", no_env);
+        let _ = extract_binary_path_candidates(r#""C:\unclosed"#, no_env);
+        let _ = extract_binary_path_candidates("   leading spaces", no_env);
     }
 
     // ── S2-F: pick_binary_path ─────────────────────────────────────────────
@@ -988,6 +1014,78 @@ mod tests {
             pick_binary_path(&candidates, exists).as_deref(),
             Some(r"C:\Program Files\Docker\Docker Desktop.exe")
         );
+    }
+
+    // ── S2-F: make_record wiring ───────────────────────────────────────────
+
+    /// A quoted cmdline stays unchanged (single candidate -> same binary_path as before).
+    /// This is the regression test: S2-F must not change quoted-path behavior.
+    #[test]
+    fn make_record_quoted_cmdline_unchanged() {
+        let r = make_record_with_exists(
+            "run_key",
+            "HKLM\\...\\Run".into(),
+            Some("MyApp".into()),
+            Some(r#""C:\Program Files\App\app.exe" -silent"#.to_string()),
+            None,
+            |_| false, // nothing exists on CI
+        );
+        // Falls back to last candidate = the quoted content (only one candidate).
+        assert_eq!(
+            r.binary_path.as_deref(),
+            Some(r"C:\Program Files\App\app.exe")
+        );
+    }
+
+    /// An unquoted spaced cmdline: when the full .exe path "exists", it is chosen
+    /// over the bare first token.
+    #[test]
+    fn make_record_unquoted_spaced_resolves_full_path() {
+        // cmdline: "C:\Program Files\App\My App.exe -x"
+        // Space positions in pre-expansion string (0-indexed bytes):
+        //   pos 17 -> "C:\Program Files\App\My App.exe -x"[17] = ' ' (between "Files" and "App")
+        //     wait, let's be precise:
+        //     "C:\Program Files\App\My App.exe -x"
+        //      0123456789012345678901234567890123456
+        //   spaces at: 10 ("C:\Program "), 16 ("Files "), 23 ("App\My "), 31 ("App.exe ")
+        //   Wait, let's count: C:\Program Files\App\My App.exe -x
+        //     C  :  \  P  r  o  g  r  a  m     F  i  l  e  s  \  A  p  p  \  M  y     A  p  p  .  e  x  e     -  x
+        //     0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33
+        // Spaces at: 10, 23, 31
+        // Candidates (longest first):
+        //   [0] "C:\Program Files\App\My App.exe -x"  (whole)
+        //   [1] "C:\Program Files\App\My App.exe"      (before " -x" at pos 31)
+        //   [2] "C:\Program Files\App\My"              (before " App.exe" at pos 23)
+        //   [3] "C:\Program"                           (before " Files" at pos 10)
+        // fake_exists: only [1] exists.
+        let fake_exists = |p: &str| p == r"C:\Program Files\App\My App.exe";
+        let r = make_record_with_exists(
+            "run_key",
+            "HKLM\\...\\Run".into(),
+            Some("MyApp".into()),
+            Some(r"C:\Program Files\App\My App.exe -x".to_string()),
+            None,
+            fake_exists,
+        );
+        assert_eq!(
+            r.binary_path.as_deref(),
+            Some(r"C:\Program Files\App\My App.exe")
+        );
+    }
+
+    /// Unquoted spaced cmdline where NOTHING exists -> fall back to bare first token.
+    #[test]
+    fn make_record_unquoted_spaced_fallback_when_nothing_exists() {
+        let r = make_record_with_exists(
+            "run_key",
+            "HKLM\\...\\Run".into(),
+            Some("MyApp".into()),
+            Some(r"C:\Program Files\App\My App.exe -x".to_string()),
+            None,
+            |_| false,
+        );
+        // Fallback: last candidate = bare first token.
+        assert_eq!(r.binary_path.as_deref(), Some(r"C:\Program"));
     }
 
     /// PersistCollector.collect returns only Persistence records, never panics, name="persist".
