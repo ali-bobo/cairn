@@ -1421,4 +1421,40 @@ mod tests {
         assert!(parse_task_xml("not xml at all").is_empty());
         assert!(parse_task_xml("").is_empty());
     }
+
+    /// A REAL exported built-in task (ScheduledDefrag) verbatim: full RegistrationInfo with
+    /// SecurityDescriptor, Principals, Settings, an empty `<Triggers />`, and the `$` char in
+    /// arguments. Confirms the parser ignores all the surrounding elements and extracts only
+    /// the URI + the single Exec's command/arguments from a complex real-world document.
+    #[test]
+    fn parse_task_xml_real_builtin_defrag() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.6" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <SecurityDescriptor>D:AI(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;LS)(A;;FR;;;AU)</SecurityDescriptor>
+    <Source>$(@%systemroot%\system32\defragsvc.dll,-800)</Source>
+    <Author>$(@%systemroot%\system32\defragsvc.dll,-801)</Author>
+    <URI>\Microsoft\Windows\Defrag\ScheduledDefrag</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="LocalSystem"><UserId>S-1-5-18</UserId></Principal>
+  </Principals>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings>
+  <Triggers />
+  <Actions Context="LocalSystem">
+    <Exec>
+      <Command>%windir%\system32\defrag.exe</Command>
+      <Arguments>-c -h -o -$</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#;
+        let acts = parse_task_xml(xml);
+        assert_eq!(acts.len(), 1, "one Exec action");
+        assert_eq!(acts[0].command, r"%windir%\system32\defrag.exe");
+        assert_eq!(acts[0].arguments, "-c -h -o -$");
+        assert_eq!(
+            acts[0].uri.as_deref(),
+            Some(r"\Microsoft\Windows\Defrag\ScheduledDefrag")
+        );
+    }
 }
