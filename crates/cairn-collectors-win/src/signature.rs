@@ -33,19 +33,19 @@ impl FileVerifier for WinSigVerifier {
 mod win {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{HANDLE, HWND};
-    use windows::Win32::Security::WinTrust::{
-        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
-        WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
-        WTD_UI_NONE,
-    };
     use windows::core::w;
+    use windows::core::PCWSTR;
     use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{HANDLE, HWND};
     use windows::Win32::Security::Cryptography::Catalog::{
         CryptCATAdminAcquireContext2, CryptCATAdminCalcHashFromFileHandle2,
         CryptCATAdminEnumCatalogFromHash, CryptCATAdminReleaseCatalogContext,
         CryptCATAdminReleaseContext, CryptCATCatalogInfoFromContext, CATALOG_INFO,
+    };
+    use windows::Win32::Security::WinTrust::{
+        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
+        WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
+        WTD_UI_NONE,
     };
     use windows::Win32::Security::WinTrust::{WINTRUST_CATALOG_INFO, WTD_CHOICE_CATALOG};
     use windows::Win32::Storage::FileSystem::{
@@ -113,7 +113,7 @@ mod win {
         if status == 0 {
             return Some(true); // embedded-signed: fast path, no catalog lookup
         }
-        verify_via_catalog(path, &wide)
+        verify_via_catalog(&wide)
     }
 
     /// RAII: releases a CryptCATAdmin context on drop. Held for the whole catalog lookup;
@@ -156,20 +156,18 @@ mod win {
         }
     }
 
-    /// Catalog fallback: returns Some(true) if the file's hash is found in a system catalog
-    /// AND that catalog verifies, Some(false) if the hash is in no catalog (genuinely
-    /// unsigned), None on any infrastructure failure (cannot acquire/open/hash). Total: never
-    /// panics. (Task 2 lands acquire/open/hash/enum; the catalog WinVerifyTrust is added in
-    /// Task 3 — until then a found hash returns Some(false) as a placeholder.)
-    fn verify_via_catalog(path: &str, wide: &[u16]) -> Option<bool> {
-        let _ = path; // path is used in Task 3 (member file path); silence unused for now
+    /// Catalog fallback (called when the embedded check failed): returns Some(true) if the
+    /// file's hash is found in a system catalog AND that catalog verifies, Some(false) if the
+    /// hash is in no catalog (genuinely unsigned) or the catalog rejects it, None on any
+    /// infrastructure failure (cannot acquire context / open file / compute hash). Total:
+    /// never panics. `wide` is the NUL-terminated UTF-16 file path (reused as the member path).
+    fn verify_via_catalog(wide: &[u16]) -> Option<bool> {
         // 1) Acquire a SHA-256 catalog admin context.
         let mut admin_raw: isize = 0;
         // SAFETY: admin_raw is a valid out-param; w!("SHA256") is a 'static NUL-terminated
         // wide literal; other params None. On Err the context is not created (nothing to free).
-        let acquired = unsafe {
-            CryptCATAdminAcquireContext2(&mut admin_raw, None, w!("SHA256"), None, None)
-        };
+        let acquired =
+            unsafe { CryptCATAdminAcquireContext2(&mut admin_raw, None, w!("SHA256"), None, None) };
         if acquired.is_err() {
             return None;
         }
@@ -223,8 +221,7 @@ mod win {
 
         // 4) Look the hash up in the system catalog DB. 0 == not in any catalog == unsigned.
         // SAFETY: admin.0 valid; hash is a live slice; other params None.
-        let info_raw =
-            unsafe { CryptCATAdminEnumCatalogFromHash(admin.0, &hash, None, None) };
+        let info_raw = unsafe { CryptCATAdminEnumCatalogFromHash(admin.0, &hash, None, None) };
         if info_raw == 0 {
             return Some(false);
         }
