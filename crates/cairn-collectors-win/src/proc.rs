@@ -39,6 +39,10 @@ mod win {
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
+    use windows::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        PROCESS_QUERY_LIMITED_INFORMATION,
+    };
 
     /// RAII guard for a snapshot HANDLE.
     /// INVARIANT: holds a valid handle from CreateToolhelp32Snapshot; closed once on drop.
@@ -50,6 +54,53 @@ mod win {
                 let _ = CloseHandle(self.0);
             }
         }
+    }
+
+    /// RAII guard for a process HANDLE.
+    /// INVARIANT: holds a valid handle from OpenProcess; closed exactly once on drop.
+    struct ProcHandle(HANDLE);
+    impl Drop for ProcHandle {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is the valid process handle from OpenProcess; closed once.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Best-effort full image path for a pid via OpenProcess + QueryFullProcessImageNameW.
+    /// Returns None if the process cannot be opened (privilege / exited) or the query fails.
+    /// Never panics. Read-only: QUERY_LIMITED_INFORMATION cannot modify the target.
+    fn full_image_path(pid: u32) -> Option<String> {
+        // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately in the
+        // guard. bInheritHandle=false; QUERY_LIMITED_INFORMATION is read-only.
+        let handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let guard = ProcHandle(handle);
+
+        // First attempt with MAX_PATH; grow once on insufficient buffer.
+        for cap in [260usize, 32768usize] {
+            let mut buf = vec![0u16; cap];
+            let mut len = cap as u32;
+            // SAFETY: guard.0 is a valid handle; buf has `len` u16 slots; len is in/out
+            // (capacity in, characters-written out).
+            let r = unsafe {
+                QueryFullProcessImageNameW(
+                    guard.0,
+                    PROCESS_NAME_WIN32,
+                    windows::core::PWSTR(buf.as_mut_ptr()),
+                    &mut len,
+                )
+            };
+            match r {
+                Ok(()) => {
+                    let s = String::from_utf16_lossy(&buf[..len as usize]);
+                    return if s.is_empty() { None } else { Some(s) };
+                }
+                Err(_) => continue, // small buffer -> retry large; large -> give up
+            }
+        }
+        None
     }
 
     pub fn enumerate() -> Result<Vec<RawProc>> {
@@ -79,7 +130,10 @@ mod win {
                 .iter()
                 .position(|&c| c == 0)
                 .unwrap_or(entry.szExeFile.len());
-            let image = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            let file_name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+            // Prefer the full image path (for signature verification downstream); fall back
+            // to the Toolhelp file name when the process can't be opened (privilege/exited).
+            let image = full_image_path(entry.th32ProcessID).unwrap_or(file_name);
             out.push(RawProc {
                 pid: entry.th32ProcessID,
                 ppid: entry.th32ParentProcessID,
@@ -114,6 +168,20 @@ mod tests {
         assert!(
             procs.iter().any(|p| p.pid == me),
             "current pid {me} not found"
+        );
+    }
+
+    /// On Windows we can open our own process, so enumerate() yields an absolute image path
+    /// for the current pid (proving the OpenProcess/QueryFullProcessImageNameW path works).
+    #[test]
+    fn current_process_has_absolute_image_path() {
+        let procs = enumerate().expect("enumerate");
+        let me = std::process::id();
+        let mine = procs.iter().find(|p| p.pid == me).expect("self in list");
+        assert!(
+            mine.image.contains(":\\"),
+            "expected absolute path, got {:?}",
+            mine.image
         );
     }
 }
