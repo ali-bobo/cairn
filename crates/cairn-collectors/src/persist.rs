@@ -44,6 +44,96 @@ fn extract_binary_path_with(
     Some(expand_env_vars(raw, &lookup))
 }
 
+/// Produce a list of candidate binary paths from a command line, LONGEST FIRST.
+///
+/// • Quoted (`"C:\path with spaces\app.exe" -args`): exactly one candidate — the
+///   content between the opening and closing quote. Unchanged from `extract_binary_path`.
+/// • Unquoted, no spaces (`C:\Windows\notepad.exe`): one candidate — the full string.
+/// • Unquoted WITH spaces (`C:\Program Files\App\app.exe`): one candidate per space
+///   boundary, longest first:
+///     - the whole string
+///     - the substring before the LAST space
+///     - the substring before the second-last space
+///     - ...
+///     - the bare first whitespace-delimited token (today's `extract_binary_path` value)
+///   This mirrors how Windows `CreateProcess` resolves ambiguous paths.
+///
+/// `%VAR%` expansion is applied to each candidate via the injected `lookup`.
+/// Returns an empty Vec for an empty / whitespace-only input (no panic).
+#[allow(dead_code)]
+pub(crate) fn extract_binary_path_candidates(
+    cmdline: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let trimmed = cmdline.trim();
+    if trimmed.is_empty() {
+        return vec![];
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        // Quoted: take up to the closing quote (same as extract_binary_path_with).
+        let raw = rest.split('"').next().unwrap_or("");
+        if raw.is_empty() {
+            return vec![];
+        }
+        return vec![expand_env_vars(raw, &lookup)];
+    }
+
+    // Unquoted: find all space positions and emit longest-first prefixes.
+    // Spaces are ASCII (single byte), so byte-index slicing is char-boundary-safe.
+    let space_positions: Vec<usize> = trimmed
+        .char_indices()
+        .filter(|(_, c)| *c == ' ')
+        .map(|(i, _)| i)
+        .collect();
+
+    if space_positions.is_empty() {
+        // No spaces: single candidate.
+        return vec![expand_env_vars(trimmed, &lookup)];
+    }
+
+    // Candidates: whole string, then prefix before each space (reverse order = longest first).
+    let mut candidates = Vec::with_capacity(space_positions.len() + 1);
+    candidates.push(expand_env_vars(trimmed, &lookup));
+    for &pos in space_positions.iter().rev() {
+        let prefix = &trimmed[..pos];
+        if !prefix.is_empty() {
+            let expanded = expand_env_vars(prefix, &lookup);
+            // Avoid consecutive duplicates (expansion can collapse adjacent prefixes to the same string).
+            if Some(&expanded) != candidates.last() {
+                candidates.push(expanded);
+            }
+        }
+    }
+    candidates
+}
+
+/// Select the best binary path from a candidate list using an injected FS probe.
+///
+/// Returns the first candidate for which `exists(c)` is true. If none exist,
+/// returns the last candidate (the bare first token — today's `extract_binary_path`
+/// value, so behavior never regresses to None where it previously had a value).
+/// Returns None only if `candidates` is empty.
+///
+/// The injected `exists` is read-only (`Path::exists` on Windows; a fake set in tests).
+/// Never panics.
+#[allow(dead_code)]
+pub(crate) fn pick_binary_path(
+    candidates: &[String],
+    exists: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    for c in candidates {
+        if exists(c.as_str()) {
+            return Some(c.clone());
+        }
+    }
+    // None found on disk: fall back to the last candidate (bare first token).
+    candidates.last().cloned()
+}
+
 /// Expand %VAR% occurrences using the injected `lookup`; unknown vars (lookup returns None)
 /// are left as the literal `%NAME%`. An unterminated `%` emits the rest verbatim. An empty
 /// var name (`%%`) is treated as unknown and kept literal. Never panics (the `%` byte is
@@ -126,16 +216,25 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-/// Build a PersistenceRecord with the deferred fields (signed/sha256) as None.
+/// Testable core for building a PersistenceRecord: accepts an injected `exists` probe
+/// for resolving unquoted spaced cmdlines to the real binary path (S2-F candidate model).
+/// `make_record` (below) calls this with the real `Path::exists`.
 #[allow(dead_code)]
-fn make_record(
+fn make_record_with_exists(
     mechanism: &str,
     location: String,
     value: Option<String>,
     command: Option<String>,
     last_write: Option<DateTime<Utc>>,
+    exists: impl Fn(&str) -> bool,
 ) -> PersistenceRecord {
-    let binary_path = command.as_deref().and_then(extract_binary_path);
+    let binary_path = command.as_deref().and_then(|cmd| {
+        // env lookup is the one remaining un-injected dependency here (the `exists`
+        // probe is injected for testability). Real %env% cmdlines are exercised in
+        // the live e2e; full env injection is deferred to S2-G.
+        let candidates = extract_binary_path_candidates(cmd, |name| std::env::var(name).ok());
+        pick_binary_path(&candidates, &exists)
+    });
     PersistenceRecord {
         mechanism: mechanism.to_string(),
         location,
@@ -146,6 +245,21 @@ fn make_record(
         signed: None,
         last_write,
     }
+}
+
+/// Build a PersistenceRecord with the deferred fields (signed/sha256) as None.
+/// Uses the candidate-list model (S2-F) so unquoted spaced paths resolve correctly.
+#[allow(dead_code)]
+fn make_record(
+    mechanism: &str,
+    location: String,
+    value: Option<String>,
+    command: Option<String>,
+    last_write: Option<DateTime<Utc>>,
+) -> PersistenceRecord {
+    make_record_with_exists(mechanism, location, value, command, last_write, |p| {
+        std::path::Path::new(p).exists()
+    })
 }
 
 /// Non-Windows: persistence reads are Windows-only; return empty so the workspace builds.
@@ -709,6 +823,244 @@ mod tests {
             normalize_service_path(r"\System32\x.sys", windir),
             r"C:\Windows\System32\x.sys"
         );
+    }
+
+    // ── S2-F: extract_binary_path_candidates ──────────────────────────────
+
+    /// Helper: fake env that returns None for every var (no expansion side-effects).
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    /// Quoted path -> exactly one candidate (the path between the quotes).
+    #[test]
+    fn candidates_quoted_single() {
+        let env = fake_env(&[]);
+        let got = extract_binary_path_candidates(r#""C:\Program Files\App\app.exe" -silent"#, &env);
+        assert_eq!(got, vec![r"C:\Program Files\App\app.exe"]);
+    }
+
+    /// Unquoted path with no spaces -> one candidate.
+    #[test]
+    fn candidates_unquoted_no_spaces() {
+        let got = extract_binary_path_candidates(r"C:\Windows\system32\svchost.exe", no_env);
+        assert_eq!(got, vec![r"C:\Windows\system32\svchost.exe"]);
+    }
+
+    /// Unquoted path WITH spaces -> longest first, bare-token last.
+    #[test]
+    fn candidates_unquoted_spaces_longest_first() {
+        let cmdline = r"C:\Program Files\Docker\Docker\Docker Desktop.exe";
+        let got = extract_binary_path_candidates(cmdline, no_env);
+        // First candidate must be the full string.
+        assert_eq!(got[0], cmdline);
+        // Last candidate must be the bare first-space token.
+        assert_eq!(got.last().unwrap(), "C:\\Program");
+        // Candidates are strictly decreasing in length.
+        for i in 1..got.len() {
+            assert!(
+                got[i].len() < got[i - 1].len(),
+                "candidates must be longest-first, but [{i}] len={} >= [{j}] len={}",
+                got[i].len(),
+                got[i - 1].len(),
+                j = i - 1
+            );
+        }
+        // The full string minus " Desktop.exe" should appear somewhere.
+        assert!(
+            got.contains(&r"C:\Program Files\Docker\Docker\Docker".to_string()),
+            "intermediate prefix missing: {:?}",
+            got
+        );
+    }
+
+    /// %env% expansion is applied to every candidate.
+    #[test]
+    fn candidates_env_expansion_applied() {
+        // Single-candidate path (no spaces in pre-expansion string).
+        let env = fake_env(&[("ProgramFiles", r"C:\Program Files")]);
+        let got = extract_binary_path_candidates(r"%ProgramFiles%\App\a.exe", &env);
+        assert_eq!(got, vec![r"C:\Program Files\App\a.exe"]);
+
+        // Multi-candidate path: the unquoted input must have a space BEFORE expansion
+        // to hit the multi-candidate branch; expansion must then be applied to each
+        // candidate. Use an env var in one of the space-separated prefixes:
+        let env3 = fake_env(&[("ROOT", r"C:\Root")]);
+        let got3 = extract_binary_path_candidates(r"%ROOT% Files\App\app.exe", &env3);
+        // Pre-expansion string has a space at position 6 ("%ROOT% Files\App\app.exe").
+        // Candidates (pre-expansion):
+        //   [0] whole: "%ROOT% Files\App\app.exe" -> "C:\Root Files\App\app.exe"
+        //   [1] before space: "%ROOT%" -> "C:\Root"
+        // After expansion every candidate must not contain '%'.
+        assert!(
+            got3.iter().all(|c| !c.contains('%')),
+            "expansion must be applied to every candidate, got: {:?}",
+            got3
+        );
+        assert_eq!(got3[0], r"C:\Root Files\App\app.exe");
+        assert_eq!(got3.last().unwrap(), r"C:\Root");
+    }
+
+    /// Empty / whitespace-only -> empty Vec.
+    #[test]
+    fn candidates_empty_input() {
+        assert!(extract_binary_path_candidates("", no_env).is_empty());
+        assert!(extract_binary_path_candidates("   ", no_env).is_empty());
+    }
+
+    /// Adversarial: lone %, trailing spaces, mismatched quotes -> no panic.
+    #[test]
+    fn candidates_adversarial_no_panic() {
+        let _ = extract_binary_path_candidates("%", no_env);
+        let _ = extract_binary_path_candidates("%%", no_env);
+        let _ = extract_binary_path_candidates(r#""C:\unclosed"#, no_env);
+        let _ = extract_binary_path_candidates("   leading spaces", no_env);
+    }
+
+    // ── S2-F: pick_binary_path ─────────────────────────────────────────────
+
+    /// First (longest) candidate exists -> chosen.
+    #[test]
+    fn pick_first_existing() {
+        let exists = |p: &str| p == r"C:\Program Files\Docker\Docker Desktop.exe";
+        let candidates = vec![
+            r"C:\Program Files\Docker\Docker Desktop.exe".to_string(),
+            r"C:\Program Files\Docker\Docker".to_string(),
+            r"C:\Program".to_string(),
+        ];
+        assert_eq!(
+            pick_binary_path(&candidates, exists).as_deref(),
+            Some(r"C:\Program Files\Docker\Docker Desktop.exe")
+        );
+    }
+
+    /// Only a shorter candidate exists -> that one chosen (longest skipped).
+    #[test]
+    fn pick_shorter_when_longer_absent() {
+        let exists = |p: &str| p == r"C:\Program Files\Docker\Docker";
+        let candidates = vec![
+            r"C:\Program Files\Docker\Docker Desktop.exe".to_string(),
+            r"C:\Program Files\Docker\Docker".to_string(),
+            r"C:\Program".to_string(),
+        ];
+        assert_eq!(
+            pick_binary_path(&candidates, exists).as_deref(),
+            Some(r"C:\Program Files\Docker\Docker")
+        );
+    }
+
+    /// None of the candidates exist -> fall back to candidates.last() (bare first token).
+    #[test]
+    fn pick_fallback_to_last_when_none_exist() {
+        let exists = |_: &str| false;
+        let candidates = vec![
+            r"C:\Program Files\Docker\Docker Desktop.exe".to_string(),
+            r"C:\Program Files\Docker\Docker".to_string(),
+            r"C:\Program".to_string(),
+        ];
+        assert_eq!(
+            pick_binary_path(&candidates, exists).as_deref(),
+            Some(r"C:\Program")
+        );
+    }
+
+    /// Empty candidates -> None (no binary_path).
+    #[test]
+    fn pick_empty_candidates_is_none() {
+        let exists = |_: &str| false;
+        assert_eq!(pick_binary_path(&[], exists), None);
+    }
+
+    /// Single candidate (quoted path) -> returned regardless of exists.
+    #[test]
+    fn pick_single_candidate_returned() {
+        let exists = |_: &str| false; // doesn't exist on CI, but fallback = last = the only one
+        let candidates = vec![r"C:\Program Files\App\app.exe".to_string()];
+        assert_eq!(
+            pick_binary_path(&candidates, exists).as_deref(),
+            Some(r"C:\Program Files\App\app.exe")
+        );
+    }
+
+    /// Multiple candidates exist -> the FIRST (longest) one is chosen, proving short-circuit.
+    #[test]
+    fn pick_first_of_multiple_existing() {
+        let exists = |p: &str| {
+            p == r"C:\Program Files\Docker\Docker Desktop.exe"
+                || p == r"C:\Program Files\Docker\Docker"
+        };
+        let candidates = vec![
+            r"C:\Program Files\Docker\Docker Desktop.exe".to_string(),
+            r"C:\Program Files\Docker\Docker".to_string(),
+            r"C:\Program".to_string(),
+        ];
+        assert_eq!(
+            pick_binary_path(&candidates, exists).as_deref(),
+            Some(r"C:\Program Files\Docker\Docker Desktop.exe")
+        );
+    }
+
+    // ── S2-F: make_record wiring ───────────────────────────────────────────
+
+    /// A quoted cmdline stays unchanged (single candidate -> same binary_path as before).
+    /// This is the regression test: S2-F must not change quoted-path behavior.
+    #[test]
+    fn make_record_quoted_cmdline_unchanged() {
+        let r = make_record_with_exists(
+            "run_key",
+            "HKLM\\...\\Run".into(),
+            Some("MyApp".into()),
+            Some(r#""C:\Program Files\App\app.exe" -silent"#.to_string()),
+            None,
+            |_| false, // nothing exists on CI
+        );
+        // Falls back to last candidate = the quoted content (only one candidate).
+        assert_eq!(
+            r.binary_path.as_deref(),
+            Some(r"C:\Program Files\App\app.exe")
+        );
+    }
+
+    /// An unquoted spaced cmdline: when the full .exe path "exists", it is chosen
+    /// over the bare first token.
+    #[test]
+    fn make_record_unquoted_spaced_resolves_full_path() {
+        // cmdline: "C:\Program Files\App\My App.exe -x"
+        // Spaces at byte positions 10, 23, 31 -> candidates (longest first):
+        //   [0] "C:\Program Files\App\My App.exe -x"  (whole)
+        //   [1] "C:\Program Files\App\My App.exe"      (before " -x")
+        //   [2] "C:\Program Files\App\My"              (before " App.exe")
+        //   [3] "C:\Program"                           (bare first token)
+        // fake_exists: only [1] exists -> [1] should be chosen.
+        let fake_exists = |p: &str| p == r"C:\Program Files\App\My App.exe";
+        let r = make_record_with_exists(
+            "run_key",
+            "HKLM\\...\\Run".into(),
+            Some("MyApp".into()),
+            Some(r"C:\Program Files\App\My App.exe -x".to_string()),
+            None,
+            fake_exists,
+        );
+        assert_eq!(
+            r.binary_path.as_deref(),
+            Some(r"C:\Program Files\App\My App.exe")
+        );
+    }
+
+    /// Unquoted spaced cmdline where NOTHING exists -> fall back to bare first token.
+    #[test]
+    fn make_record_unquoted_spaced_fallback_when_nothing_exists() {
+        let r = make_record_with_exists(
+            "run_key",
+            "HKLM\\...\\Run".into(),
+            Some("MyApp".into()),
+            Some(r"C:\Program Files\App\My App.exe -x".to_string()),
+            None,
+            |_| false,
+        );
+        // Fallback: last candidate = bare first token ("C:\Program" = everything before the
+        // first space in the cmdline "C:\Program Files\App\My App.exe -x").
+        assert_eq!(r.binary_path.as_deref(), Some(r"C:\Program"));
     }
 
     /// PersistCollector.collect returns only Persistence records, never panics, name="persist".
