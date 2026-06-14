@@ -13,6 +13,11 @@ pub const SUSPICIOUS_DIRS: &[&str] = &[
     r"\public\", // matches C:\Users\Public (world-readable shared dir) too
 ];
 
+/// The canonical install subpath for modern signed per-user apps (Notion, Warp, VS Code, …).
+/// Matched case-insensitively as a substring. Only THIS AppData subpath earns suspicious-path
+/// suppression; Temp/Roaming/other AppData subpaths stay suspicious (droppers favor them).
+pub const TRUSTED_APPDATA_SUBPATH: &str = r"\appdata\local\programs\";
+
 /// Remote ports considered ordinary egress; anything else is the "rare port" signal.
 // Tunable allowlist; ports outside this set raise the "rare port" signal. Tune per environment (e.g. 8080/636 may be common internally).
 pub const COMMON_PORTS: &[u16] = &[
@@ -31,6 +36,12 @@ pub const WINLOGON_USERINIT_DEFAULTS: &[&str] =
 pub fn is_suspicious_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     SUSPICIOUS_DIRS.iter().any(|d| lower.contains(d))
+}
+
+/// True if `path` (any case) is under the trusted per-user app install directory
+/// (`\AppData\Local\Programs\`). Used only in combination with `signed==Some(true)`.
+pub fn is_trusted_appdata_location(path: &str) -> bool {
+    path.to_ascii_lowercase().contains(TRUSTED_APPDATA_SUBPATH)
 }
 
 /// True if `port` is NOT in the common-egress set.
@@ -219,6 +230,24 @@ mod tests {
         ));
         // bare-name form
         assert!(winlogon_value_is_default("Userinit", "userinit.exe"));
+    }
+
+    #[test]
+    fn trusted_appdata_location_is_local_programs_only() {
+        assert!(is_trusted_appdata_location(
+            r"C:\Users\bosen\AppData\Local\Programs\Notion\Notion.exe"
+        ));
+        assert!(is_trusted_appdata_location(
+            r"c:\users\x\appdata\local\programs\warp\warp.exe"
+        )); // case-insensitive
+            // NOT trusted: droppers favor Temp / Roaming / other AppData subpaths
+        assert!(!is_trusted_appdata_location(
+            r"C:\Users\x\AppData\Local\Temp\e.exe"
+        ));
+        assert!(!is_trusted_appdata_location(
+            r"C:\Users\x\AppData\Roaming\e.exe"
+        ));
+        assert!(!is_trusted_appdata_location(r"C:\Program Files\App\a.exe"));
     }
 
     #[test]
