@@ -19,6 +19,14 @@ pub const COMMON_PORTS: &[u16] = &[
     80, 443, 53, 22, 3389, 445, 135, 139, 21, 25, 587, 993, 143, 110,
 ];
 
+/// Stock Winlogon `Shell` value on a default Windows install (post-normalization, lowercased).
+pub const WINLOGON_SHELL_DEFAULT: &str = "explorer.exe";
+
+/// Stock Winlogon `Userinit` values (post-normalization: lowercased, trailing comma stripped,
+/// %SystemRoot%/%windir% expanded to c:\windows). Both the absolute and bare-name forms occur.
+pub const WINLOGON_USERINIT_DEFAULTS: &[&str] =
+    &[r"c:\windows\system32\userinit.exe", "userinit.exe"];
+
 /// True if `path` (any case) contains one of the suspicious directory segments.
 pub fn is_suspicious_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
@@ -62,6 +70,35 @@ fn is_reserved_nonpublic(ip: Ipv4Addr) -> bool {
     let benchmarking = o[0] == 198 && (o[1] & 0xFE) == 18; // 198.18.0.0/15
     let class_e = o[0] >= 240; // 240.0.0.0/4
     cgnat || ietf_protocol || benchmarking || class_e
+}
+
+/// True if a Winlogon registry value carries its stock default (i.e. NOT attacker-modified).
+/// `value_name` is the registry value ("Shell"/"Userinit"); `command` is its data.
+/// Normalization tolerates case, surrounding whitespace, a single trailing comma (Windows
+/// writes `userinit.exe,`), and a leading %SystemRoot%/%windir% (expanded to c:\windows).
+/// Any appended payload, replacement, or wrong value name fails to match (fail-loud).
+pub fn winlogon_value_is_default(value_name: &str, command: &str) -> bool {
+    let norm = normalize_winlogon_command(command);
+    match value_name {
+        "Shell" => norm == WINLOGON_SHELL_DEFAULT,
+        "Userinit" => WINLOGON_USERINIT_DEFAULTS.contains(&norm.as_str()),
+        _ => false,
+    }
+}
+
+/// Lowercase, trim, strip a single trailing comma, expand a leading %SystemRoot%/%windir%.
+fn normalize_winlogon_command(command: &str) -> String {
+    let mut s = command.trim().to_ascii_lowercase();
+    if let Some(stripped) = s.strip_suffix(',') {
+        s = stripped.to_string();
+    }
+    for var in ["%systemroot%", "%windir%"] {
+        if let Some(rest) = s.strip_prefix(var) {
+            s = format!(r"c:\windows{rest}");
+            break;
+        }
+    }
+    s
 }
 
 /// Accumulates weighted signals + human-readable reasons + ATT&CK tags for one finding.
@@ -159,5 +196,44 @@ mod tests {
         assert_eq!(s.weight, 90);
         assert_eq!(s.reasons.len(), 2);
         assert_eq!(s.mitre, vec!["T1059", "T1059.001"]); // deduped, insertion order
+    }
+
+    #[test]
+    fn winlogon_default_shell_matches() {
+        assert!(winlogon_value_is_default("Shell", "explorer.exe"));
+        assert!(winlogon_value_is_default("Shell", "  explorer.exe  ")); // trimmed
+        assert!(winlogon_value_is_default("Shell", "EXPLORER.EXE")); // case-insensitive
+    }
+
+    #[test]
+    fn winlogon_default_userinit_matches_variants() {
+        // trailing comma (Windows writes "userinit.exe,") + case
+        assert!(winlogon_value_is_default(
+            "Userinit",
+            r"C:\WINDOWS\system32\userinit.exe,"
+        ));
+        // env-var form expands to C:\Windows
+        assert!(winlogon_value_is_default(
+            "Userinit",
+            r"%SystemRoot%\system32\userinit.exe"
+        ));
+        // bare-name form
+        assert!(winlogon_value_is_default("Userinit", "userinit.exe"));
+    }
+
+    #[test]
+    fn winlogon_tampered_values_do_not_match() {
+        // appended payload (the classic attack) — must NOT match
+        assert!(!winlogon_value_is_default("Shell", "explorer.exe,evil.exe"));
+        assert!(!winlogon_value_is_default(
+            "Userinit",
+            r"C:\WINDOWS\system32\userinit.exe,evil.exe"
+        ));
+        // replaced shell
+        assert!(!winlogon_value_is_default("Shell", r"C:\Temp\x.exe"));
+        // wrong value name (a userinit string under the Shell name)
+        assert!(!winlogon_value_is_default("Shell", "userinit.exe"));
+        // unknown value name
+        assert!(!winlogon_value_is_default("Notify", "explorer.exe"));
     }
 }
