@@ -339,4 +339,27 @@ mod tests {
     fn win_verifier_delegates() {
         assert_eq!(WinSigVerifier.verify(r"C:\does\not\exist\nope.exe"), None);
     }
+
+    /// The S2-G fix: a catalog-signed OS binary (svchost has NO embedded signature; it is
+    /// catalog-signed) must verify as Some(true) via the catalog fallback. Before S2-G this
+    /// returned Some(false) (the false-unsigned report). Guarded by exists() so environments
+    /// without this exact path skip rather than fail.
+    #[test]
+    fn catalog_signed_os_binary_is_true() {
+        let candidates = [
+            r"C:\Windows\System32\svchost.exe",
+            r"C:\Windows\System32\SearchIndexer.exe",
+        ];
+        for c in candidates {
+            if std::path::Path::new(c).exists() {
+                assert_eq!(
+                    verify_file(c),
+                    Some(true),
+                    "catalog-signed OS binary {c} must verify true via the catalog fallback"
+                );
+                return;
+            }
+        }
+        // No candidate present (unusual): nothing to assert, test passes vacuously.
+    }
 }
