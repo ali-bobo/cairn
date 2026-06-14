@@ -389,6 +389,7 @@ fn task_records_from_xml(
             binary_path,
             binary_sha256: None,
             signed: None,
+            signer: None,
             last_write,
         });
     }
@@ -422,6 +423,7 @@ fn make_record_with_exists(
         binary_path,
         binary_sha256: None,
         signed: None,
+        signer: None,
         last_write,
     }
 }
@@ -538,6 +540,7 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
                 binary_path: Some(full),
                 binary_sha256: None,
                 signed: None,
+                signer: None,
                 last_write,
             });
         }
@@ -706,6 +709,7 @@ mod win {
                 binary_path: bin,
                 binary_sha256: None,
                 signed: None,
+                signer: None,
                 last_write: lw,
             });
         }
@@ -992,6 +996,7 @@ mod tests {
             binary_path: bin.map(|b| b.to_string()),
             binary_sha256: None,
             signed: None,
+            signer: None,
             last_write: None,
         };
         let mut records = vec![

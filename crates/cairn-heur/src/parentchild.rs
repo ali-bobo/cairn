@@ -212,6 +212,7 @@ mod tests {
             image: image.into(),
             cmdline: cmdline.into(),
             signed: None,
+            signer: None,
             integrity: None,
             user: None,
             start_time: None,

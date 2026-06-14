@@ -161,6 +161,7 @@ mod tests {
             image: image.into(),
             cmdline: String::new(),
             signed,
+            signer: None,
             integrity: None,
             user: None,
             start_time: None,

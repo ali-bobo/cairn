@@ -137,6 +137,7 @@ mod tests {
             image: "a.exe".into(),
             cmdline: String::new(),
             signed: None,
+            signer: None,
             integrity: None,
             user: None,
             start_time: None,
