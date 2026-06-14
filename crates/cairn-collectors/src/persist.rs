@@ -389,6 +389,7 @@ fn task_records_from_xml(
             binary_path,
             binary_sha256: None,
             signed: None,
+            signer: None,
             last_write,
         });
     }
@@ -422,6 +423,7 @@ fn make_record_with_exists(
         binary_path,
         binary_sha256: None,
         signed: None,
+        signer: None,
         last_write,
     }
 }
@@ -538,6 +540,7 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
                 binary_path: Some(full),
                 binary_sha256: None,
                 signed: None,
+                signer: None,
                 last_write,
             });
         }
@@ -706,6 +709,7 @@ mod win {
                 binary_path: bin,
                 binary_sha256: None,
                 signed: None,
+                signer: None,
                 last_write: lw,
             });
         }
@@ -774,6 +778,7 @@ fn apply_signatures(records: &mut [PersistenceRecord], verifier: &dyn FileVerifi
     for r in records.iter_mut() {
         if let Some(p) = r.binary_path.as_deref() {
             r.signed = verifier.verify(p);
+            r.signer = verifier.signer(p);
         }
     }
 }
@@ -974,6 +979,48 @@ mod tests {
         fn verify(&self, path: &str) -> Option<bool> {
             self.0.get(path).copied()
         }
+        fn signer(&self, path: &str) -> Option<String> {
+            if path.eq_ignore_ascii_case(r"C:\trusted\a.exe") {
+                Some("Trusted Vendor".into())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// apply_signatures fills `signer` from the verifier for records with a binary_path.
+    #[test]
+    fn apply_signatures_fills_signer() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(r"C:\trusted\a.exe".to_string(), true);
+        let verifier = FakeVerifier(map);
+        let mut recs = vec![
+            PersistenceRecord {
+                mechanism: "run_key".into(),
+                location: "HKCU\\...\\Run".into(),
+                value: Some("X".into()),
+                command: Some(r"C:\trusted\a.exe".into()),
+                binary_path: Some(r"C:\trusted\a.exe".into()),
+                binary_sha256: None,
+                signed: None,
+                signer: None,
+                last_write: None,
+            },
+            PersistenceRecord {
+                mechanism: "run_key".into(),
+                location: "HKCU\\...\\Run".into(),
+                value: Some("Y".into()),
+                command: Some(r"C:\unknown\u.exe".into()),
+                binary_path: Some(r"C:\unknown\u.exe".into()),
+                binary_sha256: None,
+                signed: None,
+                signer: None,
+                last_write: None,
+            },
+        ];
+        apply_signatures(&mut recs, &verifier);
+        assert_eq!(recs[0].signer.as_deref(), Some("Trusted Vendor"));
+        assert_eq!(recs[1].signer, None, "unknown path -> no signer");
     }
 
     /// apply_signatures fills `signed` from the verifier for records that have a binary_path.
@@ -992,6 +1039,7 @@ mod tests {
             binary_path: bin.map(|b| b.to_string()),
             binary_sha256: None,
             signed: None,
+            signer: None,
             last_write: None,
         };
         let mut records = vec![

@@ -45,6 +45,7 @@ pub struct ProcessRecord {
     pub image: String,
     pub cmdline: String,
     pub signed: Option<bool>,
+    pub signer: Option<String>,
     pub integrity: Option<String>,
     pub user: Option<String>,
     pub start_time: Option<DateTime<Utc>>,
@@ -70,6 +71,7 @@ pub struct PersistenceRecord {
     pub binary_path: Option<String>,
     pub binary_sha256: Option<String>,
     pub signed: Option<bool>,
+    pub signer: Option<String>,
     pub last_write: Option<DateTime<Utc>>,
 }
 
@@ -121,6 +123,47 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use serde_json::json;
+
+    #[test]
+    fn persistence_record_signer_roundtrips() {
+        let mut r = PersistenceRecord {
+            mechanism: "run_key".into(),
+            location: "HKCU\\...\\Run".into(),
+            value: Some("X".into()),
+            command: Some("C:\\a.exe".into()),
+            binary_path: Some("C:\\a.exe".into()),
+            binary_sha256: None,
+            signed: Some(true),
+            signer: Some("Docker Inc".into()),
+            last_write: None,
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains(r#""signer":"Docker Inc""#));
+        let back: PersistenceRecord = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.signer.as_deref(), Some("Docker Inc"));
+        r.signer = None;
+        let j2 = serde_json::to_string(&r).unwrap();
+        let back2: PersistenceRecord = serde_json::from_str(&j2).unwrap();
+        assert_eq!(back2.signer, None);
+    }
+
+    #[test]
+    fn process_record_signer_roundtrips() {
+        let r = ProcessRecord {
+            pid: 1,
+            ppid: 0,
+            image: "C:\\a.exe".into(),
+            cmdline: "C:\\a.exe".into(),
+            signed: Some(true),
+            signer: Some("Google LLC".into()),
+            integrity: None,
+            user: None,
+            start_time: None,
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        let back: ProcessRecord = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.signer.as_deref(), Some("Google LLC"));
+    }
 
     fn sample_event() -> EventRecord {
         let mut data = serde_json::Map::new();

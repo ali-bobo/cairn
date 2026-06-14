@@ -20,6 +20,18 @@ pub fn verify_file(path: &str) -> Option<bool> {
     win::verify_file(path)
 }
 
+/// The embedded Authenticode signer's subject CN, or None (no embedded sig / unreadable /
+/// off-platform). Read-only; never panics.
+#[cfg(not(windows))]
+pub fn extract_signer(_path: &str) -> Option<String> {
+    None
+}
+
+#[cfg(windows)]
+pub fn extract_signer(path: &str) -> Option<String> {
+    win::extract_signer(path)
+}
+
 /// A `FileVerifier` backed by `verify_file`. The real default used on Windows.
 pub struct WinSigVerifier;
 
@@ -27,10 +39,14 @@ impl FileVerifier for WinSigVerifier {
     fn verify(&self, path: &str) -> Option<bool> {
         verify_file(path)
     }
+    fn signer(&self, path: &str) -> Option<String> {
+        extract_signer(path)
+    }
 }
 
 #[cfg(windows)]
 mod win {
+    use std::ffi::c_void;
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows::core::w;
@@ -41,6 +57,13 @@ mod win {
         CryptCATAdminAcquireContext2, CryptCATAdminCalcHashFromFileHandle2,
         CryptCATAdminEnumCatalogFromHash, CryptCATAdminReleaseCatalogContext,
         CryptCATAdminReleaseContext, CryptCATCatalogInfoFromContext, CATALOG_INFO,
+    };
+    use windows::Win32::Security::Cryptography::{
+        CertCloseStore, CertFindCertificateInStore, CertFreeCertificateContext, CertGetNameStringW,
+        CryptMsgClose, CryptMsgGetParam, CryptQueryObject, CERT_CONTEXT, CERT_FIND_SUBJECT_CERT,
+        CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+        CERT_QUERY_ENCODING_TYPE, CERT_QUERY_FORMAT_FLAG_BINARY, CERT_QUERY_OBJECT_FILE,
+        CMSG_SIGNER_CERT_INFO_PARAM, HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
     };
     use windows::Win32::Security::WinTrust::{
         WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
@@ -300,6 +323,132 @@ mod win {
         }
         wide_nul(&s)
     }
+
+    pub fn extract_signer(path: &str) -> Option<String> {
+        if path.is_empty() || !std::path::Path::new(path).exists() {
+            return None;
+        }
+        let wide = wide_nul(path);
+
+        let mut store: HCERTSTORE = HCERTSTORE::default();
+        let mut msg: *mut c_void = std::ptr::null_mut();
+        // SAFETY: wide outlives the call; pvObject points at the NUL-terminated wide path;
+        // store/msg are valid out-params. Reads the embedded PKCS#7 only; no write.
+        let q = unsafe {
+            CryptQueryObject(
+                CERT_QUERY_OBJECT_FILE,
+                wide.as_ptr() as *const c_void,
+                CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                CERT_QUERY_FORMAT_FLAG_BINARY,
+                0,
+                None,
+                None,
+                None,
+                Some(&mut store),
+                Some(&mut msg),
+                None,
+            )
+        };
+        if q.is_err() {
+            return None; // no embedded signature (catalog-signed/unsigned) or unreadable
+        }
+        let _store = StoreGuard(store);
+        let _msg = MsgGuard(msg);
+
+        let mut len: u32 = 0;
+        // SAFETY: msg valid; pvData None requests the size into len.
+        if unsafe { CryptMsgGetParam(msg, CMSG_SIGNER_CERT_INFO_PARAM, 0, None, &mut len) }.is_err()
+            || len == 0
+        {
+            return None;
+        }
+        let mut info = vec![0u8; len as usize];
+        // SAFETY: msg valid; info has len bytes; len is in/out.
+        if unsafe {
+            CryptMsgGetParam(
+                msg,
+                CMSG_SIGNER_CERT_INFO_PARAM,
+                0,
+                Some(info.as_mut_ptr() as *mut c_void),
+                &mut len,
+            )
+        }
+        .is_err()
+        {
+            return None;
+        }
+
+        // SAFETY: store valid; info holds a CERT_INFO for the duration of this call.
+        let cert = unsafe {
+            CertFindCertificateInStore(
+                store,
+                CERT_QUERY_ENCODING_TYPE(X509_ASN_ENCODING.0 | PKCS_7_ASN_ENCODING.0),
+                0,
+                CERT_FIND_SUBJECT_CERT,
+                Some(info.as_ptr() as *const c_void),
+                None,
+            )
+        };
+        if cert.is_null() {
+            return None;
+        }
+        let _cert = CertGuard(cert as *const CERT_CONTEXT);
+
+        // SAFETY: cert valid; None buffer returns the needed length (incl NUL).
+        let n = unsafe { CertGetNameStringW(cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, None) };
+        if n <= 1 {
+            return None; // 1 = just the NUL (empty name)
+        }
+        let mut name = vec![0u16; n as usize];
+        // SAFETY: cert valid; name has n u16 slots.
+        let written = unsafe {
+            CertGetNameStringW(
+                cert,
+                CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                0,
+                None,
+                Some(&mut name),
+            )
+        };
+        if written <= 1 {
+            return None;
+        }
+        let s = String::from_utf16_lossy(&name[..(written as usize - 1)]);
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
+    struct StoreGuard(HCERTSTORE);
+    impl Drop for StoreGuard {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is the store opened by CryptQueryObject; closed once.
+            unsafe {
+                let _ = CertCloseStore(Some(self.0), 0);
+            }
+        }
+    }
+    struct MsgGuard(*mut c_void);
+    impl Drop for MsgGuard {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is the PKCS#7 msg handle from CryptQueryObject; closed once.
+            // CryptMsgClose takes Option<*const c_void>, so cast from the stored *mut.
+            unsafe {
+                let _ = CryptMsgClose(Some(self.0 as *const c_void));
+            }
+        }
+    }
+    struct CertGuard(*const CERT_CONTEXT);
+    impl Drop for CertGuard {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is the cert context from CertFindCertificateInStore; freed once.
+            unsafe {
+                let _ = CertFreeCertificateContext(Some(self.0));
+            }
+        }
+    }
 }
 
 #[cfg(all(test, windows))]
@@ -360,5 +509,46 @@ mod tests {
             }
         }
         // No candidate present (unusual): nothing to assert, test passes vacuously.
+    }
+
+    #[test]
+    fn extract_signer_missing_is_none() {
+        assert_eq!(extract_signer(r"C:\does\not\exist\nope.exe"), None);
+    }
+
+    #[test]
+    fn extract_signer_unsigned_junk_is_none() {
+        let p = std::env::temp_dir().join(format!("cairn_s2j_{}.exe", std::process::id()));
+        std::fs::write(&p, b"MZ junk, no PKCS7").unwrap();
+        let got = extract_signer(&p.to_string_lossy());
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(got, None, "unsigned junk has no embedded signer");
+    }
+
+    #[test]
+    fn extract_signer_catalog_signed_os_binary_is_none() {
+        // notepad/SearchIndexer are catalog-signed (no embedded PKCS#7) -> embedded signer None.
+        // NOTE: svchost.exe is NOT used here: on this Win11 build (26200) it carries an embedded
+        // Authenticode signature (extract_signer -> Some("Microsoft Windows Publisher")), so it is
+        // not a reliable catalog-only specimen. The embedded-only assumption holds; svchost is just
+        // embedded-signed on this build. notepad/SearchIndexer confirmed catalog-only here.
+        for c in [
+            r"C:\Windows\System32\notepad.exe",
+            r"C:\Windows\System32\SearchIndexer.exe",
+        ] {
+            if std::path::Path::new(c).exists() {
+                assert_eq!(
+                    extract_signer(c),
+                    None,
+                    "catalog-signed -> embedded signer None"
+                );
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn win_verifier_signer_delegates() {
+        assert_eq!(WinSigVerifier.signer(r"C:\does\not\exist\nope.exe"), None);
     }
 }

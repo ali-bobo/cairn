@@ -190,6 +190,7 @@ mod tests {
             binary_path: binary_path.map(|p| p.to_string()),
             binary_sha256: None,
             signed: None,
+            signer: None,
             last_write,
         }
     }
@@ -329,6 +330,7 @@ mod tests {
             binary_path: binary_path.map(|p| p.to_string()),
             binary_sha256: None,
             signed,
+            signer: None,
             last_write,
         }
     }
