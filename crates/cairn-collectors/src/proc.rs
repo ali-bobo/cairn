@@ -2,11 +2,53 @@
 use cairn_collectors_win::proc::RawProc;
 use cairn_core::manifest::SourceEntry;
 use cairn_core::record::{ProcessRecord, Record};
-use cairn_core::traits::{CollectCtx, Collector};
+use cairn_core::traits::{CollectCtx, Collector, FileVerifier};
 use cairn_core::Result;
+#[cfg(not(windows))]
+use crate::persist::NoopVerifier;
+
+/// True if `image` looks like a Windows absolute path (drive `X:\...` or UNC `\\...`).
+/// Only absolute images are sent to verification; a bare file name (the OpenProcess-failed
+/// fallback) is left unverified so we never resolve a name against the CWD.
+pub fn is_absolute_path(image: &str) -> bool {
+    let b = image.as_bytes();
+    let drive = b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
+    let unc = image.starts_with(r"\\");
+    drive || unc
+}
+
+/// Fill `signed` for records whose image is an absolute path, via the verifier. A
+/// file-name-only image is left None. Pure wiring (no OS code).
+fn apply_signatures(records: &mut [ProcessRecord], verifier: &dyn FileVerifier) {
+    for r in records.iter_mut() {
+        if is_absolute_path(&r.image) {
+            r.signed = verifier.verify(&r.image);
+        }
+    }
+}
 
 /// Collector that enumerates live processes (SRS §4 proc_collector).
-pub struct ProcCollector;
+pub struct ProcCollector {
+    verifier: Box<dyn FileVerifier + Send + Sync>,
+}
+
+impl Default for ProcCollector {
+    fn default() -> Self {
+        #[cfg(windows)]
+        let verifier: Box<dyn FileVerifier + Send + Sync> =
+            Box::new(cairn_collectors_win::signature::WinSigVerifier);
+        #[cfg(not(windows))]
+        let verifier: Box<dyn FileVerifier + Send + Sync> = Box::new(NoopVerifier);
+        Self { verifier }
+    }
+}
+
+impl ProcCollector {
+    /// Construct with a specific verifier (tests inject a fake).
+    pub fn with_verifier(verifier: Box<dyn FileVerifier + Send + Sync>) -> Self {
+        Self { verifier }
+    }
+}
 
 impl Collector for ProcCollector {
     fn name(&self) -> &str {
@@ -14,7 +56,14 @@ impl Collector for ProcCollector {
     }
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
         let raw = cairn_collectors_win::proc::enumerate()?;
-        Ok(build_process_records(&raw))
+        // build_process_records produces only Process variants; extract them, fill signed,
+        // then wrap back into Record::Process.
+        let mut proc_recs: Vec<ProcessRecord> = build_process_records(&raw)
+            .into_iter()
+            .filter_map(|r| if let Record::Process(p) = r { Some(p) } else { None })
+            .collect();
+        apply_signatures(&mut proc_recs, self.verifier.as_ref());
+        Ok(proc_recs.into_iter().map(Record::Process).collect())
     }
     fn sources(&self) -> Vec<SourceEntry> {
         vec![SourceEntry {
@@ -65,6 +114,49 @@ mod tests {
     use super::*;
     use cairn_collectors_win::proc::RawProc;
 
+    use cairn_core::traits::FileVerifier;
+
+    struct FakeVerifier(std::collections::HashMap<String, bool>);
+    impl FileVerifier for FakeVerifier {
+        fn verify(&self, path: &str) -> Option<bool> {
+            self.0.get(path).copied()
+        }
+    }
+
+    /// is_absolute_path: drive-letter and UNC are absolute; a bare name is not.
+    #[test]
+    fn absolute_path_detection() {
+        assert!(is_absolute_path(r"C:\Windows\System32\svchost.exe"));
+        assert!(is_absolute_path(r"\\server\share\app.exe"));
+        assert!(!is_absolute_path("svchost.exe"));
+        assert!(!is_absolute_path(""));
+    }
+
+    /// apply_signatures fills signed only for absolute-path images, via the verifier.
+    #[test]
+    fn apply_signatures_fills_only_absolute_images() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(r"C:\evil\b.exe".to_string(), false);
+        map.insert(r"C:\trusted\a.exe".to_string(), true);
+        let v = FakeVerifier(map);
+
+        let mk = |pid: u32, image: &str| ProcessRecord {
+            pid, ppid: 0, image: image.into(), cmdline: String::new(),
+            signed: None, integrity: None, user: None, start_time: None,
+        };
+        let mut recs = vec![
+            mk(1, r"C:\evil\b.exe"),       // absolute, known false
+            mk(2, r"C:\trusted\a.exe"),    // absolute, known true
+            mk(3, r"C:\unknown\c.exe"),    // absolute, unknown -> None
+            mk(4, "svchost.exe"),          // file-name only -> never queried -> None
+        ];
+        apply_signatures(&mut recs, &v);
+        assert_eq!(recs[0].signed, Some(false));
+        assert_eq!(recs[1].signed, Some(true));
+        assert_eq!(recs[2].signed, None);
+        assert_eq!(recs[3].signed, None);
+    }
+
     fn raw(pid: u32, ppid: u32, image: &str) -> RawProc {
         RawProc {
             pid,
@@ -112,7 +204,7 @@ mod tests {
     /// platform stub returns empty) and never panics; its name() is "proc".
     #[test]
     fn proc_collector_collects_without_panicking() {
-        let collector = ProcCollector;
+        let collector = ProcCollector::default();
         assert_eq!(collector.name(), "proc");
         let cfg = Config::default();
         let ctx = CollectCtx {
