@@ -26,6 +26,7 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
         ),
         "winlogon" => s.add(35, "Winlogon Shell/Userinit persistence", &["T1547.004"]),
         "service" => s.add(20, "service autostart persistence", &["T1543.003"]),
+        "scheduled_task" => s.add(20, "scheduled task persistence", &["T1053.005"]),
         "run_key" => s.add(10, "Run/RunOnce key persistence", &["T1547.001"]),
         "startup" => s.add(10, "Startup folder persistence", &["T1547.001"]),
         _ => {}
@@ -330,6 +331,40 @@ mod tests {
             signed,
             last_write,
         }
+    }
+
+    // --- S2-I: scheduled_task mechanism (weight 20, service band) ---
+
+    /// A scheduled_task in a normal path, signed, old: base 20 only (Low band, like service).
+    #[test]
+    fn scheduled_task_normal_path_is_low() {
+        let now = Utc::now();
+        let old = now - Duration::days(400);
+        let p = rec_signed(
+            "scheduled_task",
+            Some(r"C:\Windows\System32\sc.exe"),
+            Some(old),
+            Some(true),
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 20, "scheduled_task base only");
+        assert!(s.reasons.iter().any(|r| r.contains("scheduled task")));
+        assert!(s.mitre.contains(&"T1053.005".to_string()));
+    }
+
+    /// An unsigned scheduled_task in Temp: base 20 + path 30 + unsigned 20 = High (fail-loud).
+    #[test]
+    fn scheduled_task_unsigned_in_temp_is_high() {
+        let now = Utc::now();
+        let old = now - Duration::days(400);
+        let p = rec_signed(
+            "scheduled_task",
+            Some(r"C:\Users\x\AppData\Local\Temp\evil.exe"),
+            Some(old),
+            Some(false),
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 70, "task 20 + path 30 + unsigned 20");
     }
 
     // --- S2-H Gate 2: trusted AppData location suppresses the suspicious-path signal ---
