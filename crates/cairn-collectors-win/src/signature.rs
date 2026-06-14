@@ -45,8 +45,9 @@ mod win {
     use windows::Win32::Security::Cryptography::Catalog::{
         CryptCATAdminAcquireContext2, CryptCATAdminCalcHashFromFileHandle2,
         CryptCATAdminEnumCatalogFromHash, CryptCATAdminReleaseCatalogContext,
-        CryptCATAdminReleaseContext,
+        CryptCATAdminReleaseContext, CryptCATCatalogInfoFromContext, CATALOG_INFO,
     };
+    use windows::Win32::Security::WinTrust::{WINTRUST_CATALOG_INFO, WTD_CHOICE_CATALOG};
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
     };
@@ -227,14 +228,78 @@ mod win {
         if info_raw == 0 {
             return Some(false);
         }
-        let _catinfo = CatInfoCtx {
+        let catinfo = CatInfoCtx {
             admin: admin.0,
             info: info_raw,
         };
 
-        // Task 3 replaces this: resolve the .cat path and WinVerifyTrust(WTD_CHOICE_CATALOG).
-        // Until then, a hash present in a catalog conservatively returns Some(false).
-        Some(false)
+        // 5) Resolve the .cat file path for this catalog context.
+        let mut ci = CATALOG_INFO {
+            cbStruct: std::mem::size_of::<CATALOG_INFO>() as u32,
+            ..Default::default()
+        };
+        // SAFETY: catinfo.info is the valid catalog context; ci is a live out-param.
+        if unsafe { CryptCATCatalogInfoFromContext(catinfo.info, &mut ci, 0) }.is_err() {
+            return None;
+        }
+
+        // 6) Verify the member against its catalog via WinVerifyTrust(WTD_CHOICE_CATALOG).
+        let member_tag = hash_to_member_tag(&hash);
+        let mut cat_info = WINTRUST_CATALOG_INFO {
+            cbStruct: std::mem::size_of::<WINTRUST_CATALOG_INFO>() as u32,
+            pcwszCatalogFilePath: PCWSTR(ci.wszCatalogFile.as_ptr()),
+            pcwszMemberTag: PCWSTR(member_tag.as_ptr()),
+            pcwszMemberFilePath: PCWSTR(wide.as_ptr()),
+            pbCalculatedFileHash: hash.as_mut_ptr(),
+            cbCalculatedFileHash: hash_len,
+            hCatAdmin: catinfo.admin,
+            ..Default::default()
+        };
+
+        let mut wtd = WINTRUST_DATA {
+            cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
+            dwUIChoice: WTD_UI_NONE,
+            fdwRevocationChecks: WTD_REVOKE_NONE,
+            dwUnionChoice: WTD_CHOICE_CATALOG,
+            dwStateAction: WTD_STATEACTION_VERIFY,
+            ..Default::default()
+        };
+        wtd.Anonymous.pCatalog = &mut cat_info;
+
+        let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        // SAFETY: wtd/cat_info/ci/member_tag/hash/wide all outlive this call; pCatalog points
+        // at the live cat_info; its PCWSTR/hash pointers point into still-owned buffers.
+        let cat_status = unsafe {
+            WinVerifyTrust(
+                HWND::default(),
+                &mut action,
+                std::ptr::addr_of_mut!(wtd).cast(),
+            )
+        };
+
+        // MUST free provider state (CLOSE) regardless of status — same as the embedded path.
+        wtd.dwStateAction = WTD_STATEACTION_CLOSE;
+        let mut close_action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+        // SAFETY: same wtd opened by VERIFY; CLOSE frees its provider state.
+        unsafe {
+            let _ = WinVerifyTrust(
+                HWND::default(),
+                &mut close_action,
+                std::ptr::addr_of_mut!(wtd).cast(),
+            );
+        }
+
+        Some(cat_status == 0)
+    }
+
+    /// Uppercase hex of the file hash, NUL-terminated UTF-16 — the catalog member tag.
+    fn hash_to_member_tag(hash: &[u8]) -> Vec<u16> {
+        let mut s = String::with_capacity(hash.len() * 2);
+        for b in hash {
+            use std::fmt::Write as _;
+            let _ = write!(s, "{:02X}", b);
+        }
+        wide_nul(&s)
     }
 }
 
