@@ -450,7 +450,7 @@ fn main() -> anyhow::Result<()> {
 
             let cfg = Config::default();
             let collectors: Vec<Box<dyn Collector>> = vec![
-                Box::new(cairn_collectors::proc::ProcCollector),
+                Box::new(cairn_collectors::proc::ProcCollector::default()),
                 Box::new(cairn_collectors::net::NetCollector),
                 Box::new(cairn_collectors::persist::PersistCollector::default()),
             ];
