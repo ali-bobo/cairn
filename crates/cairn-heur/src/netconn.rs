@@ -32,20 +32,31 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
         }
     }
     if let Some(o) = owner {
+        let mut owner_path_suspicious = false;
         if is_suspicious_path(&o.image) {
             s.add(
                 30,
                 format!("owning process runs from a suspicious path: {}", o.image),
                 &[],
             );
+            owner_path_suspicious = true;
         }
-        if o.signed == Some(false) {
+        // Unsigned owner is an amplifier: fire only if another signal (public-IP/rare-port
+        // earlier, or the owner suspicious-path above) already fired. catalog-signed OS
+        // binaries report unsigned via WTD_CHOICE_FILE, so an unconditional signal would
+        // flood every signed-by-catalog service. Never penalize None/Some(true).
+        let another_signal_fired = !s.reasons.is_empty();
+        if o.signed == Some(false) && another_signal_fired {
             s.add(20, "owning process is unsigned", &[]);
         }
-        // Compound signal: this fires IN ADDITION to the plain "unsigned" (+20) above —
-        // an unsigned process that is also listening on a high port is worse than either
-        // alone, so the +20 and this +25 are intentionally independent (not double-counted).
-        if c.state.as_deref() == Some("listen") && c.lport > 1024 && o.signed == Some(false) {
+        // Unsigned high-port listener: keep listen + port>1024 + unsigned, but ALSO require
+        // the suspicious-path signal so a catalog-signed service on an ephemeral port (every
+        // svchost RPC listener) does not flag.
+        if c.state.as_deref() == Some("listen")
+            && c.lport > 1024
+            && o.signed == Some(false)
+            && owner_path_suspicious
+        {
             s.add(
                 25,
                 format!("unsigned process listening on high port {}", c.lport),
@@ -309,6 +320,67 @@ mod tests {
         );
         let s = score_conn(&c, None);
         assert_eq!(s.weight, 0, "public IP with rport 0 should score nothing");
+    }
+
+    /// Unsigned owner WITH another signal (public IP + rare port): amplifier fires.
+    #[test]
+    fn unsigned_owner_amplifies_with_connection_signal() {
+        let c = conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        );
+        let o = owner(r"C:\Windows\System32\svc.exe", Some(false)); // normal path
+        let s = score_conn(&c, Some(&o));
+        // public ip 25 + rare port 20 + unsigned 20 = 65
+        assert_eq!(s.weight, 65);
+        assert!(s.reasons.iter().any(|r| r.contains("unsigned")));
+    }
+
+    /// Unsigned owner, NO other signal (common port 443, normal path): amplifier does NOT fire.
+    #[test]
+    fn unsigned_owner_alone_does_not_amplify() {
+        let c = conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(443),
+            Some("established"),
+            Some(1),
+        );
+        let o = owner(r"C:\Windows\System32\svchost.exe", Some(false));
+        let s = score_conn(&c, Some(&o));
+        assert_eq!(s.weight, 0);
+        assert!(!s.reasons.iter().any(|r| r.contains("unsigned")));
+    }
+
+    /// Unsigned high-port listener in a NORMAL path: listener compound does NOT fire.
+    #[test]
+    fn unsigned_listener_normal_path_does_not_fire() {
+        let c = conn("tcp", 49500, None, None, Some("listen"), Some(1));
+        let o = owner(r"C:\Windows\System32\svchost.exe", Some(false));
+        let s = score_conn(&c, Some(&o));
+        assert_eq!(
+            s.weight, 0,
+            "catalog-signed service listener in System32 must stay quiet"
+        );
+    }
+
+    /// Unsigned high-port listener in a SUSPICIOUS path: path + listener fire.
+    #[test]
+    fn unsigned_listener_suspicious_path_fires() {
+        let c = conn("tcp", 4444, None, None, Some("listen"), Some(1));
+        let o = owner(r"C:\Users\a\AppData\Local\Temp\svc.exe", Some(false));
+        let s = score_conn(&c, Some(&o));
+        // suspicious path 30 + unsigned 20 + listener 25 = 75
+        assert_eq!(s.weight, 75);
+        assert!(s
+            .reasons
+            .iter()
+            .any(|r| r.contains("listening on high port")));
     }
 
     use cairn_core::record::Record;

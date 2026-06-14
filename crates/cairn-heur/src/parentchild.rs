@@ -111,18 +111,24 @@ pub(crate) fn score_process(p: &ProcessRecord, parent: Option<&ProcessRecord>) -
             &["T1036"],
         );
     }
-    if p.signed == Some(false) {
-        s.add(20, "binary is unsigned", &[]);
-    }
-    if p.signed == Some(false) && matches!(p.integrity.as_deref(), Some("high") | Some("system")) {
-        s.add(15, "unsigned binary running at high integrity", &["T1068"]);
-    }
     if LOLBAS_WATCH.contains(&child_name.as_str()) && lolbas_suspicious(&p.cmdline) {
         s.add(
             30,
             format!("LOLBAS {child_name} with suspicious arguments"),
             &["T1218"],
         );
+    }
+    // Unsigned amplifier: an unsigned binary is a signal only when ANOTHER suspicion has
+    // already fired. catalog-signed OS binaries are reported unsigned by WTD_CHOICE_FILE, so
+    // an unconditional unsigned signal would flood every signed-by-catalog system process.
+    // Never penalize the unverifiable (None) nor the trusted (Some(true)). proc `signed` is
+    // backfilled by the proc collector via WinVerifyTrust (S2-E).
+    let another_signal_fired = !s.reasons.is_empty();
+    if p.signed == Some(false) && another_signal_fired {
+        s.add(20, "binary is unsigned", &[]);
+        if matches!(p.integrity.as_deref(), Some("high") | Some("system")) {
+            s.add(15, "unsigned binary running at high integrity", &["T1068"]);
+        }
     }
     s
 }
@@ -301,6 +307,50 @@ mod tests {
         );
         let s2 = score_process(&ps, None);
         assert!(s2.mitre.contains(&"T1059.001".to_string()));
+    }
+
+    /// Unsigned WITH another signal (suspicious path): amplifier fires (+20).
+    #[test]
+    fn unsigned_amplifies_with_suspicious_path() {
+        let mut p = proc(10, 0, r"C:\Users\a\AppData\Local\Temp\x.exe", "x.exe");
+        p.signed = Some(false);
+        let s = score_process(&p, None);
+        // suspicious path 25 + unsigned 20 = 45
+        assert_eq!(s.weight, 45);
+        assert!(s.reasons.iter().any(|r| r.contains("unsigned")));
+    }
+
+    /// Unsigned ALONE (normal path, no parent/encoded/LOLBAS): amplifier does NOT fire.
+    /// catalog-signed system process (reported unsigned) must stay quiet.
+    #[test]
+    fn unsigned_alone_does_not_amplify() {
+        let mut p = proc(11, 0, r"C:\Windows\System32\svchost.exe", "svchost.exe");
+        p.signed = Some(false);
+        p.integrity = Some("system".into());
+        let s = score_process(&p, None);
+        assert_eq!(s.weight, 0);
+        assert!(!s.reasons.iter().any(|r| r.contains("unsigned")));
+    }
+
+    /// Unsigned + high integrity WITH another signal: both unsigned amplifiers fire.
+    #[test]
+    fn unsigned_high_integrity_amplifies_with_signal() {
+        let mut p = proc(12, 0, r"C:\Users\a\AppData\Local\Temp\x.exe", "x.exe");
+        p.signed = Some(false);
+        p.integrity = Some("high".into());
+        let s = score_process(&p, None);
+        // suspicious path 25 + unsigned 20 + unsigned-high-integrity 15 = 60
+        assert_eq!(s.weight, 60);
+    }
+
+    /// Signed (Some(true)) with a suspicious path: no unsigned amplifier.
+    #[test]
+    fn signed_does_not_amplify() {
+        let mut p = proc(13, 0, r"C:\Users\a\AppData\Local\Temp\x.exe", "x.exe");
+        p.signed = Some(true);
+        let s = score_process(&p, None);
+        assert_eq!(s.weight, 25);
+        assert!(!s.reasons.iter().any(|r| r.contains("unsigned")));
     }
 
     use cairn_core::record::Record;
