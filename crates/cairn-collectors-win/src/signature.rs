@@ -40,6 +40,16 @@ mod win {
         WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
         WTD_UI_NONE,
     };
+    use windows::core::w;
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Security::Cryptography::Catalog::{
+        CryptCATAdminAcquireContext2, CryptCATAdminCalcHashFromFileHandle2,
+        CryptCATAdminEnumCatalogFromHash, CryptCATAdminReleaseCatalogContext,
+        CryptCATAdminReleaseContext,
+    };
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
+    };
 
     /// Encode a path to a NUL-terminated wide string (UTF-16).
     fn wide_nul(path: &str) -> Vec<u16> {
@@ -99,7 +109,132 @@ mod win {
             );
         }
 
-        Some(status == 0) // 0 == ERROR_SUCCESS == trusted
+        if status == 0 {
+            return Some(true); // embedded-signed: fast path, no catalog lookup
+        }
+        verify_via_catalog(path, &wide)
+    }
+
+    /// RAII: releases a CryptCATAdmin context on drop. Held for the whole catalog lookup;
+    /// must outlive any CatInfoCtx (release-catalog needs this admin handle still valid).
+    struct CatAdminCtx(isize);
+    impl Drop for CatAdminCtx {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is the valid admin context from CryptCATAdminAcquireContext2;
+            // released exactly once. dwflags must be 0.
+            unsafe {
+                let _ = CryptCATAdminReleaseContext(self.0, 0);
+            }
+        }
+    }
+
+    /// RAII: releases a catalog context on drop. Stores the admin handle because
+    /// CryptCATAdminReleaseCatalogContext requires it. Declared AFTER the admin guard so
+    /// reverse-declaration drop order frees the catalog context first, then the admin.
+    struct CatInfoCtx {
+        admin: isize,
+        info: isize,
+    }
+    impl Drop for CatInfoCtx {
+        fn drop(&mut self) {
+            // SAFETY: admin/info are the valid handles from acquire/enum; released once.
+            unsafe {
+                let _ = CryptCATAdminReleaseCatalogContext(self.admin, self.info, 0);
+            }
+        }
+    }
+
+    /// RAII: closes a file handle on drop (mirrors proc.rs ProcHandle).
+    struct FileHandle(HANDLE);
+    impl Drop for FileHandle {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is the valid handle from CreateFileW; closed exactly once.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Catalog fallback: returns Some(true) if the file's hash is found in a system catalog
+    /// AND that catalog verifies, Some(false) if the hash is in no catalog (genuinely
+    /// unsigned), None on any infrastructure failure (cannot acquire/open/hash). Total: never
+    /// panics. (Task 2 lands acquire/open/hash/enum; the catalog WinVerifyTrust is added in
+    /// Task 3 — until then a found hash returns Some(false) as a placeholder.)
+    fn verify_via_catalog(path: &str, wide: &[u16]) -> Option<bool> {
+        let _ = path; // path is used in Task 3 (member file path); silence unused for now
+        // 1) Acquire a SHA-256 catalog admin context.
+        let mut admin_raw: isize = 0;
+        // SAFETY: admin_raw is a valid out-param; w!("SHA256") is a 'static NUL-terminated
+        // wide literal; other params None. On Err the context is not created (nothing to free).
+        let acquired = unsafe {
+            CryptCATAdminAcquireContext2(&mut admin_raw, None, w!("SHA256"), None, None)
+        };
+        if acquired.is_err() {
+            return None;
+        }
+        let admin = CatAdminCtx(admin_raw);
+
+        // 2) Open the file read-only to compute its hash. GENERIC_READ + SHARE_READ +
+        //    OPEN_EXISTING: a read-only stat-and-read, never a write (golden rule 3).
+        // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives this call; params are
+        // the verified read-only/open-existing constants; returns an owned handle or Err.
+        let hfile = match unsafe {
+            CreateFileW(
+                PCWSTR(wide.as_ptr()),
+                FILE_GENERIC_READ.0,
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                None,
+            )
+        } {
+            Ok(h) => FileHandle(h),
+            Err(_) => return None,
+        };
+
+        // 3) Two-stage hash: size probe (pbhash=None) then the actual hash buffer.
+        let mut hash_len: u32 = 0;
+        // SAFETY: admin.0/hfile.0 valid; pbhash None requests the length into hash_len.
+        if unsafe {
+            CryptCATAdminCalcHashFromFileHandle2(admin.0, hfile.0, &mut hash_len, None, None)
+        }
+        .is_err()
+            || hash_len == 0
+        {
+            return None;
+        }
+        let mut hash = vec![0u8; hash_len as usize];
+        // SAFETY: admin.0/hfile.0 valid; hash has hash_len bytes; len is in/out.
+        if unsafe {
+            CryptCATAdminCalcHashFromFileHandle2(
+                admin.0,
+                hfile.0,
+                &mut hash_len,
+                Some(hash.as_mut_ptr()),
+                None,
+            )
+        }
+        .is_err()
+        {
+            return None;
+        }
+
+        // 4) Look the hash up in the system catalog DB. 0 == not in any catalog == unsigned.
+        // SAFETY: admin.0 valid; hash is a live slice; other params None.
+        let info_raw =
+            unsafe { CryptCATAdminEnumCatalogFromHash(admin.0, &hash, None, None) };
+        if info_raw == 0 {
+            return Some(false);
+        }
+        let _catinfo = CatInfoCtx {
+            admin: admin.0,
+            info: info_raw,
+        };
+
+        // Task 3 replaces this: resolve the .cat path and WinVerifyTrust(WTD_CHOICE_CATALOG).
+        // Until then, a hash present in a catalog conservatively returns Some(false).
+        Some(false)
     }
 }
 
