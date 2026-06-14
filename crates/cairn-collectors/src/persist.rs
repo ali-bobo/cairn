@@ -350,6 +350,51 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+/// PURE glue: parse a task XML and build one PersistenceRecord per Exec action, resolving
+/// binary_path via the S2-F candidate model. `lookup` (env) and `exists` (FS probe) are
+/// injected for Linux-CI testability. `file_name` is the task file stem (the `value` fallback
+/// when no <URI> leaf name is available); `last_write` is the file mtime. Never panics.
+#[allow(dead_code)]
+fn task_records_from_xml(
+    xml: &str,
+    file_name: &str,
+    last_write: Option<DateTime<Utc>>,
+    lookup: impl Fn(&str) -> Option<String>,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<PersistenceRecord> {
+    let mut out = Vec::new();
+    for act in parse_task_xml(xml) {
+        let command = if act.arguments.is_empty() {
+            act.command.clone()
+        } else {
+            format!("{} {}", act.command, act.arguments)
+        };
+        let candidates = extract_binary_path_candidates(&command, &lookup);
+        let binary_path = pick_binary_path(&candidates, &exists);
+
+        let location = act.uri.clone().unwrap_or_else(|| file_name.to_string());
+        let value = act
+            .uri
+            .as_deref()
+            .and_then(|u| u.rsplit(['\\', '/']).next())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| file_name.to_string());
+
+        out.push(PersistenceRecord {
+            mechanism: "scheduled_task".to_string(),
+            location,
+            value: Some(value),
+            command: Some(command),
+            binary_path,
+            binary_sha256: None,
+            signed: None,
+            last_write,
+        });
+    }
+    out
+}
+
 /// Testable core for building a PersistenceRecord: accepts an injected `exists` probe
 /// for resolving unquoted spaced cmdlines to the real binary path (S2-F candidate model).
 /// `make_record` (below) calls this with the real `Path::exists`.
@@ -1216,6 +1261,47 @@ mod tests {
         assert_eq!(c.sources().len(), 1);
         assert_eq!(c.sources()[0].artifact, "persistence");
         assert_eq!(c.sources()[0].method, "api");
+    }
+
+    // ── S2-I Task 3: task_records_from_xml ───────────────────────────────────
+
+    #[test]
+    fn task_records_resolves_binary_path_via_candidates() {
+        let exists = |p: &str| p.eq_ignore_ascii_case(r"C:\Windows\system32\sc.exe");
+        let env = fake_env(&[("windir", r"C:\Windows")]);
+        let recs = task_records_from_xml(SAMPLE_TASK_XML, "SynchronizeTime", None, &env, exists);
+        assert_eq!(recs.len(), 1);
+        let r = &recs[0];
+        assert_eq!(r.mechanism, "scheduled_task");
+        assert_eq!(
+            r.location.as_str(),
+            r"\Microsoft\Windows\Time Synchronization\SynchronizeTime"
+        );
+        assert_eq!(
+            r.binary_path.as_deref(),
+            Some(r"C:\Windows\system32\sc.exe")
+        );
+        assert!(r.command.as_deref().unwrap().contains("start w32time"));
+    }
+
+    #[test]
+    fn task_records_fallback_when_nothing_exists() {
+        let exists = |_: &str| false;
+        let env = fake_env(&[("windir", r"C:\Windows")]);
+        let recs = task_records_from_xml(SAMPLE_TASK_XML, "SynchronizeTime", None, &env, exists);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].binary_path.as_deref(),
+            Some(r"C:\Windows\system32\sc.exe")
+        );
+    }
+
+    #[test]
+    fn task_records_empty_for_non_exec() {
+        let exists = |_: &str| false;
+        let env = fake_env(&[]);
+        let com = r#"<Task xmlns="x"><Actions><ComHandler><ClassId>{G}</ClassId></ComHandler></Actions></Task>"#;
+        assert!(task_records_from_xml(com, "X", None, &env, exists).is_empty());
     }
 
     // ── S2-I Task 2: parse_task_xml ────────────────────────────────────────
