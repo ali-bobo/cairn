@@ -419,16 +419,43 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }
 
+            // --zip / --encrypt are not implemented yet (ZipSink / EncryptedZipSink are an S3
+            // sub-segment). Reject explicitly rather than silently producing a plain directory:
+            // a flag that is accepted but ignored is worse than one that is absent.
+            if args.zip || args.encrypt.is_some() {
+                eprintln!(
+                    "cairn run --zip / --encrypt are not implemented yet (output-packaging \
+                     sub-segment); re-run without them to write a plain output directory."
+                );
+                std::process::exit(2);
+            }
+
+            // --dry-run (FR16 / golden rule 4): write NOTHING. No output dir, no run.log file,
+            // no records/findings/manifest — logs go to stderr and we print a summary only.
+            let dry_run = args.dry_run;
+
+            // RAII guard for the file logger; None in dry-run (no run.log file is created).
+            let _guard = if dry_run {
+                tracing_subscriber::fmt()
+                    .with_env_filter(log_filter())
+                    .with_target(false)
+                    .with_writer(std::io::stderr)
+                    .init();
+                None
+            } else {
+                let dir = &args.output;
+                std::fs::create_dir_all(dir)?;
+                let file_appender = tracing_appender::rolling::never(dir, "run.log");
+                let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
+                tracing_subscriber::fmt()
+                    .with_env_filter(log_filter())
+                    .with_target(false)
+                    .with_ansi(false)
+                    .with_writer(file_writer)
+                    .init();
+                Some(guard)
+            };
             let dir = args.output.clone();
-            std::fs::create_dir_all(&dir)?;
-            let file_appender = tracing_appender::rolling::never(&dir, "run.log");
-            let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
-            tracing_subscriber::fmt()
-                .with_env_filter(log_filter())
-                .with_target(false)
-                .with_ansi(false)
-                .with_writer(file_writer)
-                .init();
 
             tracing::info!(
                 "cairn {} ({}) starting (live)",
@@ -508,12 +535,27 @@ fn main() -> anyhow::Result<()> {
                 integrity_note: "All hashes SHA-256 over bytes as collected.".into(),
             };
 
-            let mut sink = DirSink::new(dir.clone());
-            sink.write_timeline_csv(&outcome.findings)?;
-            sink.write_findings_jsonl(&outcome.findings)?;
-            write_records_jsonl(&dir, &outcome.records)?;
-            manifest_outputs_then_write(&mut sink, manifest)?;
-            tracing::info!(dir = %dir.display(), "live run complete");
+            if dry_run {
+                // Golden rule 4: write NOTHING. Report what WOULD have been produced.
+                tracing::info!(
+                    records = outcome.records.len(),
+                    findings = outcome.findings.len(),
+                    "dry-run complete; no files written"
+                );
+                println!(
+                    "dry-run: {} records, {} findings — no files written (would have gone to {})",
+                    outcome.records.len(),
+                    outcome.findings.len(),
+                    dir.display()
+                );
+            } else {
+                let mut sink = DirSink::new(dir.clone());
+                sink.write_timeline_csv(&outcome.findings)?;
+                sink.write_findings_jsonl(&outcome.findings)?;
+                write_records_jsonl(&dir, &outcome.records)?;
+                manifest_outputs_then_write(&mut sink, manifest)?;
+                tracing::info!(dir = %dir.display(), "live run complete");
+            }
             drop(_guard);
         }
         other => {
