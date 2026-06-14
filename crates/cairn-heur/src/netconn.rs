@@ -325,7 +325,14 @@ mod tests {
     /// Unsigned owner WITH another signal (public IP + rare port): amplifier fires.
     #[test]
     fn unsigned_owner_amplifies_with_connection_signal() {
-        let c = conn("tcp", 50000, Some("104.18.0.1"), Some(4444), Some("established"), Some(1));
+        let c = conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        );
         let o = owner(r"C:\Windows\System32\svc.exe", Some(false)); // normal path
         let s = score_conn(&c, Some(&o));
         // public ip 25 + rare port 20 + unsigned 20 = 65
@@ -336,7 +343,14 @@ mod tests {
     /// Unsigned owner, NO other signal (common port 443, normal path): amplifier does NOT fire.
     #[test]
     fn unsigned_owner_alone_does_not_amplify() {
-        let c = conn("tcp", 50000, Some("104.18.0.1"), Some(443), Some("established"), Some(1));
+        let c = conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(443),
+            Some("established"),
+            Some(1),
+        );
         let o = owner(r"C:\Windows\System32\svchost.exe", Some(false));
         let s = score_conn(&c, Some(&o));
         assert_eq!(s.weight, 0);
@@ -349,7 +363,10 @@ mod tests {
         let c = conn("tcp", 49500, None, None, Some("listen"), Some(1));
         let o = owner(r"C:\Windows\System32\svchost.exe", Some(false));
         let s = score_conn(&c, Some(&o));
-        assert_eq!(s.weight, 0, "catalog-signed service listener in System32 must stay quiet");
+        assert_eq!(
+            s.weight, 0,
+            "catalog-signed service listener in System32 must stay quiet"
+        );
     }
 
     /// Unsigned high-port listener in a SUSPICIOUS path: path + listener fire.
@@ -360,7 +377,10 @@ mod tests {
         let s = score_conn(&c, Some(&o));
         // suspicious path 30 + unsigned 20 + listener 25 = 75
         assert_eq!(s.weight, 75);
-        assert!(s.reasons.iter().any(|r| r.contains("listening on high port")));
+        assert!(s
+            .reasons
+            .iter()
+            .any(|r| r.contains("listening on high port")));
     }
 
     use cairn_core::record::Record;

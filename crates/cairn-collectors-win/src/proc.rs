@@ -74,8 +74,7 @@ mod win {
     fn full_image_path(pid: u32) -> Option<String> {
         // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately in the
         // guard. bInheritHandle=false; QUERY_LIMITED_INFORMATION is read-only.
-        let handle =
-            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
         let guard = ProcHandle(handle);
 
         // First attempt with MAX_PATH; grow once on insufficient buffer.

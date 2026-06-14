@@ -1,11 +1,11 @@
 //! Pure mapping: RawProc -> Record::Process. No OS access here (that's cairn-collectors-win).
+#[cfg(not(windows))]
+use crate::persist::NoopVerifier;
 use cairn_collectors_win::proc::RawProc;
 use cairn_core::manifest::SourceEntry;
 use cairn_core::record::{ProcessRecord, Record};
 use cairn_core::traits::{CollectCtx, Collector, FileVerifier};
 use cairn_core::Result;
-#[cfg(not(windows))]
-use crate::persist::NoopVerifier;
 
 /// True if `image` looks like a Windows absolute path (drive `X:\...` or UNC `\\...`).
 /// Only absolute images are sent to verification; a bare file name (the OpenProcess-failed
@@ -60,7 +60,13 @@ impl Collector for ProcCollector {
         // then wrap back into Record::Process.
         let mut proc_recs: Vec<ProcessRecord> = build_process_records(&raw)
             .into_iter()
-            .filter_map(|r| if let Record::Process(p) = r { Some(p) } else { None })
+            .filter_map(|r| {
+                if let Record::Process(p) = r {
+                    Some(p)
+                } else {
+                    None
+                }
+            })
             .collect();
         apply_signatures(&mut proc_recs, self.verifier.as_ref());
         Ok(proc_recs.into_iter().map(Record::Process).collect())
@@ -141,14 +147,20 @@ mod tests {
         let v = FakeVerifier(map);
 
         let mk = |pid: u32, image: &str| ProcessRecord {
-            pid, ppid: 0, image: image.into(), cmdline: String::new(),
-            signed: None, integrity: None, user: None, start_time: None,
+            pid,
+            ppid: 0,
+            image: image.into(),
+            cmdline: String::new(),
+            signed: None,
+            integrity: None,
+            user: None,
+            start_time: None,
         };
         let mut recs = vec![
-            mk(1, r"C:\evil\b.exe"),       // absolute, known false
-            mk(2, r"C:\trusted\a.exe"),    // absolute, known true
-            mk(3, r"C:\unknown\c.exe"),    // absolute, unknown -> None
-            mk(4, "svchost.exe"),          // file-name only -> never queried -> None
+            mk(1, r"C:\evil\b.exe"),    // absolute, known false
+            mk(2, r"C:\trusted\a.exe"), // absolute, known true
+            mk(3, r"C:\unknown\c.exe"), // absolute, unknown -> None
+            mk(4, "svchost.exe"),       // file-name only -> never queried -> None
         ];
         apply_signatures(&mut recs, &v);
         assert_eq!(recs[0].signed, Some(false));
