@@ -28,6 +28,7 @@ fn apply_signatures(records: &mut [ProcessRecord], verifier: &dyn FileVerifier) 
     for r in records.iter_mut() {
         if is_absolute_path(&r.image) {
             r.signed = verifier.verify(&r.image);
+            r.signer = verifier.signer(&r.image);
         }
     }
 }
@@ -133,6 +134,13 @@ mod tests {
         fn verify(&self, path: &str) -> Option<bool> {
             self.0.get(path).copied()
         }
+        fn signer(&self, path: &str) -> Option<String> {
+            if path.eq_ignore_ascii_case(r"C:\trusted\a.exe") {
+                Some("Proc Vendor".into())
+            } else {
+                None
+            }
+        }
     }
 
     /// is_absolute_path: drive-letter and UNC are absolute; a bare name is not.
@@ -174,6 +182,13 @@ mod tests {
         assert_eq!(recs[1].signed, Some(true));
         assert_eq!(recs[2].signed, None);
         assert_eq!(recs[3].signed, None);
+        // signer is filled only for the absolute path the fake knows; file-name-only is never queried.
+        assert_eq!(recs[1].signer.as_deref(), Some("Proc Vendor"));
+        assert_eq!(recs[0].signer, None);
+        assert_eq!(
+            recs[3].signer, None,
+            "file-name-only image: signer not queried"
+        );
     }
 
     fn raw(pid: u32, ppid: u32, image: &str) -> RawProc {

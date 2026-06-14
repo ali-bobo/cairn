@@ -67,9 +67,10 @@ pub trait OutputSink: Send {
 /// - `None`        = could not verify (file absent, path not convertible, off-platform).
 pub trait FileVerifier: Send + Sync {
     fn verify(&self, path: &str) -> Option<bool>;
-    /// The embedded Authenticode signer's subject CN (e.g. "Docker Inc"), or None when the
-    /// file has no embedded signature (catalog-signed or unsigned), cannot be read, or
-    /// off-platform. Default None; only the Windows verifier overrides it. Total — never panics.
+    /// The embedded Authenticode signer's subject display name (the certificate CN if present,
+    /// e.g. "Docker Inc"), or None when the file has no embedded signature (catalog-signed or
+    /// unsigned), cannot be read, or off-platform. Default None; only the Windows verifier
+    /// overrides it. Total — never panics.
     fn signer(&self, _path: &str) -> Option<String> {
         None
     }
