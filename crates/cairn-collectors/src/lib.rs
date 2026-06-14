@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod evtx;
+pub mod hash;
 pub mod net;
 pub mod persist;
 pub mod proc;
