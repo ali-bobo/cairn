@@ -108,6 +108,140 @@ pub(crate) fn extract_binary_path_candidates(
     candidates
 }
 
+/// One `<Exec>` action parsed from a Scheduled Task XML definition.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct ParsedExecAction {
+    pub command: String,
+    pub arguments: String,
+    /// The task's <URI> (\Folder\TaskName), shared by all actions in the task.
+    pub uri: Option<String>,
+}
+
+/// Parse a Scheduled Task XML string into one `ParsedExecAction` per `<Exec>` action.
+/// PURE: no FS, no env, never panics. Returns empty on malformed XML, missing <Actions>,
+/// or a task whose only actions are non-Exec (ComHandler/SendEmail/ShowMessage).
+/// Element matching is namespace-agnostic (uses local names), so the task xmlns is irrelevant.
+#[allow(dead_code)]
+pub(crate) fn parse_task_xml(xml: &str) -> Vec<ParsedExecAction> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut uri: Option<String> = None;
+    let mut out: Vec<ParsedExecAction> = Vec::new();
+
+    let mut in_exec = false;
+    let mut cur_command = String::new();
+    let mut cur_arguments = String::new();
+    let mut capture: Option<&'static str> = None; // "uri" | "command" | "arguments"
+
+    // Accumulate the raw (still-escaped) text of the element currently being captured.
+    // quick-xml 0.40.1 surfaces XML entities (`&amp;`) as separate Event::GeneralRef events
+    // that split the surrounding text, so we collect fragments and unescape once at the
+    // element's end rather than per Text event (which would drop everything but the last).
+    let mut buf = String::new();
+
+    // Decode the accumulated (escaped) buffer: run the standalone
+    // `quick_xml::escape::unescape` for XML entity decoding (&amp; -> &). BytesText has no
+    // `unescape()` in 0.40.1, so this is done explicitly on the assembled string.
+    let finish = |raw: &str| -> String {
+        let decoded = match quick_xml::escape::unescape(raw) {
+            Ok(c) => c.into_owned(),
+            Err(_) => raw.to_string(),
+        };
+        decoded.trim().to_string()
+    };
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = e.local_name();
+                match name.as_ref() {
+                    b"Exec" => {
+                        in_exec = true;
+                        cur_command.clear();
+                        cur_arguments.clear();
+                    }
+                    b"URI" => {
+                        capture = Some("uri");
+                        buf.clear();
+                    }
+                    b"Command" if in_exec => {
+                        capture = Some("command");
+                        buf.clear();
+                    }
+                    b"Arguments" if in_exec => {
+                        capture = Some("arguments");
+                        buf.clear();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if let (true, Ok(c)) = (capture.is_some(), e.decode()) {
+                    buf.push_str(&c);
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                // An entity reference inside captured text: re-emit it as `&name;` so the
+                // final `unescape` pass resolves it together with the rest of the buffer.
+                if let (true, Ok(c)) = (capture.is_some(), e.decode()) {
+                    buf.push('&');
+                    buf.push_str(&c);
+                    buf.push(';');
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.local_name();
+                match name.as_ref() {
+                    b"URI" => {
+                        if capture == Some("uri") {
+                            uri = Some(finish(&buf));
+                        }
+                        capture = None;
+                    }
+                    b"Command" => {
+                        if capture == Some("command") {
+                            cur_command = finish(&buf);
+                        }
+                        capture = None;
+                    }
+                    b"Arguments" => {
+                        if capture == Some("arguments") {
+                            cur_arguments = finish(&buf);
+                        }
+                        capture = None;
+                    }
+                    b"Exec" => {
+                        if !cur_command.is_empty() {
+                            out.push(ParsedExecAction {
+                                command: cur_command.clone(),
+                                arguments: cur_arguments.clone(),
+                                uri: uri.clone(),
+                            });
+                        }
+                        in_exec = false;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    if uri.is_some() {
+        for a in &mut out {
+            if a.uri.is_none() {
+                a.uri = uri.clone();
+            }
+        }
+    }
+    out
+}
+
 /// Select the best binary path from a candidate list using an injected FS probe.
 ///
 /// Returns the first candidate for which `exists(c)` is true. If none exist,
@@ -1082,5 +1216,69 @@ mod tests {
         assert_eq!(c.sources().len(), 1);
         assert_eq!(c.sources()[0].artifact, "persistence");
         assert_eq!(c.sources()[0].method, "api");
+    }
+
+    // ── S2-I Task 2: parse_task_xml ────────────────────────────────────────
+
+    const SAMPLE_TASK_XML: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.6" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <URI>\Microsoft\Windows\Time Synchronization\SynchronizeTime</URI>
+  </RegistrationInfo>
+  <Actions Context="LocalService">
+    <Exec>
+      <Command>%windir%\system32\sc.exe</Command>
+      <Arguments>start w32time task_started</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#;
+
+    #[test]
+    fn parse_task_xml_single_exec() {
+        let acts = parse_task_xml(SAMPLE_TASK_XML);
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].command, r"%windir%\system32\sc.exe");
+        assert_eq!(acts[0].arguments, "start w32time task_started");
+        assert_eq!(
+            acts[0].uri.as_deref(),
+            Some(r"\Microsoft\Windows\Time Synchronization\SynchronizeTime")
+        );
+    }
+
+    #[test]
+    fn parse_task_xml_multiple_execs() {
+        let xml = r#"<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><URI>\T</URI></RegistrationInfo>
+  <Actions>
+    <Exec><Command>a.exe</Command></Exec>
+    <Exec><Command>b.exe</Command><Arguments>-x</Arguments></Exec>
+  </Actions>
+</Task>"#;
+        let acts = parse_task_xml(xml);
+        assert_eq!(acts.len(), 2);
+        assert_eq!(acts[0].command, "a.exe");
+        assert_eq!(acts[0].arguments, "");
+        assert_eq!(acts[1].command, "b.exe");
+        assert_eq!(acts[1].arguments, "-x");
+    }
+
+    #[test]
+    fn parse_task_xml_decodes_entities() {
+        let xml = r#"<Task xmlns="x"><Actions><Exec>
+            <Command>c.exe</Command><Arguments>-p a&amp;b</Arguments>
+            </Exec></Actions></Task>"#;
+        let acts = parse_task_xml(xml);
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].arguments, "-p a&b");
+    }
+
+    #[test]
+    fn parse_task_xml_skips_non_exec_and_malformed() {
+        let com = r#"<Task xmlns="x"><Actions><ComHandler>
+            <ClassId>{GUID}</ClassId></ComHandler></Actions></Task>"#;
+        assert!(parse_task_xml(com).is_empty());
+        assert!(parse_task_xml(r#"<Task xmlns="x"></Task>"#).is_empty());
+        assert!(parse_task_xml("not xml at all").is_empty());
+        assert!(parse_task_xml("").is_empty());
     }
 }
