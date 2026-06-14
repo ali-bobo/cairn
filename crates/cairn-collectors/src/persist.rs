@@ -254,14 +254,9 @@ fn make_record(
     command: Option<String>,
     last_write: Option<DateTime<Utc>>,
 ) -> PersistenceRecord {
-    make_record_with_exists(
-        mechanism,
-        location,
-        value,
-        command,
-        last_write,
-        |p| std::path::Path::new(p).exists(),
-    )
+    make_record_with_exists(mechanism, location, value, command, last_write, |p| {
+        std::path::Path::new(p).exists()
+    })
 }
 
 /// Non-Windows: persistence reads are Windows-only; return empty so the workspace builds.
@@ -838,20 +833,14 @@ mod tests {
     #[test]
     fn candidates_quoted_single() {
         let env = fake_env(&[]);
-        let got = extract_binary_path_candidates(
-            r#""C:\Program Files\App\app.exe" -silent"#,
-            &env,
-        );
+        let got = extract_binary_path_candidates(r#""C:\Program Files\App\app.exe" -silent"#, &env);
         assert_eq!(got, vec![r"C:\Program Files\App\app.exe"]);
     }
 
     /// Unquoted path with no spaces -> one candidate.
     #[test]
     fn candidates_unquoted_no_spaces() {
-        let got = extract_binary_path_candidates(
-            r"C:\Windows\system32\svchost.exe",
-            no_env,
-        );
+        let got = extract_binary_path_candidates(r"C:\Windows\system32\svchost.exe", no_env);
         assert_eq!(got, vec![r"C:\Windows\system32\svchost.exe"]);
     }
 
