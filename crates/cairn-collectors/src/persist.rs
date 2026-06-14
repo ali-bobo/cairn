@@ -108,6 +108,32 @@ pub(crate) fn extract_binary_path_candidates(
     candidates
 }
 
+/// Select the best binary path from a candidate list using an injected FS probe.
+///
+/// Returns the first candidate for which `exists(c)` is true. If none exist,
+/// returns the last candidate (the bare first token — today's `extract_binary_path`
+/// value, so behavior never regresses to None where it previously had a value).
+/// Returns None only if `candidates` is empty.
+///
+/// The injected `exists` is read-only (`Path::exists` on Windows; a fake set in tests).
+/// Never panics.
+#[allow(dead_code)]
+pub(crate) fn pick_binary_path(
+    candidates: &[String],
+    exists: impl Fn(&str) -> bool,
+) -> Option<String> {
+    if candidates.is_empty() {
+        return None;
+    }
+    for c in candidates {
+        if exists(c.as_str()) {
+            return Some(c.clone());
+        }
+    }
+    // None found on disk: fall back to the last candidate (bare first token).
+    candidates.last().cloned()
+}
+
 /// Expand %VAR% occurrences using the injected `lookup`; unknown vars (lookup returns None)
 /// are left as the literal `%NAME%`. An unterminated `%` emits the rest verbatim. An empty
 /// var name (`%%`) is treated as unknown and kept literal. Never panics (the `%` byte is
@@ -879,6 +905,71 @@ mod tests {
         let _ = extract_binary_path_candidates("%%", &no_env);
         let _ = extract_binary_path_candidates(r#""C:\unclosed"#, &no_env);
         let _ = extract_binary_path_candidates("   leading spaces", &no_env);
+    }
+
+    // ── S2-F: pick_binary_path ─────────────────────────────────────────────
+
+    /// First (longest) candidate exists -> chosen.
+    #[test]
+    fn pick_first_existing() {
+        let exists = |p: &str| p == r"C:\Program Files\Docker\Docker Desktop.exe";
+        let candidates = vec![
+            r"C:\Program Files\Docker\Docker Desktop.exe".to_string(),
+            r"C:\Program Files\Docker\Docker".to_string(),
+            r"C:\Program".to_string(),
+        ];
+        assert_eq!(
+            pick_binary_path(&candidates, exists).as_deref(),
+            Some(r"C:\Program Files\Docker\Docker Desktop.exe")
+        );
+    }
+
+    /// Only a shorter candidate exists -> that one chosen (longest skipped).
+    #[test]
+    fn pick_shorter_when_longer_absent() {
+        let exists = |p: &str| p == r"C:\Program Files\Docker\Docker";
+        let candidates = vec![
+            r"C:\Program Files\Docker\Docker Desktop.exe".to_string(),
+            r"C:\Program Files\Docker\Docker".to_string(),
+            r"C:\Program".to_string(),
+        ];
+        assert_eq!(
+            pick_binary_path(&candidates, exists).as_deref(),
+            Some(r"C:\Program Files\Docker\Docker")
+        );
+    }
+
+    /// None of the candidates exist -> fall back to candidates.last() (bare first token).
+    #[test]
+    fn pick_fallback_to_last_when_none_exist() {
+        let exists = |_: &str| false;
+        let candidates = vec![
+            r"C:\Program Files\Docker\Docker Desktop.exe".to_string(),
+            r"C:\Program Files\Docker\Docker".to_string(),
+            r"C:\Program".to_string(),
+        ];
+        assert_eq!(
+            pick_binary_path(&candidates, exists).as_deref(),
+            Some(r"C:\Program")
+        );
+    }
+
+    /// Empty candidates -> None (no binary_path).
+    #[test]
+    fn pick_empty_candidates_is_none() {
+        let exists = |_: &str| false;
+        assert_eq!(pick_binary_path(&[], exists), None);
+    }
+
+    /// Single candidate (quoted path) -> returned regardless of exists.
+    #[test]
+    fn pick_single_candidate_returned() {
+        let exists = |_: &str| false; // doesn't exist on CI, but fallback = last = the only one
+        let candidates = vec![r"C:\Program Files\App\app.exe".to_string()];
+        assert_eq!(
+            pick_binary_path(&candidates, exists).as_deref(),
+            Some(r"C:\Program Files\App\app.exe")
+        );
     }
 
     /// PersistCollector.collect returns only Persistence records, never panics, name="persist".
