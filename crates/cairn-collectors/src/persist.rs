@@ -972,6 +972,24 @@ mod tests {
         );
     }
 
+    /// Multiple candidates exist -> the FIRST (longest) one is chosen, proving short-circuit.
+    #[test]
+    fn pick_first_of_multiple_existing() {
+        let exists = |p: &str| {
+            p == r"C:\Program Files\Docker\Docker Desktop.exe"
+                || p == r"C:\Program Files\Docker\Docker"
+        };
+        let candidates = vec![
+            r"C:\Program Files\Docker\Docker Desktop.exe".to_string(),
+            r"C:\Program Files\Docker\Docker".to_string(),
+            r"C:\Program".to_string(),
+        ];
+        assert_eq!(
+            pick_binary_path(&candidates, exists).as_deref(),
+            Some(r"C:\Program Files\Docker\Docker Desktop.exe")
+        );
+    }
+
     /// PersistCollector.collect returns only Persistence records, never panics, name="persist".
     /// On Windows it exercises the real readers; on non-Windows it gets the startup reader +
     /// empty registry stubs. Either way every record is a Persistence variant.
