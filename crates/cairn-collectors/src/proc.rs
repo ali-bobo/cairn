@@ -12,7 +12,12 @@ use cairn_core::Result;
 /// fallback) is left unverified so we never resolve a name against the CWD.
 pub fn is_absolute_path(image: &str) -> bool {
     let b = image.as_bytes();
-    let drive = b.len() >= 3 && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/');
+    // Drive path: a letter, a colon, then a separator (e.g. `C:\`). Requiring the leading
+    // ASCII letter rejects malformed `:\x` shapes (defensive; real images never hit this).
+    let drive = b.len() >= 3
+        && b[0].is_ascii_alphabetic()
+        && b[1] == b':'
+        && (b[2] == b'\\' || b[2] == b'/');
     let unc = image.starts_with(r"\\");
     drive || unc
 }

@@ -69,7 +69,8 @@ mod win {
     }
 
     /// Best-effort full image path for a pid via OpenProcess + QueryFullProcessImageNameW.
-    /// Returns None if the process cannot be opened (privilege / exited) or the query fails.
+    /// Returns None if the process cannot be opened (privilege / exited / pid 0 = System
+    /// Idle, which always fails OpenProcess — expected and handled) or the query fails.
     /// Never panics. Read-only: QUERY_LIMITED_INFORMATION cannot modify the target.
     fn full_image_path(pid: u32) -> Option<String> {
         // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately in the
@@ -81,8 +82,9 @@ mod win {
         for cap in [260usize, 32768usize] {
             let mut buf = vec![0u16; cap];
             let mut len = cap as u32;
-            // SAFETY: guard.0 is a valid handle; buf has `len` u16 slots; len is in/out
-            // (capacity in, characters-written out).
+            // SAFETY: guard.0 is a valid handle; buf has `cap` u16 slots; len is in/out
+            // (capacity in, chars-written out). On success the API guarantees len <= cap
+            // (the path + NUL fit), so the `&buf[..len]` slice below is always in-bounds.
             let r = unsafe {
                 QueryFullProcessImageNameW(
                     guard.0,
