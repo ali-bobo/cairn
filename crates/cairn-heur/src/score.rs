@@ -29,6 +29,12 @@ pub const WINLOGON_SHELL_DEFAULT: &str = "explorer.exe";
 
 /// Stock Winlogon `Userinit` values (post-normalization: lowercased, trailing comma stripped,
 /// %SystemRoot%/%windir% expanded to c:\windows). Both the absolute and bare-name forms occur.
+///
+/// The `c:\windows` drive is assumed DELIBERATELY. On a host with Windows on another volume
+/// (e.g. `D:\Windows`), a genuinely stock Userinit would fail to match and stay High — a
+/// false POSITIVE (the safe direction for a forensic tool). Do NOT "fix" this by loosening the
+/// match to ignore the drive: that would let an attacker plant `X:\...\userinit.exe` and earn
+/// suppression. Fail-loud is intentional.
 pub const WINLOGON_USERINIT_DEFAULTS: &[&str] =
     &[r"c:\windows\system32\userinit.exe", "userinit.exe"];
 
