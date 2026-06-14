@@ -229,6 +229,9 @@ fn make_record_with_exists(
     exists: impl Fn(&str) -> bool,
 ) -> PersistenceRecord {
     let binary_path = command.as_deref().and_then(|cmd| {
+        // env lookup is the one remaining un-injected dependency here (the `exists`
+        // probe is injected for testability). Real %env% cmdlines are exercised in
+        // the live e2e; full env injection is deferred to S2-G.
         let candidates = extract_binary_path_candidates(cmd, |name| std::env::var(name).ok());
         pick_binary_path(&candidates, &exists)
     });
@@ -879,14 +882,9 @@ mod tests {
         let got = extract_binary_path_candidates(r"%ProgramFiles%\App\a.exe", &env);
         assert_eq!(got, vec![r"C:\Program Files\App\a.exe"]);
 
-        // Multi-candidate path: spaces in the pre-expansion string produce multiple
-        // candidates; expansion must be applied to each one.
-        let env2 = fake_env(&[("MYAPP", r"C:\My App")]);
-        let got2 = extract_binary_path_candidates(r"%MYAPP%\bin\app.exe", &env2);
-        // No spaces in the pre-expansion string "%MYAPP%\bin\app.exe", so still single
-        // candidate — but the expansion happens after we find the candidates, so we need
-        // an input that has spaces BEFORE expansion to hit the multi-candidate branch.
-        // Use a literal unquoted spaced input with an env var in one of the prefixes:
+        // Multi-candidate path: the unquoted input must have a space BEFORE expansion
+        // to hit the multi-candidate branch; expansion must then be applied to each
+        // candidate. Use an env var in one of the space-separated prefixes:
         let env3 = fake_env(&[("ROOT", r"C:\Root")]);
         let got3 = extract_binary_path_candidates(r"%ROOT% Files\App\app.exe", &env3);
         // Pre-expansion string has a space at position 6 ("%ROOT% Files\App\app.exe").
@@ -901,9 +899,6 @@ mod tests {
         );
         assert_eq!(got3[0], r"C:\Root Files\App\app.exe");
         assert_eq!(got3.last().unwrap(), r"C:\Root");
-
-        // Suppress unused-variable warning for got2 (it's still exercising the code path).
-        let _ = got2;
     }
 
     /// Empty / whitespace-only -> empty Vec.
