@@ -248,6 +248,8 @@ mod win {
             pcwszMemberTag: PCWSTR(member_tag.as_ptr()),
             pcwszMemberFilePath: PCWSTR(wide.as_ptr()),
             pbCalculatedFileHash: hash.as_mut_ptr(),
+            // hash_len is the length CalcHashFromFileHandle2 reported; the buffer is sized to
+            // it and the API leaves it unchanged on success, so it matches pbCalculatedFileHash.
             cbCalculatedFileHash: hash_len,
             hCatAdmin: catinfo.admin,
             ..Default::default()
