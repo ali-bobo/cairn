@@ -1042,22 +1042,12 @@ mod tests {
     #[test]
     fn make_record_unquoted_spaced_resolves_full_path() {
         // cmdline: "C:\Program Files\App\My App.exe -x"
-        // Space positions in pre-expansion string (0-indexed bytes):
-        //   pos 17 -> "C:\Program Files\App\My App.exe -x"[17] = ' ' (between "Files" and "App")
-        //     wait, let's be precise:
-        //     "C:\Program Files\App\My App.exe -x"
-        //      0123456789012345678901234567890123456
-        //   spaces at: 10 ("C:\Program "), 16 ("Files "), 23 ("App\My "), 31 ("App.exe ")
-        //   Wait, let's count: C:\Program Files\App\My App.exe -x
-        //     C  :  \  P  r  o  g  r  a  m     F  i  l  e  s  \  A  p  p  \  M  y     A  p  p  .  e  x  e     -  x
-        //     0  1  2  3  4  5  6  7  8  9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33
-        // Spaces at: 10, 23, 31
-        // Candidates (longest first):
+        // Spaces at byte positions 10, 23, 31 -> candidates (longest first):
         //   [0] "C:\Program Files\App\My App.exe -x"  (whole)
-        //   [1] "C:\Program Files\App\My App.exe"      (before " -x" at pos 31)
-        //   [2] "C:\Program Files\App\My"              (before " App.exe" at pos 23)
-        //   [3] "C:\Program"                           (before " Files" at pos 10)
-        // fake_exists: only [1] exists.
+        //   [1] "C:\Program Files\App\My App.exe"      (before " -x")
+        //   [2] "C:\Program Files\App\My"              (before " App.exe")
+        //   [3] "C:\Program"                           (bare first token)
+        // fake_exists: only [1] exists -> [1] should be chosen.
         let fake_exists = |p: &str| p == r"C:\Program Files\App\My App.exe";
         let r = make_record_with_exists(
             "run_key",
@@ -1084,7 +1074,8 @@ mod tests {
             None,
             |_| false,
         );
-        // Fallback: last candidate = bare first token.
+        // Fallback: last candidate = bare first token ("C:\Program" = everything before the
+        // first space in the cmdline "C:\Program Files\App\My App.exe -x").
         assert_eq!(r.binary_path.as_deref(), Some(r"C:\Program"));
     }
 
