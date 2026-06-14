@@ -11,6 +11,7 @@ evtx.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+quick-xml = { version = "0.40.1", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 winreg.workspace = true

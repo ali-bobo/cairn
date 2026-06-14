@@ -108,6 +108,140 @@ pub(crate) fn extract_binary_path_candidates(
     candidates
 }
 
+/// One `<Exec>` action parsed from a Scheduled Task XML definition.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct ParsedExecAction {
+    pub command: String,
+    pub arguments: String,
+    /// The task's <URI> (\Folder\TaskName), shared by all actions in the task.
+    pub uri: Option<String>,
+}
+
+/// Parse a Scheduled Task XML string into one `ParsedExecAction` per `<Exec>` action.
+/// PURE: no FS, no env, never panics. Returns empty on malformed XML, missing <Actions>,
+/// or a task whose only actions are non-Exec (ComHandler/SendEmail/ShowMessage).
+/// Element matching is namespace-agnostic (uses local names), so the task xmlns is irrelevant.
+#[allow(dead_code)]
+pub(crate) fn parse_task_xml(xml: &str) -> Vec<ParsedExecAction> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut uri: Option<String> = None;
+    let mut out: Vec<ParsedExecAction> = Vec::new();
+
+    let mut in_exec = false;
+    let mut cur_command = String::new();
+    let mut cur_arguments = String::new();
+    let mut capture: Option<&'static str> = None; // "uri" | "command" | "arguments"
+
+    // Accumulate the raw (still-escaped) text of the element currently being captured.
+    // quick-xml 0.40.1 surfaces XML entities (`&amp;`) as separate Event::GeneralRef events
+    // that split the surrounding text, so we collect fragments and unescape once at the
+    // element's end rather than per Text event (which would drop everything but the last).
+    let mut buf = String::new();
+
+    // Decode the accumulated (escaped) buffer: run the standalone
+    // `quick_xml::escape::unescape` for XML entity decoding (&amp; -> &). BytesText has no
+    // `unescape()` in 0.40.1, so this is done explicitly on the assembled string.
+    let finish = |raw: &str| -> String {
+        let decoded = match quick_xml::escape::unescape(raw) {
+            Ok(c) => c.into_owned(),
+            Err(_) => raw.to_string(),
+        };
+        decoded.trim().to_string()
+    };
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = e.local_name();
+                match name.as_ref() {
+                    b"Exec" => {
+                        in_exec = true;
+                        cur_command.clear();
+                        cur_arguments.clear();
+                    }
+                    b"URI" => {
+                        capture = Some("uri");
+                        buf.clear();
+                    }
+                    b"Command" if in_exec => {
+                        capture = Some("command");
+                        buf.clear();
+                    }
+                    b"Arguments" if in_exec => {
+                        capture = Some("arguments");
+                        buf.clear();
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if let (true, Ok(c)) = (capture.is_some(), e.decode()) {
+                    buf.push_str(&c);
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                // An entity reference inside captured text: re-emit it as `&name;` so the
+                // final `unescape` pass resolves it together with the rest of the buffer.
+                if let (true, Ok(c)) = (capture.is_some(), e.decode()) {
+                    buf.push('&');
+                    buf.push_str(&c);
+                    buf.push(';');
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.local_name();
+                match name.as_ref() {
+                    b"URI" => {
+                        if capture == Some("uri") {
+                            uri = Some(finish(&buf));
+                        }
+                        capture = None;
+                    }
+                    b"Command" => {
+                        if capture == Some("command") {
+                            cur_command = finish(&buf);
+                        }
+                        capture = None;
+                    }
+                    b"Arguments" => {
+                        if capture == Some("arguments") {
+                            cur_arguments = finish(&buf);
+                        }
+                        capture = None;
+                    }
+                    b"Exec" => {
+                        if !cur_command.is_empty() {
+                            out.push(ParsedExecAction {
+                                command: cur_command.clone(),
+                                arguments: cur_arguments.clone(),
+                                uri: uri.clone(),
+                            });
+                        }
+                        in_exec = false;
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    if uri.is_some() {
+        for a in &mut out {
+            if a.uri.is_none() {
+                a.uri = uri.clone();
+            }
+        }
+    }
+    out
+}
+
 /// Select the best binary path from a candidate list using an injected FS probe.
 ///
 /// Returns the first candidate for which `exists(c)` is true. If none exist,
@@ -216,6 +350,51 @@ fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
+/// PURE glue: parse a task XML and build one PersistenceRecord per Exec action, resolving
+/// binary_path via the S2-F candidate model. `lookup` (env) and `exists` (FS probe) are
+/// injected for Linux-CI testability. `file_name` is the task file stem (the `value` fallback
+/// when no <URI> leaf name is available); `last_write` is the file mtime. Never panics.
+#[allow(dead_code)]
+fn task_records_from_xml(
+    xml: &str,
+    file_name: &str,
+    last_write: Option<DateTime<Utc>>,
+    lookup: impl Fn(&str) -> Option<String>,
+    exists: impl Fn(&str) -> bool,
+) -> Vec<PersistenceRecord> {
+    let mut out = Vec::new();
+    for act in parse_task_xml(xml) {
+        let command = if act.arguments.is_empty() {
+            act.command.clone()
+        } else {
+            format!("{} {}", act.command, act.arguments)
+        };
+        let candidates = extract_binary_path_candidates(&command, &lookup);
+        let binary_path = pick_binary_path(&candidates, &exists);
+
+        let location = act.uri.clone().unwrap_or_else(|| file_name.to_string());
+        let value = act
+            .uri
+            .as_deref()
+            .and_then(|u| u.rsplit(['\\', '/']).next())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| file_name.to_string());
+
+        out.push(PersistenceRecord {
+            mechanism: "scheduled_task".to_string(),
+            location,
+            value: Some(value),
+            command: Some(command),
+            binary_path,
+            binary_sha256: None,
+            signed: None,
+            last_write,
+        });
+    }
+    out
+}
+
 /// Testable core for building a PersistenceRecord: accepts an injected `exists` probe
 /// for resolving unquoted spaced cmdlines to the real binary path (S2-F candidate model).
 /// `make_record` (below) calls this with the real `Path::exists`.
@@ -297,6 +476,15 @@ fn read_services() -> Vec<PersistenceRecord> {
 #[cfg(windows)]
 fn read_services() -> Vec<PersistenceRecord> {
     win::read_services()
+}
+
+#[cfg(not(windows))]
+fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
+    vec![]
+}
+#[cfg(windows)]
+fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
+    win::read_scheduled_tasks()
 }
 
 /// Startup folders: per-user (%APPDATA%) and All Users (%PROGRAMDATA%) Startup dirs.
@@ -523,6 +711,50 @@ mod win {
         }
         out
     }
+
+    /// Walk %SystemRoot%\System32\Tasks recursively; parse each task XML into records.
+    /// Best-effort + graceful: an ACL-blocked root (non-admin) or unreadable file yields
+    /// nothing rather than an error. Read-only.
+    pub fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
+        let root = std::env::var("SystemRoot")
+            .map(|r| format!(r"{r}\System32\Tasks"))
+            .unwrap_or_else(|_| r"C:\Windows\System32\Tasks".to_string());
+        let mut out = Vec::new();
+        walk_tasks(std::path::Path::new(&root), &mut out);
+        out
+    }
+
+    fn walk_tasks(dir: &std::path::Path, out: &mut Vec<PersistenceRecord>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return; // ACL-blocked or missing: graceful empty
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_tasks(&path, out);
+            } else if path.is_file() {
+                let Ok(xml) = std::fs::read_to_string(&path) else {
+                    continue; // unreadable file: skip
+                };
+                let file_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let last_write = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(chrono::DateTime::<chrono::Utc>::from);
+                out.extend(super::task_records_from_xml(
+                    &xml,
+                    &file_name,
+                    last_write,
+                    |name| std::env::var(name).ok(),
+                    |p| std::path::Path::new(p).exists(),
+                ));
+            }
+        }
+    }
 }
 
 /// A verifier that never verifies (always None). Cross-platform default + test default; on
@@ -583,6 +815,7 @@ impl Collector for PersistCollector {
         records.extend(read_winlogon());
         records.extend(read_ifeo());
         records.extend(read_startup_folders());
+        records.extend(read_scheduled_tasks());
         apply_signatures(&mut records, self.verifier.as_ref());
         Ok(records.into_iter().map(Record::Persistence).collect())
     }
@@ -590,7 +823,7 @@ impl Collector for PersistCollector {
     fn sources(&self) -> Vec<SourceEntry> {
         vec![SourceEntry {
             artifact: "persistence".into(),
-            path: "live:registry+startup".into(),
+            path: "live:registry+startup+tasks".into(),
             method: "api".into(),
             size: 0,
             sha256: String::new(), // a live registry/folder read is not a byte stream (spec §5)
@@ -1082,5 +1315,146 @@ mod tests {
         assert_eq!(c.sources().len(), 1);
         assert_eq!(c.sources()[0].artifact, "persistence");
         assert_eq!(c.sources()[0].method, "api");
+    }
+
+    // ── S2-I Task 3: task_records_from_xml ───────────────────────────────────
+
+    #[test]
+    fn task_records_resolves_binary_path_via_candidates() {
+        let exists = |p: &str| p.eq_ignore_ascii_case(r"C:\Windows\system32\sc.exe");
+        let env = fake_env(&[("windir", r"C:\Windows")]);
+        let recs = task_records_from_xml(SAMPLE_TASK_XML, "SynchronizeTime", None, &env, exists);
+        assert_eq!(recs.len(), 1);
+        let r = &recs[0];
+        assert_eq!(r.mechanism, "scheduled_task");
+        assert_eq!(
+            r.location.as_str(),
+            r"\Microsoft\Windows\Time Synchronization\SynchronizeTime"
+        );
+        assert_eq!(
+            r.binary_path.as_deref(),
+            Some(r"C:\Windows\system32\sc.exe")
+        );
+        assert!(r.command.as_deref().unwrap().contains("start w32time"));
+    }
+
+    #[test]
+    fn task_records_fallback_when_nothing_exists() {
+        let exists = |_: &str| false;
+        let env = fake_env(&[("windir", r"C:\Windows")]);
+        let recs = task_records_from_xml(SAMPLE_TASK_XML, "SynchronizeTime", None, &env, exists);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].binary_path.as_deref(),
+            Some(r"C:\Windows\system32\sc.exe")
+        );
+    }
+
+    #[test]
+    fn task_records_empty_for_non_exec() {
+        let exists = |_: &str| false;
+        let env = fake_env(&[]);
+        let com = r#"<Task xmlns="x"><Actions><ComHandler><ClassId>{G}</ClassId></ComHandler></Actions></Task>"#;
+        assert!(task_records_from_xml(com, "X", None, &env, exists).is_empty());
+    }
+
+    // ── S2-I Task 2: parse_task_xml ────────────────────────────────────────
+
+    const SAMPLE_TASK_XML: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.6" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <URI>\Microsoft\Windows\Time Synchronization\SynchronizeTime</URI>
+  </RegistrationInfo>
+  <Actions Context="LocalService">
+    <Exec>
+      <Command>%windir%\system32\sc.exe</Command>
+      <Arguments>start w32time task_started</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#;
+
+    #[test]
+    fn parse_task_xml_single_exec() {
+        let acts = parse_task_xml(SAMPLE_TASK_XML);
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].command, r"%windir%\system32\sc.exe");
+        assert_eq!(acts[0].arguments, "start w32time task_started");
+        assert_eq!(
+            acts[0].uri.as_deref(),
+            Some(r"\Microsoft\Windows\Time Synchronization\SynchronizeTime")
+        );
+    }
+
+    #[test]
+    fn parse_task_xml_multiple_execs() {
+        let xml = r#"<Task xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo><URI>\T</URI></RegistrationInfo>
+  <Actions>
+    <Exec><Command>a.exe</Command></Exec>
+    <Exec><Command>b.exe</Command><Arguments>-x</Arguments></Exec>
+  </Actions>
+</Task>"#;
+        let acts = parse_task_xml(xml);
+        assert_eq!(acts.len(), 2);
+        assert_eq!(acts[0].command, "a.exe");
+        assert_eq!(acts[0].arguments, "");
+        assert_eq!(acts[1].command, "b.exe");
+        assert_eq!(acts[1].arguments, "-x");
+    }
+
+    #[test]
+    fn parse_task_xml_decodes_entities() {
+        let xml = r#"<Task xmlns="x"><Actions><Exec>
+            <Command>c.exe</Command><Arguments>-p a&amp;b</Arguments>
+            </Exec></Actions></Task>"#;
+        let acts = parse_task_xml(xml);
+        assert_eq!(acts.len(), 1);
+        assert_eq!(acts[0].arguments, "-p a&b");
+    }
+
+    #[test]
+    fn parse_task_xml_skips_non_exec_and_malformed() {
+        let com = r#"<Task xmlns="x"><Actions><ComHandler>
+            <ClassId>{GUID}</ClassId></ComHandler></Actions></Task>"#;
+        assert!(parse_task_xml(com).is_empty());
+        assert!(parse_task_xml(r#"<Task xmlns="x"></Task>"#).is_empty());
+        assert!(parse_task_xml("not xml at all").is_empty());
+        assert!(parse_task_xml("").is_empty());
+    }
+
+    /// A REAL exported built-in task (ScheduledDefrag) verbatim: full RegistrationInfo with
+    /// SecurityDescriptor, Principals, Settings, an empty `<Triggers />`, and the `$` char in
+    /// arguments. Confirms the parser ignores all the surrounding elements and extracts only
+    /// the URI + the single Exec's command/arguments from a complex real-world document.
+    #[test]
+    fn parse_task_xml_real_builtin_defrag() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.6" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <SecurityDescriptor>D:AI(A;;FA;;;BA)(A;;FA;;;SY)(A;;FRFX;;;LS)(A;;FR;;;AU)</SecurityDescriptor>
+    <Source>$(@%systemroot%\system32\defragsvc.dll,-800)</Source>
+    <Author>$(@%systemroot%\system32\defragsvc.dll,-801)</Author>
+    <URI>\Microsoft\Windows\Defrag\ScheduledDefrag</URI>
+  </RegistrationInfo>
+  <Principals>
+    <Principal id="LocalSystem"><UserId>S-1-5-18</UserId></Principal>
+  </Principals>
+  <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings>
+  <Triggers />
+  <Actions Context="LocalSystem">
+    <Exec>
+      <Command>%windir%\system32\defrag.exe</Command>
+      <Arguments>-c -h -o -$</Arguments>
+    </Exec>
+  </Actions>
+</Task>"#;
+        let acts = parse_task_xml(xml);
+        assert_eq!(acts.len(), 1, "one Exec action");
+        assert_eq!(acts[0].command, r"%windir%\system32\defrag.exe");
+        assert_eq!(acts[0].arguments, "-c -h -o -$");
+        assert_eq!(
+            acts[0].uri.as_deref(),
+            Some(r"\Microsoft\Windows\Defrag\ScheduledDefrag")
+        );
     }
 }
