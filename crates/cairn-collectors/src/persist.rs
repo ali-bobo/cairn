@@ -44,6 +44,70 @@ fn extract_binary_path_with(
     Some(expand_env_vars(raw, &lookup))
 }
 
+/// Produce a list of candidate binary paths from a command line, LONGEST FIRST.
+///
+/// • Quoted (`"C:\path with spaces\app.exe" -args`): exactly one candidate — the
+///   content between the opening and closing quote. Unchanged from `extract_binary_path`.
+/// • Unquoted, no spaces (`C:\Windows\notepad.exe`): one candidate — the full string.
+/// • Unquoted WITH spaces (`C:\Program Files\App\app.exe`): one candidate per space
+///   boundary, longest first:
+///     - the whole string
+///     - the substring before the LAST space
+///     - the substring before the second-last space
+///     - ...
+///     - the bare first whitespace-delimited token (today's `extract_binary_path` value)
+///   This mirrors how Windows `CreateProcess` resolves ambiguous paths.
+///
+/// `%VAR%` expansion is applied to each candidate via the injected `lookup`.
+/// Returns an empty Vec for an empty / whitespace-only input (no panic).
+#[allow(dead_code)]
+pub(crate) fn extract_binary_path_candidates(
+    cmdline: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let trimmed = cmdline.trim();
+    if trimmed.is_empty() {
+        return vec![];
+    }
+
+    if let Some(rest) = trimmed.strip_prefix('"') {
+        // Quoted: take up to the closing quote (same as extract_binary_path_with).
+        let raw = rest.split('"').next().unwrap_or("");
+        if raw.is_empty() {
+            return vec![];
+        }
+        return vec![expand_env_vars(raw, &lookup)];
+    }
+
+    // Unquoted: find all space positions and emit longest-first prefixes.
+    // Spaces are ASCII (single byte), so byte-index slicing is char-boundary-safe.
+    let space_positions: Vec<usize> = trimmed
+        .char_indices()
+        .filter(|(_, c)| *c == ' ')
+        .map(|(i, _)| i)
+        .collect();
+
+    if space_positions.is_empty() {
+        // No spaces: single candidate.
+        return vec![expand_env_vars(trimmed, &lookup)];
+    }
+
+    // Candidates: whole string, then prefix before each space (reverse order = longest first).
+    let mut candidates = Vec::with_capacity(space_positions.len() + 1);
+    candidates.push(expand_env_vars(trimmed, &lookup));
+    for &pos in space_positions.iter().rev() {
+        let prefix = &trimmed[..pos];
+        if !prefix.is_empty() {
+            let expanded = expand_env_vars(prefix, &lookup);
+            // Avoid duplicates (can happen if expansion produces the same string).
+            if Some(&expanded) != candidates.last() {
+                candidates.push(expanded);
+            }
+        }
+    }
+    candidates
+}
+
 /// Expand %VAR% occurrences using the injected `lookup`; unknown vars (lookup returns None)
 /// are left as the literal `%NAME%`. An unterminated `%` emits the rest verbatim. An empty
 /// var name (`%%`) is treated as unknown and kept literal. Never panics (the `%` byte is
@@ -709,6 +773,85 @@ mod tests {
             normalize_service_path(r"\System32\x.sys", windir),
             r"C:\Windows\System32\x.sys"
         );
+    }
+
+    // ── S2-F: extract_binary_path_candidates ──────────────────────────────
+
+    /// Helper: fake env that returns None for every var (no expansion side-effects).
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    /// Quoted path -> exactly one candidate (the path between the quotes).
+    #[test]
+    fn candidates_quoted_single() {
+        let env = fake_env(&[]);
+        let got = extract_binary_path_candidates(
+            r#""C:\Program Files\App\app.exe" -silent"#,
+            &env,
+        );
+        assert_eq!(got, vec![r"C:\Program Files\App\app.exe"]);
+    }
+
+    /// Unquoted path with no spaces -> one candidate.
+    #[test]
+    fn candidates_unquoted_no_spaces() {
+        let got = extract_binary_path_candidates(
+            r"C:\Windows\system32\svchost.exe",
+            &no_env,
+        );
+        assert_eq!(got, vec![r"C:\Windows\system32\svchost.exe"]);
+    }
+
+    /// Unquoted path WITH spaces -> longest first, bare-token last.
+    #[test]
+    fn candidates_unquoted_spaces_longest_first() {
+        let cmdline = r"C:\Program Files\Docker\Docker\Docker Desktop.exe";
+        let got = extract_binary_path_candidates(cmdline, &no_env);
+        // First candidate must be the full string.
+        assert_eq!(got[0], cmdline);
+        // Last candidate must be the bare first-space token.
+        assert_eq!(got.last().unwrap(), "C:\\Program");
+        // Candidates are strictly decreasing in length.
+        for i in 1..got.len() {
+            assert!(
+                got[i].len() < got[i - 1].len(),
+                "candidates must be longest-first, but [{i}] len={} >= [{j}] len={}",
+                got[i].len(),
+                got[i - 1].len(),
+                j = i - 1
+            );
+        }
+        // The full string minus " Desktop.exe" should appear somewhere.
+        assert!(
+            got.contains(&r"C:\Program Files\Docker\Docker\Docker".to_string()),
+            "intermediate prefix missing: {:?}",
+            got
+        );
+    }
+
+    /// %env% expansion is applied to every candidate.
+    #[test]
+    fn candidates_env_expansion_applied() {
+        let env = fake_env(&[("ProgramFiles", r"C:\Program Files")]);
+        let got = extract_binary_path_candidates(r"%ProgramFiles%\App\a.exe", &env);
+        assert_eq!(got, vec![r"C:\Program Files\App\a.exe"]);
+    }
+
+    /// Empty / whitespace-only -> empty Vec.
+    #[test]
+    fn candidates_empty_input() {
+        assert!(extract_binary_path_candidates("", &no_env).is_empty());
+        assert!(extract_binary_path_candidates("   ", &no_env).is_empty());
+    }
+
+    /// Adversarial: lone %, trailing spaces, mismatched quotes -> no panic.
+    #[test]
+    fn candidates_adversarial_no_panic() {
+        let _ = extract_binary_path_candidates("%", &no_env);
+        let _ = extract_binary_path_candidates("%%", &no_env);
+        let _ = extract_binary_path_candidates(r#""C:\unclosed"#, &no_env);
+        let _ = extract_binary_path_candidates("   leading spaces", &no_env);
     }
 
     /// PersistCollector.collect returns only Persistence records, never panics, name="persist".
