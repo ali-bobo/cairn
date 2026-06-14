@@ -99,7 +99,7 @@ pub(crate) fn extract_binary_path_candidates(
         let prefix = &trimmed[..pos];
         if !prefix.is_empty() {
             let expanded = expand_env_vars(prefix, &lookup);
-            // Avoid duplicates (can happen if expansion produces the same string).
+            // Avoid consecutive duplicates (expansion can collapse adjacent prefixes to the same string).
             if Some(&expanded) != candidates.last() {
                 candidates.push(expanded);
             }
@@ -833,9 +833,36 @@ mod tests {
     /// %env% expansion is applied to every candidate.
     #[test]
     fn candidates_env_expansion_applied() {
+        // Single-candidate path (no spaces in pre-expansion string).
         let env = fake_env(&[("ProgramFiles", r"C:\Program Files")]);
         let got = extract_binary_path_candidates(r"%ProgramFiles%\App\a.exe", &env);
         assert_eq!(got, vec![r"C:\Program Files\App\a.exe"]);
+
+        // Multi-candidate path: spaces in the pre-expansion string produce multiple
+        // candidates; expansion must be applied to each one.
+        let env2 = fake_env(&[("MYAPP", r"C:\My App")]);
+        let got2 = extract_binary_path_candidates(r"%MYAPP%\bin\app.exe", &env2);
+        // No spaces in the pre-expansion string "%MYAPP%\bin\app.exe", so still single
+        // candidate — but the expansion happens after we find the candidates, so we need
+        // an input that has spaces BEFORE expansion to hit the multi-candidate branch.
+        // Use a literal unquoted spaced input with an env var in one of the prefixes:
+        let env3 = fake_env(&[("ROOT", r"C:\Root")]);
+        let got3 = extract_binary_path_candidates(r"%ROOT% Files\App\app.exe", &env3);
+        // Pre-expansion string has a space at position 6 ("%ROOT% Files\App\app.exe").
+        // Candidates (pre-expansion):
+        //   [0] whole: "%ROOT% Files\App\app.exe" -> "C:\Root Files\App\app.exe"
+        //   [1] before space: "%ROOT%" -> "C:\Root"
+        // After expansion every candidate must not contain '%'.
+        assert!(
+            got3.iter().all(|c| !c.contains('%')),
+            "expansion must be applied to every candidate, got: {:?}",
+            got3
+        );
+        assert_eq!(got3[0], r"C:\Root Files\App\app.exe");
+        assert_eq!(got3.last().unwrap(), r"C:\Root");
+
+        // Suppress unused-variable warning for got2 (it's still exercising the code path).
+        let _ = got2;
     }
 
     /// Empty / whitespace-only -> empty Vec.
