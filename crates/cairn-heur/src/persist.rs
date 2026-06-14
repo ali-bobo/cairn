@@ -1,7 +1,9 @@
 //! heur_persist (FR9 ranking, SRS §10): rank persistence records by mechanism stealth +
 //! suspicious binary path + recent LastWrite. Emits a Finding per record that clears the
 //! noise floor (weight >= 15). See score.rs for severity thresholds.
-use crate::score::{is_suspicious_path, severity_for, Score};
+use crate::score::{
+    is_suspicious_path, is_trusted_appdata_location, severity_for, winlogon_value_is_default, Score,
+};
 use cairn_core::finding::{EntityFile, EntityRegistry};
 use cairn_core::record::{PersistenceRecord, Record};
 use cairn_core::traits::Analyzer;
@@ -36,7 +38,12 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
     let mut suspicious_path_fired = false;
     if p.mechanism != "startup" {
         if let Some(path) = p.binary_path.as_deref() {
-            if is_suspicious_path(path) {
+            // S2-H: a SIGNED binary in the canonical per-user app install dir
+            // (\AppData\Local\Programs\) is not a suspicion signal — that path is where
+            // Notion/Warp/VS Code legitimately install. Fail-loud: only when signed==Some(true)
+            // AND in that exact subpath; Temp/Roaming/unsigned/unverified still fire +30.
+            let trusted_appdata = p.signed == Some(true) && is_trusted_appdata_location(path);
+            if is_suspicious_path(path) && !trusted_appdata {
                 s.add(
                     30,
                     format!("binary in a suspicious path: {path}"),
@@ -47,8 +54,21 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
         }
     }
 
+    // S2-H: a Winlogon entry carrying its STOCK default value, whose binary is not disproved
+    // as unsigned, gets its recency dampened — a boot/update bumps the hive's last-write on
+    // every clean machine, which would otherwise push the default values to High. Fail-loud:
+    // any value change (e.g. "explorer.exe,evil.exe") or an unsigned body (signed==Some(false))
+    // breaks the match and recency fires again. The winlogon base weight (35, Medium) always
+    // remains, so the finding is never silenced — only lowered one band.
+    let winlogon_default = p.mechanism == "winlogon"
+        && p.signed != Some(false)
+        && p.value
+            .as_deref()
+            .zip(p.command.as_deref())
+            .is_some_and(|(v, c)| winlogon_value_is_default(v, c));
     if let Some(lw) = p.last_write {
-        if now.signed_duration_since(lw) <= Duration::days(RECENT_DAYS)
+        if !winlogon_default
+            && now.signed_duration_since(lw) <= Duration::days(RECENT_DAYS)
             && now.signed_duration_since(lw) >= Duration::zero()
         {
             s.add(15, "recently created/modified (last 7 days)", &[]);
@@ -288,6 +308,169 @@ mod tests {
         let mut r = rec(mechanism, binary_path, last_write);
         r.signed = signed;
         r
+    }
+
+    /// Like `rec_signed` but lets the test set the registry `value` and `command`
+    /// independently (the Winlogon gate keys off `value`; the existing `rec` hardcodes it).
+    fn rec_full(
+        mechanism: &str,
+        value: &str,
+        command: &str,
+        binary_path: Option<&str>,
+        last_write: Option<DateTime<Utc>>,
+        signed: Option<bool>,
+    ) -> PersistenceRecord {
+        PersistenceRecord {
+            mechanism: mechanism.into(),
+            location: "HKLM\\...\\Run".into(),
+            value: Some(value.into()),
+            command: Some(command.into()),
+            binary_path: binary_path.map(|p| p.to_string()),
+            binary_sha256: None,
+            signed,
+            last_write,
+        }
+    }
+
+    // --- S2-H Gate 2: trusted AppData location suppresses the suspicious-path signal ---
+
+    /// Signed per-user app in AppData\Local\Programs: suspicious-path +30 is suppressed,
+    /// dropping it from High (55) to Low (25). The finding still surfaces, just not as High.
+    #[test]
+    fn signed_appdata_local_programs_suppresses_path_signal() {
+        let now = Utc::now();
+        let p = rec_signed(
+            "run_key",
+            Some(r"C:\Users\bosen\AppData\Local\Programs\Notion\Notion.exe"),
+            Some(now),
+            Some(true),
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 25, "run_key 10 + recent 15; path +30 suppressed");
+        assert!(!s.reasons.iter().any(|r| r.contains("suspicious path")));
+        assert!(!s.reasons.iter().any(|r| r.contains("unsigned")));
+    }
+
+    /// Unsigned binary in the SAME trusted location is NOT suppressed (fail-loud): the path
+    /// signal fires and so does the unsigned amplifier.
+    #[test]
+    fn unsigned_appdata_local_programs_not_suppressed() {
+        let now = Utc::now();
+        let old = now - Duration::days(400); // isolate path + amplifier from recency
+        let p = rec_signed(
+            "run_key",
+            Some(r"C:\Users\x\AppData\Local\Programs\et\evil.exe"),
+            Some(old),
+            Some(false),
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 60, "run_key 10 + path 30 + unsigned 20");
+        assert!(s.reasons.iter().any(|r| r.contains("suspicious path")));
+    }
+
+    /// Signed binary in AppData\Local\TEMP is NOT suppressed (wrong subpath): path fires.
+    #[test]
+    fn signed_appdata_temp_not_suppressed() {
+        let now = Utc::now();
+        let p = rec_signed(
+            "run_key",
+            Some(r"C:\Users\x\AppData\Local\Temp\app.exe"),
+            Some(now),
+            Some(true),
+        );
+        let s = score_persistence(&p, now);
+        // run_key 10 + path 30 + recent 15 = 55 (signed -> no unsigned amplifier)
+        assert_eq!(
+            s.weight, 55,
+            "temp is not a trusted location; path +30 stays"
+        );
+        assert!(s.reasons.iter().any(|r| r.contains("suspicious path")));
+    }
+
+    /// None signature in the trusted location is NOT suppressed (unverified, fail-loud).
+    #[test]
+    fn unverified_appdata_local_programs_not_suppressed() {
+        let now = Utc::now();
+        let p = rec_signed(
+            "run_key",
+            Some(r"C:\Users\x\AppData\Local\Programs\App\a.exe"),
+            Some(now),
+            None,
+        );
+        let s = score_persistence(&p, now);
+        // run_key 10 + path 30 + recent 15 = 55 (None -> not suppressed, no amplifier)
+        assert_eq!(s.weight, 55, "None signature must not earn suppression");
+    }
+
+    // --- S2-H Gate 1: stock Winlogon default value suppresses the recency signal ---
+
+    /// Stock Winlogon Shell, recently written, signature unverifiable (explorer.exe has no
+    /// absolute path -> signed None): recency +15 suppressed, dropping High (50) to Medium (35).
+    #[test]
+    fn winlogon_default_shell_suppresses_recency() {
+        let now = Utc::now();
+        let p = rec_full("winlogon", "Shell", "explorer.exe", None, Some(now), None);
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 35, "winlogon 35; recency +15 suppressed");
+        assert!(!s.reasons.iter().any(|r| r.contains("recently")));
+    }
+
+    /// Stock Winlogon Userinit (comma + case variant), recent, None signed: recency suppressed.
+    #[test]
+    fn winlogon_default_userinit_suppresses_recency() {
+        let now = Utc::now();
+        let p = rec_full(
+            "winlogon",
+            "Userinit",
+            r"C:\WINDOWS\system32\userinit.exe,",
+            Some(r"C:\WINDOWS\system32\userinit.exe"),
+            Some(now),
+            None,
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 35, "winlogon 35; recency +15 suppressed");
+    }
+
+    /// Tampered Winlogon Shell (appended payload), recent: NOT suppressed -> stays High (50).
+    #[test]
+    fn winlogon_tampered_shell_not_suppressed() {
+        let now = Utc::now();
+        let p = rec_full(
+            "winlogon",
+            "Shell",
+            "explorer.exe,evil.exe",
+            Some(r"C:\Temp\evil.exe"),
+            Some(now),
+            None,
+        );
+        let s = score_persistence(&p, now);
+        // winlogon 35 + recent 15 = 50 (tampered value -> recency NOT suppressed)
+        assert!(
+            s.weight >= 50,
+            "tampered value must stay High; weight {}",
+            s.weight
+        );
+    }
+
+    /// Stock Winlogon value but the binary is DISPROVED as unsigned (signed==Some(false)):
+    /// NOT suppressed (fail-loud on a swapped-but-named-explorer body) -> stays High (50).
+    #[test]
+    fn winlogon_default_value_unsigned_binary_not_suppressed() {
+        let now = Utc::now();
+        let p = rec_full(
+            "winlogon",
+            "Shell",
+            "explorer.exe",
+            Some(r"C:\Windows\explorer.exe"),
+            Some(now),
+            Some(false),
+        );
+        let s = score_persistence(&p, now);
+        assert!(
+            s.weight >= 50,
+            "unsigned body must stay High; weight {}",
+            s.weight
+        );
     }
 
     /// Unsigned + suspicious path: amplifier fires (+20), reason mentions unsigned.

@@ -13,16 +13,41 @@ pub const SUSPICIOUS_DIRS: &[&str] = &[
     r"\public\", // matches C:\Users\Public (world-readable shared dir) too
 ];
 
+/// The canonical install subpath for modern signed per-user apps (Notion, Warp, VS Code, …).
+/// Matched case-insensitively as a substring. Only THIS AppData subpath earns suspicious-path
+/// suppression; Temp/Roaming/other AppData subpaths stay suspicious (droppers favor them).
+pub const TRUSTED_APPDATA_SUBPATH: &str = r"\appdata\local\programs\";
+
 /// Remote ports considered ordinary egress; anything else is the "rare port" signal.
 // Tunable allowlist; ports outside this set raise the "rare port" signal. Tune per environment (e.g. 8080/636 may be common internally).
 pub const COMMON_PORTS: &[u16] = &[
     80, 443, 53, 22, 3389, 445, 135, 139, 21, 25, 587, 993, 143, 110,
 ];
 
+/// Stock Winlogon `Shell` value on a default Windows install (post-normalization, lowercased).
+pub const WINLOGON_SHELL_DEFAULT: &str = "explorer.exe";
+
+/// Stock Winlogon `Userinit` values (post-normalization: lowercased, trailing comma stripped,
+/// %SystemRoot%/%windir% expanded to c:\windows). Both the absolute and bare-name forms occur.
+///
+/// The `c:\windows` drive is assumed DELIBERATELY. On a host with Windows on another volume
+/// (e.g. `D:\Windows`), a genuinely stock Userinit would fail to match and stay High — a
+/// false POSITIVE (the safe direction for a forensic tool). Do NOT "fix" this by loosening the
+/// match to ignore the drive: that would let an attacker plant `X:\...\userinit.exe` and earn
+/// suppression. Fail-loud is intentional.
+pub const WINLOGON_USERINIT_DEFAULTS: &[&str] =
+    &[r"c:\windows\system32\userinit.exe", "userinit.exe"];
+
 /// True if `path` (any case) contains one of the suspicious directory segments.
 pub fn is_suspicious_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     SUSPICIOUS_DIRS.iter().any(|d| lower.contains(d))
+}
+
+/// True if `path` (any case) is under the trusted per-user app install directory
+/// (`\AppData\Local\Programs\`). Used only in combination with `signed==Some(true)`.
+pub fn is_trusted_appdata_location(path: &str) -> bool {
+    path.to_ascii_lowercase().contains(TRUSTED_APPDATA_SUBPATH)
 }
 
 /// True if `port` is NOT in the common-egress set.
@@ -62,6 +87,35 @@ fn is_reserved_nonpublic(ip: Ipv4Addr) -> bool {
     let benchmarking = o[0] == 198 && (o[1] & 0xFE) == 18; // 198.18.0.0/15
     let class_e = o[0] >= 240; // 240.0.0.0/4
     cgnat || ietf_protocol || benchmarking || class_e
+}
+
+/// True if a Winlogon registry value carries its stock default (i.e. NOT attacker-modified).
+/// `value_name` is the registry value ("Shell"/"Userinit"); `command` is its data.
+/// Normalization tolerates case, surrounding whitespace, a single trailing comma (Windows
+/// writes `userinit.exe,`), and a leading %SystemRoot%/%windir% (expanded to c:\windows).
+/// Any appended payload, replacement, or wrong value name fails to match (fail-loud).
+pub fn winlogon_value_is_default(value_name: &str, command: &str) -> bool {
+    let norm = normalize_winlogon_command(command);
+    match value_name {
+        "Shell" => norm == WINLOGON_SHELL_DEFAULT,
+        "Userinit" => WINLOGON_USERINIT_DEFAULTS.contains(&norm.as_str()),
+        _ => false,
+    }
+}
+
+/// Lowercase, trim, strip a single trailing comma, expand a leading %SystemRoot%/%windir%.
+fn normalize_winlogon_command(command: &str) -> String {
+    let mut s = command.trim().to_ascii_lowercase();
+    if let Some(stripped) = s.strip_suffix(',') {
+        s = stripped.to_string();
+    }
+    for var in ["%systemroot%", "%windir%"] {
+        if let Some(rest) = s.strip_prefix(var) {
+            s = format!(r"c:\windows{rest}");
+            break;
+        }
+    }
+    s
 }
 
 /// Accumulates weighted signals + human-readable reasons + ATT&CK tags for one finding.
@@ -159,5 +213,62 @@ mod tests {
         assert_eq!(s.weight, 90);
         assert_eq!(s.reasons.len(), 2);
         assert_eq!(s.mitre, vec!["T1059", "T1059.001"]); // deduped, insertion order
+    }
+
+    #[test]
+    fn winlogon_default_shell_matches() {
+        assert!(winlogon_value_is_default("Shell", "explorer.exe"));
+        assert!(winlogon_value_is_default("Shell", "  explorer.exe  ")); // trimmed
+        assert!(winlogon_value_is_default("Shell", "EXPLORER.EXE")); // case-insensitive
+    }
+
+    #[test]
+    fn winlogon_default_userinit_matches_variants() {
+        // trailing comma (Windows writes "userinit.exe,") + case
+        assert!(winlogon_value_is_default(
+            "Userinit",
+            r"C:\WINDOWS\system32\userinit.exe,"
+        ));
+        // env-var form expands to C:\Windows
+        assert!(winlogon_value_is_default(
+            "Userinit",
+            r"%SystemRoot%\system32\userinit.exe"
+        ));
+        // bare-name form
+        assert!(winlogon_value_is_default("Userinit", "userinit.exe"));
+    }
+
+    #[test]
+    fn trusted_appdata_location_is_local_programs_only() {
+        assert!(is_trusted_appdata_location(
+            r"C:\Users\bosen\AppData\Local\Programs\Notion\Notion.exe"
+        ));
+        assert!(is_trusted_appdata_location(
+            r"c:\users\x\appdata\local\programs\warp\warp.exe"
+        )); // case-insensitive
+            // NOT trusted: droppers favor Temp / Roaming / other AppData subpaths
+        assert!(!is_trusted_appdata_location(
+            r"C:\Users\x\AppData\Local\Temp\e.exe"
+        ));
+        assert!(!is_trusted_appdata_location(
+            r"C:\Users\x\AppData\Roaming\e.exe"
+        ));
+        assert!(!is_trusted_appdata_location(r"C:\Program Files\App\a.exe"));
+    }
+
+    #[test]
+    fn winlogon_tampered_values_do_not_match() {
+        // appended payload (the classic attack) — must NOT match
+        assert!(!winlogon_value_is_default("Shell", "explorer.exe,evil.exe"));
+        assert!(!winlogon_value_is_default(
+            "Userinit",
+            r"C:\WINDOWS\system32\userinit.exe,evil.exe"
+        ));
+        // replaced shell
+        assert!(!winlogon_value_is_default("Shell", r"C:\Temp\x.exe"));
+        // wrong value name (a userinit string under the Shell name)
+        assert!(!winlogon_value_is_default("Shell", "userinit.exe"));
+        // unknown value name
+        assert!(!winlogon_value_is_default("Notify", "explorer.exe"));
     }
 }
