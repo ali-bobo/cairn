@@ -478,6 +478,15 @@ fn read_services() -> Vec<PersistenceRecord> {
     win::read_services()
 }
 
+#[cfg(not(windows))]
+fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
+    vec![]
+}
+#[cfg(windows)]
+fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
+    win::read_scheduled_tasks()
+}
+
 /// Startup folders: per-user (%APPDATA%) and All Users (%PROGRAMDATA%) Startup dirs.
 /// Reads the real process env; delegates to the testable core. Read-only.
 fn read_startup_folders() -> Vec<PersistenceRecord> {
@@ -702,6 +711,50 @@ mod win {
         }
         out
     }
+
+    /// Walk %SystemRoot%\System32\Tasks recursively; parse each task XML into records.
+    /// Best-effort + graceful: an ACL-blocked root (non-admin) or unreadable file yields
+    /// nothing rather than an error. Read-only.
+    pub fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
+        let root = std::env::var("SystemRoot")
+            .map(|r| format!(r"{r}\System32\Tasks"))
+            .unwrap_or_else(|_| r"C:\Windows\System32\Tasks".to_string());
+        let mut out = Vec::new();
+        walk_tasks(std::path::Path::new(&root), &mut out);
+        out
+    }
+
+    fn walk_tasks(dir: &std::path::Path, out: &mut Vec<PersistenceRecord>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return; // ACL-blocked or missing: graceful empty
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk_tasks(&path, out);
+            } else if path.is_file() {
+                let Ok(xml) = std::fs::read_to_string(&path) else {
+                    continue; // unreadable file: skip
+                };
+                let file_name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let last_write = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .map(chrono::DateTime::<chrono::Utc>::from);
+                out.extend(super::task_records_from_xml(
+                    &xml,
+                    &file_name,
+                    last_write,
+                    |name| std::env::var(name).ok(),
+                    |p| std::path::Path::new(p).exists(),
+                ));
+            }
+        }
+    }
 }
 
 /// A verifier that never verifies (always None). Cross-platform default + test default; on
@@ -762,6 +815,7 @@ impl Collector for PersistCollector {
         records.extend(read_winlogon());
         records.extend(read_ifeo());
         records.extend(read_startup_folders());
+        records.extend(read_scheduled_tasks());
         apply_signatures(&mut records, self.verifier.as_ref());
         Ok(records.into_iter().map(Record::Persistence).collect())
     }
@@ -769,7 +823,7 @@ impl Collector for PersistCollector {
     fn sources(&self) -> Vec<SourceEntry> {
         vec![SourceEntry {
             artifact: "persistence".into(),
-            path: "live:registry+startup".into(),
+            path: "live:registry+startup+tasks".into(),
             method: "api".into(),
             size: 0,
             sha256: String::new(), // a live registry/folder read is not a byte stream (spec §5)
