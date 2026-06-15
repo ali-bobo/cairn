@@ -203,10 +203,18 @@ fn enrich_hashes(
                         .is_some_and(|bp| file_paths.contains(bp));
                 if let Some(bp) = p.binary_path.as_deref().filter(|_| matched) {
                     p.binary_sha256 = hash_fn(bp);
+                    if p.binary_sha256.is_none() {
+                        // Selected for hashing but unhashable (over the size cap, locked, or
+                        // unreadable). Surface it so the skip is auditable, not invisible.
+                        tracing::debug!(path = bp, "find-producing binary not hashed");
+                    }
                 }
             }
             Record::Process(p) if pids.contains(&p.pid) && is_absolute_path(&p.image) => {
                 p.binary_sha256 = hash_fn(&p.image);
+                if p.binary_sha256.is_none() {
+                    tracing::debug!(path = %p.image, "find-producing binary not hashed");
+                }
             }
             _ => {}
         }
