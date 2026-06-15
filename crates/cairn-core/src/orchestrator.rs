@@ -138,6 +138,7 @@ mod tests {
             cmdline: String::new(),
             signed: None,
             signer: None,
+            binary_sha256: None,
             integrity: None,
             user: None,
             start_time: None,

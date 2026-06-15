@@ -46,6 +46,7 @@ pub struct ProcessRecord {
     pub cmdline: String,
     pub signed: Option<bool>,
     pub signer: Option<String>,
+    pub binary_sha256: Option<String>,
     pub integrity: Option<String>,
     pub user: Option<String>,
     pub start_time: Option<DateTime<Utc>>,
@@ -156,6 +157,7 @@ mod tests {
             cmdline: "C:\\a.exe".into(),
             signed: Some(true),
             signer: Some("Google LLC".into()),
+            binary_sha256: None,
             integrity: None,
             user: None,
             start_time: None,
@@ -163,6 +165,25 @@ mod tests {
         let j = serde_json::to_string(&r).unwrap();
         let back: ProcessRecord = serde_json::from_str(&j).unwrap();
         assert_eq!(back.signer.as_deref(), Some("Google LLC"));
+    }
+
+    #[test]
+    fn process_record_binary_sha256_roundtrips() {
+        let r = ProcessRecord {
+            pid: 1,
+            ppid: 0,
+            image: "C:\\a.exe".into(),
+            cmdline: "C:\\a.exe".into(),
+            signed: Some(true),
+            signer: Some("V".into()),
+            binary_sha256: Some("ba7816bf".into()),
+            integrity: None,
+            user: None,
+            start_time: None,
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        let back: ProcessRecord = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.binary_sha256.as_deref(), Some("ba7816bf"));
     }
 
     fn sample_event() -> EventRecord {
