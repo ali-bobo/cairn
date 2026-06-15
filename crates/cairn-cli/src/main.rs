@@ -221,6 +221,20 @@ fn enrich_hashes(
     }
 }
 
+/// The collector names that the run arm's construction `if` blocks would build for
+/// this selection, in canonical order. Pure mirror of those blocks, so the
+/// selection→collectors mapping is unit-testable without a live Windows host.
+/// MUST stay in sync with the run arm's three `if ... push(...)` blocks
+/// (proc/net/persist, in that order).
+#[cfg(test)]
+fn built_collector_names(selected: &[String]) -> Vec<String> {
+    ["proc", "net", "persist"]
+        .iter()
+        .filter(|n| selected.iter().any(|m| m == *n))
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Dump collected Records as JSONL so a live run produces usable data even before
 /// analyzers exist. One Record per line (the internal bus type; versioned by schema::RECORD).
 fn write_records_jsonl(
@@ -761,6 +775,23 @@ mod tests {
             p1.binary_sha256, None,
             "benign record (no finding) not hashed"
         );
+    }
+
+    #[test]
+    fn selected_collector_names_follow_selection() {
+        use cairn_core::{select_modules, Profile};
+        const AVAILABLE: &[&str] = &["proc", "net", "persist"];
+
+        // --only persist => only persist constructed.
+        let only = vec!["persist".to_string()];
+        let sel = select_modules(Profile::Standard, Some(&only), AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert_eq!(built, vec!["persist".to_string()]);
+
+        // no --only => all three, in canonical order.
+        let sel = select_modules(Profile::Standard, None, AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert_eq!(built, vec!["proc", "net", "persist"]);
     }
 
     #[test]
