@@ -494,6 +494,23 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }
 
+            // S2-L: parse --profile into the typed enum FIRST; an invalid value is a
+            // clean CLI error (exit non-zero) before we create any output or start a
+            // run — not a silent Standard fallback.
+            let profile: cairn_core::Profile = args
+                .profile
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?;
+
+            // S2-L: --only is a comma-separated allow-list. None => no restriction.
+            let only: Option<Vec<String>> = args.only.as_deref().map(|csv| {
+                csv.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            });
+
             // --dry-run (FR16 / golden rule 4): write NOTHING. No output dir, no run.log file,
             // no records/findings/manifest — logs go to stderr and we print a summary only.
             let dry_run = args.dry_run;
@@ -539,12 +556,37 @@ fn main() -> anyhow::Result<()> {
                 "unknown".into()
             });
 
+            // S2-L: decide which collectors run. AVAILABLE = the live collectors' real
+            // Collector::name() strings. Pure decision; logged for transparency (FR6).
+            const AVAILABLE: &[&str] = &["proc", "net", "persist"];
+            let selection = cairn_core::select_modules(profile, only.as_deref(), AVAILABLE);
+            for name in &selection.unknown_only {
+                tracing::warn!(
+                    only = %name,
+                    "--only names a module that is not an available live collector; ignoring it"
+                );
+            }
+            tracing::info!(
+                profile = %args.profile.to_ascii_lowercase(),
+                modules = %selection.selected.join(","),
+                "collector selection"
+            );
+
             let cfg = Config::default();
-            let collectors: Vec<Box<dyn Collector>> = vec![
-                Box::new(cairn_collectors::proc::ProcCollector::default()),
-                Box::new(cairn_collectors::net::NetCollector),
-                Box::new(cairn_collectors::persist::PersistCollector::default()),
-            ];
+            // S2-L: construct only the selected collectors, matching the real
+            // Collector::name() strings; order follows AVAILABLE (deterministic).
+            let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
+            if selection.selected.iter().any(|m| m == "proc") {
+                collectors.push(Box::new(cairn_collectors::proc::ProcCollector::default()));
+            }
+            if selection.selected.iter().any(|m| m == "net") {
+                collectors.push(Box::new(cairn_collectors::net::NetCollector));
+            }
+            if selection.selected.iter().any(|m| m == "persist") {
+                collectors.push(Box::new(
+                    cairn_collectors::persist::PersistCollector::default(),
+                ));
+            }
             let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
                 Box::new(cairn_heur::NetConnHeuristic),
@@ -596,8 +638,8 @@ fn main() -> anyhow::Result<()> {
                     cmdline: std::env::args().collect::<Vec<_>>().join(" "),
                     operator: String::new(),
                     case_id: String::new(),
-                    profile: String::new(),       // set in Task 4
-                    selected_modules: Vec::new(), // set in Task 4
+                    profile: args.profile.to_ascii_lowercase(),
+                    selected_modules: selection.selected.clone(),
                 },
                 host: HostInfo {
                     hostname: outcome.hostname.clone(),
