@@ -20,6 +20,25 @@ pub enum Profile {
     Verbose,
 }
 
+impl std::str::FromStr for Profile {
+    /// A human-readable message (the bad value + the valid set), surfaced to the
+    /// CLI user. `cairn-core` libs use `CairnError`, but `--profile` parsing is a
+    /// pure string→enum mapping with no I/O; a `String` message keeps it dependency-
+    /// free and lets the CLI present it directly.
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "minimal" => Ok(Profile::Minimal),
+            "standard" => Ok(Profile::Standard),
+            "verbose" => Ok(Profile::Verbose),
+            other => Err(format!(
+                "unknown profile '{other}'; valid profiles: minimal, standard, verbose"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OutputKind {
     Dir(PathBuf),
@@ -122,5 +141,29 @@ mod tests {
         );
         let cfg = cfg.with_rules_plain(true);
         assert!(cfg.rules_plain);
+    }
+
+    #[test]
+    fn profile_from_str_parses_known_values_case_insensitively() {
+        assert_eq!("minimal".parse::<Profile>().unwrap(), Profile::Minimal);
+        assert_eq!("standard".parse::<Profile>().unwrap(), Profile::Standard);
+        assert_eq!("verbose".parse::<Profile>().unwrap(), Profile::Verbose);
+        // case-insensitive: an analyst typing --profile MINIMAL still works.
+        assert_eq!("MINIMAL".parse::<Profile>().unwrap(), Profile::Minimal);
+        assert_eq!("Standard".parse::<Profile>().unwrap(), Profile::Standard);
+    }
+
+    #[test]
+    fn profile_from_str_rejects_unknown_value() {
+        let err = "bogus".parse::<Profile>().unwrap_err();
+        // The error names the bad value AND the valid set (a usable CLI error).
+        assert!(
+            err.contains("bogus"),
+            "error should echo the bad value: {err}"
+        );
+        assert!(
+            err.contains("minimal") && err.contains("standard") && err.contains("verbose"),
+            "error should list valid profiles: {err}"
+        );
     }
 }

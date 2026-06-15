@@ -18,12 +18,14 @@ pub mod finding;
 pub mod manifest;
 pub mod orchestrator;
 pub mod record;
+pub mod selection;
 pub mod traits;
 
 pub use config::{Config, OutputKind, Profile, Target};
 pub use finding::{Entity, Finding, FindingSource, Severity};
 pub use manifest::{Manifest, SourceEntry};
 pub use record::Record;
+pub use selection::{select_modules, SelectionOutcome};
 pub use traits::{Analyzer, CollectCtx, Collector, OutputSink};
 
 use thiserror::Error;

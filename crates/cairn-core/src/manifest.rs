@@ -30,6 +30,11 @@ pub struct RunInfo {
     pub cmdline: String,
     pub operator: String,
     pub case_id: String,
+    /// The active run profile (minimal|standard|verbose) — transparency (FR6).
+    pub profile: String,
+    /// The collector modules actually selected for this run (S2-L). Empty is honest:
+    /// e.g. `--only nonexistent` ran no collectors.
+    pub selected_modules: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +98,8 @@ mod tests {
                 cmdline: "cairn evtx Security.evtx --rules ./rules".into(),
                 operator: "analyst".into(),
                 case_id: "IR-2026-001".into(),
+                profile: "standard".into(),
+                selected_modules: vec!["evtx".into()],
             },
             host: HostInfo {
                 hostname: "WS01".into(),
@@ -135,6 +142,24 @@ mod tests {
         assert_eq!(back.schema, "cairn.manifest/1");
         assert_eq!(back.tool.build_sha, "a0ed50a");
         assert_eq!(back.counts.findings_by_sev.get("critical"), Some(&1));
+    }
+
+    /// RunInfo round-trips the new profile + selected_modules fields through serde.
+    #[test]
+    fn run_info_round_trips_profile_and_modules() {
+        let ri = RunInfo {
+            started_utc: chrono::Utc::now(),
+            finished_utc: None,
+            cmdline: "cairn run --profile minimal --only persist".into(),
+            operator: String::new(),
+            case_id: String::new(),
+            profile: "minimal".into(),
+            selected_modules: vec!["persist".into()],
+        };
+        let json = serde_json::to_string(&ri).unwrap();
+        let back: RunInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.profile, "minimal");
+        assert_eq!(back.selected_modules, vec!["persist".to_string()]);
     }
 
     /// `SourceEntry.errors` defaults to empty when absent from JSON, so a manifest

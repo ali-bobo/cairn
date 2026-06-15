@@ -221,6 +221,20 @@ fn enrich_hashes(
     }
 }
 
+/// The collector names that the run arm's construction `if` blocks would build for
+/// this selection, in canonical order. Pure mirror of those blocks, so the
+/// selection→collectors mapping is unit-testable without a live Windows host.
+/// MUST stay in sync with the run arm's three `if ... push(...)` blocks
+/// (proc/net/persist, in that order).
+#[cfg(test)]
+fn built_collector_names(selected: &[String]) -> Vec<String> {
+    ["proc", "net", "persist"]
+        .iter()
+        .filter(|n| selected.iter().any(|m| m == *n))
+        .map(|s| s.to_string())
+        .collect()
+}
+
 /// Dump collected Records as JSONL so a live run produces usable data even before
 /// analyzers exist. One Record per line (the internal bus type; versioned by schema::RECORD).
 fn write_records_jsonl(
@@ -289,6 +303,10 @@ fn build_manifest(cfg: &Config, hostname: &str, records: u64, findings: &[Findin
             cmdline: std::env::args().collect::<Vec<_>>().join(" "),
             operator: cfg.operator.clone(),
             case_id: cfg.case_id.clone(),
+            // The evtx subcommand parses EVTX with the default profile; it runs no
+            // live collectors, so the selected module is the evtx engine itself.
+            profile: "standard".into(),
+            selected_modules: vec!["evtx".into()],
         },
         host: HostInfo {
             hostname: hostname.to_string(),
@@ -490,6 +508,23 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }
 
+            // S2-L: parse --profile into the typed enum FIRST; an invalid value is a
+            // clean CLI error (exit non-zero) before we create any output or start a
+            // run — not a silent Standard fallback.
+            let profile: cairn_core::Profile = args
+                .profile
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?;
+
+            // S2-L: --only is a comma-separated allow-list. None => no restriction.
+            let only: Option<Vec<String>> = args.only.as_deref().map(|csv| {
+                csv.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            });
+
             // --dry-run (FR16 / golden rule 4): write NOTHING. No output dir, no run.log file,
             // no records/findings/manifest — logs go to stderr and we print a summary only.
             let dry_run = args.dry_run;
@@ -535,12 +570,37 @@ fn main() -> anyhow::Result<()> {
                 "unknown".into()
             });
 
+            // S2-L: decide which collectors run. AVAILABLE = the live collectors' real
+            // Collector::name() strings. Pure decision; logged for transparency (FR6).
+            const AVAILABLE: &[&str] = &["proc", "net", "persist"];
+            let selection = cairn_core::select_modules(profile, only.as_deref(), AVAILABLE);
+            for name in &selection.unknown_only {
+                tracing::warn!(
+                    only = %name,
+                    "--only names a module that is not an available live collector; ignoring it"
+                );
+            }
+            tracing::info!(
+                profile = %args.profile.to_ascii_lowercase(),
+                modules = %selection.selected.join(","),
+                "collector selection"
+            );
+
             let cfg = Config::default();
-            let collectors: Vec<Box<dyn Collector>> = vec![
-                Box::new(cairn_collectors::proc::ProcCollector::default()),
-                Box::new(cairn_collectors::net::NetCollector),
-                Box::new(cairn_collectors::persist::PersistCollector::default()),
-            ];
+            // S2-L: construct only the selected collectors, matching the real
+            // Collector::name() strings; order follows AVAILABLE (deterministic).
+            let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
+            if selection.selected.iter().any(|m| m == "proc") {
+                collectors.push(Box::new(cairn_collectors::proc::ProcCollector::default()));
+            }
+            if selection.selected.iter().any(|m| m == "net") {
+                collectors.push(Box::new(cairn_collectors::net::NetCollector));
+            }
+            if selection.selected.iter().any(|m| m == "persist") {
+                collectors.push(Box::new(
+                    cairn_collectors::persist::PersistCollector::default(),
+                ));
+            }
             let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
                 Box::new(cairn_heur::NetConnHeuristic),
@@ -592,6 +652,8 @@ fn main() -> anyhow::Result<()> {
                     cmdline: std::env::args().collect::<Vec<_>>().join(" "),
                     operator: String::new(),
                     case_id: String::new(),
+                    profile: args.profile.to_ascii_lowercase(),
+                    selected_modules: selection.selected.clone(),
                 },
                 host: HostInfo {
                     hostname: outcome.hostname.clone(),
@@ -713,6 +775,23 @@ mod tests {
             p1.binary_sha256, None,
             "benign record (no finding) not hashed"
         );
+    }
+
+    #[test]
+    fn selected_collector_names_follow_selection() {
+        use cairn_core::{select_modules, Profile};
+        const AVAILABLE: &[&str] = &["proc", "net", "persist"];
+
+        // --only persist => only persist constructed.
+        let only = vec!["persist".to_string()];
+        let sel = select_modules(Profile::Standard, Some(&only), AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert_eq!(built, vec!["persist".to_string()]);
+
+        // no --only => all three, in canonical order.
+        let sel = select_modules(Profile::Standard, None, AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert_eq!(built, vec!["proc", "net", "persist"]);
     }
 
     #[test]
