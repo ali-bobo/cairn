@@ -415,6 +415,8 @@ mod tests {
                 cmdline: "cairn evtx x.evtx".into(),
                 operator: String::new(),
                 case_id: String::new(),
+                profile: "standard".into(),
+                selected_modules: vec!["evtx".into()],
             },
             host: HostInfo {
                 hostname: "WS01".into(),

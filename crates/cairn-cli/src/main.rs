@@ -289,6 +289,10 @@ fn build_manifest(cfg: &Config, hostname: &str, records: u64, findings: &[Findin
             cmdline: std::env::args().collect::<Vec<_>>().join(" "),
             operator: cfg.operator.clone(),
             case_id: cfg.case_id.clone(),
+            // The evtx subcommand parses EVTX with the default profile; it runs no
+            // live collectors, so the selected module is the evtx engine itself.
+            profile: "standard".into(),
+            selected_modules: vec!["evtx".into()],
         },
         host: HostInfo {
             hostname: hostname.to_string(),
@@ -592,6 +596,8 @@ fn main() -> anyhow::Result<()> {
                     cmdline: std::env::args().collect::<Vec<_>>().join(" "),
                     operator: String::new(),
                     case_id: String::new(),
+                    profile: String::new(),       // set in Task 4
+                    selected_modules: Vec::new(), // set in Task 4
                 },
                 host: HostInfo {
                     hostname: outcome.hostname.clone(),
