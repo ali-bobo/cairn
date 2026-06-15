@@ -136,27 +136,53 @@ in `selection.rs` (initially `["mft"]`), and `profile_base(Minimal, available)` 
 set. When S2-N/O/P add `"mft_macb"`/`"usn"`/`"hive"` to `RAW_NTFS`, `minimal` skips them with
 no further change.
 
-### ② Attacker view: malformed NTFS as a DoS vector (CLAUDE.md hard requirement)
+### ② Attacker view: malformed NTFS as a DoS vector — MEASURED, must be closed
 
 **Entry point:** the raw bytes of the on-disk NTFS structures. On a compromised host the
 attacker may control `$MFT` content — a deliberately corrupt MFT (huge attribute-length
-fields, cyclic references, absurd record counts) could drive a parser to OOM or an infinite
-loop. For a tool whose explicit promise is "don't take the production host down" (SRS §19),
-that is a denial-of-service against the responder.
+fields, cyclic references, absurd record counts) or a source that short-reads mid-parse
+could drive a parser to panic / OOM / infinite-loop. For a tool whose explicit promise is
+"don't take the production host down" (SRS §19), that is a denial-of-service against the
+responder. User directive for S2-M: **the raw read must NOT become an exploitable vuln.**
 
-**Mitigations in S2-M:**
-- The `ntfs` crate's behaviour on malformed input (panic vs `Err`) is **TASK-0 verification**
-  — we do not assume it is robust.
-- `VolumeReader` caps single-read size (above).
-- The mft collector caps the number of records it will iterate (a configurable ceiling;
-  default generous but finite) — the minimal NFR10 nod. Hitting the cap is recorded as a
-  `SourceEntry` note ("record cap reached"), not a panic.
-- Any parse error → `Err(Collector{..})`, never `panic!` (matches the existing collector
-  convention; the orchestrator degrades gracefully).
+**MEASURED, not assumed (probe run 2026-06-16, `ntfs` 0.4.0, throwaway project, 6 hostile
+inputs through `Ntfs::new` + root-dir iteration, each in a worker thread with a 5s timeout
+and `catch_unwind`):**
 
-**Residual risk:** a malformed volume could still slow the run before the cap trips; the full
-circuit breaker / RAM ceiling (NFR10) that bounds wall-clock + peak RAM under adversarial
-input is S2-N's job, not fully closed here. Documented, not hidden.
+| hostile input | result |
+|---|---|
+| empty reader | **PANIC** (`unreachable!` at ntfs-0.4.0 `error.rs:236`, via "failed to fill whole buffer" parsing `bootjmp`) |
+| truncated (3 bytes) | **PANIC** (same bug, field `oem_name`) |
+| all-zero 512B / 1MiB | clean `Err` (boot signature check) |
+| random garbage 4096B | clean `Err` (boot signature check) |
+| fake "NTFS" sig + absurd geometry (length-field attack: $MFT LCN = u64::MAX, sector size 65535) | clean `Err` ("sector size … needs 512–4096") |
+
+**Verdict:** `ntfs` 0.4 is robust against malformed *content* (every length-field / garbage /
+absurd-geometry case returned a clean `Err`; NO timeout ⇒ no infinite-loop risk) **EXCEPT it
+panics — via its own `unreachable!()` — when the reader is too short to fill a boot sector.**
+That panic is a real DoS path: the orchestrator degrades on `Err` but a panic would unwind
+past it. The bug is in the dependency, not our code (the original spec wrongly assumed "any
+error → Err"). It is fully closeable because it has exactly one trigger: a short read.
+
+**Mitigations in S2-M (BOTH required — defense in depth):**
+- **(a) Length pre-check at the VolumeReader/collector seam — eliminates the only panic
+  trigger.** Before calling `Ntfs::new`, confirm the source yields at least one full boot
+  sector (read the first sector; a short read → `Err(Collector{..})`, never call `ntfs`).
+  This removes the short-read path entirely.
+- **(b) `catch_unwind` around the `ntfs` parse in the mft collector — defense in depth.** Even
+  if `ntfs` panics somewhere unforeseen, wrap the parse so a panic becomes `Err(Collector{..})`
+  and never escapes the collector. The probe proved `catch_unwind` cleanly contains this exact
+  panic (the process did not crash; verdicts printed). The `unsafe`-free collector may use
+  `std::panic::catch_unwind`; document why (containing a third-party panic, not hiding our own).
+- **(c) `VolumeReader` caps single-read size** (≤ 1 MiB block; above).
+- **(d) The collector caps records iterated** (finite ceiling; "record cap reached" recorded as
+  a `SourceEntry` note, not a panic) — the minimal NFR10 nod.
+- **(e) Any parse error → `Err(Collector{..})`, never `panic!`** in our own code.
+
+**Residual risk:** a malformed volume could still slow the run before the record cap trips; the
+full circuit breaker / RAM + wall-clock ceiling (NFR10) under adversarial input is S2-N's job,
+not fully closed here. Documented, not hidden. A future `ntfs` upgrade should be re-probed in
+case the short-read panic is fixed (then (b) becomes pure belt-and-suspenders).
 
 ### ③ Streaming from day one (SRS §2 memory model, "MFT iterate")
 
@@ -180,7 +206,9 @@ the start.
 ## Error handling
 
 - Volume open failure (not elevated, volume missing, off-platform) → `Err`, degrade.
-- `ntfs` parse failure → `Err(Collector{..})`, degrade, never panic.
+- `ntfs` parse failure → `Err(Collector{..})`, degrade, never panic. A short read (the one
+  measured `ntfs` 0.4 panic trigger, §②) is prevented by the boot-sector length pre-check AND
+  contained by `catch_unwind` if it ever fires elsewhere.
 - Off-platform (`cfg(not(windows))`) → `VolumeReader::open` returns `Err(Unsupported)`; the
   collector degrades; the workspace still compiles + tests on Linux CI.
 - Determinism (NFR4): "first N file names" must be taken in a deterministic order (by MFT
@@ -195,23 +223,30 @@ the start.
 - **Explainability**: the `Record::FileMeta` provenance + the `SourceEntry { method:"raw_ntfs" }`
   make it auditable what was read and how.
 
-## TASK-0 verification items (must be resolved by the FIRST plan task, before building)
+## TASK-0 verification items
 
-These are **not assumptions to encode** — they are unknowns to settle empirically with a
-throwaway probe (`cargo add ntfs`, a tiny `main`), because I have not compiled `ntfs` 0.4:
+**Already settled by the 2026-06-16 throwaway probe (`ntfs` 0.4.0) — do NOT re-litigate:**
 
-1. Does `ntfs` 0.4 accept an arbitrary `&mut impl Read + Seek` (our `VolumeReader`), and what
-   is the exact API to (a) construct, (b) reach `$MFT`, (c) iterate records, (d) get a file
-   name? Confirm it does NOT self-open the volume.
-2. Does `ntfs` 0.4 return `Result` (not panic) on a truncated/garbage reader? Probe with a
-   deliberately bad reader.
+1. ✅ `ntfs` 0.4 accepts an arbitrary `&mut impl Read + Seek` and does NOT self-open the volume
+   (`Ntfs::new(&mut cur)` over a `Cursor`). Entry path: `Ntfs::new` → `root_directory(&mut r)`
+   → `directory_index(&mut r)` → `.entries()` → `entries.next(&mut r)`. All return `Result` /
+   `Option<Result>`. (The exact `$MFT`-iteration call used for the record COUNT — vs. the
+   directory walk the probe used — is the one remaining API detail to pin in the first build
+   task; the reader-injection question is settled.)
+2. ✅/⚠️ It returns clean `Err` on garbage/length-field/absurd-geometry input, BUT **panics on a
+   short read** (reader smaller than one boot sector) via its own `unreachable!()`. This is why
+   §② mandates BOTH the boot-sector length pre-check AND `catch_unwind`. (Settled — the panic is
+   characterized, not just suspected.)
+
+**Still to settle in the first build task (Windows-only, can't probe on this dev box cheaply):**
+
 3. The exact WinAPI to query the volume's logical sector size (which `windows` crate feature).
-   If costly/unavailable, fall back to fixed 4096-aligned blocks.
-4. Whether reaching `$MFT` requires us to parse the boot sector for the MFT cluster, or `ntfs`
-   does it from the volume start. (Expected: `ntfs` handles it, but verify.)
+   If costly/unavailable, fall back to fixed 4096-aligned blocks (a multiple of 512).
+4. Whether reaching `$MFT` for the count requires parsing the boot sector for the MFT cluster,
+   or `ntfs` exposes it from the volume start. (Expected: `ntfs` handles it; verify on Windows.)
 
-If TASK-0 shows `ntfs` 0.4 cannot eat an external `Read+Seek` or panics on bad input, STOP and
-revisit crate choice (`ntfs-forensic`/`ntfs-reader`) before writing the collector.
+If a future build task finds `ntfs` 0.4 cannot reach `$MFT` from an external `Read+Seek` on a
+real volume, STOP and revisit crate choice (`ntfs-forensic`/`ntfs-reader`) before the collector.
 
 ## Testing
 
@@ -226,6 +261,11 @@ revisit crate choice (`ntfs-forensic`/`ntfs-reader`) before writing the collecto
   access attempted). The streaming/count logic is unit-tested by feeding `ntfs` a small
   synthetic NTFS image fixture IF one is feasible; otherwise the count path is covered by the
   e2e (documented honestly — no fake-passing test).
+- **not-exploitable (unit, any platform — the user-directive gate):** the parse helper, given a
+  short/truncated/empty in-memory source, returns `Err` and does NOT panic out. This exercises
+  both the boot-sector length pre-check (a) and the `catch_unwind` containment (b) — feed a
+  `Cursor` of < one sector and a 3-byte `Cursor` (the two probe inputs that panicked raw) and
+  assert `Err`, no panic escapes.
 - **cli wiring (smoke):** `built_collector_names` mirror includes `"mft"` when selected;
   `--profile minimal` excludes it; `--only mft` includes only it.
 - **e2e (manual, Windows, ELEVATED — the new gate):**
@@ -247,6 +287,11 @@ revisit crate choice (`ntfs-forensic`/`ntfs-reader`) before writing the collecto
   `#![forbid(unsafe_code)]`. The unsafe is confined to `volume.rs` and every `unsafe` block
   carries a `// SAFETY:` justifying it.
 - `CreateFileW` verified read-only (`GENERIC_READ` + `OPEN_EXISTING`, no write flag) at review.
+- **Not-exploitable gate (user directive):** the measured `ntfs` 0.4 short-read panic (§②) is
+  closed by BOTH (a) a boot-sector length pre-check before `Ntfs::new` AND (b) `catch_unwind`
+  around the parse — with a unit test proving a deliberately short/truncated source yields
+  `Err`, never a panic that escapes the collector. No panic may unwind past the mft collector
+  for ANY input.
 - Elevated e2e: a real raw-NTFS read produces `Record::FileMeta`; non-elevated degrades with a
   recorded reason; `--profile minimal` skips mft; `cairn verify` passes; earlier stages
   unchanged.
