@@ -161,6 +161,58 @@ fn finding_tiebreak(f: &cairn_core::Finding) -> u32 {
     }
 }
 
+/// FR14: fill `binary_sha256` on the records that produced a finding, using an injected hasher.
+///
+/// Records are matched to findings by a STABLE KEY (not fragile path comparison):
+/// registry-backed persistence finding -> (entity.registry.key, entity.registry.value) matches
+/// PersistenceRecord (location, value); startup file finding -> entity.file.path matches the
+/// persistence record's binary_path; process finding -> entity.process.pid matches
+/// ProcessRecord pid. Only matched records with a binary_path / absolute image are hashed.
+/// Findings count is small (triage), so the linear scans are cheap.
+fn enrich_hashes(
+    records: &mut [cairn_core::record::Record],
+    findings: &[cairn_core::Finding],
+    hash_fn: impl Fn(&str) -> Option<String>,
+) {
+    use cairn_collectors::proc::is_absolute_path;
+    use cairn_core::record::Record;
+    use std::collections::HashSet;
+
+    let mut reg_keys: HashSet<(String, String)> = HashSet::new();
+    let mut file_paths: HashSet<String> = HashSet::new();
+    let mut pids: HashSet<u32> = HashSet::new();
+    for f in findings {
+        if let Some(r) = &f.entity.registry {
+            reg_keys.insert((r.key.clone(), r.value.clone()));
+        }
+        if let Some(fi) = &f.entity.file {
+            file_paths.insert(fi.path.clone());
+        }
+        if let Some(p) = &f.entity.process {
+            pids.insert(p.pid);
+        }
+    }
+
+    for rec in records.iter_mut() {
+        match rec {
+            Record::Persistence(p) => {
+                let value = p.value.clone().unwrap_or_default();
+                let matched = reg_keys.contains(&(p.location.clone(), value))
+                    || p.binary_path
+                        .as_deref()
+                        .is_some_and(|bp| file_paths.contains(bp));
+                if let Some(bp) = p.binary_path.as_deref().filter(|_| matched) {
+                    p.binary_sha256 = hash_fn(bp);
+                }
+            }
+            Record::Process(p) if pids.contains(&p.pid) && is_absolute_path(&p.image) => {
+                p.binary_sha256 = hash_fn(&p.image);
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Dump collected Records as JSONL so a live run produces usable data even before
 /// analyzers exist. One Record per line (the internal bus type; versioned by schema::RECORD).
 fn write_records_jsonl(
@@ -493,6 +545,20 @@ fn main() -> anyhow::Result<()> {
                 f.host = outcome.hostname.clone();
             }
             sort_findings(&mut outcome.findings);
+            // FR14: hash the binaries behind findings (streaming, size-capped) and fill
+            // binary_sha256 so each suspicious record carries an IOC hash. In-memory only —
+            // for --dry-run nothing is written (golden rule 4).
+            enrich_hashes(&mut outcome.records, &outcome.findings, |path| {
+                cairn_collectors::hash::hash_file_capped(
+                    path,
+                    cairn_collectors::hash::DEFAULT_MAX_HASH_BYTES,
+                    |p| {
+                        let len = std::fs::metadata(p).ok()?.len();
+                        let file = std::fs::File::open(p).ok()?;
+                        Some((len, file))
+                    },
+                )
+            });
             tracing::info!(
                 records = outcome.records.len(),
                 findings = outcome.findings.len(),
@@ -586,6 +652,60 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enrich_hashes_fills_only_find_producing_records() {
+        use cairn_core::finding::EntityRegistry;
+        use cairn_core::record::{PersistenceRecord, Record};
+        use cairn_core::{Entity, Finding, FindingSource, Severity};
+
+        let mk = |value: &str, bin: &str| {
+            Record::Persistence(PersistenceRecord {
+                mechanism: "run_key".into(),
+                location: "HKCU\\Run".into(),
+                value: Some(value.into()),
+                command: Some(bin.into()),
+                binary_path: Some(bin.into()),
+                binary_sha256: None,
+                signed: None,
+                signer: None,
+                last_write: None,
+            })
+        };
+        let mut records = vec![mk("Evil", "C:\\evil.exe"), mk("Benign", "C:\\benign.exe")];
+
+        // A finding whose registry (key,value) matches record[0] only.
+        let mut f = Finding::new(
+            Severity::High,
+            "Suspicious persistence: run_key",
+            FindingSource::Heuristic,
+        );
+        f.entity = Entity {
+            registry: Some(EntityRegistry {
+                hive: "HKCU".into(),
+                key: "HKCU\\Run".into(),
+                value: "Evil".into(),
+                data: "C:\\evil.exe".into(),
+                last_write: None,
+            }),
+            ..Entity::default()
+        };
+        let findings = vec![f];
+
+        enrich_hashes(&mut records, &findings, |p| Some(format!("hash-of-{p}")));
+
+        let Record::Persistence(p0) = &records[0] else {
+            panic!()
+        };
+        let Record::Persistence(p1) = &records[1] else {
+            panic!()
+        };
+        assert_eq!(p0.binary_sha256.as_deref(), Some("hash-of-C:\\evil.exe"));
+        assert_eq!(
+            p1.binary_sha256, None,
+            "benign record (no finding) not hashed"
+        );
+    }
 
     #[test]
     fn findings_sort_is_deterministic_by_ts_then_title() {
