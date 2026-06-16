@@ -228,7 +228,7 @@ fn enrich_hashes(
 /// (proc/net/persist, in that order).
 #[cfg(test)]
 fn built_collector_names(selected: &[String]) -> Vec<String> {
-    ["proc", "net", "persist"]
+    ["proc", "net", "persist", "mft"]
         .iter()
         .filter(|n| selected.iter().any(|m| m == *n))
         .map(|s| s.to_string())
@@ -572,7 +572,7 @@ fn main() -> anyhow::Result<()> {
 
             // S2-L: decide which collectors run. AVAILABLE = the live collectors' real
             // Collector::name() strings. Pure decision; logged for transparency (FR6).
-            const AVAILABLE: &[&str] = &["proc", "net", "persist"];
+            const AVAILABLE: &[&str] = &["proc", "net", "persist", "mft"];
             let selection = cairn_core::select_modules(profile, only.as_deref(), AVAILABLE);
             for name in &selection.unknown_only {
                 tracing::warn!(
@@ -600,6 +600,9 @@ fn main() -> anyhow::Result<()> {
                 collectors.push(Box::new(
                     cairn_collectors::persist::PersistCollector::default(),
                 ));
+            }
+            if selection.selected.iter().any(|m| m == "mft") {
+                collectors.push(Box::new(cairn_collectors::mft::MftCollector));
             }
             let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
@@ -780,7 +783,7 @@ mod tests {
     #[test]
     fn selected_collector_names_follow_selection() {
         use cairn_core::{select_modules, Profile};
-        const AVAILABLE: &[&str] = &["proc", "net", "persist"];
+        const AVAILABLE: &[&str] = &["proc", "net", "persist", "mft"];
 
         // --only persist => only persist constructed.
         let only = vec!["persist".to_string()];
@@ -788,10 +791,22 @@ mod tests {
         let built = built_collector_names(&sel.selected);
         assert_eq!(built, vec!["persist".to_string()]);
 
-        // no --only => all three, in canonical order.
+        // no --only => all four in canonical order (minimal skips mft).
         let sel = select_modules(Profile::Standard, None, AVAILABLE);
         let built = built_collector_names(&sel.selected);
-        assert_eq!(built, vec!["proc", "net", "persist"]);
+        assert_eq!(built, vec!["proc", "net", "persist", "mft"]);
+
+        // --profile minimal must NOT select mft (raw-NTFS); standard must.
+        let sel = select_modules(Profile::Minimal, None, AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert!(
+            !built.contains(&"mft".to_string()),
+            "minimal skips raw-NTFS mft"
+        );
+
+        let sel = select_modules(Profile::Standard, None, AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert!(built.contains(&"mft".to_string()), "standard includes mft");
     }
 
     #[test]
