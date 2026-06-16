@@ -44,6 +44,57 @@ pub(crate) fn align_up(n: u64, align: u64) -> u64 {
     (n + align - 1) & !(align - 1)
 }
 
+// ── Sub-range / alignment window helper ──────────────────────────────────────
+
+/// Result of computing the sector-aligned window required for a logical read.
+///
+/// `FILE_FLAG_NO_BUFFERING` forces ReadFile to operate on sector-aligned
+/// offset+length pairs. This struct captures the exact window to issue to the
+/// kernel, and where within that window the caller's requested bytes begin.
+pub(crate) struct AlignedWindow {
+    /// Sector-aligned byte offset at which ReadFile must begin.
+    pub aligned_start: u64,
+    /// Sector-aligned byte offset at which ReadFile must end (exclusive).
+    /// `aligned_end - aligned_start` is the number of bytes to read.
+    pub aligned_end: u64,
+    /// Byte offset within the aligned buffer where the caller's data begins.
+    /// Slicing `buf[inner_offset .. inner_offset + requested]` yields exactly
+    /// the bytes that live at `[pos .. pos + requested]` on the volume.
+    pub inner_offset: usize,
+    /// Number of caller bytes requested (already clamped to MAX_READ and the
+    /// aligned window size by the caller before constructing this value).
+    pub requested: usize,
+}
+
+/// Compute the sector-aligned window needed to satisfy a logical read.
+///
+/// Given a logical byte position `pos`, the number of bytes the caller wants
+/// (`requested`), and the drive's physical `sector` size, returns an
+/// [`AlignedWindow`] describing:
+/// - The aligned `[aligned_start, aligned_end)` range to pass to ReadFile.
+/// - The `inner_offset` into the resulting buffer where the caller's bytes begin.
+///
+/// This function is pure (no I/O, no host state) and is the sole place where
+/// the alignment arithmetic lives, making it independently testable without a
+/// real volume handle.
+///
+/// # Panics (debug only)
+/// `sector` must be a power of two. Violating this triggers a `debug_assert!`
+/// inside `align_down` / `align_up`.
+#[inline]
+pub(crate) fn compute_aligned_window(pos: u64, requested: usize, sector: u64) -> AlignedWindow {
+    let end = pos + requested as u64;
+    let aligned_start = align_down(pos, sector);
+    let aligned_end = align_up(end, sector);
+    let inner_offset = (pos - aligned_start) as usize;
+    AlignedWindow {
+        aligned_start,
+        aligned_end,
+        inner_offset,
+        requested,
+    }
+}
+
 // ── Non-Windows stub ──────────────────────────────────────────────────────────
 
 #[cfg(not(windows))]
@@ -92,7 +143,7 @@ mod imp {
 
 #[cfg(windows)]
 mod imp {
-    use super::{align_down, align_up, io};
+    use super::{compute_aligned_window, io};
     use cairn_core::{CairnError, Result};
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, GENERIC_READ, HANDLE};
@@ -161,6 +212,22 @@ mod imp {
             // OPEN_EXISTING (never creates), and FILE_SHARE_READ|FILE_SHARE_WRITE so
             // we do not block concurrent access to the live volume. The returned handle
             // is wrapped in VolumeHandle immediately, so it is always closed on error.
+            //
+            // FILE_FLAG_NO_BUFFERING — deliberate forensic choice (golden rule 4):
+            //   This flag tells the kernel to bypass the Windows file-system cache
+            //   entirely. Raw volume reads therefore do NOT populate or pollute the
+            //   target host's page cache — minimising our forensic footprint and
+            //   preserving the cache state that a memory-forensics pass might examine.
+            //   The trade-off is a strict kernel-level constraint: both the file
+            //   offset and the read length passed to ReadFile MUST be exact multiples
+            //   of the physical sector size (typically 512 B or 4096 B). This is
+            //   exactly why every call goes through `compute_aligned_window` before
+            //   reaching `read_aligned`: the helper computes the enclosing
+            //   sector-aligned window and the byte offset within it where the
+            //   caller's requested range begins, so we always issue sector-aligned
+            //   ReadFile calls while returning the precise sub-range the caller asked
+            //   for. The correctness of that math is proven by the
+            //   `volume::tests::subrange_*` unit tests.
             let raw = unsafe {
                 CreateFileW(
                     PCWSTR(wide.as_ptr()),
@@ -241,31 +308,28 @@ mod imp {
             }
 
             let requested = buf.len().min(MAX_READ);
-            let end = self.pos + requested as u64;
 
-            let aligned_start = align_down(self.pos, self.sector);
-            let aligned_end = align_up(end, self.sector);
-            let aligned_len = (aligned_end - aligned_start) as usize;
+            // Delegate all alignment arithmetic to the pure helper so that
+            // the window math can be tested independently of the I/O path.
+            let w = compute_aligned_window(self.pos, requested, self.sector);
+            let aligned_len = (w.aligned_end - w.aligned_start) as usize;
 
             // Allocate the aligned window buffer (zeroed).
             let mut tmp = vec![0u8; aligned_len];
-            let n = self.read_aligned(aligned_start, &mut tmp)?;
+            let n = self.read_aligned(w.aligned_start, &mut tmp)?;
 
             if n == 0 {
                 return Ok(0);
             }
 
-            // Compute the byte offset within the aligned window where pos lives.
-            let inner_start = (self.pos - aligned_start) as usize;
-
-            // How many bytes are actually available from pos onward?
-            let available = n.saturating_sub(inner_start);
+            // How many caller bytes are actually available from pos onward?
+            let available = n.saturating_sub(w.inner_offset);
             if available == 0 {
                 return Ok(0);
             }
 
-            let to_copy = requested.min(available);
-            buf[..to_copy].copy_from_slice(&tmp[inner_start..inner_start + to_copy]);
+            let to_copy = w.requested.min(available);
+            buf[..to_copy].copy_from_slice(&tmp[w.inner_offset..w.inner_offset + to_copy]);
             self.pos += to_copy as u64;
             Ok(to_copy)
         }
@@ -409,5 +473,190 @@ mod tests {
             VolumeReader::open(r"\\.\C:").is_err(),
             "expected Err on non-Windows"
         );
+    }
+
+    // ── Sub-range / byte-correctness tests ───────────────────────────────────
+    //
+    // These tests exercise `compute_aligned_window` plus the slice extraction
+    // logic used by `VolumeReader::read()` WITHOUT a real volume handle.
+    //
+    // Strategy: build a synthetic "volume" as a Vec<u8> filled with the pattern
+    //   byte[i] = (i % 251) as u8
+    // (251 is prime so the pattern has no accidental sector-sized period).
+    // For each (pos, len, sector) case we:
+    //   1. Call `compute_aligned_window` and assert the resulting window is
+    //      sector-aligned.
+    //   2. Slice the pattern at [aligned_start .. aligned_end] to simulate what
+    //      ReadFile would return (a sector-aligned chunk of the "volume").
+    //   3. Extract `buf[inner_offset .. inner_offset + len]` from that chunk and
+    //      assert it equals the pattern bytes at `[pos .. pos + len]`.
+    //
+    // This proves that the alignment arithmetic and inner-offset bookkeeping are
+    // correct for arbitrary (pos, len) pairs, i.e. misaligned starts, requests
+    // that span two sectors, and requests larger than one sector.
+
+    use super::compute_aligned_window;
+
+    // Volume size for the synthetic pattern: 4 MiB (enough for all cases below).
+    const PATTERN_LEN: usize = 4 * 1024 * 1024;
+
+    fn make_pattern() -> Vec<u8> {
+        (0..PATTERN_LEN).map(|i| (i % 251) as u8).collect()
+    }
+
+    /// Simulate the "ReadFile returns aligned window" + "extract sub-range" step.
+    fn simulate_read(pattern: &[u8], pos: u64, len: usize, sector: u64) -> Vec<u8> {
+        let w = compute_aligned_window(pos, len, sector);
+
+        // --- structural assertions on the window itself ---
+        assert_eq!(
+            w.aligned_start % sector,
+            0,
+            "aligned_start must be sector-aligned (pos={pos}, len={len}, sector={sector})"
+        );
+        assert_eq!(
+            w.aligned_end % sector,
+            0,
+            "aligned_end must be sector-aligned (pos={pos}, len={len}, sector={sector})"
+        );
+        assert!(w.aligned_start <= pos, "aligned_start must be <= pos");
+        assert!(
+            w.aligned_end >= pos + len as u64,
+            "aligned_end must cover pos+len"
+        );
+        assert_eq!(w.requested, len, "requested must equal len");
+
+        // Simulate the bytes ReadFile would hand back (aligned window from pattern).
+        let as_ = w.aligned_start as usize;
+        let ae = w.aligned_end as usize;
+        assert!(ae <= pattern.len(), "pattern too short for this test case");
+        let aligned_buf = &pattern[as_..ae];
+
+        // Extract the caller's sub-range (mirrors VolumeReader::read).
+        aligned_buf[w.inner_offset..w.inner_offset + len].to_vec()
+    }
+
+    #[test]
+    fn subrange_aligned_pos_aligned_len() {
+        // pos and len are both on a sector boundary: inner_offset must be 0,
+        // and the full aligned window is returned directly.
+        let pattern = make_pattern();
+        let sector: u64 = 512;
+        let pos: u64 = 1024;
+        let len: usize = 512;
+
+        let got = simulate_read(&pattern, pos, len, sector);
+        let want = &pattern[pos as usize..pos as usize + len];
+        assert_eq!(got, want, "aligned pos+len: bytes must match pattern");
+
+        // Inner offset should be zero for an already-aligned position.
+        let w = compute_aligned_window(pos, len, sector);
+        assert_eq!(w.inner_offset, 0, "inner_offset must be 0 for aligned pos");
+    }
+
+    #[test]
+    fn subrange_unaligned_pos_within_first_sector() {
+        // pos is 7 bytes past a sector boundary; len fits within that sector.
+        let pattern = make_pattern();
+        let sector: u64 = 512;
+        let pos: u64 = 512 + 7; // 519
+        let len: usize = 100;
+
+        let got = simulate_read(&pattern, pos, len, sector);
+        let want = &pattern[pos as usize..pos as usize + len];
+        assert_eq!(got, want);
+
+        let w = compute_aligned_window(pos, len, sector);
+        assert_eq!(
+            w.inner_offset, 7,
+            "inner_offset must be the sub-sector offset"
+        );
+        assert_eq!(
+            w.aligned_start, 512,
+            "aligned_start is the sector boundary before pos"
+        );
+        assert_eq!(w.aligned_end, 1024, "single-sector window");
+    }
+
+    #[test]
+    fn subrange_unaligned_pos_spanning_two_sectors() {
+        // pos lands 400 bytes into a sector; len=200 crosses into the next sector.
+        let pattern = make_pattern();
+        let sector: u64 = 512;
+        let pos: u64 = 512 + 400; // 912
+        let len: usize = 200; // 912..1112 crosses the 1024 boundary
+
+        let got = simulate_read(&pattern, pos, len, sector);
+        let want = &pattern[pos as usize..pos as usize + len];
+        assert_eq!(got, want, "cross-sector read must return correct bytes");
+
+        let w = compute_aligned_window(pos, len, sector);
+        assert_eq!(w.aligned_start, 512);
+        assert_eq!(w.aligned_end, 1536); // two sectors: 512..1024 and 1024..1536
+        assert_eq!(w.inner_offset, 400);
+    }
+
+    #[test]
+    fn subrange_len_larger_than_one_sector() {
+        // len > sector: the window must span multiple sectors.
+        let pattern = make_pattern();
+        let sector: u64 = 512;
+        let pos: u64 = 200; // unaligned start
+        let len: usize = 2000; // spans 4+ sectors
+
+        let got = simulate_read(&pattern, pos, len, sector);
+        let want = &pattern[pos as usize..pos as usize + len];
+        assert_eq!(got, want, "multi-sector span must return correct bytes");
+
+        let w = compute_aligned_window(pos, len, sector);
+        // aligned_start = 0, aligned_end must cover 200+2000=2200, rounded up to 2560
+        assert_eq!(w.aligned_start, 0);
+        assert_eq!(w.aligned_end, 2560); // align_up(2200, 512) = 2560
+        assert_eq!(w.inner_offset, 200);
+    }
+
+    #[test]
+    fn subrange_4k_sector_unaligned() {
+        // 4096-byte sectors (Advanced Format drives / emulated physical sector).
+        let pattern = make_pattern();
+        let sector: u64 = 4096;
+        let pos: u64 = 4096 + 1337; // unaligned within second sector
+        let len: usize = 500;
+
+        let got = simulate_read(&pattern, pos, len, sector);
+        let want = &pattern[pos as usize..pos as usize + len];
+        assert_eq!(got, want, "4096-byte sector: bytes must match pattern");
+
+        let w = compute_aligned_window(pos, len, sector);
+        assert_eq!(w.aligned_start, 4096);
+        assert_eq!(w.aligned_end, 8192); // 4096+1337+500 = 5933; align_up(5933,4096) = 8192
+        assert_eq!(w.inner_offset, 1337);
+    }
+
+    #[test]
+    fn subrange_max_read_cap() {
+        // Simulate what happens when len == MAX_READ (1 MiB). The window must
+        // still be sector-aligned and the extracted bytes must match the pattern.
+        // We use a small pos offset to exercise the unaligned-start path at scale.
+        let pattern = make_pattern();
+        let sector: u64 = 512;
+        let max_read: usize = 1024 * 1024; // mirrors imp::MAX_READ
+        let pos: u64 = 300;
+        let len: usize = max_read;
+
+        let w = compute_aligned_window(pos, len, sector);
+        assert_eq!(w.aligned_start % sector, 0, "aligned_start sector-aligned");
+        assert_eq!(w.aligned_end % sector, 0, "aligned_end sector-aligned");
+
+        // Verify the bytes (limit to first 8 KiB to keep the test fast).
+        let sample_len = 8192_usize.min(len);
+        let got = {
+            let as_ = w.aligned_start as usize;
+            let ae = w.aligned_end as usize;
+            let aligned_buf = &pattern[as_..ae];
+            aligned_buf[w.inner_offset..w.inner_offset + sample_len].to_vec()
+        };
+        let want = &pattern[pos as usize..pos as usize + sample_len];
+        assert_eq!(got, want, "MAX_READ cap: sampled bytes must match pattern");
     }
 }
