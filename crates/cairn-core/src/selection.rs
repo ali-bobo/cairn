@@ -124,9 +124,8 @@ mod tests {
 
     #[test]
     fn minimal_no_only_selects_the_live_light_set() {
-        // Today the three live collectors are all light, so minimal == the full live
-        // set. The DIFFERENCE appears when S2-M+ add raw-NTFS collectors tagged
-        // standard/verbose-only; minimal will then skip them.
+        // Today's avail() fixture has no raw-NTFS modules, so minimal and standard return
+        // the same set here. The profile divergence is tested by minimal_excludes_raw_ntfs_collectors.
         let out = select_modules(Profile::Minimal, None, &avail());
         assert_eq!(out.selected, vec!["proc", "net", "persist"]);
     }
