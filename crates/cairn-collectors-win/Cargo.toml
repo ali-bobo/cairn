@@ -24,4 +24,6 @@ features = [
   "Win32_System_SystemInformation",
   "Win32_NetworkManagement_IpHelper",
   "Win32_Networking_WinSock",
+  "Win32_System_IO",    # provides DeviceIoControl (sector-size IOCTL), paired with Win32_System_Ioctl (IOCTL constants)
+  "Win32_System_Ioctl",
 ]

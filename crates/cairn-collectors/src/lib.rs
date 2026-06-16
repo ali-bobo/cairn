@@ -7,6 +7,7 @@
 
 pub mod evtx;
 pub mod hash;
+pub mod mft;
 pub mod net;
 pub mod persist;
 pub mod proc;
