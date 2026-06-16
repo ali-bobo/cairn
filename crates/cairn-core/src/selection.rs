@@ -29,14 +29,23 @@ fn canonical_only_name(raw: &str) -> String {
     }
 }
 
+/// Collector names that are raw-NTFS reads (admin + heavy). `--profile minimal` skips
+/// these (SRS §19.1). Grows as S2-N/O/P add modules — the single place that knowledge lives.
+const RAW_NTFS: &[&str] = &["mft"];
+
 /// Modules a profile selects from `available`, BEFORE the `--only` intersection.
-/// Today all three profiles map to the full live set (the live collectors are
-/// light). When S2-M+ register heavier collectors tagged standard/verbose-only,
-/// `minimal` will return a subset — this is the single place that mapping lives.
-fn profile_base<'a>(_profile: Profile, available: &[&'a str]) -> Vec<&'a str> {
-    // Minimal/Standard/Verbose currently select the same live set. The mechanism
-    // (intersect with `available`) is what S2-L installs; profiles diverge later.
-    available.to_vec()
+/// `minimal` = the light live set (raw-NTFS excluded, SRS §19.1). `standard`/`verbose`
+/// currently select everything available. The mechanism is here; profiles diverge as
+/// heavier collectors register into `RAW_NTFS`.
+fn profile_base<'a>(profile: Profile, available: &[&'a str]) -> Vec<&'a str> {
+    match profile {
+        Profile::Minimal => available
+            .iter()
+            .copied()
+            .filter(|name| !RAW_NTFS.contains(name))
+            .collect(),
+        Profile::Standard | Profile::Verbose => available.to_vec(),
+    }
 }
 
 /// Decide which collector modules run.
@@ -178,5 +187,33 @@ mod tests {
         let only = vec!["persist".to_string(), "persist".to_string()];
         let out = select_modules(Profile::Standard, Some(&only), &avail());
         assert_eq!(out.selected, vec!["persist"]);
+    }
+
+    #[test]
+    fn minimal_excludes_raw_ntfs_collectors() {
+        // SRS §19.1: --profile minimal SKIPS raw-NTFS. "mft" is the first raw-NTFS module.
+        let available = vec!["proc", "net", "persist", "mft"];
+        let out = select_modules(Profile::Minimal, None, &available);
+        assert_eq!(out.selected, vec!["proc", "net", "persist"]); // no "mft"
+    }
+
+    #[test]
+    fn standard_and_verbose_include_raw_ntfs() {
+        let available = vec!["proc", "net", "persist", "mft"];
+        let std = select_modules(Profile::Standard, None, &available);
+        assert_eq!(std.selected, vec!["proc", "net", "persist", "mft"]);
+        let vb = select_modules(Profile::Verbose, None, &available);
+        assert_eq!(vb.selected, vec!["proc", "net", "persist", "mft"]);
+    }
+
+    #[test]
+    fn only_mft_under_minimal_still_excluded() {
+        // --only cannot re-enable a module the profile base excludes (only INTERSECTS base).
+        let available = vec!["proc", "net", "persist", "mft"];
+        let only = vec!["mft".to_string()];
+        let out = select_modules(Profile::Minimal, Some(&only), &available);
+        assert!(out.selected.is_empty());
+        // "mft" IS available (just not in minimal's base), so it is NOT an unknown_only warning.
+        assert!(out.unknown_only.is_empty());
     }
 }
