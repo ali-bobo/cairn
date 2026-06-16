@@ -224,8 +224,8 @@ fn enrich_hashes(
 /// The collector names that the run arm's construction `if` blocks would build for
 /// this selection, in canonical order. Pure mirror of those blocks, so the
 /// selection→collectors mapping is unit-testable without a live Windows host.
-/// MUST stay in sync with the run arm's three `if ... push(...)` blocks
-/// (proc/net/persist, in that order).
+/// MUST stay in sync with the four `if ... push(...)` blocks in `main` that
+/// construct proc/net/persist/mft collectors (search: "S2-L: construct only").
 #[cfg(test)]
 fn built_collector_names(selected: &[String]) -> Vec<String> {
     ["proc", "net", "persist", "mft"]
