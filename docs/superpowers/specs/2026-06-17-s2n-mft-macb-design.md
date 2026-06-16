@@ -157,7 +157,7 @@ pub fn filetime_to_utc(ft: u64) -> Option<DateTime<Utc>> {
 `checked_sub` prevents underflow for 1601–1970 times → `None`; `from_timestamp` returns
 `None` on overflow. Zero panic; fully unit-testable from FILETIME constants without a
 real disk. Cross-check constant: ntfs's own `time.rs` test uses
-`130018833000000000 → 2013-01-01T00:15:00Z`.
+`130018833000000000 → 2013-01-05T18:15:00Z`.
 
 ## 4. Collector full-$MFT iteration + DoS defenses (the heart of S2-N)
 
@@ -258,7 +258,7 @@ technique), except the one elevated e2e.
 
 | Test | Level | Platform | Asserts |
 |---|---|---|---|
-| `filetime_to_utc` known value → RFC3339 | unit | any | 1601-epoch math correct (cross-check `130018833000000000`→2013-01-01T00:15:00Z) |
+| `filetime_to_utc` known value → RFC3339 | unit | any | 1601-epoch math correct (cross-check `130018833000000000`→2013-01-05T18:15:00Z) |
 | `filetime_to_utc(0)`/underflow/overflow → `None` | unit | any | boundaries, zero panic (NFR5) |
 | record-count cap truncates → note, not panic | unit | any | capacity>cap synthetic boot sector: loop stops at cap, manifest records truncation |
 | single bad record → `continue`, overall `Ok` | unit | any | bad-signature record mid-image: no abort, count correct |
