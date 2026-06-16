@@ -26,11 +26,19 @@
 use std::io;
 
 // ── Platform-independent alignment helpers ────────────────────────────────────
+//
+// These helpers are the alignment core consumed by the `#[cfg(windows)]` `read()`
+// path AND by the (all-platform) unit tests. On a non-Windows lib build the Windows
+// impl module is absent, so nothing in the *library* references them — clippy then
+// reports dead_code. They ARE exercised by the tests on every platform, so we keep
+// them platform-independent and silence dead_code ONLY on non-Windows (Windows stays
+// strict, so a genuinely-unused helper there is still caught).
 
 /// Round `n` down to the nearest multiple of `align`.
 /// `align` must be a power of two and non-zero; the result is `n` when
 /// `n` is already aligned.
 #[inline]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn align_down(n: u64, align: u64) -> u64 {
     debug_assert!(align.is_power_of_two(), "align must be a power of two");
     n & !(align - 1)
@@ -42,6 +50,7 @@ pub(crate) fn align_down(n: u64, align: u64) -> u64 {
 ///
 /// Returns `None` if the addition overflows `u64`.
 #[inline]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn align_up_checked(n: u64, align: u64) -> Option<u64> {
     debug_assert!(align.is_power_of_two(), "align must be a power of two");
     n.checked_add(align - 1).map(|v| v & !(align - 1))
@@ -54,6 +63,7 @@ pub(crate) fn align_up_checked(n: u64, align: u64) -> Option<u64> {
 /// `FILE_FLAG_NO_BUFFERING` forces ReadFile to operate on sector-aligned
 /// offset+length pairs. This struct captures the exact window to issue to the
 /// kernel, and where within that window the caller's requested bytes begin.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) struct AlignedWindow {
     /// Sector-aligned byte offset at which ReadFile must begin.
     pub aligned_start: u64,
@@ -91,6 +101,7 @@ pub(crate) struct AlignedWindow {
 /// `sector` must be a power of two. Violating this triggers a `debug_assert!`
 /// inside `align_down` / `align_up_checked`.
 #[inline]
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn compute_aligned_window(
     pos: u64,
     requested: usize,
@@ -143,6 +154,7 @@ pub(crate) fn compute_aligned_window(
 /// cover: full window, zero bytes read, exactly inner_offset bytes read (empty
 /// result), inner_offset-1 bytes (empty result), and partial fills of k bytes
 /// (k < requested).
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) fn extract_subrange<'a>(tmp: &'a [u8], n: usize, w: &AlignedWindow) -> &'a [u8] {
     let available = n.saturating_sub(w.inner_offset);
     if available == 0 {
