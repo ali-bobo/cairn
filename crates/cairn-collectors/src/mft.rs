@@ -92,6 +92,7 @@ impl Collector for MftCollector {
                     si_btime: None,
                     si_mtime: None,
                     fn_btime: None,
+                    fn_mtime: None,
                     zone_identifier: None,
                 })
             })
