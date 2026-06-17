@@ -96,6 +96,12 @@ cairn run --target live --only mft --max-mft-records 5 --output <dir2>
 #   expect: <= 5 Record::FileMeta entries; run.log records_emitted <= 5; no panic.
 ```
 
+> WALL-CLOCK NOTE (from final review): `ntfs::Ntfs::file()` re-resolves the $MFT's own
+> `$DATA` on every call, so a full scan to the 1M default cap is I/O-heavy (roughly
+> O(n²)-ish in I/O) — bounded (no DoS escape, the cap holds) but slow on a large real
+> volume. The operator should time the elevated full-cap run and watch wall-clock; a
+> streaming / custom-$MFT reader is already flagged as future work in the mft module doc.
+
 What is already de-risked WITHOUT the elevated run:
 - ntfs 0.4 API path (Ntfs::file iteration, info() for SI, attributes()/structured_value
   for FN, NtfsTime::nt_timestamp) — confirmed against the crate source 2026-06-17.

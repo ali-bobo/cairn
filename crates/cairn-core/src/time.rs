@@ -63,7 +63,7 @@ mod tests {
     }
 
     #[test]
-    fn max_filetime_is_none_not_panic() {
+    fn max_filetime_is_some_not_panic() {
         // u64::MAX is representable by chrono (~year 60056).
         // The key is: no panic, ever. The assertion documents the actual behavior.
         let result = filetime_to_utc(u64::MAX);

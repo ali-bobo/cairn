@@ -363,8 +363,8 @@ mod tests {
     }
 
     // Build a minimal ntfs-0.4-parseable NTFS boot sector header into `buf`,
-    // declaring total_sectors and an MFT at cluster mft_lcn. (Same crafting style as
-    // parse_valid_boot_sector_garbage_mft_returns_err.)
+    // declaring total_sectors and an MFT at cluster mft_lcn. (Used by
+    // parse_garbage_mft_body_yields_zero_records_or_err and record_cap_truncates_without_panic.)
     fn write_boot_sector(buf: &mut [u8], total_sectors: u64, mft_lcn: u64) {
         buf[3..11].copy_from_slice(b"NTFS    ");
         buf[11] = 0x00; // bytes_per_sector = 512 (LE u16)
