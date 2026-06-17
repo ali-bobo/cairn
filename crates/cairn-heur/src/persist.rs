@@ -146,6 +146,8 @@ fn persistence_entity(p: &PersistenceRecord) -> Entity {
                 mtime: p.last_write,
                 si_btime: None,
                 fn_btime: None,
+                si_mtime: None,
+                fn_mtime: None,
             }),
             ..Entity::default()
         }
