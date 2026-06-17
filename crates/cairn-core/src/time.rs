@@ -67,6 +67,9 @@ mod tests {
         // u64::MAX is representable by chrono (~year 60056).
         // The key is: no panic, ever. The assertion documents the actual behavior.
         let result = filetime_to_utc(u64::MAX);
-        assert!(result.is_some(), "u64::MAX should be representable, not panic");
+        assert!(
+            result.is_some(),
+            "u64::MAX should be representable, not panic"
+        );
     }
 }
