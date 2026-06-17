@@ -19,6 +19,7 @@ pub mod manifest;
 pub mod orchestrator;
 pub mod record;
 pub mod selection;
+pub mod time;
 pub mod traits;
 
 pub use config::{Config, OutputKind, Profile, Target};
@@ -26,6 +27,7 @@ pub use finding::{Entity, Finding, FindingSource, Severity};
 pub use manifest::{Manifest, SourceEntry};
 pub use record::Record;
 pub use selection::{select_modules, SelectionOutcome};
+pub use time::filetime_to_utc;
 pub use traits::{Analyzer, CollectCtx, Collector, OutputSink};
 
 use thiserror::Error;

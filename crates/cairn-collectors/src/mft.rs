@@ -1,9 +1,16 @@
-//! MftCollector: minimal raw-NTFS proof of read path (SRS §4, S2-M).
+//! MftCollector: full $MFT scan with SI/FN btime+mtime (SRS §4, S2-N).
 //!
 //! This module consumes the safe `VolumeReader` (already built in
-//! `cairn-collectors-win::volume`) and the `ntfs` 0.4 crate to parse a live NTFS
-//! volume far enough to count $MFT records and list the first N file names from
-//! the root-directory index, emitting them as `Record::FileMeta`.
+//! `cairn-collectors-win::volume`) and the `ntfs` 0.4 crate to scan the $MFT and
+//! read SI/FN btime+mtime into FileMetaRecord, bounded by a record cap, emitting
+//! them as `Record::FileMeta`.
+//!
+//! ## Peak memory (NFR10)
+//! The scan holds up to `max_mft_records` `FileMetaRecord`s in a `Vec` before they are
+//! mapped to `Record::FileMeta`, so peak RAM is bounded by the record cap
+//! (default 1_000_000 × ~the size of a `FileMetaRecord`). The cap — not the volume's
+//! declared capacity — is the bound, so a boot sector lying about volume size cannot
+//! inflate it. A streaming sink (removing the intermediate `Vec`) is a future improvement.
 //!
 //! ## Two-layer DoS guard (BOTH required — defense in depth)
 //!
@@ -32,24 +39,22 @@ use std::panic::{self, AssertUnwindSafe};
 use cairn_collectors_win::volume::VolumeReader;
 use cairn_core::manifest::SourceEntry;
 use cairn_core::record::{FileMetaRecord, Record};
+use cairn_core::time::filetime_to_utc;
 use cairn_core::traits::{CollectCtx, Collector};
 use cairn_core::{CairnError, Result};
+use ntfs::structured_values::{NtfsFileName, NtfsFileNamespace};
 use ntfs::Ntfs;
-
-/// Maximum number of file names collected from the root-directory index (proof bound).
-const MAX_NAMES: usize = 50;
 
 /// NTFS boot sector length in bytes. The ntfs crate panics if the source is shorter
 /// than this; guard (a) checks this BEFORE calling `Ntfs::new`.
 const BOOT_SECTOR_LEN: usize = 512;
 
-/// MftCollector: privilege-gated, read-only, raw-NTFS $MFT proof.
+/// MftCollector: privilege-gated, read-only, full $MFT scan with SI/FN times.
 ///
 /// Requires `Administrator + SeBackupPrivilege`. On success emits
-/// `Record::FileMeta` for each of the first [`MAX_NAMES`] file names found in
-/// the root-directory index, plus a `tracing::info!` log of the theoretical MFT
-/// capacity estimate (volume_size / file_record_size) and the number of names
-/// actually emitted.
+/// `Record::FileMeta` for each file record found in the $MFT (up to
+/// `Config.max_mft_records`), populating `si_btime`, `si_mtime`, `fn_btime`,
+/// and `fn_mtime` via `filetime_to_utc`.
 #[derive(Default)]
 pub struct MftCollector;
 
@@ -69,35 +74,18 @@ impl Collector for MftCollector {
             });
         }
 
+        let cap = ctx.config.max_mft_records;
         let mut reader = VolumeReader::open(r"\\.\C:")?;
-        let (capacity, names) = parse_mft_names(&mut reader, MAX_NAMES)?;
+        let (capacity, records) = parse_mft_records(&mut reader, cap)?;
 
-        // `capacity` is volume_size / file_record_size: the maximum number of file
-        // records the volume could theoretically address, NOT the count of allocated
-        // MFT entries and NOT the number examined. `names_emitted` is the count
-        // actually harvested from the root-directory index (≤ MAX_NAMES = 50).
         tracing::info!(
             mft_capacity_estimate = capacity,
-            names_emitted = names.len(),
-            "mft proof"
+            records_emitted = records.len(),
+            record_cap = cap,
+            "mft scan"
         );
 
-        let records = names
-            .into_iter()
-            .map(|name| {
-                Record::FileMeta(FileMetaRecord {
-                    path: name,
-                    size: 0,
-                    sha256: None,
-                    si_btime: None,
-                    si_mtime: None,
-                    fn_btime: None,
-                    zone_identifier: None,
-                })
-            })
-            .collect();
-
-        Ok(records)
+        Ok(records.into_iter().map(Record::FileMeta).collect())
     }
 
     fn sources(&self) -> Vec<SourceEntry> {
@@ -124,40 +112,26 @@ fn mft_err(reason: String) -> CairnError {
     }
 }
 
-/// Parse file names from the root-directory index of an NTFS source.
+/// Scan the $MFT and return `(mft_capacity_estimate, file_meta_records)`.
 ///
-/// Returns `(mft_capacity_estimate, first_max_names_file_names)` where
-/// `mft_capacity_estimate` = `volume_size / file_record_size`: the maximum number
-/// of file records the volume could theoretically address (a geometric upper bound),
-/// NOT the count of allocated MFT entries and NOT the number of records examined.
-///
-/// Applies BOTH DoS guards (see module doc):
-/// - Guard (a): 512-byte pre-check — returns `Err` for short sources without
-///   calling `Ntfs::new`.
-/// - Guard (b): `catch_unwind` around `parse_mft_inner` — converts any third-party
-///   panic to `Err`.
-pub(crate) fn parse_mft_names<R: Read + Seek>(
+/// `mft_capacity_estimate` = volume_size / file_record_size: a geometric upper bound on
+/// addressable file records, NOT the count of allocated entries. The scan iterates
+/// `0..min(capacity, max_records)` — the hard cap closes the lied-about-capacity
+/// wall-clock DoS. Both S2-M DoS guards apply:
+/// - Guard (a): 512-byte pre-check — short source -> Err without calling `Ntfs::new`.
+/// - Guard (b): `catch_unwind` around the scan — any third-party panic -> Err.
+pub(crate) fn parse_mft_records<R: Read + Seek>(
     src: &mut R,
-    max_names: usize,
-) -> Result<(u64, Vec<String>)> {
-    // Guard (a): read exactly BOOT_SECTOR_LEN bytes to prove the source is long
-    // enough for `Ntfs::new` to read its boot sector without panicking.
-    // If `read_exact` fails (UnexpectedEof or other I/O error), convert it to a
-    // Collector error and return immediately — never call `Ntfs::new`.
+    max_records: u64,
+) -> Result<(u64, Vec<FileMetaRecord>)> {
     src.seek(SeekFrom::Start(0))
         .map_err(|e| mft_err(format!("seek to start failed: {e}")))?;
-
     let mut probe = [0u8; BOOT_SECTOR_LEN];
     src.read_exact(&mut probe).map_err(|_| {
         mft_err(format!(
-            "source is shorter than {BOOT_SECTOR_LEN} bytes; \
-             refusing to call Ntfs::new (would panic)"
+            "source is shorter than {BOOT_SECTOR_LEN} bytes; refusing to call Ntfs::new (would panic)"
         ))
     })?;
-
-    // Seek back to position 0 before calling `Ntfs::new`.
-    // `Ntfs::new` rewinds the reader to offset 0 itself internally, so this is
-    // belt-and-suspenders (defensive), not load-bearing for correctness.
     src.seek(SeekFrom::Start(0))
         .map_err(|e| mft_err(format!("seek-back failed: {e}")))?;
 
@@ -171,68 +145,106 @@ pub(crate) fn parse_mft_names<R: Read + Seek>(
     //   but we NEVER use `src` after a caught panic — we immediately return Err.
     // - We are NOT using catch_unwind to hide our own logic errors; only to
     //   contain a measured, third-party panic that we cannot fix.
-    let result = panic::catch_unwind(AssertUnwindSafe(|| parse_mft_inner(src, max_names)));
-
+    let result = panic::catch_unwind(AssertUnwindSafe(|| parse_mft_inner(src, max_records)));
     match result {
-        Ok(inner_result) => inner_result,
-        Err(_payload) => Err(mft_err(
+        Ok(inner) => inner,
+        Err(_) => Err(mft_err(
             "ntfs parser panicked (contained); treating volume as unreadable".into(),
         )),
     }
 }
 
-/// Inner ntfs parse: walk root-directory index, collect first `max_names` file names.
-///
-/// Called only after guard (a) (boot-sector length pre-check) has passed.
-/// Wrapped by guard (b) (`catch_unwind`) in `parse_mft_names`.
-///
-/// Returns `(mft_capacity_estimate, names)`.
-/// - `mft_capacity_estimate` = `volume_size / file_record_size`, both obtained from
-///   `Ntfs` boot-sector metadata. This is the maximum number of file records the
-///   volume could theoretically address (a geometric capacity upper bound), NOT the
-///   count of allocated MFT entries and NOT the number of records examined here.
-///   It is deterministic and stable across runs for the same volume state.
-/// - `names` are collected from the root-directory index in the order the iterator
-///   yields them (ascending by NTFS case-insensitive key), bounded by `max_names`.
-fn parse_mft_inner<R: Read + Seek>(src: &mut R, max_names: usize) -> Result<(u64, Vec<String>)> {
-    // Parse the boot sector and derive filesystem geometry.
-    let ntfs = Ntfs::new(src).map_err(|e| mft_err(format!("Ntfs::new failed: {e}")))?;
-
-    // Compute a geometric capacity estimate: volume_size / file_record_size.
-    // This is the maximum number of file records the volume could theoretically
-    // address, NOT the count of allocated MFT entries and NOT the number examined.
-    let file_record_size = ntfs.file_record_size() as u64;
-    let mft_capacity_estimate = ntfs.size().checked_div(file_record_size).unwrap_or(0);
-
-    // Walk root-directory index to collect file names.
-    let root = ntfs
-        .root_directory(src)
-        .map_err(|e| mft_err(format!("root_directory failed: {e}")))?;
-
-    let index = root
-        .directory_index(src)
-        .map_err(|e| mft_err(format!("directory_index failed: {e}")))?;
-
-    let mut entries = index.entries();
-    let mut names: Vec<String> = Vec::with_capacity(max_names);
-
-    // Iterate bounded by max_names; entries() yields in ascending NTFS key order
-    // (deterministic: same order every run for the same volume state).
-    while names.len() < max_names {
-        let entry = match entries.next(src) {
-            None => break,
-            Some(r) => r.map_err(|e| mft_err(format!("index entry error: {e}")))?,
+/// Pick the preferred `$FILE_NAME`: first Win32 or Win32AndDos (avoid DOS 8.3 short
+/// names like PROGRA~1); fall back to the first available. Returns its name plus the
+/// raw FILETIME u64s of its creation/modification times. Deterministic (NFR4).
+/// A per-attribute parse error is skipped (continue), never propagated — one unreadable
+/// attribute must not abort name selection for the whole file.
+fn preferred_file_name<R: Read + Seek>(
+    file: &ntfs::NtfsFile<'_>,
+    src: &mut R,
+) -> Option<(String, u64, u64)> {
+    let mut fallback: Option<(String, u64, u64)> = None;
+    let mut attrs = file.attributes();
+    while let Some(item) = attrs.next(src) {
+        let item = match item {
+            Ok(i) => i,
+            Err(_) => continue,
         };
-
-        // key() returns Option<Result<NtfsFileName>>; None on the last (sentinel) entry.
-        if let Some(key_result) = entry.key() {
-            let file_name = key_result.map_err(|e| mft_err(format!("file name key error: {e}")))?;
-            // NtfsFileName::name() returns U16StrLe; to_string_lossy() converts to String.
-            names.push(file_name.name().to_string_lossy());
+        let attr = match item.to_attribute() {
+            Ok(a) => a,
+            Err(_) => continue,
+        };
+        if attr.ty().ok() != Some(ntfs::NtfsAttributeType::FileName) {
+            continue;
+        }
+        let fname: NtfsFileName = match attr.structured_value::<_, NtfsFileName>(src) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let name = fname.name().to_string_lossy();
+        let btime = fname.creation_time().nt_timestamp();
+        let mtime = fname.modification_time().nt_timestamp();
+        match fname.namespace() {
+            NtfsFileNamespace::Win32 | NtfsFileNamespace::Win32AndDos => {
+                return Some((name, btime, mtime));
+            }
+            _ => {
+                if fallback.is_none() {
+                    fallback = Some((name, btime, mtime));
+                }
+            }
         }
     }
+    fallback
+}
 
-    Ok((mft_capacity_estimate, names))
+/// Inner $MFT scan. Called only after guard (a); wrapped by guard (b).
+///
+/// UPSTREAM LIMITATION (ntfs 0.4): `Ntfs::file()` assumes the $MFT itself has no
+/// `$ATTRIBUTE_LIST`. On a heavily fragmented volume whose $MFT spans multiple data
+/// runs, records beyond the first run yield `Err` and are silently skipped via the
+/// per-record `continue`. This is a triage trade-off, not a correctness bug; a future
+/// crate upgrade or a custom $MFT reader would lift it. Surfaced here so the gap is
+/// auditable.
+fn parse_mft_inner<R: Read + Seek>(
+    src: &mut R,
+    max_records: u64,
+) -> Result<(u64, Vec<FileMetaRecord>)> {
+    let ntfs = Ntfs::new(src).map_err(|e| mft_err(format!("Ntfs::new failed: {e}")))?;
+    let file_record_size = ntfs.file_record_size() as u64;
+    let capacity = ntfs.size().checked_div(file_record_size).unwrap_or(0);
+    let ceiling = capacity.min(max_records);
+
+    // Not pre-allocated to `ceiling`: most records are typically skipped (no FN /
+    // parse error), so Vec::new avoids reserving worst-case capacity up front.
+    let mut out: Vec<FileMetaRecord> = Vec::new();
+    for rec_num in 0..ceiling {
+        // Single-record isolation: a bad/unallocated record is skipped, never aborts.
+        let file = match ntfs.file(src, rec_num) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let si = file.info().ok();
+        let (path, fn_b_raw, fn_m_raw) = match preferred_file_name(&file, src) {
+            Some(t) => t,
+            None => continue, // no $FILE_NAME -> not a meaningful file-meta record
+        };
+        out.push(FileMetaRecord {
+            path,
+            size: 0,
+            sha256: None,
+            si_btime: si
+                .as_ref()
+                .and_then(|s| filetime_to_utc(s.creation_time().nt_timestamp())),
+            si_mtime: si
+                .as_ref()
+                .and_then(|s| filetime_to_utc(s.modification_time().nt_timestamp())),
+            fn_btime: filetime_to_utc(fn_b_raw),
+            fn_mtime: filetime_to_utc(fn_m_raw),
+            zone_identifier: None,
+        });
+    }
+    Ok((capacity, out))
 }
 
 #[cfg(test)]
@@ -250,8 +262,13 @@ mod tests {
     // ntfs to hit an `unreachable!()` branch deep in index or attribute parsing.
     // That combination is hard to craft deterministically without reading the
     // ntfs 0.4 internals in detail. The test
-    // `parse_valid_boot_sector_garbage_mft_returns_err` below attempts this;
+    // `parse_garbage_mft_body_yields_zero_records_or_err` below attempts this;
     // see its comment for which path it actually exercised.
+    //
+    // SI/FN time population and FN-namespace preference are covered by the ELEVATED
+    // e2e (T6), not by a synthetic image — a fully ntfs-0.4-parseable $MFT with real
+    // SI/FN attributes is impractical to hand-craft deterministically. The unit tests
+    // here pin: return shape, the cap bound, and guard (a)/(b) regression.
     //
     // ─────────────────────────────────────────────────────────────────────────
 
@@ -261,7 +278,7 @@ mod tests {
         // Through the guarded helper they MUST be Err, with no panic escaping.
         for bytes in [vec![], vec![0xEB, 0x52, 0x90]] {
             let mut cur = std::io::Cursor::new(bytes);
-            let r = parse_mft_names(&mut cur, MAX_NAMES);
+            let r = parse_mft_records(&mut cur, 8);
             assert!(r.is_err(), "short source must be Err, never panic");
         }
     }
@@ -271,7 +288,7 @@ mod tests {
         // A full sector+ of zeros: ntfs returns clean Err (invalid boot signature);
         // the wrapper passes it through as Err.
         let mut cur = std::io::Cursor::new(vec![0u8; 1024]);
-        let r = parse_mft_names(&mut cur, MAX_NAMES);
+        let r = parse_mft_records(&mut cur, 8);
         assert!(r.is_err());
     }
 
@@ -296,43 +313,37 @@ mod tests {
     /// and that the process does NOT abort (i.e., the panic, if any, was contained
     /// by guard b).
     ///
-    /// Actual path exercised (as observed): ntfs 0.4.0 returns a clean `Err` from
-    /// deep within MFT/index parsing (the crafted geometry passes BootSector::validate
-    /// but the MFT data at cluster 4 is all zeros, causing an attribute or file-record
-    /// parse error). Guard (b)'s catch-arm was NOT triggered — the error was a clean
-    /// `Err`, not a panic. This still extends coverage past the boot sector into the
-    /// MFT/index parse layer. The residual gap (an in-process panic from ntfs) is
-    /// documented in the guard-b note above.
+    /// Actual path exercised (as observed with the S2-N full-$MFT scan): the boot
+    /// sector parses successfully (geometry is valid), then `ntfs.file(src, rec_num)`
+    /// is called for each record in `0..ceiling`. Every file record in the garbage MFT
+    /// body fails to parse and is skipped via `continue`. The scan completes and
+    /// returns `Ok((capacity, vec![]))` — zero records, no panic. This is the correct,
+    /// per-record-isolation behaviour of the new scan (S2-N design: individual bad
+    /// records are skipped, not the whole scan). Guard (b)'s catch-arm was NOT
+    /// triggered. The residual gap (an in-process panic from ntfs) is documented in
+    /// the guard-b note above.
     #[test]
-    fn parse_valid_boot_sector_garbage_mft_returns_err() {
+    fn parse_garbage_mft_body_yields_zero_records_or_err() {
         const BUF_LEN: usize = 1024 * 1024; // 1 MiB
         let mut buf = vec![0u8; BUF_LEN];
 
-        // OEM ID: "NTFS    " at offset 3
-        buf[3..11].copy_from_slice(b"NTFS    ");
-        // bytes_per_sector = 512 at offset 11 (LE u16)
-        buf[11] = 0x00;
-        buf[12] = 0x02;
-        // sectors_per_cluster = 8 at offset 13
-        buf[13] = 0x08;
-        // clusters_per_file_record: 0xF6 = -10 → record_size = 2^10 = 1024 bytes (offset 64)
-        buf[64] = 0xF6;
-        // total_sectors = 2047 (1 MiB / 512 - 1) at offset 40 (LE u64)
         let total_sectors: u64 = (BUF_LEN as u64 / 512).saturating_sub(1);
-        buf[40..48].copy_from_slice(&total_sectors.to_le_bytes());
-        // MFT LCN = 4 (cluster 4 = byte offset 4 * 8 * 512 = 16384) at offset 48 (LE u64)
-        buf[48..56].copy_from_slice(&4u64.to_le_bytes());
-        // Boot signature 0x55AA at offset 510
-        buf[510] = 0x55;
-        buf[511] = 0xAA;
+        write_boot_sector(&mut buf, total_sectors, 4);
 
         let mut cur = std::io::Cursor::new(buf);
-        let r = parse_mft_names(&mut cur, MAX_NAMES);
-        // Must be Err (either clean error or contained panic); process must not abort.
-        assert!(
-            r.is_err(),
-            "crafted boot-sector + garbage MFT must yield Err, not Ok"
-        );
+        let r = parse_mft_records(&mut cur, 8);
+        // S2-N: per-record isolation means individual bad file records are skipped, not
+        // the whole scan. A garbage MFT body yields Ok with zero records (all skipped) —
+        // not Err. Err is also acceptable (e.g. if Ntfs::new itself fails on the geometry).
+        // The process must not panic/abort.
+        if let Ok((_, records)) = &r {
+            assert!(
+                records.is_empty(),
+                "garbage MFT body must yield zero records (all skipped), got {}",
+                records.len()
+            );
+        }
+        // Err(_) is also acceptable — no assertion needed.
     }
 
     #[test]
@@ -349,5 +360,42 @@ mod tests {
             matches!(r, Err(CairnError::Privilege { .. })),
             "no admin/se_backup must yield Privilege err before any volume open"
         );
+    }
+
+    // Build a minimal ntfs-0.4-parseable NTFS boot sector header into `buf`,
+    // declaring total_sectors and an MFT at cluster mft_lcn. (Used by
+    // parse_garbage_mft_body_yields_zero_records_or_err and record_cap_truncates_without_panic.)
+    fn write_boot_sector(buf: &mut [u8], total_sectors: u64, mft_lcn: u64) {
+        buf[3..11].copy_from_slice(b"NTFS    ");
+        buf[11] = 0x00; // bytes_per_sector = 512 (LE u16)
+        buf[12] = 0x02;
+        buf[13] = 0x08; // sectors_per_cluster = 8
+        buf[64] = 0xF6; // clusters_per_file_record = -10 -> record_size 1024
+        buf[40..48].copy_from_slice(&total_sectors.to_le_bytes());
+        buf[48..56].copy_from_slice(&mft_lcn.to_le_bytes());
+        buf[510] = 0x55;
+        buf[511] = 0xAA;
+    }
+
+    #[test]
+    fn record_cap_truncates_without_panic() {
+        // Boot sector declaring a huge volume -> huge capacity; with a tiny cap the scan
+        // must stop at the cap (not loop to capacity) and never panic. The synthetic MFT
+        // body is garbage so records are skipped; what we assert is: the call RETURNS
+        // (no panic, no hang) — Err or Ok both acceptable here.
+        const BUF: usize = 1024 * 1024;
+        let mut buf = vec![0u8; BUF];
+        write_boot_sector(&mut buf, (BUF as u64 / 512).saturating_sub(1), 4);
+        let mut cur = std::io::Cursor::new(buf);
+        let _ = parse_mft_records(&mut cur, 8); // must return, not panic/hang
+    }
+
+    #[test]
+    fn parse_mft_records_short_source_is_err_shape() {
+        // Pins the new return type (u64, Vec<FileMetaRecord>) and guard (a): a 3-byte
+        // source (panicked the raw ntfs crate in S2-M's probe) is Err, no panic.
+        let mut empty = std::io::Cursor::new(vec![0u8; 3]);
+        let r: Result<(u64, Vec<FileMetaRecord>)> = parse_mft_records(&mut empty, 8);
+        assert!(r.is_err());
     }
 }

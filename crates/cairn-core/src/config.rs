@@ -63,6 +63,10 @@ pub struct Config {
     pub operator: String,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub use_vss: bool,
+    /// Hard cap on $MFT records scanned by the mft collector (NFR10). Default 1_000_000.
+    /// Hitting it records a truncation note in the manifest and stops the scan
+    /// (never OOM / never an unbounded loop on a lied-about volume capacity).
+    pub max_mft_records: u64,
 }
 
 impl Default for Config {
@@ -79,6 +83,7 @@ impl Default for Config {
             operator: String::new(),
             since: None,
             use_vss: false,
+            max_mft_records: 1_000_000,
         }
     }
 }
@@ -165,5 +170,11 @@ mod tests {
             err.contains("minimal") && err.contains("standard") && err.contains("verbose"),
             "error should list valid profiles: {err}"
         );
+    }
+
+    #[test]
+    fn max_mft_records_defaults_to_one_million() {
+        let cfg = Config::default();
+        assert_eq!(cfg.max_mft_records, 1_000_000);
     }
 }

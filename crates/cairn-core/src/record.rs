@@ -85,6 +85,7 @@ pub struct FileMetaRecord {
     pub si_btime: Option<DateTime<Utc>>,
     pub si_mtime: Option<DateTime<Utc>>,
     pub fn_btime: Option<DateTime<Utc>>,
+    pub fn_mtime: Option<DateTime<Utc>>,
     pub zone_identifier: Option<String>, // mark-of-the-web
 }
 
@@ -241,5 +242,28 @@ mod tests {
         });
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"kind\":\"execution\""));
+    }
+
+    #[test]
+    fn file_meta_fn_mtime_roundtrips_and_old_json_is_none() {
+        let r = FileMetaRecord {
+            path: r"C:\Windows\notepad.exe".into(),
+            size: 0,
+            sha256: None,
+            si_btime: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
+            si_mtime: Some(Utc.with_ymd_and_hms(2026, 2, 2, 0, 0, 0).unwrap()),
+            fn_btime: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
+            fn_mtime: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
+            zone_identifier: None,
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains("fn_mtime"));
+        let back: FileMetaRecord = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.fn_mtime, r.fn_mtime);
+
+        // Older JSONL (FR1 replay) lacking fn_mtime must deserialize to None.
+        let old = r#"{"path":"x","size":0,"sha256":null,"si_btime":null,"si_mtime":null,"fn_btime":null,"zone_identifier":null}"#;
+        let parsed: FileMetaRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.fn_mtime, None);
     }
 }
