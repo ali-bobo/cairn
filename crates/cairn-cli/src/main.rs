@@ -110,6 +110,10 @@ struct RunArgs {
     operator: Option<String>,
     #[arg(long)]
     use_vss: bool,
+    /// Hard cap on $MFT records the mft collector scans (NFR10). Default 1,000,000.
+    /// Keep this default in sync with `cairn_core::config::Config::default().max_mft_records`.
+    #[arg(long, default_value_t = 1_000_000)]
+    max_mft_records: u64,
 }
 
 /// A one-line, human-readable run plan for the `evtx` subcommand, logged to run.log
@@ -586,7 +590,10 @@ fn main() -> anyhow::Result<()> {
                 "collector selection"
             );
 
-            let cfg = Config::default();
+            let cfg = Config {
+                max_mft_records: args.max_mft_records,
+                ..Config::default()
+            };
             // S2-L: construct only the selected collectors, matching the real
             // Collector::name() strings; order follows AVAILABLE (deterministic).
             let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
@@ -954,5 +961,28 @@ mod tests {
         std::fs::write(rules.join("r.yml"), b"title: TAMPERED\n").unwrap();
         let ok = run_verify(&dir.join("manifest.json"), Some(rules), true).unwrap();
         assert!(!ok, "modified ruleset must fail verify");
+    }
+
+    #[test]
+    fn max_mft_records_flag_defaults_to_one_million() {
+        // clap default must match Config's default so an unspecified flag is a no-op.
+        use clap::Parser;
+        let args = RunArgs::parse_from(["cairn", "--target", "live", "--output", "out"]);
+        assert_eq!(args.max_mft_records, 1_000_000);
+    }
+
+    #[test]
+    fn max_mft_records_flag_parses_override() {
+        use clap::Parser;
+        let args = RunArgs::parse_from([
+            "cairn",
+            "--target",
+            "live",
+            "--output",
+            "out",
+            "--max-mft-records",
+            "42",
+        ]);
+        assert_eq!(args.max_mft_records, 42);
     }
 }
