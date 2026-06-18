@@ -221,11 +221,13 @@ pub(crate) fn parse_mft_records<R: Read + Seek>(
 /// raw FILETIME u64s of its creation/modification times. Deterministic (NFR4).
 /// A per-attribute parse error is skipped (continue), never propagated — one unreadable
 /// attribute must not abort name selection for the whole file.
+///
+/// tuple is (name, parent_record_number, fn_btime_raw, fn_mtime_raw)
 fn preferred_file_name<R: Read + Seek>(
     file: &ntfs::NtfsFile<'_>,
     src: &mut R,
-) -> Option<(String, u64, u64)> {
-    let mut fallback: Option<(String, u64, u64)> = None;
+) -> Option<(String, u64, u64, u64)> {
+    let mut fallback: Option<(String, u64, u64, u64)> = None;
     let mut attrs = file.attributes();
     while let Some(item) = attrs.next(src) {
         let item = match item {
@@ -246,13 +248,14 @@ fn preferred_file_name<R: Read + Seek>(
         let name = fname.name().to_string_lossy();
         let btime = fname.creation_time().nt_timestamp();
         let mtime = fname.modification_time().nt_timestamp();
+        let parent = fname.parent_directory_reference().file_record_number();
         match fname.namespace() {
             NtfsFileNamespace::Win32 | NtfsFileNamespace::Win32AndDos => {
-                return Some((name, btime, mtime));
+                return Some((name, parent, btime, mtime));
             }
             _ => {
                 if fallback.is_none() {
-                    fallback = Some((name, btime, mtime));
+                    fallback = Some((name, parent, btime, mtime));
                 }
             }
         }
@@ -287,7 +290,7 @@ fn parse_mft_inner<R: Read + Seek>(
             Err(_) => continue,
         };
         let si = file.info().ok();
-        let (path, fn_b_raw, fn_m_raw) = match preferred_file_name(&file, src) {
+        let (path, _parent, fn_b_raw, fn_m_raw) = match preferred_file_name(&file, src) {
             Some(t) => t,
             None => continue, // no $FILE_NAME -> not a meaningful file-meta record
         };
@@ -308,6 +311,42 @@ fn parse_mft_inner<R: Read + Seek>(
         });
     }
     Ok((capacity, out))
+}
+
+#[allow(dead_code)] // called by T4 disabled-resolution branch
+/// Single-pass S2-N behaviour: emit `FileMetaRecord` with `path` = bare filename and
+/// `path_complete = None`. Used when `resolve_mft_paths` is disabled (future minimal
+/// profile). Kept identical in spirit to the original S2-N scan so disabling path
+/// resolution is a faithful fallback, not a degraded one.
+fn scan_bare<R: Read + Seek>(src: &mut R, ntfs: &Ntfs, ceiling: u64) -> Vec<FileMetaRecord> {
+    let mut out: Vec<FileMetaRecord> = Vec::new();
+    for rec_num in 0..ceiling {
+        let file = match ntfs.file(src, rec_num) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let si = file.info().ok();
+        let (path, _parent, fn_b_raw, fn_m_raw) = match preferred_file_name(&file, src) {
+            Some(t) => t,
+            None => continue,
+        };
+        out.push(FileMetaRecord {
+            path,
+            size: 0,
+            sha256: None,
+            si_btime: si
+                .as_ref()
+                .and_then(|s| filetime_to_utc(s.creation_time().nt_timestamp())),
+            si_mtime: si
+                .as_ref()
+                .and_then(|s| filetime_to_utc(s.modification_time().nt_timestamp())),
+            fn_btime: filetime_to_utc(fn_b_raw),
+            fn_mtime: filetime_to_utc(fn_m_raw),
+            zone_identifier: None,
+            path_complete: None,
+        });
+    }
+    out
 }
 
 #[cfg(test)]
