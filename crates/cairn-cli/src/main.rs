@@ -615,6 +615,10 @@ fn main() -> anyhow::Result<()> {
                 Box::new(cairn_heur::ParentChildHeuristic),
                 Box::new(cairn_heur::NetConnHeuristic),
                 Box::new(cairn_heur::PersistHeuristic),
+                // S2-N′: threshold from Config (fixed default 24h; no CLI flag).
+                Box::new(cairn_heur::TimestompHeuristic::new(
+                    chrono::Duration::hours(cfg.timestomp_threshold_hours),
+                )),
             ];
             let mut outcome = run_live(&cfg, privileges, hostname, &collectors, &analyzers);
             // Stamp the host onto each finding (analyzers don't know the hostname), then
@@ -847,6 +851,20 @@ mod tests {
         assert!(line.contains("2 file(s)"), "{line}");
         assert!(line.contains("rules=./rules"), "{line}");
         assert!(line.contains("output="), "{line}");
+    }
+
+    /// The live analyzer set includes the timestomp heuristic (S2-N' wiring).
+    #[test]
+    fn live_analyzers_include_timestomp() {
+        use cairn_core::traits::Analyzer;
+        let threshold = chrono::Duration::hours(24);
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![
+            Box::new(cairn_heur::ParentChildHeuristic),
+            Box::new(cairn_heur::NetConnHeuristic),
+            Box::new(cairn_heur::PersistHeuristic),
+            Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
+        ];
+        assert!(analyzers.iter().any(|a| a.name() == "heur_timestomp"));
     }
 
     #[test]
