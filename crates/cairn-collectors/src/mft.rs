@@ -33,6 +33,7 @@
 //! Both guards are proven by unit tests that use the exact inputs that panicked the
 //! raw crate (empty reader, 3-byte reader).
 
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{self, AssertUnwindSafe};
 
@@ -48,6 +49,63 @@ use ntfs::Ntfs;
 /// NTFS boot sector length in bytes. The ntfs crate panics if the source is shorter
 /// than this; guard (a) checks this BEFORE calling `Ntfs::new`.
 const BOOT_SECTOR_LEN: usize = 512;
+
+/// NTFS practical max directory nesting; also the cycle/runaway depth ceiling for
+/// the path walk. A chain exceeding this is treated as truncated (best-effort).
+const MAX_PATH_DEPTH: usize = 255;
+
+/// Root directory record number (NTFS fixed: KnownNtfsFileRecordNumber::RootDirectory).
+/// In real NTFS the root's own $FILE_NAME parent-references itself; the walk
+/// terminates on reaching this number BEFORE the cycle check.
+const ROOT_RECORD: u64 = 5;
+
+/// Walk parent references from `start` to the root directory, returning
+/// `(path, complete)`. `index` maps `rec_num -> (name, parent_num)` (built in the
+/// scan phase). Pure (no I/O), never panics: bounded by `MAX_PATH_DEPTH`, a visited
+/// set detects cycles, and any dead end yields a best-effort partial path rather
+/// than aborting (golden rule 8).
+///
+/// `complete == true` only when the walk reaches `ROOT_RECORD`. `path` is always a
+/// clean filesystem path (e.g. `C:\a\b\file` or, best-effort, `C:\a\b`); it is NEVER
+/// prefixed with a pollution marker — resolution quality lives solely in `complete`.
+#[allow(dead_code)] // called by T4 two-phase scan; not yet wired in this task
+fn resolve_path(start: u64, index: &HashMap<u64, (String, u64)>) -> (String, bool) {
+    let mut components: Vec<String> = Vec::new();
+    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut current = start;
+    let mut complete = false;
+
+    for _ in 0..MAX_PATH_DEPTH {
+        // ① Root FIRST: record 5 self-references in real NTFS, so terminating here
+        //    before the cycle check is what makes a clean walk-to-root NOT cyclic.
+        if current == ROOT_RECORD {
+            complete = true;
+            break;
+        }
+        // ② Cycle detection: re-visiting a record means the chain loops.
+        if !visited.insert(current) {
+            break; // complete stays false
+        }
+        // ③ Index lookup: a missing parent is an orphan / deleted / skipped record.
+        match index.get(&current) {
+            Some((name, parent)) => {
+                components.push(name.clone());
+                current = *parent;
+            }
+            None => break, // complete stays false
+        }
+    }
+    // depth exhausted without reaching root → complete stays false (truncated).
+
+    components.reverse();
+    let path = if components.is_empty() {
+        // start == ROOT_RECORD (or an immediate dead end at start): just the drive root.
+        r"C:\".to_string()
+    } else {
+        format!(r"C:\{}", components.join(r"\"))
+    };
+    (path, complete)
+}
 
 /// MftCollector: privilege-gated, read-only, full $MFT scan with SI/FN times.
 ///
@@ -398,5 +456,89 @@ mod tests {
         let mut empty = std::io::Cursor::new(vec![0u8; 3]);
         let r: Result<(u64, Vec<FileMetaRecord>)> = parse_mft_records(&mut empty, 8);
         assert!(r.is_err());
+    }
+
+    // ── resolve_path tests (S2-O Task 2) ─────────────────────────────────────
+
+    use std::collections::HashMap;
+
+    // index helper: rec_num -> (name, parent_num)
+    fn idx(pairs: &[(u64, &str, u64)]) -> HashMap<u64, (String, u64)> {
+        pairs
+            .iter()
+            .map(|(r, n, p)| (*r, (n.to_string(), *p)))
+            .collect()
+    }
+
+    #[test]
+    fn resolves_clean_path_to_root() {
+        // 100(file, parent 50), 50(dir "b", parent 40), 40(dir "a", parent 5 root)
+        let index = idx(&[(100, "evil.exe", 50), (50, "b", 40), (40, "a", 5)]);
+        let (path, complete) = resolve_path(100, &index);
+        assert_eq!(path, r"C:\a\b\evil.exe");
+        assert!(complete);
+    }
+
+    #[test]
+    fn root_self_reference_not_cyclic() {
+        // A top-level file directly under root: 100(parent 5). Root (5) is NOT in the
+        // index (it self-references in real NTFS); termination is by current==ROOT_RECORD,
+        // checked BEFORE the cycle/visited check, so this is complete, not cyclic.
+        let index = idx(&[(100, "evil.exe", 5)]);
+        let (path, complete) = resolve_path(100, &index);
+        assert_eq!(path, r"C:\evil.exe");
+        assert!(complete, "walk ending at root must be complete, not cyclic");
+    }
+
+    #[test]
+    fn root_record_itself_resolves_to_c_backslash() {
+        // start == 5 (the root directory record itself).
+        let index = idx(&[]);
+        let (path, complete) = resolve_path(5, &index);
+        assert_eq!(path, r"C:\");
+        assert!(complete);
+    }
+
+    #[test]
+    fn cycle_returns_best_effort() {
+        // A(parent B), B(parent A): a cycle that never reaches root.
+        let index = idx(&[(100, "a", 200), (200, "b", 100)]);
+        let (_path, complete) = resolve_path(100, &index);
+        assert!(!complete, "a cycle must be best-effort");
+    }
+
+    #[test]
+    fn orphan_parent_missing_best_effort() {
+        // 100(parent 999) where 999 is not in the index (deleted/skipped directory).
+        let index = idx(&[(100, "evil.exe", 999)]);
+        let (path, complete) = resolve_path(100, &index);
+        assert!(!complete, "missing parent must be best-effort");
+        assert!(
+            path.contains("evil.exe"),
+            "best-effort path keeps the part it resolved: {path}"
+        );
+    }
+
+    #[test]
+    fn depth_ceiling_truncates() {
+        // A 300-deep chain that never hits root: rec k -> parent k+1, for k in 1001..=1300.
+        // Records start at 1001 to avoid accidentally passing through ROOT_RECORD (5).
+        // The walk must stop at MAX_PATH_DEPTH and report best-effort without hanging.
+        let pairs: Vec<(u64, String, u64)> = (1001..=1300u64)
+            .map(|k| (k, format!("d{k}"), k + 1))
+            .collect();
+        let index: HashMap<u64, (String, u64)> =
+            pairs.into_iter().map(|(r, n, p)| (r, (n, p))).collect();
+        let (_path, complete) = resolve_path(1001, &index);
+        assert!(!complete, "exceeding MAX_PATH_DEPTH must be best-effort");
+    }
+
+    #[test]
+    fn best_effort_path_not_polluted() {
+        // The orphan path must be a clean partial path: no "[orphan]"/"[truncated]" prefix.
+        let index = idx(&[(100, "evil.exe", 999)]);
+        let (path, _complete) = resolve_path(100, &index);
+        assert!(!path.contains("[orphan]"), "no pollution prefix: {path}");
+        assert!(!path.contains("[truncated]"), "no pollution prefix: {path}");
     }
 }
