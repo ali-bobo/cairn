@@ -53,8 +53,11 @@ pub struct EntityFile {
     /// timestomp Finding carries all four axes as cross-checkable evidence.
     pub si_mtime: Option<DateTime<Utc>>,
     pub fn_mtime: Option<DateTime<Utc>>,
-    /// Path-resolution quality carried onto a Finding (S2-O); mirrors
-    /// `FileMetaRecord.path_complete`.
+    /// Path-resolution quality from the source MFT record (S2-O).
+    /// Some(true)  = full path walked clean to root (C:\);
+    /// Some(false) = best-effort partial path (orphan/truncated/cyclic ancestry);
+    /// None        = resolution disabled or no path available.
+    /// Mirrors `FileMetaRecord.path_complete`.
     pub path_complete: Option<bool>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
