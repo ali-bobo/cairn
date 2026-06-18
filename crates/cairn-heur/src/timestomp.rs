@@ -140,6 +140,7 @@ impl Analyzer for TimestompHeuristic {
                     fn_btime: m.fn_btime,
                     si_mtime: m.si_mtime,
                     fn_mtime: m.fn_mtime,
+                    path_complete: m.path_complete,
                 }),
                 ..Entity::default()
             };
@@ -213,6 +214,7 @@ mod tests {
             fn_btime,
             fn_mtime,
             zone_identifier: None,
+            path_complete: None,
         }
     }
 

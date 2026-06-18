@@ -53,6 +53,9 @@ pub struct EntityFile {
     /// timestomp Finding carries all four axes as cross-checkable evidence.
     pub si_mtime: Option<DateTime<Utc>>,
     pub fn_mtime: Option<DateTime<Utc>>,
+    /// Path-resolution quality carried onto a Finding (S2-O); mirrors
+    /// `FileMetaRecord.path_complete`.
+    pub path_complete: Option<bool>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityNetConn {
@@ -231,10 +234,34 @@ mod tests {
             fn_btime: Some(t),
             si_mtime: Some(t),
             fn_mtime: Some(t),
+            path_complete: None,
         };
         let j = serde_json::to_string(&full).unwrap();
         let back: EntityFile = serde_json::from_str(&j).unwrap();
         assert_eq!(back.si_mtime, Some(t));
         assert_eq!(back.fn_mtime, Some(t));
+    }
+
+    #[test]
+    fn entityfile_path_complete_roundtrips_and_old_json_none() {
+        use super::EntityFile;
+        // old JSON lacking path_complete -> None
+        let old = r#"{"path":"C:\\a.exe","sha256":null,"mtime":null,"si_btime":null,"fn_btime":null,"si_mtime":null,"fn_mtime":null}"#;
+        let e: EntityFile = serde_json::from_str(old).unwrap();
+        assert_eq!(e.path_complete, None);
+
+        let full = EntityFile {
+            path: "C:\\a.exe".into(),
+            sha256: None,
+            mtime: None,
+            si_btime: None,
+            fn_btime: None,
+            si_mtime: None,
+            fn_mtime: None,
+            path_complete: Some(false),
+        };
+        let j = serde_json::to_string(&full).unwrap();
+        let back: EntityFile = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.path_complete, Some(false));
     }
 }

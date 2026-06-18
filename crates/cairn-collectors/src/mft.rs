@@ -242,6 +242,7 @@ fn parse_mft_inner<R: Read + Seek>(
             fn_btime: filetime_to_utc(fn_b_raw),
             fn_mtime: filetime_to_utc(fn_m_raw),
             zone_identifier: None,
+            path_complete: None,
         });
     }
     Ok((capacity, out))
