@@ -7,8 +7,10 @@
 //!
 //! Severity is MAGNITUDE-BANDED on the max fired delta — it is NOT additive scoring,
 //! so it deliberately does NOT use `score.rs::severity_for` (a weight→severity map).
-use cairn_core::record::FileMetaRecord;
-use cairn_core::Severity;
+use cairn_core::finding::EntityFile;
+use cairn_core::record::{FileMetaRecord, Record};
+use cairn_core::traits::Analyzer;
+use cairn_core::{Entity, Finding, FindingSource, Result, Severity};
 use chrono::{DateTime, Duration, Utc};
 
 /// One axis that fired the directional-delta test, kept for the reason string + entity.
@@ -83,6 +85,99 @@ pub fn timestomp_severity(max_delta: Duration) -> Severity {
         Severity::High
     } else {
         Severity::Medium
+    }
+}
+
+/// Analyzer: flags timestomped files from the FileMeta stream. Holds the threshold
+/// (read from `Config.timestomp_threshold_hours` when the analyzer vec is built).
+pub struct TimestompHeuristic {
+    threshold: Duration,
+}
+
+impl TimestompHeuristic {
+    pub fn new(threshold: Duration) -> Self {
+        TimestompHeuristic { threshold }
+    }
+}
+
+impl Analyzer for TimestompHeuristic {
+    fn name(&self) -> &str {
+        "heur_timestomp"
+    }
+
+    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+        let mut out = Vec::new();
+        for r in records {
+            let Record::FileMeta(m) = r else { continue };
+            let Some(hit) = detect_timestomp(m, self.threshold) else {
+                continue;
+            };
+            let severity = timestomp_severity(hit.max_delta);
+
+            let mut f = Finding::new(
+                severity,
+                "Timestomp: SI timestamps backdated vs $FILE_NAME",
+                FindingSource::Heuristic,
+            );
+            f.reason = Some(reason_for(&hit, &m.path));
+            f.mitre = vec!["T1070.006".to_string()];
+            f.artifact = "file_meta".into();
+            f.details = format!("path={} {}", m.path, axes_detail(&hit));
+            // Anchor the finding at the real creation time (FN.btime) when known.
+            f.ts = m.fn_btime.or(m.fn_mtime).unwrap_or_else(Utc::now);
+            f.entity = Entity {
+                file: Some(EntityFile {
+                    path: m.path.clone(),
+                    sha256: m.sha256.clone(),
+                    mtime: m.si_mtime,
+                    si_btime: m.si_btime,
+                    fn_btime: m.fn_btime,
+                    si_mtime: m.si_mtime,
+                    fn_mtime: m.fn_mtime,
+                }),
+                ..Entity::default()
+            };
+            out.push(f);
+        }
+        Ok(out)
+    }
+}
+
+/// Human-readable explanation (golden rule 6): names each fired axis and its delta.
+fn reason_for(hit: &TimestompHit, path: &str) -> String {
+    let parts: Vec<String> = hit
+        .hits
+        .iter()
+        .map(|h| {
+            format!(
+                "SI.{} {} is earlier than FN.{} {} by {}",
+                h.axis,
+                h.si.to_rfc3339(),
+                h.axis,
+                h.fn_.to_rfc3339(),
+                humanize(h.delta),
+            )
+        })
+        .collect();
+    format!("{} ({})", parts.join("; "), path)
+}
+
+/// Compact technical axis listing for `details`.
+fn axes_detail(hit: &TimestompHit) -> String {
+    hit.hits
+        .iter()
+        .map(|h| format!("{}_delta={}", h.axis, humanize(h.delta)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Render a Duration as a coarse human string (days when ≥ 1 day, else hours).
+fn humanize(d: Duration) -> String {
+    let days = d.num_days();
+    if days >= 1 {
+        format!("{days}d")
+    } else {
+        format!("{}h", d.num_hours())
     }
 }
 
@@ -225,5 +320,49 @@ mod tests {
             None,
         );
         assert_eq!(detect_timestomp(&m, thresh()), None);
+    }
+
+    #[test]
+    fn analyzer_emits_finding_with_four_axis_entity() {
+        use cairn_core::record::Record;
+        use cairn_core::traits::Analyzer;
+        // one stomped file (SI.btime 2y before FN.btime, SI.mtime 2y before FN.mtime)
+        // and one clean file → exactly one Finding, carrying all four times + T1070.006.
+        let stomped = Record::FileMeta(meta(
+            Some(t("2011-01-01T00:00:00Z")),
+            Some(t("2013-01-05T18:15:00Z")),
+            Some(t("2011-01-01T00:00:00Z")),
+            Some(t("2013-01-05T18:15:00Z")),
+        ));
+        let clean_t = t("2024-06-01T00:00:00Z");
+        let clean = Record::FileMeta(meta(
+            Some(clean_t),
+            Some(clean_t),
+            Some(clean_t),
+            Some(clean_t),
+        ));
+
+        let h = TimestompHeuristic::new(Duration::hours(24));
+        let findings = h.analyze(&[stomped, clean]).expect("analyze");
+
+        assert_eq!(findings.len(), 1, "only the stomped file fires");
+        let f = &findings[0];
+        assert!(matches!(f.source, cairn_core::FindingSource::Heuristic));
+        assert!(f.reason.is_some(), "golden rule 6: reason required");
+        assert!(f.mitre.contains(&"T1070.006".to_string()));
+        assert_eq!(f.severity, Severity::Critical);
+        assert_eq!(f.artifact, "file_meta");
+        let ef = f.entity.file.as_ref().expect("file entity");
+        assert!(ef.si_btime.is_some() && ef.fn_btime.is_some());
+        assert!(ef.si_mtime.is_some() && ef.fn_mtime.is_some());
+        assert_eq!(ef.path, r"C:\Users\a\evil.exe");
+    }
+
+    #[test]
+    fn analyzer_ignores_non_filemeta_and_empty_stream() {
+        use cairn_core::traits::Analyzer;
+        // an empty stream yields zero findings (no crash).
+        let h = TimestompHeuristic::new(Duration::hours(24));
+        assert!(h.analyze(&[]).unwrap().is_empty());
     }
 }

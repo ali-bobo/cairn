@@ -13,3 +13,4 @@ pub mod timestomp;
 pub use netconn::NetConnHeuristic;
 pub use parentchild::ParentChildHeuristic;
 pub use persist::PersistHeuristic;
+pub use timestomp::TimestompHeuristic;
