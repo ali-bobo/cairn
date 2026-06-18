@@ -38,7 +38,9 @@ fn eval_axis(
     threshold: Duration,
 ) -> Option<AxisHit> {
     let (si, fn_) = (si?, fn_?);
-    let delta = fn_ - si; // positive == SI earlier than FN == backdating direction
+    // positive == SI earlier than FN == backdating direction. Cannot overflow: both
+    // times come from filetime_to_utc (S2-N), which clamps to chrono's representable range.
+    let delta = fn_ - si;
     if delta > threshold {
         Some(AxisHit {
             axis,
@@ -64,7 +66,11 @@ pub fn detect_timestomp(meta: &FileMetaRecord, threshold: Duration) -> Option<Ti
     if hits.is_empty() {
         return None;
     }
-    let max_delta = hits.iter().map(|h| h.delta).max().expect("non-empty");
+    let max_delta = hits
+        .iter()
+        .map(|h| h.delta)
+        .max()
+        .unwrap_or_else(|| unreachable!("hits is non-empty — checked above"));
     Some(TimestompHit { hits, max_delta })
 }
 
@@ -207,5 +213,17 @@ mod tests {
         let hit = detect_timestomp(&m, thresh()).expect("both axes fire");
         assert_eq!(hit.hits.len(), 2);
         assert_eq!(timestomp_severity(hit.max_delta), Severity::Critical);
+    }
+
+    #[test]
+    fn delta_exactly_equal_to_threshold_does_not_fire() {
+        // strict `>`: a delta of EXACTLY the threshold (24h) must NOT fire.
+        let m = meta(
+            Some(t("2024-06-01T00:00:00Z")),
+            Some(t("2024-06-02T00:00:00Z")), // exactly +24h == threshold
+            None,
+            None,
+        );
+        assert_eq!(detect_timestomp(&m, thresh()), None);
     }
 }
