@@ -124,11 +124,17 @@ impl Analyzer for TimestompHeuristic {
             f.artifact = "file_meta".into();
             f.details = format!("path={} {}", m.path, axes_detail(&hit));
             // Anchor the finding at the real creation time (FN.btime) when known.
+            // A fired hit always has both sides Some on at least one axis (eval_axis
+            // requires it), so fn_btime OR fn_mtime is Some here — the now() fallback
+            // is unreachable, present only to keep ts total.
             f.ts = m.fn_btime.or(m.fn_mtime).unwrap_or_else(Utc::now);
             f.entity = Entity {
                 file: Some(EntityFile {
                     path: m.path.clone(),
                     sha256: m.sha256.clone(),
+                    // Generic mtime = SI mtime ON PURPOSE: it surfaces the attacker's
+                    // backdated value in the generic timeline field; the real value is
+                    // preserved in fn_mtime below. Do not "fix" this to fn_mtime.
                     mtime: m.si_mtime,
                     si_btime: m.si_btime,
                     fn_btime: m.fn_btime,
@@ -359,10 +365,27 @@ mod tests {
     }
 
     #[test]
-    fn analyzer_ignores_non_filemeta_and_empty_stream() {
+    fn analyzer_yields_nothing_on_empty_stream() {
         use cairn_core::traits::Analyzer;
         // an empty stream yields zero findings (no crash).
         let h = TimestompHeuristic::new(Duration::hours(24));
         assert!(h.analyze(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn analyzer_skips_non_filemeta_records() {
+        // A non-FileMeta record must be silently skipped (no panic, no finding).
+        use cairn_core::traits::Analyzer;
+        let nc = Record::NetConn(cairn_core::record::NetConnRecord {
+            proto: "tcp".into(),
+            laddr: "127.0.0.1".into(),
+            lport: 0,
+            raddr: None,
+            rport: None,
+            state: Some("LISTEN".into()),
+            pid: None,
+        });
+        let h = TimestompHeuristic::new(Duration::hours(24));
+        assert!(h.analyze(&[nc]).unwrap().is_empty());
     }
 }
