@@ -201,5 +201,16 @@ Unit tests in `timestomp.rs`, one per signal + boundaries + analyzer end-to-end:
 - **False-negative by design:** sub-threshold backdating (< 24h) is intentionally
   missed to keep false positives near zero. A SOC analyst wanting hour-level drift
   can lower `timestomp_threshold_hours` (Config), but the default protects trust.
+- **Known false-positive class (accept, do not auto-suppress):** a legitimate
+  metadata-restoring operation — archive extraction that preserves the original
+  btime (`unzip -X`, 7-Zip), `robocopy /COPY:T`, an MSI that restores packaged
+  timestamps — lands SI at the *old archived* time while FN takes the real
+  extraction time, which is the SAME shape as a stomp and WILL fire (banded by how
+  old the archive is; a year-old archive surfaces as Critical). This is accepted
+  deliberately: the alternative (whitelisting system paths / band-down) creates an
+  "attacker hides in WinSxS" blind spot. The triage stance is loud-but-explained —
+  the full path + four timestamps are in the Finding's `reason`/`details` for the
+  analyst to dismiss in seconds. Surfaced here so the band is never mistaken for a
+  certainty. (Raised by the final whole-feature review, 2026-06-18.)
 - **No host effect:** the analyzer reads Records only; it cannot modify artifacts
   or the host (golden rule 3).
