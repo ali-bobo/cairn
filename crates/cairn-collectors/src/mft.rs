@@ -33,7 +33,7 @@
 //! Both guards are proven by unit tests that use the exact inputs that panicked the
 //! raw crate (empty reader, 3-byte reader).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{self, AssertUnwindSafe};
 
@@ -68,10 +68,14 @@ const ROOT_RECORD: u64 = 5;
 /// `complete == true` only when the walk reaches `ROOT_RECORD`. `path` is always a
 /// clean filesystem path (e.g. `C:\a\b\file` or, best-effort, `C:\a\b`); it is NEVER
 /// prefixed with a pollution marker — resolution quality lives solely in `complete`.
+///
+/// The drive prefix is a fixed `C:` — the collector reads `\\.\C:` and $MFT carries
+/// no mount/drive-letter info, so by design no other letter is inferred (spec: no
+/// drive-letter discovery).
 #[allow(dead_code)] // called by T4 two-phase scan; not yet wired in this task
 fn resolve_path(start: u64, index: &HashMap<u64, (String, u64)>) -> (String, bool) {
     let mut components: Vec<String> = Vec::new();
-    let mut visited: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut visited: HashSet<u64> = HashSet::new();
     let mut current = start;
     let mut complete = false;
 
