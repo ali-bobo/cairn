@@ -67,6 +67,10 @@ pub struct Config {
     /// Hitting it records a truncation note in the manifest and stops the scan
     /// (never OOM / never an unbounded loop on a lied-about volume capacity).
     pub max_mft_records: u64,
+    /// Min FN−SI delta (hours), either axis, before a timestomp Finding fires (S2-N′).
+    /// Below this, sub-day SI/FN drift from legit ops (unzip/copy/install) is ignored.
+    /// Fixed default; no CLI flag — banding (Medium/High/Critical) carries severity.
+    pub timestomp_threshold_hours: i64,
 }
 
 impl Default for Config {
@@ -84,6 +88,7 @@ impl Default for Config {
             since: None,
             use_vss: false,
             max_mft_records: 1_000_000,
+            timestomp_threshold_hours: 24,
         }
     }
 }
@@ -176,5 +181,11 @@ mod tests {
     fn max_mft_records_defaults_to_one_million() {
         let cfg = Config::default();
         assert_eq!(cfg.max_mft_records, 1_000_000);
+    }
+
+    #[test]
+    fn timestomp_threshold_defaults_to_24_hours() {
+        let cfg = Config::default();
+        assert_eq!(cfg.timestomp_threshold_hours, 24);
     }
 }

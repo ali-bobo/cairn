@@ -49,6 +49,10 @@ pub struct EntityFile {
     pub mtime: Option<DateTime<Utc>>,
     pub si_btime: Option<DateTime<Utc>>,
     pub fn_btime: Option<DateTime<Utc>>,
+    /// SI/FN modification times (S2-N′): exposed alongside the btimes so a
+    /// timestomp Finding carries all four axes as cross-checkable evidence.
+    pub si_mtime: Option<DateTime<Utc>>,
+    pub fn_mtime: Option<DateTime<Utc>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityNetConn {
@@ -200,5 +204,37 @@ mod tests {
         // reason is Some -> present and round-trips.
         let back: Finding = serde_json::from_str(&json).unwrap();
         assert_eq!(back.reason.as_deref(), f.reason.as_deref());
+    }
+
+    /// EntityFile JSON written before S2-N′ (no si_mtime/fn_mtime) still deserializes,
+    /// with the two new fields defaulting to None (serde backward compat). And a full
+    /// four-axis EntityFile round-trips.
+    #[test]
+    fn entityfile_old_json_gets_none_mtimes_and_new_roundtrips() {
+        use super::EntityFile;
+        // old JSON: lacks si_mtime / fn_mtime
+        let old = r#"{"path":"C:\\a.exe","sha256":null,"mtime":null,
+        "si_btime":null,"fn_btime":null}"#;
+        let e: EntityFile = serde_json::from_str(old).unwrap();
+        assert_eq!(e.si_mtime, None);
+        assert_eq!(e.fn_mtime, None);
+
+        // new EntityFile carries all four times and survives a round-trip
+        let t = chrono::DateTime::parse_from_rfc3339("2013-01-05T18:15:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let full = EntityFile {
+            path: "C:\\a.exe".into(),
+            sha256: None,
+            mtime: None,
+            si_btime: Some(t),
+            fn_btime: Some(t),
+            si_mtime: Some(t),
+            fn_mtime: Some(t),
+        };
+        let j = serde_json::to_string(&full).unwrap();
+        let back: EntityFile = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.si_mtime, Some(t));
+        assert_eq!(back.fn_mtime, Some(t));
     }
 }
