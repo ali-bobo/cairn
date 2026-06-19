@@ -9,7 +9,9 @@
 //! With path resolution ENABLED (default), the scan holds two bounded structures:
 //! a `Vec` of per-record time skeletons AND a `HashMap<rec_num -> (name, parent)>`
 //! path index, both bounded by `max_mft_records` (the name is stored once in the
-//! index, not duplicated into the skeleton). With `resolve_mft_paths` DISABLED, the
+//! index, not duplicated into the skeleton). Both are live simultaneously during
+//! phase 2 (path resolution), so peak RAM is `index + pending` together, each
+//! bounded by the record cap. With `resolve_mft_paths` DISABLED, the
 //! footprint reverts exactly to the S2-N single-`Vec` behaviour. The record cap —
 //! not the volume's declared capacity — is the bound, so a boot sector lying about
 //! volume size cannot inflate it. A streaming sink is a future improvement.
