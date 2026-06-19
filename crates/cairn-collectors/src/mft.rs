@@ -579,12 +579,14 @@ mod tests {
 
     #[test]
     fn root_in_index_with_self_parent_still_completes() {
-        // The REAL NTFS crux: record 5 (root) is PRESENT in the index and
-        // self-references (parent == 5). The walk reaches 5 and must terminate via
-        // the root check (complete=true) BEFORE the cycle/visited check would see
-        // 5 a second time. If the termination order were ever flipped to
-        // cycle-before-root, the self-reference would be misflagged cyclic and this
-        // test would fail. 100(file, parent 5) under a self-referencing root 5.
+        // Real-NTFS configuration: record 5 (root) is PRESENT in the index and
+        // self-references (parent == 5), with a file 100 directly under it. The walk
+        // reaches 5 and terminates via the root check in the SAME iteration it would
+        // first insert 5 into `visited`, so it completes cleanly. This pins that the
+        // root check is NOT removed/elided: without it the walk would push "." and then
+        // hit 5 a second time, yielding a wrong path and a false `complete`. (A pure
+        // reorder of the two checks is observationally equivalent for this input — the
+        // invariant this test guards is the root check's PRESENCE, not check ordering.)
         let index = idx(&[(100, "evil.exe", 5), (5, ".", 5)]);
         let (path, complete) = resolve_path(100, &index);
         assert_eq!(path, r"C:\evil.exe");
