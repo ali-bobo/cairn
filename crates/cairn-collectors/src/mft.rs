@@ -578,6 +578,23 @@ mod tests {
     }
 
     #[test]
+    fn root_in_index_with_self_parent_still_completes() {
+        // The REAL NTFS crux: record 5 (root) is PRESENT in the index and
+        // self-references (parent == 5). The walk reaches 5 and must terminate via
+        // the root check (complete=true) BEFORE the cycle/visited check would see
+        // 5 a second time. If the termination order were ever flipped to
+        // cycle-before-root, the self-reference would be misflagged cyclic and this
+        // test would fail. 100(file, parent 5) under a self-referencing root 5.
+        let index = idx(&[(100, "evil.exe", 5), (5, ".", 5)]);
+        let (path, complete) = resolve_path(100, &index);
+        assert_eq!(path, r"C:\evil.exe");
+        assert!(
+            complete,
+            "root present in index with self-parent must still complete, not cyclic"
+        );
+    }
+
+    #[test]
     fn root_record_itself_resolves_to_c_backslash() {
         // start == 5 (the root directory record itself).
         let index = idx(&[]);
