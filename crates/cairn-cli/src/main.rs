@@ -1003,4 +1003,15 @@ mod tests {
         ]);
         assert_eq!(args.max_mft_records, 42);
     }
+
+    #[test]
+    fn live_config_enables_mft_path_resolution_by_default() {
+        // The live Config is built with `..Config::default()`; path resolution must be
+        // on by default so the mft collector reconstructs full paths (S2-O).
+        let cfg = Config::default();
+        assert!(
+            cfg.resolve_mft_paths,
+            "path resolution must default on for the live run"
+        );
+    }
 }
