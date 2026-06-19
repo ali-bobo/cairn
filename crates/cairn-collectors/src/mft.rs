@@ -6,11 +6,13 @@
 //! them as `Record::FileMeta`.
 //!
 //! ## Peak memory (NFR10)
-//! The scan holds up to `max_mft_records` `FileMetaRecord`s in a `Vec` before they are
-//! mapped to `Record::FileMeta`, so peak RAM is bounded by the record cap
-//! (default 1_000_000 × ~the size of a `FileMetaRecord`). The cap — not the volume's
-//! declared capacity — is the bound, so a boot sector lying about volume size cannot
-//! inflate it. A streaming sink (removing the intermediate `Vec`) is a future improvement.
+//! With path resolution ENABLED (default), the scan holds two bounded structures:
+//! a `Vec` of per-record time skeletons AND a `HashMap<rec_num -> (name, parent)>`
+//! path index, both bounded by `max_mft_records` (the name is stored once in the
+//! index, not duplicated into the skeleton). With `resolve_mft_paths` DISABLED, the
+//! footprint reverts exactly to the S2-N single-`Vec` behaviour. The record cap —
+//! not the volume's declared capacity — is the bound, so a boot sector lying about
+//! volume size cannot inflate it. A streaming sink is a future improvement.
 //!
 //! ## Two-layer DoS guard (BOTH required — defense in depth)
 //!
@@ -72,7 +74,6 @@ const ROOT_RECORD: u64 = 5;
 /// The drive prefix is a fixed `C:` — the collector reads `\\.\C:` and $MFT carries
 /// no mount/drive-letter info, so by design no other letter is inferred (spec: no
 /// drive-letter discovery).
-#[allow(dead_code)] // called by T4 two-phase scan; not yet wired in this task
 fn resolve_path(start: u64, index: &HashMap<u64, (String, u64)>) -> (String, bool) {
     let mut components: Vec<String> = Vec::new();
     let mut visited: HashSet<u64> = HashSet::new();
@@ -137,8 +138,9 @@ impl Collector for MftCollector {
         }
 
         let cap = ctx.config.max_mft_records;
+        let resolve_paths = ctx.config.resolve_mft_paths;
         let mut reader = VolumeReader::open(r"\\.\C:")?;
-        let (capacity, records) = parse_mft_records(&mut reader, cap)?;
+        let (capacity, records) = parse_mft_records(&mut reader, cap, resolve_paths)?;
 
         tracing::info!(
             mft_capacity_estimate = capacity,
@@ -185,6 +187,7 @@ fn mft_err(reason: String) -> CairnError {
 pub(crate) fn parse_mft_records<R: Read + Seek>(
     src: &mut R,
     max_records: u64,
+    resolve_paths: bool,
 ) -> Result<(u64, Vec<FileMetaRecord>)> {
     src.seek(SeekFrom::Start(0))
         .map_err(|e| mft_err(format!("seek to start failed: {e}")))?;
@@ -207,7 +210,9 @@ pub(crate) fn parse_mft_records<R: Read + Seek>(
     //   but we NEVER use `src` after a caught panic — we immediately return Err.
     // - We are NOT using catch_unwind to hide our own logic errors; only to
     //   contain a measured, third-party panic that we cannot fix.
-    let result = panic::catch_unwind(AssertUnwindSafe(|| parse_mft_inner(src, max_records)));
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        parse_mft_inner(src, max_records, resolve_paths)
+    }));
     match result {
         Ok(inner) => inner,
         Err(_) => Err(mft_err(
@@ -265,6 +270,13 @@ fn preferred_file_name<R: Read + Seek>(
 
 /// Inner $MFT scan. Called only after guard (a); wrapped by guard (b).
 ///
+/// When `resolve_paths` is true, a two-phase scan is performed: phase 1 builds a
+/// `HashMap<rec_num -> (name, parent)>` path index while collecting time skeletons;
+/// phase 2 calls `resolve_path` for each record and emits `FileMetaRecord` with a
+/// reconstructed full path and a definitive `path_complete`. When `resolve_paths` is
+/// false, `scan_bare` is used directly (S2-N single-pass, bare filename, `path_complete
+/// = None`).
+///
 /// UPSTREAM LIMITATION (ntfs 0.4): `Ntfs::file()` assumes the $MFT itself has no
 /// `$ATTRIBUTE_LIST`. On a heavily fragmented volume whose $MFT spans multiple data
 /// runs, records beyond the first run yield `Err` and are silently skipped via the
@@ -274,46 +286,76 @@ fn preferred_file_name<R: Read + Seek>(
 fn parse_mft_inner<R: Read + Seek>(
     src: &mut R,
     max_records: u64,
+    resolve_paths: bool,
 ) -> Result<(u64, Vec<FileMetaRecord>)> {
     let ntfs = Ntfs::new(src).map_err(|e| mft_err(format!("Ntfs::new failed: {e}")))?;
     let file_record_size = ntfs.file_record_size() as u64;
     let capacity = ntfs.size().checked_div(file_record_size).unwrap_or(0);
     let ceiling = capacity.min(max_records);
 
-    // Not pre-allocated to `ceiling`: most records are typically skipped (no FN /
-    // parse error), so Vec::new avoids reserving worst-case capacity up front.
-    let mut out: Vec<FileMetaRecord> = Vec::new();
+    if !resolve_paths {
+        // S2-N single-pass fallback: bare filename, path_complete None.
+        return Ok((capacity, scan_bare(src, &ntfs, ceiling)));
+    }
+
+    // ── Phase 1: scan + build index (rec_num -> (name, parent)) and time skeletons ──
+    let mut index: HashMap<u64, (String, u64)> = HashMap::new();
+    // Skeleton carries only times; the name lives once in `index` (not duplicated).
+    let mut pending: Vec<(u64, FileTimes)> = Vec::new();
     for rec_num in 0..ceiling {
-        // Single-record isolation: a bad/unallocated record is skipped, never aborts.
         let file = match ntfs.file(src, rec_num) {
             Ok(f) => f,
             Err(_) => continue,
         };
         let si = file.info().ok();
-        let (path, _parent, fn_b_raw, fn_m_raw) = match preferred_file_name(&file, src) {
+        let (name, parent, fn_b_raw, fn_m_raw) = match preferred_file_name(&file, src) {
             Some(t) => t,
-            None => continue, // no $FILE_NAME -> not a meaningful file-meta record
+            None => continue,
         };
+        index.insert(rec_num, (name, parent));
+        pending.push((
+            rec_num,
+            FileTimes {
+                si_btime: si
+                    .as_ref()
+                    .and_then(|s| filetime_to_utc(s.creation_time().nt_timestamp())),
+                si_mtime: si
+                    .as_ref()
+                    .and_then(|s| filetime_to_utc(s.modification_time().nt_timestamp())),
+                fn_btime: filetime_to_utc(fn_b_raw),
+                fn_mtime: filetime_to_utc(fn_m_raw),
+            },
+        ));
+    }
+
+    // ── Phase 2: resolve paths and emit ──
+    let mut out: Vec<FileMetaRecord> = Vec::with_capacity(pending.len());
+    for (rec_num, times) in pending {
+        let (path, complete) = resolve_path(rec_num, &index);
         out.push(FileMetaRecord {
             path,
             size: 0,
             sha256: None,
-            si_btime: si
-                .as_ref()
-                .and_then(|s| filetime_to_utc(s.creation_time().nt_timestamp())),
-            si_mtime: si
-                .as_ref()
-                .and_then(|s| filetime_to_utc(s.modification_time().nt_timestamp())),
-            fn_btime: filetime_to_utc(fn_b_raw),
-            fn_mtime: filetime_to_utc(fn_m_raw),
+            si_btime: times.si_btime,
+            si_mtime: times.si_mtime,
+            fn_btime: times.fn_btime,
+            fn_mtime: times.fn_mtime,
             zone_identifier: None,
-            path_complete: None,
+            path_complete: Some(complete),
         });
     }
     Ok((capacity, out))
 }
 
-#[allow(dead_code)] // called by T4 disabled-resolution branch
+/// The four MACB-relevant times pulled from one $MFT record in phase 1, carried to
+/// phase 2 WITHOUT the name (the name is held once in the path index, not duplicated).
+struct FileTimes {
+    si_btime: Option<chrono::DateTime<chrono::Utc>>,
+    si_mtime: Option<chrono::DateTime<chrono::Utc>>,
+    fn_btime: Option<chrono::DateTime<chrono::Utc>>,
+    fn_mtime: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Single-pass S2-N behaviour: emit `FileMetaRecord` with `path` = bare filename and
 /// `path_complete = None`. Used when `resolve_mft_paths` is disabled (future minimal
 /// profile). Kept identical in spirit to the original S2-N scan so disabling path
@@ -380,7 +422,7 @@ mod tests {
         // Through the guarded helper they MUST be Err, with no panic escaping.
         for bytes in [vec![], vec![0xEB, 0x52, 0x90]] {
             let mut cur = std::io::Cursor::new(bytes);
-            let r = parse_mft_records(&mut cur, 8);
+            let r = parse_mft_records(&mut cur, 8, true);
             assert!(r.is_err(), "short source must be Err, never panic");
         }
     }
@@ -390,7 +432,7 @@ mod tests {
         // A full sector+ of zeros: ntfs returns clean Err (invalid boot signature);
         // the wrapper passes it through as Err.
         let mut cur = std::io::Cursor::new(vec![0u8; 1024]);
-        let r = parse_mft_records(&mut cur, 8);
+        let r = parse_mft_records(&mut cur, 8, true);
         assert!(r.is_err());
     }
 
@@ -433,7 +475,7 @@ mod tests {
         write_boot_sector(&mut buf, total_sectors, 4);
 
         let mut cur = std::io::Cursor::new(buf);
-        let r = parse_mft_records(&mut cur, 8);
+        let r = parse_mft_records(&mut cur, 8, true);
         // S2-N: per-record isolation means individual bad file records are skipped, not
         // the whole scan. A garbage MFT body yields Ok with zero records (all skipped) —
         // not Err. Err is also acceptable (e.g. if Ntfs::new itself fails on the geometry).
@@ -489,7 +531,7 @@ mod tests {
         let mut buf = vec![0u8; BUF];
         write_boot_sector(&mut buf, (BUF as u64 / 512).saturating_sub(1), 4);
         let mut cur = std::io::Cursor::new(buf);
-        let _ = parse_mft_records(&mut cur, 8); // must return, not panic/hang
+        let _ = parse_mft_records(&mut cur, 8, true); // must return, not panic/hang
     }
 
     #[test]
@@ -497,7 +539,7 @@ mod tests {
         // Pins the new return type (u64, Vec<FileMetaRecord>) and guard (a): a 3-byte
         // source (panicked the raw ntfs crate in S2-M's probe) is Err, no panic.
         let mut empty = std::io::Cursor::new(vec![0u8; 3]);
-        let r: Result<(u64, Vec<FileMetaRecord>)> = parse_mft_records(&mut empty, 8);
+        let r: Result<(u64, Vec<FileMetaRecord>)> = parse_mft_records(&mut empty, 8, true);
         assert!(r.is_err());
     }
 
@@ -583,5 +625,16 @@ mod tests {
         let (path, _complete) = resolve_path(100, &index);
         assert!(!path.contains("[orphan]"), "no pollution prefix: {path}");
         assert!(!path.contains("[truncated]"), "no pollution prefix: {path}");
+    }
+
+    #[test]
+    fn parse_mft_records_accepts_resolve_flag_both_values() {
+        // Pins the new signature: parse_mft_records(src, max, resolve_paths).
+        // A short source is Err either way (guard a), proving the flag is threaded
+        // without changing the DoS posture.
+        let mut a = std::io::Cursor::new(vec![0u8; 3]);
+        assert!(parse_mft_records(&mut a, 8, true).is_err());
+        let mut b = std::io::Cursor::new(vec![0u8; 3]);
+        assert!(parse_mft_records(&mut b, 8, false).is_err());
     }
 }
