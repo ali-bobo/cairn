@@ -87,6 +87,11 @@ pub struct FileMetaRecord {
     pub fn_btime: Option<DateTime<Utc>>,
     pub fn_mtime: Option<DateTime<Utc>>,
     pub zone_identifier: Option<String>, // mark-of-the-web
+    /// Path-resolution quality (path map, S2-O): Some(true) = walked clean to root
+    /// (C:\); Some(false) = best-effort (orphan/truncated/cyclic — `path` is a partial
+    /// REAL path fragment, never prefixed/polluted); None = resolution disabled or no
+    /// path. The `path` string stays a clean filesystem path for any string consumer.
+    pub path_complete: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +260,7 @@ mod tests {
             fn_btime: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
             fn_mtime: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
             zone_identifier: None,
+            path_complete: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         assert!(j.contains("fn_mtime"));
@@ -265,5 +271,29 @@ mod tests {
         let old = r#"{"path":"x","size":0,"sha256":null,"si_btime":null,"si_mtime":null,"fn_btime":null,"zone_identifier":null}"#;
         let parsed: FileMetaRecord = serde_json::from_str(old).unwrap();
         assert_eq!(parsed.fn_mtime, None);
+    }
+
+    #[test]
+    fn file_meta_path_complete_roundtrips_and_old_json_none() {
+        let r = FileMetaRecord {
+            path: r"C:\Users\a\evil.exe".into(),
+            size: 0,
+            sha256: None,
+            si_btime: None,
+            si_mtime: None,
+            fn_btime: None,
+            fn_mtime: None,
+            zone_identifier: None,
+            path_complete: Some(true),
+        };
+        let j = serde_json::to_string(&r).unwrap();
+        assert!(j.contains("path_complete"));
+        let back: FileMetaRecord = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.path_complete, Some(true));
+
+        // Older JSONL (FR1 replay) lacking path_complete must deserialize to None.
+        let old = r#"{"path":"x","size":0,"sha256":null,"si_btime":null,"si_mtime":null,"fn_btime":null,"fn_mtime":null,"zone_identifier":null}"#;
+        let parsed: FileMetaRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.path_complete, None);
     }
 }

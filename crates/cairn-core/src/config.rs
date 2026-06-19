@@ -71,6 +71,10 @@ pub struct Config {
     /// Below this, sub-day SI/FN drift from legit ops (unzip/copy/install) is ignored.
     /// Fixed default; no CLI flag — banding (Medium/High/Critical) carries severity.
     pub timestomp_threshold_hours: i64,
+    /// Reconstruct full file paths from $MFT parent references (path map, S2-O).
+    /// false → fall back to S2-N bare-filename behaviour (path_complete = None),
+    /// the first optional enhancement to drop under a future minimal profile.
+    pub resolve_mft_paths: bool,
 }
 
 impl Default for Config {
@@ -89,6 +93,7 @@ impl Default for Config {
             use_vss: false,
             max_mft_records: 1_000_000,
             timestomp_threshold_hours: 24,
+            resolve_mft_paths: true,
         }
     }
 }
@@ -187,5 +192,11 @@ mod tests {
     fn timestomp_threshold_defaults_to_24_hours() {
         let cfg = Config::default();
         assert_eq!(cfg.timestomp_threshold_hours, 24);
+    }
+
+    #[test]
+    fn resolve_mft_paths_defaults_to_true() {
+        let cfg = Config::default();
+        assert!(cfg.resolve_mft_paths);
     }
 }

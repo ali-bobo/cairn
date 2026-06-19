@@ -148,6 +148,7 @@ fn persistence_entity(p: &PersistenceRecord) -> Entity {
                 fn_btime: None,
                 si_mtime: None,
                 fn_mtime: None,
+                path_complete: None,
             }),
             ..Entity::default()
         }

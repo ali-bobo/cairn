@@ -6,11 +6,15 @@
 //! them as `Record::FileMeta`.
 //!
 //! ## Peak memory (NFR10)
-//! The scan holds up to `max_mft_records` `FileMetaRecord`s in a `Vec` before they are
-//! mapped to `Record::FileMeta`, so peak RAM is bounded by the record cap
-//! (default 1_000_000 × ~the size of a `FileMetaRecord`). The cap — not the volume's
-//! declared capacity — is the bound, so a boot sector lying about volume size cannot
-//! inflate it. A streaming sink (removing the intermediate `Vec`) is a future improvement.
+//! With path resolution ENABLED (default), the scan holds two bounded structures:
+//! a `Vec` of per-record time skeletons AND a `HashMap<rec_num -> (name, parent)>`
+//! path index, both bounded by `max_mft_records` (the name is stored once in the
+//! index, not duplicated into the skeleton). Both are live simultaneously during
+//! phase 2 (path resolution), so peak RAM is `index + pending` together, each
+//! bounded by the record cap. With `resolve_mft_paths` DISABLED, the
+//! footprint reverts exactly to the S2-N single-`Vec` behaviour. The record cap —
+//! not the volume's declared capacity — is the bound, so a boot sector lying about
+//! volume size cannot inflate it. A streaming sink is a future improvement.
 //!
 //! ## Two-layer DoS guard (BOTH required — defense in depth)
 //!
@@ -33,6 +37,7 @@
 //! Both guards are proven by unit tests that use the exact inputs that panicked the
 //! raw crate (empty reader, 3-byte reader).
 
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{self, AssertUnwindSafe};
 
@@ -48,6 +53,66 @@ use ntfs::Ntfs;
 /// NTFS boot sector length in bytes. The ntfs crate panics if the source is shorter
 /// than this; guard (a) checks this BEFORE calling `Ntfs::new`.
 const BOOT_SECTOR_LEN: usize = 512;
+
+/// NTFS practical max directory nesting; also the cycle/runaway depth ceiling for
+/// the path walk. A chain exceeding this is treated as truncated (best-effort).
+const MAX_PATH_DEPTH: usize = 255;
+
+/// Root directory record number (NTFS fixed: KnownNtfsFileRecordNumber::RootDirectory).
+/// In real NTFS the root's own $FILE_NAME parent-references itself; the walk
+/// terminates on reaching this number BEFORE the cycle check.
+const ROOT_RECORD: u64 = 5;
+
+/// Walk parent references from `start` to the root directory, returning
+/// `(path, complete)`. `index` maps `rec_num -> (name, parent_num)` (built in the
+/// scan phase). Pure (no I/O), never panics: bounded by `MAX_PATH_DEPTH`, a visited
+/// set detects cycles, and any dead end yields a best-effort partial path rather
+/// than aborting (golden rule 8).
+///
+/// `complete == true` only when the walk reaches `ROOT_RECORD`. `path` is always a
+/// clean filesystem path (e.g. `C:\a\b\file` or, best-effort, `C:\a\b`); it is NEVER
+/// prefixed with a pollution marker — resolution quality lives solely in `complete`.
+///
+/// The drive prefix is a fixed `C:` — the collector reads `\\.\C:` and $MFT carries
+/// no mount/drive-letter info, so by design no other letter is inferred (spec: no
+/// drive-letter discovery).
+fn resolve_path(start: u64, index: &HashMap<u64, (String, u64)>) -> (String, bool) {
+    let mut components: Vec<String> = Vec::new();
+    let mut visited: HashSet<u64> = HashSet::new();
+    let mut current = start;
+    let mut complete = false;
+
+    for _ in 0..MAX_PATH_DEPTH {
+        // ① Root FIRST: record 5 self-references in real NTFS, so terminating here
+        //    before the cycle check is what makes a clean walk-to-root NOT cyclic.
+        if current == ROOT_RECORD {
+            complete = true;
+            break;
+        }
+        // ② Cycle detection: re-visiting a record means the chain loops.
+        if !visited.insert(current) {
+            break; // complete stays false
+        }
+        // ③ Index lookup: a missing parent is an orphan / deleted / skipped record.
+        match index.get(&current) {
+            Some((name, parent)) => {
+                components.push(name.clone());
+                current = *parent;
+            }
+            None => break, // complete stays false
+        }
+    }
+    // depth exhausted without reaching root → complete stays false (truncated).
+
+    components.reverse();
+    let path = if components.is_empty() {
+        // start == ROOT_RECORD (or an immediate dead end at start): just the drive root.
+        r"C:\".to_string()
+    } else {
+        format!(r"C:\{}", components.join(r"\"))
+    };
+    (path, complete)
+}
 
 /// MftCollector: privilege-gated, read-only, full $MFT scan with SI/FN times.
 ///
@@ -75,8 +140,9 @@ impl Collector for MftCollector {
         }
 
         let cap = ctx.config.max_mft_records;
+        let resolve_paths = ctx.config.resolve_mft_paths;
         let mut reader = VolumeReader::open(r"\\.\C:")?;
-        let (capacity, records) = parse_mft_records(&mut reader, cap)?;
+        let (capacity, records) = parse_mft_records(&mut reader, cap, resolve_paths)?;
 
         tracing::info!(
             mft_capacity_estimate = capacity,
@@ -123,6 +189,7 @@ fn mft_err(reason: String) -> CairnError {
 pub(crate) fn parse_mft_records<R: Read + Seek>(
     src: &mut R,
     max_records: u64,
+    resolve_paths: bool,
 ) -> Result<(u64, Vec<FileMetaRecord>)> {
     src.seek(SeekFrom::Start(0))
         .map_err(|e| mft_err(format!("seek to start failed: {e}")))?;
@@ -145,7 +212,9 @@ pub(crate) fn parse_mft_records<R: Read + Seek>(
     //   but we NEVER use `src` after a caught panic — we immediately return Err.
     // - We are NOT using catch_unwind to hide our own logic errors; only to
     //   contain a measured, third-party panic that we cannot fix.
-    let result = panic::catch_unwind(AssertUnwindSafe(|| parse_mft_inner(src, max_records)));
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        parse_mft_inner(src, max_records, resolve_paths)
+    }));
     match result {
         Ok(inner) => inner,
         Err(_) => Err(mft_err(
@@ -159,11 +228,13 @@ pub(crate) fn parse_mft_records<R: Read + Seek>(
 /// raw FILETIME u64s of its creation/modification times. Deterministic (NFR4).
 /// A per-attribute parse error is skipped (continue), never propagated — one unreadable
 /// attribute must not abort name selection for the whole file.
+///
+/// tuple is (name, parent_record_number, fn_btime_raw, fn_mtime_raw)
 fn preferred_file_name<R: Read + Seek>(
     file: &ntfs::NtfsFile<'_>,
     src: &mut R,
-) -> Option<(String, u64, u64)> {
-    let mut fallback: Option<(String, u64, u64)> = None;
+) -> Option<(String, u64, u64, u64)> {
+    let mut fallback: Option<(String, u64, u64, u64)> = None;
     let mut attrs = file.attributes();
     while let Some(item) = attrs.next(src) {
         let item = match item {
@@ -184,13 +255,14 @@ fn preferred_file_name<R: Read + Seek>(
         let name = fname.name().to_string_lossy();
         let btime = fname.creation_time().nt_timestamp();
         let mtime = fname.modification_time().nt_timestamp();
+        let parent = fname.parent_directory_reference().file_record_number();
         match fname.namespace() {
             NtfsFileNamespace::Win32 | NtfsFileNamespace::Win32AndDos => {
-                return Some((name, btime, mtime));
+                return Some((name, parent, btime, mtime));
             }
             _ => {
                 if fallback.is_none() {
-                    fallback = Some((name, btime, mtime));
+                    fallback = Some((name, parent, btime, mtime));
                 }
             }
         }
@@ -199,6 +271,13 @@ fn preferred_file_name<R: Read + Seek>(
 }
 
 /// Inner $MFT scan. Called only after guard (a); wrapped by guard (b).
+///
+/// When `resolve_paths` is true, a two-phase scan is performed: phase 1 builds a
+/// `HashMap<rec_num -> (name, parent)>` path index while collecting time skeletons;
+/// phase 2 calls `resolve_path` for each record and emits `FileMetaRecord` with a
+/// reconstructed full path and a definitive `path_complete`. When `resolve_paths` is
+/// false, `scan_bare` is used directly (S2-N single-pass, bare filename, `path_complete
+/// = None`).
 ///
 /// UPSTREAM LIMITATION (ntfs 0.4): `Ntfs::file()` assumes the $MFT itself has no
 /// `$ATTRIBUTE_LIST`. On a heavily fragmented volume whose $MFT spans multiple data
@@ -209,25 +288,91 @@ fn preferred_file_name<R: Read + Seek>(
 fn parse_mft_inner<R: Read + Seek>(
     src: &mut R,
     max_records: u64,
+    resolve_paths: bool,
 ) -> Result<(u64, Vec<FileMetaRecord>)> {
     let ntfs = Ntfs::new(src).map_err(|e| mft_err(format!("Ntfs::new failed: {e}")))?;
     let file_record_size = ntfs.file_record_size() as u64;
     let capacity = ntfs.size().checked_div(file_record_size).unwrap_or(0);
     let ceiling = capacity.min(max_records);
 
-    // Not pre-allocated to `ceiling`: most records are typically skipped (no FN /
-    // parse error), so Vec::new avoids reserving worst-case capacity up front.
-    let mut out: Vec<FileMetaRecord> = Vec::new();
+    if !resolve_paths {
+        // S2-N single-pass fallback: bare filename, path_complete None.
+        return Ok((capacity, scan_bare(src, &ntfs, ceiling)));
+    }
+
+    // ── Phase 1: scan + build index (rec_num -> (name, parent)) and time skeletons ──
+    let mut index: HashMap<u64, (String, u64)> = HashMap::new();
+    // Skeleton carries only times; the name lives once in `index` (not duplicated).
+    let mut pending: Vec<(u64, FileTimes)> = Vec::new();
     for rec_num in 0..ceiling {
-        // Single-record isolation: a bad/unallocated record is skipped, never aborts.
         let file = match ntfs.file(src, rec_num) {
             Ok(f) => f,
             Err(_) => continue,
         };
         let si = file.info().ok();
-        let (path, fn_b_raw, fn_m_raw) = match preferred_file_name(&file, src) {
+        let (name, parent, fn_b_raw, fn_m_raw) = match preferred_file_name(&file, src) {
             Some(t) => t,
-            None => continue, // no $FILE_NAME -> not a meaningful file-meta record
+            None => continue,
+        };
+        index.insert(rec_num, (name, parent));
+        pending.push((
+            rec_num,
+            FileTimes {
+                si_btime: si
+                    .as_ref()
+                    .and_then(|s| filetime_to_utc(s.creation_time().nt_timestamp())),
+                si_mtime: si
+                    .as_ref()
+                    .and_then(|s| filetime_to_utc(s.modification_time().nt_timestamp())),
+                fn_btime: filetime_to_utc(fn_b_raw),
+                fn_mtime: filetime_to_utc(fn_m_raw),
+            },
+        ));
+    }
+
+    // ── Phase 2: resolve paths and emit ──
+    let mut out: Vec<FileMetaRecord> = Vec::with_capacity(pending.len());
+    for (rec_num, times) in pending {
+        let (path, complete) = resolve_path(rec_num, &index);
+        out.push(FileMetaRecord {
+            path,
+            size: 0,
+            sha256: None,
+            si_btime: times.si_btime,
+            si_mtime: times.si_mtime,
+            fn_btime: times.fn_btime,
+            fn_mtime: times.fn_mtime,
+            zone_identifier: None,
+            path_complete: Some(complete),
+        });
+    }
+    Ok((capacity, out))
+}
+
+/// The four MACB-relevant times pulled from one $MFT record in phase 1, carried to
+/// phase 2 WITHOUT the name (the name is held once in the path index, not duplicated).
+struct FileTimes {
+    si_btime: Option<chrono::DateTime<chrono::Utc>>,
+    si_mtime: Option<chrono::DateTime<chrono::Utc>>,
+    fn_btime: Option<chrono::DateTime<chrono::Utc>>,
+    fn_mtime: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Single-pass S2-N behaviour: emit `FileMetaRecord` with `path` = bare filename and
+/// `path_complete = None`. Used when `resolve_mft_paths` is disabled (future minimal
+/// profile). Kept identical in spirit to the original S2-N scan so disabling path
+/// resolution is a faithful fallback, not a degraded one.
+fn scan_bare<R: Read + Seek>(src: &mut R, ntfs: &Ntfs, ceiling: u64) -> Vec<FileMetaRecord> {
+    let mut out: Vec<FileMetaRecord> = Vec::new();
+    for rec_num in 0..ceiling {
+        let file = match ntfs.file(src, rec_num) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        let si = file.info().ok();
+        let (path, _parent, fn_b_raw, fn_m_raw) = match preferred_file_name(&file, src) {
+            Some(t) => t,
+            None => continue,
         };
         out.push(FileMetaRecord {
             path,
@@ -242,9 +387,10 @@ fn parse_mft_inner<R: Read + Seek>(
             fn_btime: filetime_to_utc(fn_b_raw),
             fn_mtime: filetime_to_utc(fn_m_raw),
             zone_identifier: None,
+            path_complete: None,
         });
     }
-    Ok((capacity, out))
+    out
 }
 
 #[cfg(test)]
@@ -278,7 +424,7 @@ mod tests {
         // Through the guarded helper they MUST be Err, with no panic escaping.
         for bytes in [vec![], vec![0xEB, 0x52, 0x90]] {
             let mut cur = std::io::Cursor::new(bytes);
-            let r = parse_mft_records(&mut cur, 8);
+            let r = parse_mft_records(&mut cur, 8, true);
             assert!(r.is_err(), "short source must be Err, never panic");
         }
     }
@@ -288,7 +434,7 @@ mod tests {
         // A full sector+ of zeros: ntfs returns clean Err (invalid boot signature);
         // the wrapper passes it through as Err.
         let mut cur = std::io::Cursor::new(vec![0u8; 1024]);
-        let r = parse_mft_records(&mut cur, 8);
+        let r = parse_mft_records(&mut cur, 8, true);
         assert!(r.is_err());
     }
 
@@ -331,7 +477,7 @@ mod tests {
         write_boot_sector(&mut buf, total_sectors, 4);
 
         let mut cur = std::io::Cursor::new(buf);
-        let r = parse_mft_records(&mut cur, 8);
+        let r = parse_mft_records(&mut cur, 8, true);
         // S2-N: per-record isolation means individual bad file records are skipped, not
         // the whole scan. A garbage MFT body yields Ok with zero records (all skipped) —
         // not Err. Err is also acceptable (e.g. if Ntfs::new itself fails on the geometry).
@@ -387,7 +533,7 @@ mod tests {
         let mut buf = vec![0u8; BUF];
         write_boot_sector(&mut buf, (BUF as u64 / 512).saturating_sub(1), 4);
         let mut cur = std::io::Cursor::new(buf);
-        let _ = parse_mft_records(&mut cur, 8); // must return, not panic/hang
+        let _ = parse_mft_records(&mut cur, 8, true); // must return, not panic/hang
     }
 
     #[test]
@@ -395,7 +541,121 @@ mod tests {
         // Pins the new return type (u64, Vec<FileMetaRecord>) and guard (a): a 3-byte
         // source (panicked the raw ntfs crate in S2-M's probe) is Err, no panic.
         let mut empty = std::io::Cursor::new(vec![0u8; 3]);
-        let r: Result<(u64, Vec<FileMetaRecord>)> = parse_mft_records(&mut empty, 8);
+        let r: Result<(u64, Vec<FileMetaRecord>)> = parse_mft_records(&mut empty, 8, true);
         assert!(r.is_err());
+    }
+
+    // ── resolve_path tests (S2-O Task 2) ─────────────────────────────────────
+
+    use std::collections::HashMap;
+
+    // index helper: rec_num -> (name, parent_num)
+    fn idx(pairs: &[(u64, &str, u64)]) -> HashMap<u64, (String, u64)> {
+        pairs
+            .iter()
+            .map(|(r, n, p)| (*r, (n.to_string(), *p)))
+            .collect()
+    }
+
+    #[test]
+    fn resolves_clean_path_to_root() {
+        // 100(file, parent 50), 50(dir "b", parent 40), 40(dir "a", parent 5 root)
+        let index = idx(&[(100, "evil.exe", 50), (50, "b", 40), (40, "a", 5)]);
+        let (path, complete) = resolve_path(100, &index);
+        assert_eq!(path, r"C:\a\b\evil.exe");
+        assert!(complete);
+    }
+
+    #[test]
+    fn root_self_reference_not_cyclic() {
+        // A top-level file directly under root: 100(parent 5). Root (5) is NOT in the
+        // index (it self-references in real NTFS); termination is by current==ROOT_RECORD,
+        // checked BEFORE the cycle/visited check, so this is complete, not cyclic.
+        let index = idx(&[(100, "evil.exe", 5)]);
+        let (path, complete) = resolve_path(100, &index);
+        assert_eq!(path, r"C:\evil.exe");
+        assert!(complete, "walk ending at root must be complete, not cyclic");
+    }
+
+    #[test]
+    fn root_in_index_with_self_parent_still_completes() {
+        // Real-NTFS configuration: record 5 (root) is PRESENT in the index and
+        // self-references (parent == 5), with a file 100 directly under it. The walk
+        // reaches 5 and terminates via the root check in the SAME iteration it would
+        // first insert 5 into `visited`, so it completes cleanly. This pins that the
+        // root check is NOT removed/elided: without it the walk would push "." and then
+        // hit 5 a second time, yielding a wrong path and a false `complete`. (A pure
+        // reorder of the two checks is observationally equivalent for this input — the
+        // invariant this test guards is the root check's PRESENCE, not check ordering.)
+        let index = idx(&[(100, "evil.exe", 5), (5, ".", 5)]);
+        let (path, complete) = resolve_path(100, &index);
+        assert_eq!(path, r"C:\evil.exe");
+        assert!(
+            complete,
+            "root present in index with self-parent must still complete, not cyclic"
+        );
+    }
+
+    #[test]
+    fn root_record_itself_resolves_to_c_backslash() {
+        // start == 5 (the root directory record itself).
+        let index = idx(&[]);
+        let (path, complete) = resolve_path(5, &index);
+        assert_eq!(path, r"C:\");
+        assert!(complete);
+    }
+
+    #[test]
+    fn cycle_returns_best_effort() {
+        // A(parent B), B(parent A): a cycle that never reaches root.
+        let index = idx(&[(100, "a", 200), (200, "b", 100)]);
+        let (_path, complete) = resolve_path(100, &index);
+        assert!(!complete, "a cycle must be best-effort");
+    }
+
+    #[test]
+    fn orphan_parent_missing_best_effort() {
+        // 100(parent 999) where 999 is not in the index (deleted/skipped directory).
+        let index = idx(&[(100, "evil.exe", 999)]);
+        let (path, complete) = resolve_path(100, &index);
+        assert!(!complete, "missing parent must be best-effort");
+        assert!(
+            path.contains("evil.exe"),
+            "best-effort path keeps the part it resolved: {path}"
+        );
+    }
+
+    #[test]
+    fn depth_ceiling_truncates() {
+        // A 300-deep chain that never hits root: rec k -> parent k+1, for k in 1001..=1300.
+        // Records start at 1001 to avoid accidentally passing through ROOT_RECORD (5).
+        // The walk must stop at MAX_PATH_DEPTH and report best-effort without hanging.
+        let pairs: Vec<(u64, String, u64)> = (1001..=1300u64)
+            .map(|k| (k, format!("d{k}"), k + 1))
+            .collect();
+        let index: HashMap<u64, (String, u64)> =
+            pairs.into_iter().map(|(r, n, p)| (r, (n, p))).collect();
+        let (_path, complete) = resolve_path(1001, &index);
+        assert!(!complete, "exceeding MAX_PATH_DEPTH must be best-effort");
+    }
+
+    #[test]
+    fn best_effort_path_not_polluted() {
+        // The orphan path must be a clean partial path: no "[orphan]"/"[truncated]" prefix.
+        let index = idx(&[(100, "evil.exe", 999)]);
+        let (path, _complete) = resolve_path(100, &index);
+        assert!(!path.contains("[orphan]"), "no pollution prefix: {path}");
+        assert!(!path.contains("[truncated]"), "no pollution prefix: {path}");
+    }
+
+    #[test]
+    fn parse_mft_records_accepts_resolve_flag_both_values() {
+        // Pins the new signature: parse_mft_records(src, max, resolve_paths).
+        // A short source is Err either way (guard a), proving the flag is threaded
+        // without changing the DoS posture.
+        let mut a = std::io::Cursor::new(vec![0u8; 3]);
+        assert!(parse_mft_records(&mut a, 8, true).is_err());
+        let mut b = std::io::Cursor::new(vec![0u8; 3]);
+        assert!(parse_mft_records(&mut b, 8, false).is_err());
     }
 }
