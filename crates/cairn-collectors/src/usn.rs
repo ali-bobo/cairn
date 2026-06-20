@@ -24,6 +24,8 @@ use cairn_core::{CairnError, Result};
 const V2_HEADER_LEN: usize = 60;
 /// USN_RECORD_V3 fixed header length: V2 + 16 (two 128-bit file refs instead of u64).
 const V3_HEADER_LEN: usize = 76;
+/// USN records are 8-byte aligned; the scanner steps by this when skipping zero/sparse.
+const USN_ALIGN: u64 = 8;
 /// Low 48 bits of a file reference number are the MFT record number; high 16 are the
 /// sequence number. Mask to extract the record number (matches mft.rs convention).
 const MFT_REF_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
@@ -191,6 +193,78 @@ pub(crate) fn parse_usn_record(buf: &[u8]) -> Result<Option<ParsedUsn>> {
     }))
 }
 
+/// Scan a contiguous $J byte buffer into events, returning (events, truncated).
+///
+/// - Zero/sparse regions (RecordLength == 0) are skipped: the cursor advances to the
+///   next USN_ALIGN (8-byte) boundary and continues. This is the correctness fallback
+///   that handles both the sparse head and inter-record padding.
+/// - Stops and returns `truncated = true` when `max_records` events have been collected.
+/// - A corrupt record (parse Err) STOPS the scan, keeping already-parsed events, and is
+///   NOT reported as a cap truncation.
+///
+/// Pure (no I/O); unit-tested against synthetic buffers.
+pub(crate) fn scan_usn_stream(buf: &[u8], max_records: u64) -> (Vec<UsnEventRecord>, bool) {
+    let mut events: Vec<UsnEventRecord> = Vec::new();
+    let mut pos: usize = 0;
+    let mut truncated = false;
+
+    while pos < buf.len() {
+        match parse_usn_record(&buf[pos..]) {
+            Ok(Some(ParsedUsn::Event { record_length, rec })) => {
+                if events.len() as u64 >= max_records {
+                    truncated = true;
+                    break;
+                }
+                events.push(rec);
+                // record_length is validated <= remaining buffer by parse_usn_record,
+                // and is nonzero for an Event; advance by it (rounded up to alignment
+                // defensively in case a record's length is not 8-aligned).
+                pos += advance_by(record_length as usize);
+            }
+            Ok(Some(ParsedUsn::Skipped { record_length })) => {
+                pos += advance_by(record_length as usize);
+            }
+            Ok(None) => {
+                // Sparse/padding: step to the next 8-byte boundary and keep scanning.
+                pos = next_aligned(pos);
+            }
+            Err(_) => break, // corrupt record: keep what we have, stop here.
+        }
+    }
+
+    // Re-check the cap boundary: if we filled exactly to the cap AND there were more
+    // bytes that could hold another record, mark truncated. The break above handles the
+    // common case; this covers exact-fill.
+    if events.len() as u64 >= max_records && pos < buf.len() {
+        truncated = true;
+    }
+
+    (events, truncated)
+}
+
+/// Advance amount for a record, never zero (a zero-length non-sparse record would
+/// otherwise loop forever); rounds up to the 8-byte USN alignment.
+#[inline]
+fn advance_by(record_length: usize) -> usize {
+    next_aligned_usize(record_length.max(USN_ALIGN as usize))
+}
+
+/// Next 8-byte-aligned position at or after `pos` (usize variant).
+#[inline]
+fn next_aligned_usize(pos: usize) -> usize {
+    let a = USN_ALIGN as usize;
+    pos.next_multiple_of(a)
+}
+
+/// Next 8-byte-aligned position STRICTLY after `pos` when `pos` is already aligned,
+/// else the next boundary. Used to step out of a zero region so we never re-read the
+/// same zero word forever.
+#[inline]
+fn next_aligned(pos: usize) -> usize {
+    let a = USN_ALIGN as usize;
+    (pos / a + 1) * a
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,5 +418,71 @@ mod tests {
             other => panic!("expected Event, got {other:?}"),
         };
         assert_eq!(rec.ts, chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn scan_multiple_records_sequential() {
+        let r1 = build_usn_v2(1, USN_REASON_FILE_CREATE, 0, "a.txt");
+        let r2 = build_usn_v2(2, USN_REASON_FILE_CREATE, 0, "b.txt");
+        let r3 = build_usn_v2(3, USN_REASON_FILE_CREATE, 0, "c.txt");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&r1);
+        buf.extend_from_slice(&r2);
+        buf.extend_from_slice(&r3);
+        let (events, truncated) = scan_usn_stream(&buf, 100);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].path, "a.txt");
+        assert_eq!(events[2].path, "c.txt");
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn scan_skips_leading_sparse_zeros() {
+        // 4 KiB of zeroes (a sparse-read gap), then one real record.
+        let r1 = build_usn_v2(1, USN_REASON_FILE_CREATE, 0, "late.txt");
+        let mut buf = vec![0u8; 4096];
+        buf.extend_from_slice(&r1);
+        let (events, _) = scan_usn_stream(&buf, 100);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].path, "late.txt");
+    }
+
+    #[test]
+    fn scan_mixed_v2_v3() {
+        let r1 = build_usn_v2(1, USN_REASON_FILE_CREATE, 0, "v2.txt");
+        let r2 = build_usn_v3(2, USN_REASON_FILE_CREATE, 0, "v3.txt");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&r1);
+        buf.extend_from_slice(&r2);
+        let (events, _) = scan_usn_stream(&buf, 100);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].path, "v2.txt");
+        assert_eq!(events[1].path, "v3.txt");
+    }
+
+    #[test]
+    fn scan_respects_record_cap() {
+        let mut buf = Vec::new();
+        for i in 0..5 {
+            buf.extend_from_slice(&build_usn_v2(i, USN_REASON_FILE_CREATE, 0, "x"));
+        }
+        let (events, truncated) = scan_usn_stream(&buf, 2);
+        assert_eq!(events.len(), 2, "cap=2 bounds the output");
+        assert!(truncated, "hitting the cap reports truncation");
+    }
+
+    #[test]
+    fn scan_stops_on_corrupt_record() {
+        // One valid record, then a record claiming a length that overruns the buffer.
+        let r1 = build_usn_v2(1, USN_REASON_FILE_CREATE, 0, "good.txt");
+        let mut bad = vec![0u8; 16];
+        bad[0..4].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // absurd RecordLength
+        bad[4..6].copy_from_slice(&2u16.to_le_bytes());
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&r1);
+        buf.extend_from_slice(&bad);
+        let (events, truncated) = scan_usn_stream(&buf, 100);
+        assert_eq!(events.len(), 1, "the good record is kept");
+        assert!(!truncated, "stopping on corruption is not a cap truncation");
     }
 }
