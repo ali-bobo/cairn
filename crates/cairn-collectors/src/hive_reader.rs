@@ -4,8 +4,8 @@
 //! ntfs find_child navigation, same catch_unwind third-party-panic containment, same
 //! read_value_capped memory ceiling. No temp files (notatin from_file takes a reader).
 
-use chrono::{DateTime, Utc};
 use cairn_core::{CairnError, Result};
+use chrono::{DateTime, Utc};
 
 /// A locked hive's on-volume location. Drive prefix is fixed C: (reads \\.\C:),
 /// matching mft/usn — $MFT carries no drive-letter info.
@@ -241,10 +241,7 @@ fn find_child_dir<'n, R: std::io::Read + std::io::Seek>(
 /// - any genuine read error (Err) => Failed (a log existed but couldn't be read)
 /// - both absent (Ok(None), Ok(None)) => NotFound
 /// - at least one present (Ok(Some)) => Applied
-fn derive_log_status(
-    log1: &Result<Option<Vec<u8>>>,
-    log2: &Result<Option<Vec<u8>>>,
-) -> LogStatus {
+fn derive_log_status(log1: &Result<Option<Vec<u8>>>, log2: &Result<Option<Vec<u8>>>) -> LogStatus {
     // A genuine failure on EITHER log is the most important signal to surface.
     for log in [log1, log2] {
         if let Err(e) = log {
