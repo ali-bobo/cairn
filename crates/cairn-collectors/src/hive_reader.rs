@@ -27,6 +27,7 @@ pub(crate) const SYSTEM_HIVE: HivePath = HivePath {
 pub(crate) const HIVE_HARD_CEILING: u64 = 512 * 1024 * 1024;
 
 /// Outcome of attempting transaction-log replay. Recorded in the manifest.
+#[derive(Debug, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum LogStatus {
     /// At least one of .LOG1/.LOG2 was found and handed to notatin.
@@ -47,6 +48,7 @@ pub(crate) struct OpenedHive {
 }
 
 /// Build a Collector-variant CairnError (mirrors usn_err/mft_err).
+#[inline]
 #[allow(dead_code)]
 fn hive_err(reason: String) -> CairnError {
     CairnError::Collector {
@@ -61,14 +63,18 @@ fn hive_err(reason: String) -> CairnError {
 /// key_path uses notatin's path syntax WITHOUT the root prefix (key_path_has_root =
 /// false), e.g. r"ControlSet001\Control\Session Manager\AppCompatCache".
 ///
-/// AppCompatCache is always REG_BINARY, so only the binary case matters; non-binary
-/// values return Ok(None).
-#[allow(dead_code, clippy::type_complexity)]
+/// Only REG_BINARY values are returned; other value types yield Ok(None). Suitable
+/// for binary-format artifacts (AppCompatCache, Amcache hashes, ...). Callers
+/// needing string values (REG_SZ) must use a different accessor.
+///
+/// Note: `parser` must be `&mut` because notatin's `Parser::get_key` traverses the
+/// hive lazily via an internal cursor — it mutates state on every lookup.
+#[allow(dead_code)]
 pub(crate) fn get_value_bytes(
     parser: &mut notatin::parser::Parser,
     key_path: &str,
     value_name: &str,
-) -> Result<Option<(Vec<u8>, Option<DateTime<Utc>>)>> {
+) -> Result<Option<(Vec<u8>, DateTime<Utc>)>> {
     let key = match parser
         .get_key(key_path, false)
         .map_err(|e| hive_err(format!("get_key({key_path}) failed: {e}")))?
@@ -88,7 +94,7 @@ pub(crate) fn get_value_bytes(
         notatin::cell_value::CellValue::Binary(b) => b,
         _ => return Ok(None),
     };
-    Ok(Some((bytes, Some(last_write))))
+    Ok(Some((bytes, last_write)))
 }
 
 #[cfg(test)]
@@ -96,11 +102,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn system_hive_path_is_config_system() {
-        assert_eq!(
-            SYSTEM_HIVE.components,
-            &["Windows", "System32", "config", "SYSTEM"]
-        );
+    fn system_hive_path_joins_to_config_system() {
+        let joined = SYSTEM_HIVE.components.join("\\");
+        assert_eq!(joined, r"Windows\System32\config\SYSTEM");
     }
 
     #[test]
@@ -110,9 +114,9 @@ mod tests {
     }
 
     #[test]
-    fn log_status_variants_construct() {
-        let _ = LogStatus::Applied;
-        let _ = LogStatus::NotFound;
-        let _ = LogStatus::Failed("x".into());
+    fn log_status_variants_are_distinct() {
+        assert_ne!(LogStatus::Applied, LogStatus::NotFound);
+        assert_ne!(LogStatus::NotFound, LogStatus::Failed("x".into()));
+        assert_eq!(LogStatus::Failed("y".into()), LogStatus::Failed("y".into()));
     }
 }
