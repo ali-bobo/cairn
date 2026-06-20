@@ -58,7 +58,9 @@ pub fn lower_priority() -> Result<()> {
     // Step 2: Enter background IO mode (also reduces IO priority for this process).
     // SAFETY: h is the pseudo-handle from GetCurrentProcess() (see above).
     // PROCESS_MODE_BACKGROUND_BEGIN is a well-known constant (PROCESS_CREATION_FLAGS
-    // newtype, value 1048576). This call is idempotent if already in background mode.
+    // newtype, value 1048576). NOT idempotent: if the process is already in background mode, Windows returns
+    // ERROR_PROCESS_MODE_ALREADY_BACKGROUND (0x192). The caller treats any Err as
+    // best-effort (low_priority_applied=false) and continues at the current priority.
     unsafe { SetPriorityClass(h, PROCESS_MODE_BACKGROUND_BEGIN) }.map_err(|e| {
         CairnError::Collector {
             collector: "priority".into(),
