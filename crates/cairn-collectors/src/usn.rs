@@ -106,6 +106,7 @@ fn reason_to_string(reason: u32) -> String {
         (0x0008_0000, "object_id_change"),
         (0x0010_0000, "reparse_point_change"),
         (0x0020_0000, "stream_change"),
+        (0x0040_0000, "integrity_change"),
         (0x8000_0000, "close"),
     ];
     let parts: Vec<&str> = BITS
@@ -183,7 +184,7 @@ pub(crate) fn parse_usn_record(buf: &[u8]) -> Result<Option<ParsedUsn>> {
         record_length,
         rec: UsnEventRecord {
             ts,
-            path: path.to_string(),
+            path,
             reason: reason_to_string(reason),
             mft_ref,
         },
@@ -326,8 +327,8 @@ mod tests {
 
     #[test]
     fn parse_bad_utf16_filename_best_effort() {
-        // An odd FileNameLength (1 byte) is not valid UTF-16; from_utf16_lossy must
-        // produce a best-effort string (replacement char) without erroring/panicking.
+        // 1 byte cannot form a UTF-16 code unit; chunks_exact(2) yields no chunks,
+        // so path is "" — best-effort: the event is still kept, not dropped/panicked.
         let mut b = build_usn_v2(1, USN_REASON_FILE_CREATE, 0, "xy");
         b[56..58].copy_from_slice(&1u16.to_le_bytes()); // 1 byte of name (odd => lossy)
         let parsed = parse_usn_record(&b).unwrap();
