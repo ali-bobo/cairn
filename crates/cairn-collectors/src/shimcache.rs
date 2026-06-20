@@ -1,7 +1,15 @@
 //! ShimCollector: parse the AppCompatCache (shimcache) value from a locked SYSTEM
-//! hive into Record::Execution. The version-aware blob parser (parse_appcompatcache)
-//! is a pure, never-panic function (bounds-checked readers, like parse_usn_record);
-//! the collector is privilege-gated and read-only, using hive_reader to fetch bytes.
+//! hive into Record::Execution.
+//!
+//! AppCompatCache records files the OS noted for application-compatibility shimming —
+//! a classic "this path existed on the system" artifact (presence, NOT proof of
+//! execution). Its on-disk format is a version-specific binary blob inside a single
+//! REG_BINARY value. The blob parser (`parse_appcompatcache`) is pure and never-panics
+//! (bounds-checked readers, like parse_usn_record): a corrupt/adversarial blob yields a
+//! best-effort partial result or empty, never a crash. On an UNRECOGNISED format version
+//! it ABSTAINS (returns Unknown, no entries) rather than guess — misreading a forensic
+//! artifact is worse than abstaining (NFR12). This segment recognises the Win10+ format
+//! only (header size 0x34 used as the version fingerprint).
 
 use chrono::{DateTime, Utc};
 
@@ -16,7 +24,9 @@ pub(crate) const SHIMCACHE_KEY: &str =
 #[allow(dead_code)]
 pub(crate) const SHIMCACHE_VALUE: &str = "AppCompatCache";
 
-/// Win10+ header is 0x34 bytes; the 32-bit value at offset 0 equals 0x34.
+/// Win10+ (1607+) AppCompatCache header is 0x34 bytes, and Microsoft uses that header
+/// SIZE as the format magic — the u32 at offset 0 equals 0x34. Older formats use
+/// different magics (e.g. Win7 0xBADC0FFE), so header != 0x34 => not Win10+ => abstain.
 const WIN10PLUS_HEADER_LEN: usize = 0x34;
 
 /// Per-entry signature for Win8.1+/Win10/Win11 cache entries.
@@ -44,19 +54,15 @@ pub(crate) enum ShimVersion {
 
 /// Bounds-checked little-endian readers (Option = out of bounds), like usn.rs.
 fn rd_u16(buf: &[u8], off: usize) -> Option<u16> {
-    buf.get(off..off + 2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    buf.get(off..off + 2)?.try_into().ok().map(u16::from_le_bytes)
 }
 
 fn rd_u32(buf: &[u8], off: usize) -> Option<u32> {
-    buf.get(off..off + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    buf.get(off..off + 4)?.try_into().ok().map(u32::from_le_bytes)
 }
 
 fn rd_u64(buf: &[u8], off: usize) -> Option<u64> {
-    buf.get(off..off + 8).map(|b| {
-        u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-    })
+    buf.get(off..off + 8)?.try_into().ok().map(u64::from_le_bytes)
 }
 
 /// Version-aware AppCompatCache parser. NO I/O, never-panic. Unknown header → abstain.
@@ -98,18 +104,26 @@ pub(crate) fn parse_appcompatcache(buf: &[u8]) -> (ShimVersion, Vec<ShimEntry>) 
         // ft == 0 naturally maps to None via filetime_to_utc's own guard.
         let last_modified = rd_u64(buf, ft_off).and_then(filetime_to_utc);
 
-        let data_len_off = ft_off + 8;
+        let data_len_off = match ft_off.checked_add(8) {
+            Some(o) => o,
+            None => break,
+        };
         let data_len = match rd_u32(buf, data_len_off) {
             Some(l) => l as usize,
             None => break,
         };
-        let data_start = data_len_off + 4;
+        let data_start = match data_len_off.checked_add(4) {
+            Some(o) => o,
+            None => break,
+        };
         let data_end = match data_start.checked_add(data_len) {
             Some(e) if e <= buf.len() => e,
             _ => break,
         };
 
-        // Execution flag: data == 01 00 00 00 indicates execution (best-effort).
+        // Execution flag: only 01 00 00 00 means "executed". 02 00 00 00 and other
+        // values are observed in the wild but undocumented — treat as not-executed
+        // (NFR12: honest output, no guessing).
         let executed = buf.get(data_start..data_end) == Some(&[1, 0, 0, 0][..]);
 
         entries.push(ShimEntry {
@@ -125,6 +139,8 @@ pub(crate) fn parse_appcompatcache(buf: &[u8]) -> (ShimVersion, Vec<ShimEntry>) 
 
 /// UTF-16LE → String, lossy (bad units → replacement char). Never panics.
 fn utf16le_lossy(bytes: &[u8]) -> String {
+    // chunks_exact(2): a trailing odd byte (malformed UTF-16LE) is silently dropped —
+    // best-effort, same policy as usn.rs. Bad code units become the replacement char.
     let units: Vec<u16> = bytes
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -235,5 +251,47 @@ mod tests {
         blob.extend_from_slice(&0xFFFFu16.to_le_bytes()); // huge path len
         let (_ver, entries) = parse_appcompatcache(&blob);
         assert!(entries.is_empty(), "lying path len must yield no entry, no panic");
+    }
+
+    #[test]
+    fn executed_flag_only_01_is_true() {
+        // 02 00 00 00 (seen in the wild, undocumented) must be treated as not-executed.
+        let blob = build_shim_win10plus(&[(r"C:\test.exe", FT_2021, false)]);
+        let (_, e0) = parse_appcompatcache(&blob);
+        assert!(!e0[0].executed, "00 00 00 00 => not executed");
+
+        // Patch the first data byte (data_start = 4th byte from the end) from 0 to 2.
+        let mut blob2 = blob.clone();
+        let n = blob2.len();
+        blob2[n - 4] = 2; // now data == 02 00 00 00
+        let (_, e2) = parse_appcompatcache(&blob2);
+        assert!(!e2[0].executed, "02 00 00 00 => not executed (only 01 counts)");
+
+        // And confirm 01 00 00 00 IS executed (sanity, via the builder's executed=true).
+        let blob3 = build_shim_win10plus(&[(r"C:\x.exe", FT_2021, true)]);
+        let (_, e3) = parse_appcompatcache(&blob3);
+        assert!(e3[0].executed, "01 00 00 00 => executed");
+    }
+
+    #[test]
+    fn odd_byte_path_no_panic() {
+        // path_len == 3 (odd) is malformed UTF-16LE; chunks_exact(2) drops the trailing
+        // byte. Must not panic; should still yield one best-effort entry.
+        let mut blob = vec![0u8; WIN10_HEADER as usize];
+        blob[0..4].copy_from_slice(&WIN10_HEADER.to_le_bytes());
+        let data = vec![0u8, 0, 0, 0];
+        let path_bytes = b"abc"; // 3 bytes (odd)
+        let entry_data_size = 2u32 + path_bytes.len() as u32 + 8 + 4 + data.len() as u32;
+        blob.extend_from_slice(b"10ts");
+        blob.extend_from_slice(&0u32.to_le_bytes());
+        blob.extend_from_slice(&entry_data_size.to_le_bytes());
+        blob.extend_from_slice(&(path_bytes.len() as u16).to_le_bytes());
+        blob.extend_from_slice(path_bytes);
+        blob.extend_from_slice(&0u64.to_le_bytes()); // filetime (0 => last_modified None)
+        blob.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        blob.extend_from_slice(&data);
+        let (ver, entries) = parse_appcompatcache(&blob);
+        assert_eq!(ver, ShimVersion::Win10Plus);
+        assert_eq!(entries.len(), 1, "odd-byte path yields one best-effort entry, no panic");
     }
 }
