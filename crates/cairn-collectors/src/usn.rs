@@ -701,4 +701,42 @@ mod tests {
         assert_eq!(events.len(), 1, "the good record is kept");
         assert!(!truncated, "stopping on corruption is not a cap truncation");
     }
+
+    /// ELEVATED, manual-only. Run from an Administrator shell with SeBackupPrivilege:
+    ///   cargo test -p cairn-collectors usn::tests::elevated_e2e_real_j -- --ignored --nocapture
+    /// Opens the real \\.\C:, parses $Extend\$UsnJrnl:$J, and asserts at least one event
+    /// with a non-empty reason was decoded. CI never runs this (no privilege, no real disk).
+    #[test]
+    #[ignore = "requires Administrator + SeBackupPrivilege and a real NTFS C: volume"]
+    fn elevated_e2e_real_j() {
+        let cfg = Config::default();
+        let ctx = CollectCtx {
+            config: &cfg,
+            admin: true,
+            se_backup: true,
+            se_debug: false,
+        };
+        let records = UsnCollector::default()
+            .collect(&ctx)
+            .expect("elevated $J collect should succeed on a live admin host");
+        let usn_events: Vec<_> = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::UsnEvent(e) => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !usn_events.is_empty(),
+            "a live C: volume with an active journal should yield USN events"
+        );
+        assert!(
+            usn_events.iter().any(|e| !e.reason.is_empty()),
+            "at least one event should carry a decoded reason"
+        );
+        eprintln!(
+            "elevated_e2e_real_j: decoded {} USN events",
+            usn_events.len()
+        );
+    }
 }
