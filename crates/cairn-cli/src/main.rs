@@ -231,6 +231,39 @@ fn enrich_hashes(
     }
 }
 
+/// Harvest record-cap truncation notes from collector provenance into manifest
+/// Truncation entries. Collectors surface a cap via a `sources()` error string of the
+/// form "truncated: max_<X>_records reached (cap=N)"; this parses the cap and attributes
+/// it to the SourceEntry's artifact name. The authoritative source is the collector's own
+/// sources() — no separate truncation channel is invented (governance design).
+fn collect_truncations(
+    sources: &[cairn_core::manifest::SourceEntry],
+) -> Vec<cairn_core::manifest::Truncation> {
+    let mut out = Vec::new();
+    for entry in sources {
+        for err in &entry.errors {
+            if let Some(rest) = err.strip_prefix("truncated: ") {
+                if let Some(cap) = parse_cap(rest) {
+                    out.push(cairn_core::manifest::Truncation {
+                        collector: entry.artifact.clone(),
+                        cap,
+                        reason: err.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Extract N from a string containing "(cap=N)". Returns None if absent or unparsable.
+fn parse_cap(s: &str) -> Option<u64> {
+    let start = s.find("(cap=")? + "(cap=".len();
+    let tail = &s[start..];
+    let end = tail.find(')')?;
+    tail[..end].parse::<u64>().ok()
+}
+
 /// The collector names that the run arm's construction `if` blocks would build for
 /// this selection, in canonical order. Pure mirror of those blocks, so the
 /// selection→collectors mapping is unit-testable without a live Windows host.
@@ -633,14 +666,6 @@ fn main() -> anyhow::Result<()> {
                 false
             };
 
-            // truncations populated when raw-NTFS collectors (mft) join the live AVAILABLE
-            // set (next segment); thread/priority fields are live now.
-            let governance_report = cairn_core::manifest::GovernanceReport {
-                effective_threads,
-                low_priority_applied,
-                truncations: Vec::new(),
-            };
-
             // S2-L: construct only the selected collectors, matching the real
             // Collector::name() strings; order follows AVAILABLE (deterministic).
             let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
@@ -693,6 +718,12 @@ fn main() -> anyhow::Result<()> {
                 findings = outcome.findings.len(),
                 "live collection + analysis complete"
             );
+
+            let governance_report = cairn_core::manifest::GovernanceReport {
+                effective_threads,
+                low_priority_applied,
+                truncations: collect_truncations(&outcome.sources),
+            };
 
             let by_sev = cairn_report::Summary::from_findings(
                 &outcome.findings,
@@ -1114,5 +1145,60 @@ mod tests {
             cfg.resolve_mft_paths,
             "path resolution must default on for the live run"
         );
+    }
+
+    #[test]
+    fn collect_truncations_extracts_mft_and_usn() {
+        use cairn_core::manifest::SourceEntry;
+        let sources = vec![
+            SourceEntry {
+                artifact: "mft".into(),
+                path: r"\\.\C:".into(),
+                method: "raw_ntfs".into(),
+                size: 0,
+                sha256: String::new(),
+                errors: vec!["truncated: max_mft_records reached (cap=1000000)".into()],
+            },
+            SourceEntry {
+                artifact: "usn".into(),
+                path: r"\\.\C:".into(),
+                method: "raw_ntfs_usn".into(),
+                size: 0,
+                sha256: String::new(),
+                errors: vec!["truncated: max_usn_records reached (cap=42)".into()],
+            },
+        ];
+        let t = collect_truncations(&sources);
+        assert_eq!(t.len(), 2);
+        assert!(t.iter().any(|x| x.collector == "mft" && x.cap == 1_000_000));
+        assert!(t.iter().any(|x| x.collector == "usn" && x.cap == 42));
+    }
+
+    #[test]
+    fn collect_truncations_empty_when_no_caps() {
+        use cairn_core::manifest::SourceEntry;
+        let sources = vec![SourceEntry {
+            artifact: "mft".into(),
+            path: r"\\.\C:".into(),
+            method: "raw_ntfs".into(),
+            size: 0,
+            sha256: String::new(),
+            errors: vec![],
+        }];
+        assert!(collect_truncations(&sources).is_empty());
+    }
+
+    #[test]
+    fn collect_truncations_ignores_unrelated_errors() {
+        use cairn_core::manifest::SourceEntry;
+        let sources = vec![SourceEntry {
+            artifact: "proc".into(),
+            path: "live".into(),
+            method: "toolhelp".into(),
+            size: 0,
+            sha256: String::new(),
+            errors: vec!["some unrelated warning".into()],
+        }];
+        assert!(collect_truncations(&sources).is_empty());
     }
 }
