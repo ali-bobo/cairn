@@ -271,8 +271,8 @@ fn parse_cap(s: &str) -> Option<u64> {
 /// The collector names that the run arm's construction `if` blocks would build for
 /// this selection, in canonical order. Pure mirror of those blocks, so the
 /// selection→collectors mapping is unit-testable without a live Windows host.
-/// MUST stay in sync with the five `if ... push(...)` blocks in `main` that
-/// construct proc/net/persist/mft/usn collectors (search: "S2-L: construct only").
+/// MUST stay in sync with the six `if ... push(...)` blocks in `main` that
+/// construct proc/net/persist/mft/usn/shimcache collectors (search: "S2-L: construct only").
 #[cfg(test)]
 fn built_collector_names(selected: &[String]) -> Vec<String> {
     ["proc", "net", "persist", "mft", "usn", "shimcache"]

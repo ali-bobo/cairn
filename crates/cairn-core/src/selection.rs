@@ -230,5 +230,7 @@ mod tests {
         let available = vec!["proc", "net", "persist", "mft", "usn", "shimcache"];
         let out = select_modules(Profile::Minimal, None, &available);
         assert_eq!(out.selected, vec!["proc", "net", "persist"]); // no raw-NTFS
+        let std = select_modules(Profile::Standard, None, &available);
+        assert!(std.selected.contains(&"shimcache".to_string())); // standard keeps shimcache
     }
 }
