@@ -26,8 +26,7 @@ use crate::hive_reader::{get_value_bytes, open_hive, LogStatus, SYSTEM_HIVE};
 
 /// AppCompatCache key/value location. ControlSet001, NOT CurrentControlSet — the
 /// latter is a runtime symlink absent from an offline hive.
-pub(crate) const SHIMCACHE_KEY: &str =
-    r"ControlSet001\Control\Session Manager\AppCompatCache";
+pub(crate) const SHIMCACHE_KEY: &str = r"ControlSet001\Control\Session Manager\AppCompatCache";
 
 pub(crate) const SHIMCACHE_VALUE: &str = "AppCompatCache";
 
@@ -59,15 +58,24 @@ pub(crate) enum ShimVersion {
 
 /// Bounds-checked little-endian readers (Option = out of bounds), like usn.rs.
 fn rd_u16(buf: &[u8], off: usize) -> Option<u16> {
-    buf.get(off..off + 2)?.try_into().ok().map(u16::from_le_bytes)
+    buf.get(off..off + 2)?
+        .try_into()
+        .ok()
+        .map(u16::from_le_bytes)
 }
 
 fn rd_u32(buf: &[u8], off: usize) -> Option<u32> {
-    buf.get(off..off + 4)?.try_into().ok().map(u32::from_le_bytes)
+    buf.get(off..off + 4)?
+        .try_into()
+        .ok()
+        .map(u32::from_le_bytes)
 }
 
 fn rd_u64(buf: &[u8], off: usize) -> Option<u64> {
-    buf.get(off..off + 8)?.try_into().ok().map(u64::from_le_bytes)
+    buf.get(off..off + 8)?
+        .try_into()
+        .ok()
+        .map(u64::from_le_bytes)
 }
 
 /// Version-aware AppCompatCache parser. NO I/O, never-panic. Unknown header → abstain.
@@ -208,7 +216,10 @@ impl Collector for ShimCollector {
         let (version, entries) = parse_appcompatcache(&bytes);
         if let ShimVersion::Unknown(magic) = version {
             self.abstained_unknown_fmt.store(true, Ordering::Relaxed);
-            tracing::warn!(magic = format!("{magic:#x}"), "shimcache: unknown format; abstaining");
+            tracing::warn!(
+                magic = format!("{magic:#x}"),
+                "shimcache: unknown format; abstaining"
+            );
             return Ok(Vec::new());
         }
 
@@ -276,9 +287,9 @@ mod tests {
 
     // ── ShimCollector surface tests (no I/O) ─────────────────────────────────
 
+    use cairn_core::config::Config;
     use cairn_core::traits::{CollectCtx, Collector};
     use cairn_core::CairnError;
-    use cairn_core::config::Config;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -341,6 +352,39 @@ mod tests {
         assert!(s[0].errors.iter().any(|e| e.contains("log_replay_failed")));
     }
 
+    /// ELEVATED E2E (manual): run as Administrator with SeBackupPrivilege:
+    ///   cargo test -p cairn-collectors shimcache::tests::shimcache_e2e_real_system_hive -- --ignored --nocapture
+    /// Proves the full chain: raw \\.\C: -> ntfs locate SYSTEM -> notatin parse
+    /// (+ log replay) -> AppCompatCache -> Record::Execution. Mirrors usn elevated_e2e_real_j.
+    #[test]
+    #[ignore = "requires Administrator + SeBackupPrivilege and a real NTFS C: volume"]
+    fn shimcache_e2e_real_system_hive() {
+        let cfg = Config::default();
+        let ctx = CollectCtx {
+            config: &cfg,
+            admin: true,
+            se_backup: true,
+            se_debug: false,
+        };
+        let recs = ShimCollector::default()
+            .collect(&ctx)
+            .expect("collect should succeed on a real elevated host");
+        assert!(!recs.is_empty(), "expected at least one shimcache entry");
+        for r in &recs {
+            if let Record::Execution(e) = r {
+                assert_eq!(e.source, "shimcache");
+                assert!(!e.path.is_empty(), "every entry must have a path");
+                assert!(e.last_run.is_none(), "shimcache must not claim a last_run");
+            } else {
+                panic!("shimcache must only emit Execution records");
+            }
+        }
+        eprintln!(
+            "shimcache_e2e_real_system_hive: parsed {} entries",
+            recs.len()
+        );
+    }
+
     // ── Parser unit tests ─────────────────────────────────────────────────────
 
     const SIG_10TS: &[u8; 4] = b"10ts";
@@ -353,8 +397,7 @@ mod tests {
         let mut buf = vec![0u8; WIN10_HEADER as usize];
         buf[0..4].copy_from_slice(&WIN10_HEADER.to_le_bytes()); // header signature = 0x34
         for (path, filetime, executed) in entries {
-            let path_utf16: Vec<u8> =
-                path.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+            let path_utf16: Vec<u8> = path.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
             let data: Vec<u8> = if *executed {
                 vec![1, 0, 0, 0]
             } else {
@@ -362,8 +405,7 @@ mod tests {
             };
             // entry-data-size = everything after the size field: pathlen(2)+path+
             // filetime(8)+datalen(4)+data
-            let entry_data_size =
-                (2 + path_utf16.len() + 8 + 4 + data.len()) as u32;
+            let entry_data_size = (2 + path_utf16.len() + 8 + 4 + data.len()) as u32;
             buf.extend_from_slice(SIG_10TS);
             buf.extend_from_slice(&0u32.to_le_bytes()); // unknown
             buf.extend_from_slice(&entry_data_size.to_le_bytes());
@@ -441,7 +483,10 @@ mod tests {
         blob.extend_from_slice(&0u32.to_le_bytes());
         blob.extend_from_slice(&0xFFFFu16.to_le_bytes()); // huge path len
         let (_ver, entries) = parse_appcompatcache(&blob);
-        assert!(entries.is_empty(), "lying path len must yield no entry, no panic");
+        assert!(
+            entries.is_empty(),
+            "lying path len must yield no entry, no panic"
+        );
     }
 
     #[test]
@@ -456,7 +501,10 @@ mod tests {
         let n = blob2.len();
         blob2[n - 4] = 2; // now data == 02 00 00 00
         let (_, e2) = parse_appcompatcache(&blob2);
-        assert!(!e2[0].executed, "02 00 00 00 => not executed (only 01 counts)");
+        assert!(
+            !e2[0].executed,
+            "02 00 00 00 => not executed (only 01 counts)"
+        );
 
         // And confirm 01 00 00 00 IS executed (sanity, via the builder's executed=true).
         let blob3 = build_shim_win10plus(&[(r"C:\x.exe", FT_2021, true)]);
@@ -483,6 +531,10 @@ mod tests {
         blob.extend_from_slice(&data);
         let (ver, entries) = parse_appcompatcache(&blob);
         assert_eq!(ver, ShimVersion::Win10Plus);
-        assert_eq!(entries.len(), 1, "odd-byte path yields one best-effort entry, no panic");
+        assert_eq!(
+            entries.len(),
+            1,
+            "odd-byte path yields one best-effort entry, no panic"
+        );
     }
 }
