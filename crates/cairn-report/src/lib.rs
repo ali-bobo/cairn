@@ -433,6 +433,7 @@ mod tests {
             outputs: vec![],
             counts: Counts::default(),
             integrity_note: "All hashes SHA-256 over bytes as collected.".into(),
+            governance: cairn_core::manifest::GovernanceReport::default(),
         }
     }
 
