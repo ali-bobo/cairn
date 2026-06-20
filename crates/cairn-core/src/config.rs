@@ -212,8 +212,10 @@ mod tests {
 
     #[test]
     fn normalize_for_profile_minimal_disables_path_resolution() {
-        let mut cfg = Config::default();
-        cfg.profile = Profile::Minimal;
+        let mut cfg = Config {
+            profile: Profile::Minimal,
+            ..Config::default()
+        };
         assert!(cfg.resolve_mft_paths, "default starts true");
         cfg.normalize_for_profile();
         assert!(!cfg.resolve_mft_paths, "minimal must force false");
@@ -225,9 +227,11 @@ mod tests {
     #[test]
     fn normalize_for_profile_standard_and_verbose_leave_path_resolution() {
         for p in [Profile::Standard, Profile::Verbose] {
-            let mut cfg = Config::default();
-            cfg.profile = p;
-            cfg.resolve_mft_paths = true;
+            let mut cfg = Config {
+                profile: p,
+                resolve_mft_paths: true,
+                ..Config::default()
+            };
             cfg.normalize_for_profile();
             assert!(cfg.resolve_mft_paths, "{p:?} must not disable resolution");
         }
