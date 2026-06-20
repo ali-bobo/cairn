@@ -39,6 +39,7 @@ sigma-rust = "0.7.0"  # T6: Sigma 2.0 engine (cairn-sigma; ADR-0001)
 winresource = "0.1.31" # embed PE version/manifest resource (legitimacy; Windows-only build-dep)
 windows = "0.62.2"    # native WinAPI for live collectors (cairn-collectors-win only; S2)
 winreg = "0.56.0"    # safe Windows Registry wrapper (cairn-collectors persist, Windows-only)
+notatin = { version = "1.0.1", default-features = false } # Offline Windows registry hive parser (Apache-2.0, 100% safe Rust). default-features = false drops binary-only deps (clap/xlsxwriter/walkdir). Used by hive_reader for locked-hive parse + .LOG1/.LOG2 replay. Last upstream release 2023-08 (mature, stale); cargo audit gates advisories.
 
 [profile.release]
 # legitimacy: NO strip, NO panic=abort tricks for "small/low-entropy" binary.

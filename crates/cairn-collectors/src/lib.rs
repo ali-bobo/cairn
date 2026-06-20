@@ -7,8 +7,10 @@
 
 pub mod evtx;
 pub mod hash;
+pub mod hive_reader;
 pub mod mft;
 pub mod net;
 pub mod persist;
 pub mod proc;
+pub mod shimcache;
 pub mod usn;
