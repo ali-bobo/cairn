@@ -22,7 +22,7 @@ pub mod selection;
 pub mod time;
 pub mod traits;
 
-pub use config::{Config, OutputKind, Profile, Target};
+pub use config::{resolve_max_threads, Config, Governance, OutputKind, Profile, Target};
 pub use finding::{Entity, Finding, FindingSource, Severity};
 pub use manifest::{Manifest, SourceEntry};
 pub use record::Record;

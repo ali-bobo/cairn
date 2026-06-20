@@ -39,6 +39,35 @@ impl std::str::FromStr for Profile {
     }
 }
 
+/// Resource-governance knobs (NFR9). Grouped so the resource posture is one object.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Governance {
+    /// rayon global pool ceiling. None = default min(cores, MAX_THREADS_CEILING)
+    /// (NFR9: not all cores). Some(n>0) = explicit `--max-threads N` (clamped to
+    /// real cores by `resolve_max_threads`). Some(0) is treated as None.
+    pub max_threads: Option<usize>,
+    /// Lower this process's CPU + IO priority. Default true for a live target,
+    /// false for offline analysis. `--full-speed` forces false for any target.
+    pub low_priority: bool,
+}
+
+/// NFR9 "sane ceiling, not all cores": the default rayon pool size is capped here
+/// even on a many-core box, leaving headroom for the production workload.
+pub const MAX_THREADS_CEILING: usize = 8;
+
+/// Effective rayon thread count. Pure; no global state, so it is unit-testable.
+///
+/// - None / Some(0) → min(available, MAX_THREADS_CEILING)
+/// - Some(n>0)      → min(n, available)  (never exceed real cores)
+/// - Always returns >= 1 (a 0 `available` is clamped up so rayon gets a valid count).
+pub fn resolve_max_threads(requested: Option<usize>, available: usize) -> usize {
+    let avail = available.max(1);
+    match requested {
+        None | Some(0) => avail.min(MAX_THREADS_CEILING),
+        Some(n) => n.min(avail),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OutputKind {
     Dir(PathBuf),
@@ -75,6 +104,8 @@ pub struct Config {
     /// false → fall back to S2-N bare-filename behaviour (path_complete = None),
     /// the first optional enhancement to drop under a future minimal profile.
     pub resolve_mft_paths: bool,
+    /// Resource governance (NFR9): thread cap + priority posture.
+    pub governance: Governance,
 }
 
 impl Default for Config {
@@ -94,6 +125,7 @@ impl Default for Config {
             max_mft_records: 1_000_000,
             timestomp_threshold_hours: 24,
             resolve_mft_paths: true,
+            governance: Governance::default(),
         }
     }
 }
@@ -113,6 +145,73 @@ impl Config {
     pub fn with_rules_plain(mut self, plain: bool) -> Self {
         self.rules_plain = plain;
         self
+    }
+
+    /// Apply profile-implied light-mode overrides. Call once after CLI parsing,
+    /// before the run. Currently: `minimal` disables full-path reconstruction
+    /// (path map is the first enhancement dropped in light mode). Idempotent.
+    pub fn normalize_for_profile(&mut self) {
+        if self.profile == Profile::Minimal {
+            self.resolve_mft_paths = false;
+        }
+    }
+}
+
+#[test]
+fn governance_defaults_are_uncapped_and_normal_priority() {
+    let cfg = Config::default();
+    assert_eq!(cfg.governance.max_threads, None);
+    assert!(!cfg.governance.low_priority);
+}
+
+#[test]
+fn resolve_max_threads_none_uses_min_cores_ceiling() {
+    // None → min(available, 8). available=4 → 4; available=32 → 8 (ceiling).
+    assert_eq!(resolve_max_threads(None, 4), 4);
+    assert_eq!(resolve_max_threads(None, 32), 8);
+    assert_eq!(resolve_max_threads(None, 8), 8);
+}
+
+#[test]
+fn resolve_max_threads_zero_is_treated_as_default() {
+    // Some(0) is meaningless; fall back to the None default.
+    assert_eq!(resolve_max_threads(Some(0), 16), 8);
+}
+
+#[test]
+fn resolve_max_threads_explicit_never_exceeds_available() {
+    assert_eq!(resolve_max_threads(Some(2), 16), 2);
+    assert_eq!(resolve_max_threads(Some(1000), 16), 16); // clamped to cores
+    assert_eq!(resolve_max_threads(Some(4), 4), 4);
+}
+
+#[test]
+fn resolve_max_threads_never_returns_zero() {
+    // available could be reported as 0 in pathological cases; result must be >= 1.
+    assert!(resolve_max_threads(None, 0) >= 1);
+    assert!(resolve_max_threads(Some(0), 0) >= 1);
+}
+
+#[test]
+fn normalize_for_profile_minimal_disables_path_resolution() {
+    let mut cfg = Config::default();
+    cfg.profile = Profile::Minimal;
+    assert!(cfg.resolve_mft_paths, "default starts true");
+    cfg.normalize_for_profile();
+    assert!(!cfg.resolve_mft_paths, "minimal must force false");
+    // idempotent
+    cfg.normalize_for_profile();
+    assert!(!cfg.resolve_mft_paths);
+}
+
+#[test]
+fn normalize_for_profile_standard_and_verbose_leave_path_resolution() {
+    for p in [Profile::Standard, Profile::Verbose] {
+        let mut cfg = Config::default();
+        cfg.profile = p;
+        cfg.resolve_mft_paths = true;
+        cfg.normalize_for_profile();
+        assert!(cfg.resolve_mft_paths, "{p:?} must not disable resolution");
     }
 }
 
