@@ -81,6 +81,8 @@ pub struct Counts {
 /// Resource-governance report (NFR9/NFR10): what the run throttled or truncated.
 /// Additive; `#[serde(default)]` on the `Manifest` field keeps pre-governance
 /// manifests parseable.
+/// Truncations here are the structured form; the same event is also recorded as a
+/// string in `manifest.sources[].errors` for SRS NFR10 compatibility.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GovernanceReport {
     /// Effective rayon thread count used this run.
@@ -97,9 +99,13 @@ pub struct GovernanceReport {
 /// A single circuit-breaker / cap hit, recorded for transparency (NFR10).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Truncation {
-    pub collector: String, // e.g. "mft"
-    pub cap: u64,          // the cap that fired
-    pub reason: String,    // e.g. "max_mft_records reached"
+    /// The collector module that was truncated, e.g. `"mft"`.
+    pub collector: String,
+    /// The cap value that fired, in the collector's natural unit (e.g. a record
+    /// count for `max_mft_records`); see `reason` for the unit context.
+    pub cap: u64,
+    /// Human-readable explanation, e.g. `"max_mft_records reached"`.
+    pub reason: String,
 }
 
 #[cfg(test)]
@@ -219,6 +225,8 @@ mod tests {
         assert!(back.low_priority_applied);
         assert_eq!(back.truncations.len(), 1);
         assert_eq!(back.truncations[0].collector, "mft");
+        assert_eq!(back.truncations[0].cap, 1_000_000);
+        assert_eq!(back.truncations[0].reason, "max_mft_records reached");
 
         // A GovernanceReport with no truncations omits/defaults the vec.
         let empty: GovernanceReport = serde_json::from_str("{}").unwrap();

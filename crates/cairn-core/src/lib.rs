@@ -24,7 +24,7 @@ pub mod traits;
 
 pub use config::{resolve_max_threads, Config, Governance, OutputKind, Profile, Target};
 pub use finding::{Entity, Finding, FindingSource, Severity};
-pub use manifest::{Manifest, SourceEntry};
+pub use manifest::{GovernanceReport, Manifest, SourceEntry, Truncation};
 pub use record::Record;
 pub use selection::{select_modules, SelectionOutcome};
 pub use time::filetime_to_utc;
