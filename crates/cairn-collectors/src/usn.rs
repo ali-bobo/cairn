@@ -13,10 +13,13 @@
 //!   unit-testable without a real volume: `parse_usn_record` (one record) and
 //!   `scan_usn_stream` (a whole buffer, with sparse + cap handling).
 
-#![allow(dead_code)] // Task 1 is the pure parser core; all functions are tested but unused in lib.rs until Task 4.
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use cairn_core::record::UsnEventRecord;
+use cairn_collectors_win::volume::VolumeReader;
+use cairn_core::manifest::SourceEntry;
+use cairn_core::record::{Record, UsnEventRecord};
 use cairn_core::time::filetime_to_utc;
+use cairn_core::traits::{CollectCtx, Collector};
 use cairn_core::{CairnError, Result};
 
 /// USN_RECORD_V2 fixed header length in bytes (before the variable filename).
@@ -258,9 +261,209 @@ fn next_aligned(pos: usize) -> usize {
     (pos / a + 1) * a
 }
 
+// ── UsnCollector (Task 4) ────────────────────────────────────────────────────
+
+/// UsnCollector: privilege-gated, read-only $Extend\$UsnJrnl:$J parse.
+///
+/// Requires Administrator + SeBackupPrivilege (raw \\.\C: open). Emits
+/// Record::UsnEvent for each parsed USN_RECORD_V2/V3, bounded by Config.max_usn_records.
+#[derive(Default)]
+pub struct UsnCollector {
+    /// 0 = not truncated; >0 = the cap value the scan stopped at (mirrors MftCollector).
+    truncated_cap: AtomicU64,
+}
+
+impl Collector for UsnCollector {
+    fn name(&self) -> &str {
+        "usn"
+    }
+
+    fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
+        // Privilege gate BEFORE any volume open (mirrors mft).
+        if !(ctx.admin && ctx.se_backup) {
+            return Err(CairnError::Privilege {
+                what: "usn".into(),
+                need: "Administrator + SeBackupPrivilege".into(),
+            });
+        }
+
+        let cap = ctx.config.max_usn_records;
+        let mut reader = VolumeReader::open(r"\\.\C:")?;
+        let (events, truncated) = read_usn_journal(&mut reader, cap)?;
+        self.truncated_cap
+            .store(if truncated { cap } else { 0 }, Ordering::Relaxed);
+
+        tracing::info!(
+            usn_events = events.len(),
+            record_cap = cap,
+            truncated,
+            "usn scan"
+        );
+
+        Ok(events.into_iter().map(Record::UsnEvent).collect())
+    }
+
+    fn sources(&self) -> Vec<SourceEntry> {
+        let mut errors = Vec::new();
+        let cap = self.truncated_cap.load(Ordering::Relaxed);
+        if cap > 0 {
+            errors.push(format!("truncated: max_usn_records reached (cap={cap})"));
+        }
+        vec![SourceEntry {
+            artifact: "usn".into(),
+            path: r"\\.\C:".into(),
+            method: "raw_ntfs_usn".into(),
+            size: 0,
+            sha256: String::new(),
+            errors,
+        }]
+    }
+}
+
+/// Open the $J change-journal stream via ntfs ADS and scan it into events.
+/// Wrapped in catch_unwind (mirroring mft guard b): the ntfs crate panics on some
+/// inputs (and named-stream lookup panics without read_upcase_table); contain any
+/// third-party panic and convert to Err so it never escapes this collector.
+fn read_usn_journal<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    max_records: u64,
+) -> Result<(Vec<UsnEventRecord>, bool)> {
+    use std::panic::{self, AssertUnwindSafe};
+    let result = panic::catch_unwind(AssertUnwindSafe(|| read_usn_inner(reader, max_records)));
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err(usn_err(
+            "ntfs parser panicked (contained); treating $J as unreadable".into(),
+        )),
+    }
+}
+
+/// Inner $J read: navigate root -> $Extend -> $UsnJrnl, read the "$J" ADS, scan it.
+/// Only called inside catch_unwind. read_upcase_table is called before any named
+/// lookup (ntfs panics otherwise).
+fn read_usn_inner<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    max_records: u64,
+) -> Result<(Vec<UsnEventRecord>, bool)> {
+    use ntfs::Ntfs;
+
+    let mut ntfs = Ntfs::new(reader).map_err(|e| usn_err(format!("Ntfs::new failed: {e}")))?;
+    ntfs.read_upcase_table(reader)
+        .map_err(|e| usn_err(format!("read_upcase_table failed: {e}")))?;
+
+    let root = ntfs
+        .root_directory(reader)
+        .map_err(|e| usn_err(format!("root_directory failed: {e}")))?;
+    let extend = find_child(&ntfs, reader, &root, "$Extend")?;
+    let usnjrnl = find_child(&ntfs, reader, &extend, "$UsnJrnl")?;
+
+    let data_item = usnjrnl
+        .data(reader, "$J")
+        .ok_or_else(|| usn_err("$J stream absent (USN journal disabled)".into()))?
+        .map_err(|e| usn_err(format!("$J data attribute error: {e}")))?;
+    let attr = data_item
+        .to_attribute()
+        .map_err(|e| usn_err(format!("$J to_attribute failed: {e}")))?;
+    let value = attr
+        .value(reader)
+        .map_err(|e| usn_err(format!("$J value failed: {e}")))?;
+
+    let buf = read_value_capped(value, reader, max_records)?;
+    Ok(scan_usn_stream(&buf, max_records))
+}
+
+/// Look up a child file by name in a directory, returning its NtfsFile.
+/// read_upcase_table MUST already have been called on `ntfs` (find() panics otherwise).
+fn find_child<'n, R: std::io::Read + std::io::Seek>(
+    ntfs: &'n ntfs::Ntfs,
+    reader: &mut R,
+    dir: &ntfs::NtfsFile<'n>,
+    name: &str,
+) -> Result<ntfs::NtfsFile<'n>> {
+    use ntfs::indexes::NtfsFileNameIndex;
+    let index = dir
+        .directory_index(reader)
+        .map_err(|e| usn_err(format!("directory_index for {name} failed: {e}")))?;
+    let mut finder = index.finder();
+    let entry = NtfsFileNameIndex::find(&mut finder, ntfs, reader, name)
+        .ok_or_else(|| usn_err(format!("{name} not found in directory")))?
+        .map_err(|e| usn_err(format!("find {name} failed: {e}")))?;
+    entry
+        .to_file(ntfs, reader)
+        .map_err(|e| usn_err(format!("to_file for {name} failed: {e}")))
+}
+
+/// Read up to a memory-bounded number of bytes from an ntfs attribute value into a Vec.
+/// Ceiling derived from the record cap, clamped to a hard 512 MiB ceiling so a
+/// lied-about value length cannot force a huge allocation (NFR10).
+fn read_value_capped<R: std::io::Read + std::io::Seek>(
+    value: ntfs::attribute_value::NtfsAttributeValue<'_, '_>,
+    reader: &mut R,
+    max_records: u64,
+) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    const HARD_CEILING: u64 = 512 * 1024 * 1024;
+    let functional = max_records.saturating_mul(1024);
+    let ceiling = functional.min(HARD_CEILING) as usize;
+
+    let mut attached = value.attach(reader);
+    let mut buf = Vec::new();
+    attached
+        .by_ref()
+        .take(ceiling as u64)
+        .read_to_end(&mut buf)
+        .map_err(|e| usn_err(format!("reading $J value failed: {e}")))?;
+    Ok(buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_core::config::Config;
+
+    // ── UsnCollector unit tests (Task 4) ──────────────────────────────────────
+
+    #[test]
+    fn collect_without_privilege_returns_err_no_host_access() {
+        let cfg = Config::default();
+        let ctx = CollectCtx {
+            config: &cfg,
+            admin: false,
+            se_backup: false,
+            se_debug: false,
+        };
+        let r = UsnCollector::default().collect(&ctx);
+        assert!(
+            matches!(r, Err(CairnError::Privilege { .. })),
+            "no admin/se_backup must yield Privilege err before any volume open"
+        );
+    }
+
+    #[test]
+    fn name_is_usn() {
+        assert_eq!(UsnCollector::default().name(), "usn");
+    }
+
+    #[test]
+    fn sources_reports_truncation_when_capped() {
+        let c = UsnCollector::default();
+        c.truncated_cap.store(42, Ordering::Relaxed);
+        let s = c.sources();
+        assert_eq!(s.len(), 1);
+        assert!(s[0].errors.iter().any(|e| e.contains("cap=42")));
+        assert!(s[0].errors.iter().any(|e| e.contains("max_usn_records")));
+    }
+
+    #[test]
+    fn sources_clean_when_not_truncated() {
+        let s = UsnCollector::default().sources();
+        assert_eq!(s.len(), 1);
+        assert!(s[0].errors.is_empty());
+        assert_eq!(s[0].artifact, "usn");
+        assert_eq!(s[0].method, "raw_ntfs_usn");
+    }
+
+    // ── Pure parser tests (Tasks 1–3) ─────────────────────────────────────────
 
     // USN reason bits we assert on (subset; full set decoded in reason_to_string).
     const USN_REASON_FILE_CREATE: u32 = 0x0000_0100;
