@@ -109,6 +109,10 @@ pub struct Config {
     /// Hitting it records a truncation note in the manifest and stops the scan
     /// (never OOM / never an unbounded loop on a lied-about volume capacity).
     pub max_mft_records: u64,
+    /// Hard cap on USN ($J) records the usn collector emits (NFR10). Default 1,000,000.
+    /// Hitting it records a truncation note in the manifest and stops the scan, so a
+    /// huge journal on a long-uptime server cannot exhaust memory. Mirrors max_mft_records.
+    pub max_usn_records: u64,
     /// Min FN−SI delta (hours), either axis, before a timestomp Finding fires (S2-N′).
     /// Below this, sub-day SI/FN drift from legit ops (unzip/copy/install) is ignored.
     /// Fixed default; no CLI flag — banding (Medium/High/Critical) carries severity.
@@ -136,6 +140,7 @@ impl Default for Config {
             since: None,
             use_vss: false,
             max_mft_records: 1_000_000,
+            max_usn_records: 1_000_000,
             timestomp_threshold_hours: 24,
             resolve_mft_paths: true,
             governance: Governance::default(),
@@ -303,6 +308,12 @@ mod tests {
     fn max_mft_records_defaults_to_one_million() {
         let cfg = Config::default();
         assert_eq!(cfg.max_mft_records, 1_000_000);
+    }
+
+    #[test]
+    fn max_usn_records_defaults_to_one_million() {
+        let cfg = Config::default();
+        assert_eq!(cfg.max_usn_records, 1_000_000);
     }
 
     #[test]
