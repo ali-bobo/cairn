@@ -114,6 +114,10 @@ struct RunArgs {
     /// Keep this default in sync with `cairn_core::config::Config::default().max_mft_records`.
     #[arg(long, default_value_t = 1_000_000)]
     max_mft_records: u64,
+    /// Hard cap on USN ($J) records the usn collector emits (NFR10). Default 1,000,000.
+    /// Keep in sync with `cairn_core::config::Config::default().max_usn_records`.
+    #[arg(long, default_value_t = 1_000_000)]
+    max_usn_records: u64,
     /// Cap the rayon worker pool (NFR9). Default: min(cores, 8). 0 = use default.
     #[arg(long)]
     max_threads: Option<usize>,
@@ -267,11 +271,11 @@ fn parse_cap(s: &str) -> Option<u64> {
 /// The collector names that the run arm's construction `if` blocks would build for
 /// this selection, in canonical order. Pure mirror of those blocks, so the
 /// selection→collectors mapping is unit-testable without a live Windows host.
-/// MUST stay in sync with the four `if ... push(...)` blocks in `main` that
-/// construct proc/net/persist/mft collectors (search: "S2-L: construct only").
+/// MUST stay in sync with the five `if ... push(...)` blocks in `main` that
+/// construct proc/net/persist/mft/usn collectors (search: "S2-L: construct only").
 #[cfg(test)]
 fn built_collector_names(selected: &[String]) -> Vec<String> {
-    ["proc", "net", "persist", "mft"]
+    ["proc", "net", "persist", "mft", "usn"]
         .iter()
         .filter(|n| selected.iter().any(|m| m == *n))
         .map(|s| s.to_string())
@@ -616,7 +620,7 @@ fn main() -> anyhow::Result<()> {
 
             // S2-L: decide which collectors run. AVAILABLE = the live collectors' real
             // Collector::name() strings. Pure decision; logged for transparency (FR6).
-            const AVAILABLE: &[&str] = &["proc", "net", "persist", "mft"];
+            const AVAILABLE: &[&str] = &["proc", "net", "persist", "mft", "usn"];
             let selection = cairn_core::select_modules(profile, only.as_deref(), AVAILABLE);
             for name in &selection.unknown_only {
                 tracing::warn!(
@@ -632,6 +636,7 @@ fn main() -> anyhow::Result<()> {
 
             let mut cfg = Config {
                 max_mft_records: args.max_mft_records,
+                max_usn_records: args.max_usn_records,
                 profile,
                 ..Config::default()
             };
@@ -682,6 +687,9 @@ fn main() -> anyhow::Result<()> {
             }
             if selection.selected.iter().any(|m| m == "mft") {
                 collectors.push(Box::new(cairn_collectors::mft::MftCollector::default()));
+            }
+            if selection.selected.iter().any(|m| m == "usn") {
+                collectors.push(Box::new(cairn_collectors::usn::UsnCollector::default()));
             }
             let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
@@ -873,7 +881,7 @@ mod tests {
     #[test]
     fn selected_collector_names_follow_selection() {
         use cairn_core::{select_modules, Profile};
-        const AVAILABLE: &[&str] = &["proc", "net", "persist", "mft"];
+        const AVAILABLE: &[&str] = &["proc", "net", "persist", "mft", "usn"];
 
         // --only persist => only persist constructed.
         let only = vec!["persist".to_string()];
@@ -881,10 +889,10 @@ mod tests {
         let built = built_collector_names(&sel.selected);
         assert_eq!(built, vec!["persist".to_string()]);
 
-        // no --only => all four in canonical order (minimal skips mft).
+        // no --only => all five in canonical order (minimal skips mft and usn).
         let sel = select_modules(Profile::Standard, None, AVAILABLE);
         let built = built_collector_names(&sel.selected);
-        assert_eq!(built, vec!["proc", "net", "persist", "mft"]);
+        assert_eq!(built, vec!["proc", "net", "persist", "mft", "usn"]);
 
         // --profile minimal must NOT select mft (raw-NTFS); standard must.
         let sel = select_modules(Profile::Minimal, None, AVAILABLE);
@@ -897,6 +905,14 @@ mod tests {
         let sel = select_modules(Profile::Standard, None, AVAILABLE);
         let built = built_collector_names(&sel.selected);
         assert!(built.contains(&"mft".to_string()), "standard includes mft");
+
+        // raw-NTFS collectors: standard includes usn, minimal skips it.
+        let sel = select_modules(Profile::Standard, None, AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert!(built.contains(&"usn".to_string()), "standard includes usn");
+        let sel = select_modules(Profile::Minimal, None, AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert!(!built.contains(&"usn".to_string()), "minimal skips usn");
     }
 
     #[test]
@@ -1081,6 +1097,28 @@ mod tests {
             "42",
         ]);
         assert_eq!(args.max_mft_records, 42);
+    }
+
+    #[test]
+    fn max_usn_records_flag_defaults_to_one_million() {
+        use clap::Parser;
+        let args = RunArgs::parse_from(["cairn", "--target", "live", "--output", "out"]);
+        assert_eq!(args.max_usn_records, 1_000_000);
+    }
+
+    #[test]
+    fn max_usn_records_flag_parses_override() {
+        use clap::Parser;
+        let args = RunArgs::parse_from([
+            "cairn",
+            "--target",
+            "live",
+            "--output",
+            "out",
+            "--max-usn-records",
+            "42",
+        ]);
+        assert_eq!(args.max_usn_records, 42);
     }
 
     #[test]
