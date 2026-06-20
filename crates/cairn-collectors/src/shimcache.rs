@@ -11,17 +11,24 @@
 //! artifact is worse than abstaining (NFR12). This segment recognises the Win10+ format
 //! only (header size 0x34 used as the version fingerprint).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use chrono::{DateTime, Utc};
 
+use cairn_collectors_win::volume::VolumeReader;
+use cairn_core::manifest::SourceEntry;
+use cairn_core::record::{ExecutionRecord, Record};
 use cairn_core::time::filetime_to_utc;
+use cairn_core::traits::{CollectCtx, Collector};
+use cairn_core::{CairnError, Result};
+
+use crate::hive_reader::{get_value_bytes, open_hive, LogStatus, SYSTEM_HIVE};
 
 /// AppCompatCache key/value location. ControlSet001, NOT CurrentControlSet — the
 /// latter is a runtime symlink absent from an offline hive.
-#[allow(dead_code)]
 pub(crate) const SHIMCACHE_KEY: &str =
     r"ControlSet001\Control\Session Manager\AppCompatCache";
 
-#[allow(dead_code)]
 pub(crate) const SHIMCACHE_VALUE: &str = "AppCompatCache";
 
 /// Win10+ (1607+) AppCompatCache header is 0x34 bytes, and Microsoft uses that header
@@ -33,7 +40,6 @@ const WIN10PLUS_HEADER_LEN: usize = 0x34;
 const ENTRY_SIG: &[u8; 4] = b"10ts";
 
 /// One AppCompatCache entry (pure data).
-#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 pub(crate) struct ShimEntry {
     pub path: String,
@@ -45,7 +51,6 @@ pub(crate) struct ShimEntry {
 
 /// AppCompatCache format. Win10 and Win11 share one layout since Win10 1607, so they
 /// collapse to Win10Plus; anything else abstains (NFR12).
-#[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 pub(crate) enum ShimVersion {
     Win10Plus,
@@ -66,7 +71,6 @@ fn rd_u64(buf: &[u8], off: usize) -> Option<u64> {
 }
 
 /// Version-aware AppCompatCache parser. NO I/O, never-panic. Unknown header → abstain.
-#[allow(dead_code)]
 pub(crate) fn parse_appcompatcache(buf: &[u8]) -> (ShimVersion, Vec<ShimEntry>) {
     let header = match rd_u32(buf, 0) {
         Some(h) => h,
@@ -148,9 +152,159 @@ fn utf16le_lossy(bytes: &[u8]) -> String {
     String::from_utf16_lossy(&units)
 }
 
+/// ShimCollector: privilege-gated, read-only AppCompatCache read from SYSTEM hive.
+/// Requires Administrator + SeBackupPrivilege (raw \\.\C: open). Emits
+/// Record::Execution (source="shimcache", execution_confirmed reflects the data flag).
+#[derive(Default)]
+pub struct ShimCollector {
+    /// 0 = clean; 1 = abstained (unknown version / truncated hive) — surfaced via
+    /// sources() so the manifest is honest (NFR12).
+    abstained: AtomicU64,
+}
+
+impl Collector for ShimCollector {
+    fn name(&self) -> &str {
+        "shimcache"
+    }
+
+    fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
+        // Privilege gate BEFORE any volume open (mirrors usn/mft).
+        if !(ctx.admin && ctx.se_backup) {
+            return Err(CairnError::Privilege {
+                what: "shimcache".into(),
+                need: "Administrator + SeBackupPrivilege".into(),
+            });
+        }
+
+        let mut reader = VolumeReader::open(r"\\.\C:")?;
+        let mut opened = open_hive(&mut reader, &SYSTEM_HIVE)?;
+
+        if opened.truncated {
+            // Hive exceeded the memory ceiling — abstain rather than parse a partial.
+            self.abstained.store(1, Ordering::Relaxed);
+            tracing::warn!("shimcache: SYSTEM hive exceeded ceiling; abstaining");
+            return Ok(Vec::new());
+        }
+        if let LogStatus::Failed(reason) = &opened.log_status {
+            tracing::warn!(reason = %reason, "shimcache: log replay failed; primary-only");
+        }
+
+        let bytes = match get_value_bytes(&mut opened.parser, SHIMCACHE_KEY, SHIMCACHE_VALUE)? {
+            Some((b, _last_write)) => b,
+            None => {
+                tracing::info!("shimcache: AppCompatCache value absent");
+                return Ok(Vec::new());
+            }
+        };
+
+        let (version, entries) = parse_appcompatcache(&bytes);
+        if let ShimVersion::Unknown(magic) = version {
+            self.abstained.store(1, Ordering::Relaxed);
+            tracing::warn!(magic = format!("{magic:#x}"), "shimcache: unknown format; abstaining");
+            return Ok(Vec::new());
+        }
+
+        let mut records: Vec<Record> = entries
+            .into_iter()
+            .map(|e| {
+                Record::Execution(ExecutionRecord {
+                    source: "shimcache".into(),
+                    path: e.path,
+                    // shimcache last_modified is a FILE mtime, NOT an exec time, so it
+                    // must NOT go in first_run/last_run (NFR12 honesty). ExecutionRecord
+                    // has no "file mtime" field, so e.last_modified is intentionally
+                    // dropped at the Record layer this segment (timeline ts is projected
+                    // from Finding, not Record). Lying it into last_run would be worse.
+                    first_run: None,
+                    last_run: None,
+                    run_count: None,
+                    sha1: None,
+                    user_sid: None,
+                    execution_confirmed: Some(e.executed),
+                })
+            })
+            .collect();
+        // Determinism (NFR4): sort by path (entries carry no record_id/native ts).
+        records.sort_by(|a, b| record_sort_key(a).cmp(record_sort_key(b)));
+
+        tracing::info!(shim_entries = records.len(), "shimcache scan");
+        Ok(records)
+    }
+
+    fn sources(&self) -> Vec<SourceEntry> {
+        let mut errors = Vec::new();
+        if self.abstained.load(Ordering::Relaxed) > 0 {
+            errors.push("abstained: unknown format or hive exceeded ceiling".to_string());
+        }
+        vec![SourceEntry {
+            artifact: "shimcache".into(),
+            path: r"\\.\C:".into(),
+            method: "raw_ntfs_hive".into(),
+            size: 0,
+            sha256: String::new(),
+            errors,
+        }]
+    }
+}
+
+/// Stable sort key: the Execution path (shimcache records have no native ts/id).
+fn record_sort_key(r: &Record) -> &str {
+    match r {
+        Record::Execution(e) => &e.path,
+        _ => "",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ShimCollector surface tests (no I/O) ─────────────────────────────────
+
+    use cairn_core::traits::{CollectCtx, Collector};
+    use cairn_core::CairnError;
+    use cairn_core::config::Config;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn collect_without_privilege_returns_err() {
+        let cfg = Config::default();
+        let ctx = CollectCtx {
+            config: &cfg,
+            admin: false,
+            se_backup: false,
+            se_debug: false,
+        };
+        let r = ShimCollector::default().collect(&ctx);
+        assert!(
+            matches!(r, Err(CairnError::Privilege { .. })),
+            "no admin/se_backup must yield Privilege err before any volume open"
+        );
+    }
+
+    #[test]
+    fn name_is_shimcache() {
+        assert_eq!(ShimCollector::default().name(), "shimcache");
+    }
+
+    #[test]
+    fn sources_clean_when_not_abstained() {
+        let s = ShimCollector::default().sources();
+        assert_eq!(s.len(), 1);
+        assert!(s[0].errors.is_empty());
+        assert_eq!(s[0].artifact, "shimcache");
+        assert_eq!(s[0].method, "raw_ntfs_hive");
+    }
+
+    #[test]
+    fn sources_reports_abstain() {
+        let c = ShimCollector::default();
+        c.abstained.store(1, Ordering::Relaxed);
+        let s = c.sources();
+        assert!(s[0].errors.iter().any(|e| e.contains("abstain")));
+    }
+
+    // ── Parser unit tests ─────────────────────────────────────────────────────
 
     const SIG_10TS: &[u8; 4] = b"10ts";
     const WIN10_HEADER: u32 = 0x34;

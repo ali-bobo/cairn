@@ -9,26 +9,22 @@ use cairn_core::{CairnError, Result};
 
 /// A locked hive's on-volume location. Drive prefix is fixed C: (reads \\.\C:),
 /// matching mft/usn — $MFT carries no drive-letter info.
-#[allow(dead_code)]
 pub(crate) struct HivePath {
     /// Volume-relative path components, last element is the hive filename.
     pub components: &'static [&'static str],
 }
 
 /// SYSTEM hive — the only path wired this segment.
-#[allow(dead_code)]
 pub(crate) const SYSTEM_HIVE: HivePath = HivePath {
     components: &["Windows", "System32", "config", "SYSTEM"],
 };
 
 /// 512 MiB hard ceiling on a single hive's in-memory size (NFR10). A boot sector or
 /// attribute length lying about size cannot force a larger allocation than this.
-#[allow(dead_code)]
 pub(crate) const HIVE_HARD_CEILING: u64 = 512 * 1024 * 1024;
 
 /// Outcome of attempting transaction-log replay. Recorded in the manifest.
 #[derive(Debug, PartialEq)]
-#[allow(dead_code)]
 pub(crate) enum LogStatus {
     /// At least one of .LOG1/.LOG2 was found and handed to notatin.
     Applied,
@@ -39,7 +35,6 @@ pub(crate) enum LogStatus {
 }
 
 /// Result of open_hive.
-#[allow(dead_code)]
 pub(crate) struct OpenedHive {
     pub parser: notatin::parser::Parser,
     pub log_status: LogStatus,
@@ -49,7 +44,6 @@ pub(crate) struct OpenedHive {
 
 /// Build a Collector-variant CairnError (mirrors usn_err/mft_err).
 #[inline]
-#[allow(dead_code)]
 fn hive_err(reason: String) -> CairnError {
     CairnError::Collector {
         collector: "hive".into(),
@@ -63,7 +57,6 @@ fn hive_err(reason: String) -> CairnError {
 /// ntfs crate panics on some inputs (named-stream lookup panics without
 /// read_upcase_table; short sources panic in Ntfs::new) and notatin is third-party
 /// too. Contain any panic and convert to Err so it never escapes this collector.
-#[allow(dead_code)] // called by shimcache collector (next task)
 pub(crate) fn open_hive<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
     hive: &HivePath,
@@ -86,7 +79,6 @@ pub(crate) fn open_hive<R: std::io::Read + std::io::Seek>(
 
 /// Inner open: navigate to the hive file, read primary + .LOG1/.LOG2 into memory,
 /// build the notatin Parser. Only called inside catch_unwind.
-#[allow(dead_code)]
 fn open_hive_inner<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
     hive: &HivePath,
@@ -171,7 +163,6 @@ fn read_stream_bytes<'n, R: std::io::Read + std::io::Seek>(
 
 /// Read a named child file's DEFAULT (unnamed, "") data stream into a memory-capped Vec.
 /// Returns (bytes, truncated). truncated == true if HIVE_HARD_CEILING was hit.
-#[allow(dead_code)]
 fn read_default_stream<'n, R: std::io::Read + std::io::Seek>(
     ntfs: &'n ntfs::Ntfs,
     reader: &mut R,
@@ -227,7 +218,6 @@ fn read_log_stream<'n, R: std::io::Read + std::io::Seek>(
 /// read_upcase_table MUST already have been called on `ntfs` (find() panics otherwise).
 /// Named find_child_dir to avoid collision with usn::find_child (both are pub(crate) in
 /// separate modules; this name is local to hive_reader).
-#[allow(dead_code)]
 fn find_child_dir<'n, R: std::io::Read + std::io::Seek>(
     ntfs: &'n ntfs::Ntfs,
     reader: &mut R,
@@ -279,7 +269,6 @@ fn derive_log_status(
 /// - `build(self)` on `ParserBuilderFromFile` consumes the builder by value (not `&self`).
 /// - notatin `ReadSeek` is a blanket impl over all `T: Read + Seek`, so
 ///   `std::io::Cursor<Vec<u8>>` satisfies it automatically.
-#[allow(dead_code)]
 fn build_parser(
     primary: Vec<u8>,
     log1: Option<Vec<u8>>,
@@ -316,7 +305,6 @@ fn build_parser(
 ///
 /// Note: `parser` must be `&mut` because notatin's `Parser::get_key` traverses the
 /// hive lazily via an internal cursor — it mutates state on every lookup.
-#[allow(dead_code)]
 pub(crate) fn get_value_bytes(
     parser: &mut notatin::parser::Parser,
     key_path: &str,
