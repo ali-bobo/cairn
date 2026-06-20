@@ -118,7 +118,7 @@ struct RunArgs {
     #[arg(long)]
     max_threads: Option<usize>,
     /// Do NOT lower process priority on a live run (opt out of below-normal).
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     full_speed: bool,
 }
 
@@ -599,10 +599,13 @@ fn main() -> anyhow::Result<()> {
 
             let mut cfg = Config {
                 max_mft_records: args.max_mft_records,
+                profile,
                 ..Config::default()
             };
 
             // ── Resource governance (NFR9/NFR10) ──────────────────────────────────────
+            // Always true in this handler (a non-live --target exits earlier); kept to
+            // document intent and to make low_priority target-aware if more targets are added.
             let is_live = matches!(cfg.target, cairn_core::Target::Live);
             cfg.governance.max_threads = args.max_threads;
             cfg.governance.low_priority = is_live && !args.full_speed;
@@ -710,7 +713,7 @@ fn main() -> anyhow::Result<()> {
                     cmdline: std::env::args().collect::<Vec<_>>().join(" "),
                     operator: String::new(),
                     case_id: String::new(),
-                    profile: args.profile.to_ascii_lowercase(),
+                    profile: format!("{:?}", cfg.profile).to_lowercase(),
                     selected_modules: selection.selected.clone(),
                 },
                 host: HostInfo {
@@ -1064,6 +1067,42 @@ mod tests {
         };
         assert_eq!(report.effective_threads, 3);
         assert!(report.low_priority_applied);
+    }
+
+    /// Clap-parse assertion: --max-threads and --full-speed flags wire correctly into RunArgs.
+    /// Guards that the flag names and their RunArgs field types match the handler's expectations
+    /// (a rename or type mismatch would break this test immediately).
+    #[test]
+    fn run_args_max_threads_and_full_speed_parse_correctly() {
+        use clap::Parser;
+        // --max-threads 3 must parse and set max_threads = Some(3); full_speed defaults false.
+        let args = RunArgs::parse_from([
+            "cairn",
+            "--target",
+            "live",
+            "--output",
+            "out",
+            "--max-threads",
+            "3",
+        ]);
+        assert_eq!(
+            args.max_threads,
+            Some(3),
+            "--max-threads 3 must parse to Some(3)"
+        );
+        assert!(!args.full_speed, "--full-speed absent => false");
+
+        // --full-speed must parse and set full_speed = true.
+        let args_fs = RunArgs::parse_from([
+            "cairn",
+            "--target",
+            "live",
+            "--output",
+            "out",
+            "--full-speed",
+        ]);
+        assert!(args_fs.full_speed, "--full-speed present => true");
+        assert_eq!(args_fs.max_threads, None, "max_threads absent => None");
     }
 
     #[test]
