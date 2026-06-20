@@ -11,7 +11,7 @@
 //! artifact is worse than abstaining (NFR12). This segment recognises the Win10+ format
 //! only (header size 0x34 used as the version fingerprint).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 
@@ -157,9 +157,14 @@ fn utf16le_lossy(bytes: &[u8]) -> String {
 /// Record::Execution (source="shimcache", execution_confirmed reflects the data flag).
 #[derive(Default)]
 pub struct ShimCollector {
-    /// 0 = clean; 1 = abstained (unknown version / truncated hive) — surfaced via
-    /// sources() so the manifest is honest (NFR12).
-    abstained: AtomicU64,
+    /// Set when the SYSTEM hive exceeded the memory ceiling (parse abstained). NFR10/NFR12.
+    abstained_truncated: AtomicBool,
+    /// Set when the AppCompatCache format version was not recognised (parse abstained). NFR12.
+    abstained_unknown_fmt: AtomicBool,
+    /// Set when a transaction log (.LOG1/.LOG2) existed but could not be read; the parse
+    /// proceeded primary-only. Surfaced so the manifest does not silently imply replay
+    /// succeeded (NFR12 — closes the loop on hive_reader's LogStatus::Failed).
+    log_replay_failed: AtomicBool,
 }
 
 impl Collector for ShimCollector {
@@ -168,7 +173,9 @@ impl Collector for ShimCollector {
     }
 
     fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
-        // Privilege gate BEFORE any volume open (mirrors usn/mft).
+        // Privilege gate BEFORE any volume open (mirrors usn/mft). SeBackupPrivilege is
+        // required because the SYSTEM hive is held open/locked by the running OS, so it's
+        // only reachable via a raw \\.\C: read, not the normal file API.
         if !(ctx.admin && ctx.se_backup) {
             return Err(CairnError::Privilege {
                 what: "shimcache".into(),
@@ -181,11 +188,12 @@ impl Collector for ShimCollector {
 
         if opened.truncated {
             // Hive exceeded the memory ceiling — abstain rather than parse a partial.
-            self.abstained.store(1, Ordering::Relaxed);
+            self.abstained_truncated.store(true, Ordering::Relaxed);
             tracing::warn!("shimcache: SYSTEM hive exceeded ceiling; abstaining");
             return Ok(Vec::new());
         }
         if let LogStatus::Failed(reason) = &opened.log_status {
+            self.log_replay_failed.store(true, Ordering::Relaxed);
             tracing::warn!(reason = %reason, "shimcache: log replay failed; primary-only");
         }
 
@@ -199,22 +207,26 @@ impl Collector for ShimCollector {
 
         let (version, entries) = parse_appcompatcache(&bytes);
         if let ShimVersion::Unknown(magic) = version {
-            self.abstained.store(1, Ordering::Relaxed);
+            self.abstained_unknown_fmt.store(true, Ordering::Relaxed);
             tracing::warn!(magic = format!("{magic:#x}"), "shimcache: unknown format; abstaining");
             return Ok(Vec::new());
         }
 
-        let mut records: Vec<Record> = entries
+        // Determinism (NFR4): sort entries by path before mapping (entries carry no
+        // native ts/record_id, so path is the stable key).
+        let mut entries = entries;
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+        let records: Vec<Record> = entries
             .into_iter()
             .map(|e| {
                 Record::Execution(ExecutionRecord {
                     source: "shimcache".into(),
                     path: e.path,
-                    // shimcache last_modified is a FILE mtime, NOT an exec time, so it
-                    // must NOT go in first_run/last_run (NFR12 honesty). ExecutionRecord
-                    // has no "file mtime" field, so e.last_modified is intentionally
-                    // dropped at the Record layer this segment (timeline ts is projected
-                    // from Finding, not Record). Lying it into last_run would be worse.
+                    // shimcache last_modified is a FILE mtime, NOT an exec time, so it must
+                    // NOT go in first_run/last_run (NFR12 honesty). ExecutionRecord has no
+                    // file-mtime field, so e.last_modified is intentionally dropped at the
+                    // Record layer (timeline ts is projected from Finding, not Record).
                     first_run: None,
                     last_run: None,
                     run_count: None,
@@ -224,8 +236,6 @@ impl Collector for ShimCollector {
                 })
             })
             .collect();
-        // Determinism (NFR4): sort by path (entries carry no record_id/native ts).
-        records.sort_by(|a, b| record_sort_key(a).cmp(record_sort_key(b)));
 
         tracing::info!(shim_entries = records.len(), "shimcache scan");
         Ok(records)
@@ -233,8 +243,21 @@ impl Collector for ShimCollector {
 
     fn sources(&self) -> Vec<SourceEntry> {
         let mut errors = Vec::new();
-        if self.abstained.load(Ordering::Relaxed) > 0 {
-            errors.push("abstained: unknown format or hive exceeded ceiling".to_string());
+        if self.abstained_truncated.load(Ordering::Relaxed) {
+            errors.push(
+                "abstained: SYSTEM hive exceeded memory ceiling (NFR10); not parsed".to_string(),
+            );
+        }
+        if self.abstained_unknown_fmt.load(Ordering::Relaxed) {
+            errors.push(
+                "abstained: AppCompatCache format version not recognised (NFR12)".to_string(),
+            );
+        }
+        if self.log_replay_failed.load(Ordering::Relaxed) {
+            errors.push(
+                "log_replay_failed: transaction log present but unreadable; primary-only parse"
+                    .to_string(),
+            );
         }
         vec![SourceEntry {
             artifact: "shimcache".into(),
@@ -244,14 +267,6 @@ impl Collector for ShimCollector {
             sha256: String::new(),
             errors,
         }]
-    }
-}
-
-/// Stable sort key: the Execution path (shimcache records have no native ts/id).
-fn record_sort_key(r: &Record) -> &str {
-    match r {
-        Record::Execution(e) => &e.path,
-        _ => "",
     }
 }
 
@@ -297,11 +312,33 @@ mod tests {
     }
 
     #[test]
-    fn sources_reports_abstain() {
+    fn sources_reports_truncation_abstain() {
         let c = ShimCollector::default();
-        c.abstained.store(1, Ordering::Relaxed);
+        c.abstained_truncated.store(true, Ordering::Relaxed);
         let s = c.sources();
-        assert!(s[0].errors.iter().any(|e| e.contains("abstain")));
+        assert!(s[0]
+            .errors
+            .iter()
+            .any(|e| e.contains("exceeded memory ceiling")));
+    }
+
+    #[test]
+    fn sources_reports_unknown_format_abstain() {
+        let c = ShimCollector::default();
+        c.abstained_unknown_fmt.store(true, Ordering::Relaxed);
+        let s = c.sources();
+        assert!(s[0]
+            .errors
+            .iter()
+            .any(|e| e.contains("format version not recognised")));
+    }
+
+    #[test]
+    fn sources_reports_log_replay_failed() {
+        let c = ShimCollector::default();
+        c.log_replay_failed.store(true, Ordering::Relaxed);
+        let s = c.sources();
+        assert!(s[0].errors.iter().any(|e| e.contains("log_replay_failed")));
     }
 
     // ── Parser unit tests ─────────────────────────────────────────────────────

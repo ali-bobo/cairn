@@ -82,16 +82,34 @@ pub mod hive_reader;
 pub mod shimcache;
 ```
 
+- [ ] **Step 4b: Pin nom to 7.1.3 (REQUIRED — discovered during execution)**
+
+notatin 1.0.1 declares `nom = ">=6"` (an unbounded range — the very anti-pattern
+the global security framework forbids). cargo resolves that to the latest **nom
+8.0.0**, whose combinator API changed (returns `impl Parser`, not callable) so
+notatin's nom-6/7-era code FAILS TO COMPILE. Verified resolution:
+- nom 6 is NOT viable: it requires `memchr <2.4` but the workspace needs
+  `memchr 2.6+` elsewhere → unresolvable chain that would drag memchr backwards.
+- **nom 7.1.3 IS viable and clean:** no memchr conflict; notatin compiles; the
+  workspace has no other crate that actually needs nom 8 (notatin is the sole
+  nom consumer). Pinning also kills the unbounded-range supply-chain risk and
+  makes the build reproducible (NFR7 + global framework).
+
+Run: `cargo update -p nom --precise 7.1.3`
+Expected: `Downgrading nom v8.0.0 -> v7.1.3` written to Cargo.lock.
+
 - [ ] **Step 5: Verify it compiles**
 
 Run: `cargo check --workspace`
-Expected: PASS (notatin resolves; empty modules compile). If notatin pulls an unexpected transitive advisory, run `cargo audit` and report before proceeding.
+Expected: PASS (notatin compiles under nom 7.1.3; empty modules compile). Run
+`cargo audit` if available and report before proceeding. Confirm
+`grep -A1 'name = "nom"' Cargo.lock` shows `version = "7.1.3"`.
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add Cargo.toml Cargo.lock crates/cairn-collectors/Cargo.toml crates/cairn-collectors/src/hive_reader.rs crates/cairn-collectors/src/shimcache.rs crates/cairn-collectors/src/lib.rs
-git commit -m "feat(hive): add notatin dep, stub hive_reader + shimcache modules
+git commit -m "feat(hive): add notatin dep (nom pinned 7.1.3), stub hive_reader + shimcache
 
 Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 ```
