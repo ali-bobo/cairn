@@ -10,6 +10,7 @@
 
 pub mod host;
 pub mod net;
+pub mod priority;
 pub mod privilege;
 pub mod proc;
 pub mod signature;
