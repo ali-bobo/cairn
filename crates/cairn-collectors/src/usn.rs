@@ -242,6 +242,8 @@ pub(crate) fn scan_usn_stream(buf: &[u8], max_records: u64) -> (Vec<UsnEventReco
 /// otherwise loop forever); rounds up to the 8-byte USN alignment.
 #[inline]
 fn advance_by(record_length: usize) -> usize {
+    // .max(alignment): defense in depth — guarantees a nonzero advance so the scan
+    // loop always terminates, even if a future change let a zero-ish length reach here.
     next_aligned_usize(record_length.max(USN_ALIGN as usize))
 }
 
@@ -329,6 +331,13 @@ fn read_usn_journal<R: std::io::Read + std::io::Seek>(
     max_records: u64,
 ) -> Result<(Vec<UsnEventRecord>, bool)> {
     use std::panic::{self, AssertUnwindSafe};
+    // NOTE: AssertUnwindSafe is correct here because:
+    // - `reader` is the only captured mutable reference.
+    // - If the ntfs crate panics, `reader` may be in an undefined mid-parse state,
+    //   but we NEVER use `reader` after a caught panic — we immediately return Err.
+    // - We are NOT using catch_unwind to hide our own logic errors; only to contain
+    //   a third-party panic (ntfs named-stream lookup panics without
+    //   read_upcase_table; unforeseen ntfs regressions are also contained).
     let result = panic::catch_unwind(AssertUnwindSafe(|| read_usn_inner(reader, max_records)));
     match result {
         Ok(inner) => inner,
@@ -396,6 +405,14 @@ fn find_child<'n, R: std::io::Read + std::io::Seek>(
 /// Read up to a memory-bounded number of bytes from an ntfs attribute value into a Vec.
 /// Ceiling derived from the record cap, clamped to a hard 512 MiB ceiling so a
 /// lied-about value length cannot force a huge allocation (NFR10).
+///
+/// NOTE: $J begins with a large sparse region; the ntfs crate fills sparse
+/// data-run reads with zeroes (not errors), so `read_to_end` may absorb up to
+/// `ceiling` bytes of ntfs-supplied zeroes before any real record appears. The
+/// scanner discards them via RecordLength==0, but the allocation is real. A future
+/// improvement (spec §4.4 "performance path"): inspect data_runs() and seek past
+/// leading sparse runs before buffering. Deferred — the record cap is the functional
+/// bound; this ceiling is the hard memory backstop (NFR10).
 fn read_value_capped<R: std::io::Read + std::io::Seek>(
     value: ntfs::attribute_value::NtfsAttributeValue<'_, '_>,
     reader: &mut R,
@@ -403,6 +420,9 @@ fn read_value_capped<R: std::io::Read + std::io::Seek>(
 ) -> Result<Vec<u8>> {
     use std::io::Read as _;
     const HARD_CEILING: u64 = 512 * 1024 * 1024;
+    // 1024 bytes/record: conservative upper bound (USN_RECORD_V2 min ~64 B; generous
+    // for long UTF-16 filenames + 8-byte alignment). Keeps the functional ceiling
+    // comfortably above any realistic burst of max_records records.
     let functional = max_records.saturating_mul(1024);
     let ceiling = functional.min(HARD_CEILING) as usize;
 
