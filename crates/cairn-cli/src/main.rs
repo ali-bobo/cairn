@@ -609,7 +609,7 @@ fn main() -> anyhow::Result<()> {
                 ));
             }
             if selection.selected.iter().any(|m| m == "mft") {
-                collectors.push(Box::new(cairn_collectors::mft::MftCollector));
+                collectors.push(Box::new(cairn_collectors::mft::MftCollector::default()));
             }
             let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),

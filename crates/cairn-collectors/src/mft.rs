@@ -40,6 +40,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use cairn_collectors_win::volume::VolumeReader;
 use cairn_core::manifest::SourceEntry;
@@ -121,7 +122,12 @@ fn resolve_path(start: u64, index: &HashMap<u64, (String, u64)>) -> (String, boo
 /// `Config.max_mft_records`), populating `si_btime`, `si_mtime`, `fn_btime`,
 /// and `fn_mtime` via `filetime_to_utc`.
 #[derive(Default)]
-pub struct MftCollector;
+pub struct MftCollector {
+    /// Set by `collect` when the scan stopped at the record cap rather than the
+    /// volume's true record count. Read by `sources()`. AtomicBool (not Cell)
+    /// because `Collector: Send + Sync`.
+    truncated: AtomicBool,
+}
 
 impl Collector for MftCollector {
     fn name(&self) -> &str {
@@ -142,12 +148,14 @@ impl Collector for MftCollector {
         let cap = ctx.config.max_mft_records;
         let resolve_paths = ctx.config.resolve_mft_paths;
         let mut reader = VolumeReader::open(r"\\.\C:")?;
-        let (capacity, records) = parse_mft_records(&mut reader, cap, resolve_paths)?;
+        let (capacity, truncated, records) = parse_mft_records(&mut reader, cap, resolve_paths)?;
+        self.truncated.store(truncated, Ordering::Relaxed);
 
         tracing::info!(
             mft_capacity_estimate = capacity,
             records_emitted = records.len(),
             record_cap = cap,
+            truncated,
             "mft scan"
         );
 
@@ -155,13 +163,17 @@ impl Collector for MftCollector {
     }
 
     fn sources(&self) -> Vec<SourceEntry> {
+        let mut errors = Vec::new();
+        if self.truncated.load(Ordering::Relaxed) {
+            errors.push("truncated: max_mft_records reached".to_string());
+        }
         vec![SourceEntry {
             artifact: "mft".into(),
             path: r"\\.\C:".into(),
             method: "raw_ntfs".into(),
             size: 0,
             sha256: String::new(),
-            errors: vec![],
+            errors,
         }]
     }
 }
@@ -178,19 +190,20 @@ fn mft_err(reason: String) -> CairnError {
     }
 }
 
-/// Scan the $MFT and return `(mft_capacity_estimate, file_meta_records)`.
+/// Scan the $MFT and return `(mft_capacity_estimate, truncated, file_meta_records)`.
 ///
 /// `mft_capacity_estimate` = volume_size / file_record_size: a geometric upper bound on
 /// addressable file records, NOT the count of allocated entries. The scan iterates
 /// `0..min(capacity, max_records)` — the hard cap closes the lied-about-capacity
-/// wall-clock DoS. Both S2-M DoS guards apply:
+/// wall-clock DoS. `truncated` is true when `capacity > max_records` (the record cap
+/// fired before exhausting the volume). Both S2-M DoS guards apply:
 /// - Guard (a): 512-byte pre-check — short source -> Err without calling `Ntfs::new`.
 /// - Guard (b): `catch_unwind` around the scan — any third-party panic -> Err.
 pub(crate) fn parse_mft_records<R: Read + Seek>(
     src: &mut R,
     max_records: u64,
     resolve_paths: bool,
-) -> Result<(u64, Vec<FileMetaRecord>)> {
+) -> Result<(u64, bool, Vec<FileMetaRecord>)> {
     src.seek(SeekFrom::Start(0))
         .map_err(|e| mft_err(format!("seek to start failed: {e}")))?;
     let mut probe = [0u8; BOOT_SECTOR_LEN];
@@ -289,15 +302,16 @@ fn parse_mft_inner<R: Read + Seek>(
     src: &mut R,
     max_records: u64,
     resolve_paths: bool,
-) -> Result<(u64, Vec<FileMetaRecord>)> {
+) -> Result<(u64, bool, Vec<FileMetaRecord>)> {
     let ntfs = Ntfs::new(src).map_err(|e| mft_err(format!("Ntfs::new failed: {e}")))?;
     let file_record_size = ntfs.file_record_size() as u64;
     let capacity = ntfs.size().checked_div(file_record_size).unwrap_or(0);
     let ceiling = capacity.min(max_records);
+    let truncated = capacity > max_records;
 
     if !resolve_paths {
         // S2-N single-pass fallback: bare filename, path_complete None.
-        return Ok((capacity, scan_bare(src, &ntfs, ceiling)));
+        return Ok((capacity, truncated, scan_bare(src, &ntfs, ceiling)));
     }
 
     // ── Phase 1: scan + build index (rec_num -> (name, parent)) and time skeletons ──
@@ -346,7 +360,7 @@ fn parse_mft_inner<R: Read + Seek>(
             path_complete: Some(complete),
         });
     }
-    Ok((capacity, out))
+    Ok((capacity, truncated, out))
 }
 
 /// The four MACB-relevant times pulled from one $MFT record in phase 1, carried to
@@ -482,7 +496,7 @@ mod tests {
         // the whole scan. A garbage MFT body yields Ok with zero records (all skipped) —
         // not Err. Err is also acceptable (e.g. if Ntfs::new itself fails on the geometry).
         // The process must not panic/abort.
-        if let Ok((_, records)) = &r {
+        if let Ok((_, _truncated, records)) = &r {
             assert!(
                 records.is_empty(),
                 "garbage MFT body must yield zero records (all skipped), got {}",
@@ -501,7 +515,7 @@ mod tests {
             se_backup: false,
             se_debug: false,
         };
-        let r = MftCollector.collect(&ctx);
+        let r = MftCollector::default().collect(&ctx);
         assert!(
             matches!(r, Err(CairnError::Privilege { .. })),
             "no admin/se_backup must yield Privilege err before any volume open"
@@ -538,10 +552,10 @@ mod tests {
 
     #[test]
     fn parse_mft_records_short_source_is_err_shape() {
-        // Pins the new return type (u64, Vec<FileMetaRecord>) and guard (a): a 3-byte
-        // source (panicked the raw ntfs crate in S2-M's probe) is Err, no panic.
+        // Pins the new return type (u64, bool, Vec<FileMetaRecord>) and guard (a): a
+        // 3-byte source (panicked the raw ntfs crate in S2-M's probe) is Err, no panic.
         let mut empty = std::io::Cursor::new(vec![0u8; 3]);
-        let r: Result<(u64, Vec<FileMetaRecord>)> = parse_mft_records(&mut empty, 8, true);
+        let r: Result<(u64, bool, Vec<FileMetaRecord>)> = parse_mft_records(&mut empty, 8, true);
         assert!(r.is_err());
     }
 
@@ -657,5 +671,35 @@ mod tests {
         assert!(parse_mft_records(&mut a, 8, true).is_err());
         let mut b = std::io::Cursor::new(vec![0u8; 3]);
         assert!(parse_mft_records(&mut b, 8, false).is_err());
+    }
+
+    #[test]
+    fn truncated_true_when_capacity_exceeds_cap() {
+        // Huge declared volume → huge capacity; a tiny cap bounds the scan → truncated.
+        const BUF: usize = 1024 * 1024;
+        let mut buf = vec![0u8; BUF];
+        write_boot_sector(&mut buf, (BUF as u64 / 512).saturating_sub(1), 4);
+        let mut cur = std::io::Cursor::new(buf);
+        let (capacity, truncated, _records) =
+            parse_mft_records(&mut cur, 8, false).expect("valid boot sector parses");
+        assert!(
+            capacity > 8,
+            "synthetic volume capacity must exceed the cap"
+        );
+        assert!(truncated, "cap=8 below capacity must report truncation");
+    }
+
+    #[test]
+    fn truncated_false_when_cap_above_capacity() {
+        const BUF: usize = 1024 * 1024;
+        let mut buf = vec![0u8; BUF];
+        write_boot_sector(&mut buf, (BUF as u64 / 512).saturating_sub(1), 4);
+        let mut cur = std::io::Cursor::new(buf);
+        let (capacity, truncated, _records) =
+            parse_mft_records(&mut cur, u64::MAX, false).expect("valid boot sector parses");
+        assert!(
+            !truncated,
+            "cap above capacity ({capacity}) must not report truncation"
+        );
     }
 }
