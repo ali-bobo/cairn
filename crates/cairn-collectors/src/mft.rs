@@ -40,7 +40,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use cairn_collectors_win::volume::VolumeReader;
 use cairn_core::manifest::SourceEntry;
@@ -123,10 +123,10 @@ fn resolve_path(start: u64, index: &HashMap<u64, (String, u64)>) -> (String, boo
 /// and `fn_mtime` via `filetime_to_utc`.
 #[derive(Default)]
 pub struct MftCollector {
-    /// Set by `collect` when the scan stopped at the record cap rather than the
-    /// volume's true record count. Read by `sources()`. AtomicBool (not Cell)
-    /// because `Collector: Send + Sync`.
-    truncated: AtomicBool,
+    /// When the scan stopped at the record cap, this holds the cap value (>0); 0 means
+    /// no truncation. AtomicU64 (not Cell) because Collector: Send + Sync; carries the
+    /// cap so sources() can report it without a separate log lookup.
+    truncated_cap: AtomicU64,
 }
 
 impl Collector for MftCollector {
@@ -149,7 +149,8 @@ impl Collector for MftCollector {
         let resolve_paths = ctx.config.resolve_mft_paths;
         let mut reader = VolumeReader::open(r"\\.\C:")?;
         let (capacity, truncated, records) = parse_mft_records(&mut reader, cap, resolve_paths)?;
-        self.truncated.store(truncated, Ordering::Relaxed);
+        self.truncated_cap
+            .store(if truncated { cap } else { 0 }, Ordering::Relaxed);
 
         tracing::info!(
             mft_capacity_estimate = capacity,
@@ -164,8 +165,9 @@ impl Collector for MftCollector {
 
     fn sources(&self) -> Vec<SourceEntry> {
         let mut errors = Vec::new();
-        if self.truncated.load(Ordering::Relaxed) {
-            errors.push("truncated: max_mft_records reached".to_string());
+        let cap = self.truncated_cap.load(Ordering::Relaxed);
+        if cap > 0 {
+            errors.push(format!("truncated: max_mft_records reached (cap={cap})"));
         }
         vec![SourceEntry {
             artifact: "mft".into(),
@@ -697,6 +699,7 @@ mod tests {
         let mut cur = std::io::Cursor::new(buf);
         let (capacity, truncated, _records) =
             parse_mft_records(&mut cur, u64::MAX, false).expect("valid boot sector parses");
+        assert!(capacity > 0, "synthetic volume must have positive capacity");
         assert!(
             !truncated,
             "cap above capacity ({capacity}) must not report truncation"
