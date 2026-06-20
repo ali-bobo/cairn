@@ -172,6 +172,7 @@ const SHIMCACHE_VALUE: &str = "AppCompatCache";
 pub(crate) struct ShimEntry {
     pub path: String,
     pub last_modified: Option<DateTime<Utc>>,  // file mtime from cache, NOT exec time
+    pub executed: bool,                        // best-effort data-flag (drives execution_confirmed)
 }
 
 #[derive(Debug, PartialEq)]
@@ -223,9 +224,18 @@ ShimCollector::collect(ctx)
 
 **Timestamp semantics (NFR12 honesty):** a shimcache entry carries the file's
 **last-modified** time, NOT an execution time. `last_run`/`first_run` are `None`
-(never lie). `execution_confirmed: Some(false)` flags "presence ≠ execution".
-The entry's last_modified becomes the timeline event ts ("this path was in the
-cache; file modified at this time").
+(never lie). `execution_confirmed` reflects the entry's data-flag (best-effort:
+`Some(true)` iff the flag indicates execution, else `Some(false)`).
+
+**last_modified has no Record-layer home (known limitation):** `ExecutionRecord`
+has no "file mtime" field, and putting the mtime in `last_run` would be a lie.
+So `last_modified` is parsed (it's real evidence) but **dropped at the Record
+layer** this segment. The timeline ts is projected from `Finding`, not `Record`
+(see `cairn-report::timeline_row`), so surfacing the mtime is a downstream
+Finding/analyzer concern or a future schema field — out of scope here. Collector
+output is therefore sorted by **path** (the only stable key a shimcache Record
+carries), not (ts, path); the (ts, record_id) ordering applies at the Finding/
+timeline layer.
 
 ---
 
@@ -249,7 +259,9 @@ new `hive_err(reason)` helper mirroring `usn_err`/`mft_err`.
 **never-modify-host:** only `GENERIC_READ`+`OPEN_EXISTING` raw read + in-memory
 notatin parse. No write, no temp file, no `--dry-run` conflict. GR3 + GR4.
 
-**determinism:** output sorted by (ts, path), same as mft/usn.
+**determinism:** collector output sorted by **path** (shimcache Records carry no
+native ts/record_id). The (ts, record_id) timeline ordering applies downstream at
+the Finding layer, same as all other Record sources.
 
 ---
 
