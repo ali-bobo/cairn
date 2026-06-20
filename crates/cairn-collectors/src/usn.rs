@@ -232,13 +232,6 @@ pub(crate) fn scan_usn_stream(buf: &[u8], max_records: u64) -> (Vec<UsnEventReco
         }
     }
 
-    // Re-check the cap boundary: if we filled exactly to the cap AND there were more
-    // bytes that could hold another record, mark truncated. The break above handles the
-    // common case; this covers exact-fill.
-    if events.len() as u64 >= max_records && pos < buf.len() {
-        truncated = true;
-    }
-
     (events, truncated)
 }
 
