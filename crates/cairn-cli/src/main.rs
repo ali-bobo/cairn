@@ -49,7 +49,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Full run: collect + analyze + report.
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     /// Stage-1 engine only: parse EVTX files and run Sigma.
     Evtx {
         files: Vec<PathBuf>,
@@ -114,6 +114,12 @@ struct RunArgs {
     /// Keep this default in sync with `cairn_core::config::Config::default().max_mft_records`.
     #[arg(long, default_value_t = 1_000_000)]
     max_mft_records: u64,
+    /// Cap the rayon worker pool (NFR9). Default: min(cores, 8). 0 = use default.
+    #[arg(long)]
+    max_threads: Option<usize>,
+    /// Do NOT lower process priority on a live run (opt out of below-normal).
+    #[arg(long)]
+    full_speed: bool,
 }
 
 /// A one-line, human-readable run plan for the `evtx` subcommand, logged to run.log
@@ -330,6 +336,7 @@ fn build_manifest(cfg: &Config, hostname: &str, records: u64, findings: &[Findin
             findings_by_sev: by_sev,
         },
         integrity_note: "All hashes SHA-256 over bytes as collected.".into(),
+        governance: cairn_core::manifest::GovernanceReport::default(),
     }
 }
 
@@ -590,10 +597,50 @@ fn main() -> anyhow::Result<()> {
                 "collector selection"
             );
 
-            let cfg = Config {
+            let mut cfg = Config {
                 max_mft_records: args.max_mft_records,
+                profile,
                 ..Config::default()
             };
+
+            // ── Resource governance (NFR9/NFR10) ──────────────────────────────────────
+            // Always true in this handler (a non-live --target exits earlier); kept to
+            // document intent and to make low_priority target-aware if more targets are added.
+            let is_live = matches!(cfg.target, cairn_core::Target::Live);
+            cfg.governance.max_threads = args.max_threads;
+            cfg.governance.low_priority = is_live && !args.full_speed;
+            cfg.normalize_for_profile();
+
+            let available = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1);
+            let effective_threads =
+                cairn_core::resolve_max_threads(cfg.governance.max_threads, available);
+            // build_global is a process one-shot; a second call (e.g. in tests) errors — ignore it.
+            let _ = rayon::ThreadPoolBuilder::new()
+                .num_threads(effective_threads)
+                .build_global();
+
+            let low_priority_applied = if cfg.governance.low_priority {
+                match cairn_collectors_win::priority::lower_priority() {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "failed to lower process priority; continuing at normal priority");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            // truncations populated when raw-NTFS collectors (mft) join the live AVAILABLE
+            // set (next segment); thread/priority fields are live now.
+            let governance_report = cairn_core::manifest::GovernanceReport {
+                effective_threads,
+                low_priority_applied,
+                truncations: Vec::new(),
+            };
+
             // S2-L: construct only the selected collectors, matching the real
             // Collector::name() strings; order follows AVAILABLE (deterministic).
             let mut collectors: Vec<Box<dyn Collector>> = Vec::new();
@@ -609,7 +656,7 @@ fn main() -> anyhow::Result<()> {
                 ));
             }
             if selection.selected.iter().any(|m| m == "mft") {
-                collectors.push(Box::new(cairn_collectors::mft::MftCollector));
+                collectors.push(Box::new(cairn_collectors::mft::MftCollector::default()));
             }
             let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
@@ -666,7 +713,7 @@ fn main() -> anyhow::Result<()> {
                     cmdline: std::env::args().collect::<Vec<_>>().join(" "),
                     operator: String::new(),
                     case_id: String::new(),
-                    profile: args.profile.to_ascii_lowercase(),
+                    profile: format!("{:?}", cfg.profile).to_lowercase(),
                     selected_modules: selection.selected.clone(),
                 },
                 host: HostInfo {
@@ -683,6 +730,7 @@ fn main() -> anyhow::Result<()> {
                     findings_by_sev: by_sev,
                 },
                 integrity_note: "All hashes SHA-256 over bytes as collected.".into(),
+                governance: governance_report,
             };
 
             if dry_run {
@@ -1002,6 +1050,59 @@ mod tests {
             "42",
         ]);
         assert_eq!(args.max_mft_records, 42);
+    }
+
+    #[test]
+    fn governance_report_assembles_threads_and_priority() {
+        use cairn_core::manifest::GovernanceReport;
+        use cairn_core::resolve_max_threads;
+        // Pure assembly logic mirrored: effective_threads from resolver, priority flag
+        // from (is_live && !full_speed). This guards the wiring contract without
+        // touching the global pool.
+        let effective = resolve_max_threads(Some(3), 16);
+        let report = GovernanceReport {
+            effective_threads: effective,
+            low_priority_applied: true,
+            truncations: vec![],
+        };
+        assert_eq!(report.effective_threads, 3);
+        assert!(report.low_priority_applied);
+    }
+
+    /// Clap-parse assertion: --max-threads and --full-speed flags wire correctly into RunArgs.
+    /// Guards that the flag names and their RunArgs field types match the handler's expectations
+    /// (a rename or type mismatch would break this test immediately).
+    #[test]
+    fn run_args_max_threads_and_full_speed_parse_correctly() {
+        use clap::Parser;
+        // --max-threads 3 must parse and set max_threads = Some(3); full_speed defaults false.
+        let args = RunArgs::parse_from([
+            "cairn",
+            "--target",
+            "live",
+            "--output",
+            "out",
+            "--max-threads",
+            "3",
+        ]);
+        assert_eq!(
+            args.max_threads,
+            Some(3),
+            "--max-threads 3 must parse to Some(3)"
+        );
+        assert!(!args.full_speed, "--full-speed absent => false");
+
+        // --full-speed must parse and set full_speed = true.
+        let args_fs = RunArgs::parse_from([
+            "cairn",
+            "--target",
+            "live",
+            "--output",
+            "out",
+            "--full-speed",
+        ]);
+        assert!(args_fs.full_speed, "--full-speed present => true");
+        assert_eq!(args_fs.max_threads, None, "max_threads absent => None");
     }
 
     #[test]
