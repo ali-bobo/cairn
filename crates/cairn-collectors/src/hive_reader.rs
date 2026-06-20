@@ -116,18 +116,18 @@ fn open_hive_inner<R: std::io::Read + std::io::Seek>(
     // require read_upcase_table (only non-empty names need the upcase table).
     let (primary, truncated) = read_default_stream(&ntfs, reader, &cur, file_name)?;
 
-    // Read .LOG1/.LOG2 best-effort (graceful: absent -> NotFound).
+    // Read .LOG1/.LOG2 best-effort via tri-state: Ok(None)=absent, Ok(Some)=present+read,
+    // Err=present but read failed. derive_log_status must be called BEFORE .ok() consumption.
     let log1_name = format!("{file_name}.LOG1");
     let log2_name = format!("{file_name}.LOG2");
-    let log1 = read_default_stream(&ntfs, reader, &cur, &log1_name);
-    let log2 = read_default_stream(&ntfs, reader, &cur, &log2_name);
+    let log1 = read_log_stream(&ntfs, reader, &cur, &log1_name);
+    let log2 = read_log_stream(&ntfs, reader, &cur, &log2_name);
 
     let log_status = derive_log_status(&log1, &log2);
-    let parser = build_parser(
-        primary,
-        log1.ok().map(|(b, _)| b),
-        log2.ok().map(|(b, _)| b),
-    )?;
+    // Extract bytes only when Ok(Some(_)); Err and Ok(None) both yield None here.
+    let log1_bytes = log1.ok().flatten();
+    let log2_bytes = log2.ok().flatten();
+    let parser = build_parser(primary, log1_bytes, log2_bytes)?;
 
     Ok(OpenedHive {
         parser,
@@ -136,17 +136,17 @@ fn open_hive_inner<R: std::io::Read + std::io::Seek>(
     })
 }
 
-/// Read a named child file's DEFAULT (unnamed, "") data stream into a memory-capped Vec.
-/// Returns (bytes, truncated). truncated == true if HIVE_HARD_CEILING was hit.
-#[allow(dead_code)]
-fn read_default_stream<'n, R: std::io::Read + std::io::Seek>(
-    ntfs: &'n ntfs::Ntfs,
+/// Read an already-located file's DEFAULT (unnamed) $DATA stream into a memory-capped
+/// Vec. Returns (bytes, truncated); truncated == (n == HIVE_HARD_CEILING).
+/// A lying $DATA attribute length cannot force a larger allocation than this ceiling
+/// (NFR10); see HIVE_HARD_CEILING.
+fn read_stream_bytes<'n, R: std::io::Read + std::io::Seek>(
+    _ntfs: &'n ntfs::Ntfs,
     reader: &mut R,
-    dir: &ntfs::NtfsFile<'n>,
+    file: &ntfs::NtfsFile<'n>,
     name: &str,
-) -> Result<(Vec<u8>, bool)> {
+) -> Result<Vec<u8>> {
     use std::io::Read as _;
-    let file = find_child_dir(ntfs, reader, dir, name)?;
     // Empty string selects the unnamed (default) $DATA attribute.
     // ntfs confirms: is_empty() == true path skips the upcase-table lookup.
     let data_item = file
@@ -161,13 +161,66 @@ fn read_default_stream<'n, R: std::io::Read + std::io::Seek>(
         .map_err(|e| hive_err(format!("{name} value failed: {e}")))?;
     let mut attached = value.attach(reader);
     let mut buf = Vec::new();
-    let n = attached
+    attached
         .by_ref()
         .take(HIVE_HARD_CEILING)
         .read_to_end(&mut buf)
         .map_err(|e| hive_err(format!("reading {name} failed: {e}")))?;
-    let truncated = n as u64 == HIVE_HARD_CEILING;
-    Ok((buf, truncated))
+    Ok(buf)
+}
+
+/// Read a named child file's DEFAULT (unnamed, "") data stream into a memory-capped Vec.
+/// Returns (bytes, truncated). truncated == true if HIVE_HARD_CEILING was hit.
+#[allow(dead_code)]
+fn read_default_stream<'n, R: std::io::Read + std::io::Seek>(
+    ntfs: &'n ntfs::Ntfs,
+    reader: &mut R,
+    dir: &ntfs::NtfsFile<'n>,
+    name: &str,
+) -> Result<(Vec<u8>, bool)> {
+    let file = find_child_dir(ntfs, reader, dir, name)?;
+    let bytes = read_stream_bytes(ntfs, reader, &file, name)?;
+    // Conservative: a hive exactly == ceiling reports truncated (a false positive that
+    // is impossible in practice — real hives are far below 512 MiB). Do NOT relax to
+    // `>`; hitting the cap means we may have cut data, which must abstain (NFR10/NFR12).
+    let truncated = bytes.len() as u64 == HIVE_HARD_CEILING;
+    Ok((bytes, truncated))
+}
+
+/// Read a log file's default stream as a tri-state:
+/// - Ok(None)        => the log file is ABSENT (graceful: clean shutdown / no logs)
+/// - Ok(Some(bytes)) => present and read OK
+/// - Err(reason)     => the log file EXISTS but reading it FAILED (genuine error)
+///
+/// This separation lets derive_log_status report LogStatus::Failed honestly instead
+/// of silently claiming replay succeeded (NFR12 — the manifest must not lie about
+/// whether transaction logs were applied).
+fn read_log_stream<'n, R: std::io::Read + std::io::Seek>(
+    ntfs: &'n ntfs::Ntfs,
+    reader: &mut R,
+    dir: &ntfs::NtfsFile<'n>,
+    name: &str,
+) -> Result<Option<Vec<u8>>> {
+    // First locate the file. "Not found in directory" => absent => Ok(None).
+    // find_child_dir builds its not-found message as "<name> not found in directory".
+    // We treat THAT specific case as absent. Any other error (directory_index/find/
+    // to_file failure, or the subsequent read failure) is a genuine Err.
+    match find_child_dir(ntfs, reader, dir, name) {
+        Err(e) => {
+            // Distinguish "not found" (absent) from a real navigation error.
+            let msg = e.to_string();
+            if msg.contains("not found in directory") {
+                Ok(None) // absent — graceful
+            } else {
+                Err(e) // genuine navigation error
+            }
+        }
+        Ok(file) => {
+            // File exists: read its default stream. A failure here is genuine.
+            let bytes = read_stream_bytes(ntfs, reader, &file, name)?;
+            Ok(Some(bytes))
+        }
+    }
 }
 
 /// Look up a child entry by name in a directory, returning the NtfsFile.
@@ -194,12 +247,25 @@ fn find_child_dir<'n, R: std::io::Read + std::io::Seek>(
         .map_err(|e| hive_err(format!("to_file for {name} failed: {e}")))
 }
 
-/// Derive LogStatus from the two log read results.
-#[allow(dead_code)]
-fn derive_log_status(log1: &Result<(Vec<u8>, bool)>, log2: &Result<(Vec<u8>, bool)>) -> LogStatus {
-    match (log1.is_ok(), log2.is_ok()) {
-        (false, false) => LogStatus::NotFound,
-        _ => LogStatus::Applied,
+/// Honest LogStatus from the two tri-state log reads:
+/// - any genuine read error (Err) => Failed (a log existed but couldn't be read)
+/// - both absent (Ok(None), Ok(None)) => NotFound
+/// - at least one present (Ok(Some)) => Applied
+fn derive_log_status(
+    log1: &Result<Option<Vec<u8>>>,
+    log2: &Result<Option<Vec<u8>>>,
+) -> LogStatus {
+    // A genuine failure on EITHER log is the most important signal to surface.
+    for log in [log1, log2] {
+        if let Err(e) = log {
+            return LogStatus::Failed(e.to_string());
+        }
+    }
+    let any_present = matches!(log1, Ok(Some(_))) || matches!(log2, Ok(Some(_)));
+    if any_present {
+        LogStatus::Applied
+    } else {
+        LogStatus::NotFound
     }
 }
 
@@ -224,6 +290,8 @@ fn build_parser(
 
     let mut builder = ParserBuilder::from_file(Cursor::new(primary));
     builder.recover_deleted(false);
+    // YAGNI: deleted-key recovery isn't needed for shimcache/amcache (they read live
+    // keys). Enable in a later task only if a consumer (e.g. userassist) needs it.
     if let Some(b) = log1 {
         builder.with_transaction_log(Cursor::new(b));
     }
