@@ -94,7 +94,7 @@ pub struct FileMetaRecord {
     pub path_complete: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsnEventRecord {
     pub ts: DateTime<Utc>,
     pub path: String,
