@@ -445,4 +445,44 @@ mod tests {
         assert!(errs.iter().any(|e| e.contains("unreadable")));
         assert!(errs.iter().any(|e| e.contains("MAM decompression")));
     }
+
+    /// ELEVATED E2E (manual): run as Administrator:
+    ///   cargo test -p cairn-collectors prefetch::tests::prefetch_e2e_real_dir -- --ignored --nocapture
+    /// Proves the full chain: std::fs enumerate C:\Windows\Prefetch -> MAM decompress (compcol)
+    /// -> parse v30 header -> Record::Execution. The any_run assertion verifies the v30 offset
+    /// consts are correct (wrong offsets => zero/garbage run_count or run times).
+    #[test]
+    #[ignore = "requires Administrator and a real Windows C:\\Windows\\Prefetch"]
+    fn prefetch_e2e_real_dir() {
+        let cfg = Config::default();
+        let ctx = CollectCtx {
+            config: &cfg,
+            admin: true,
+            se_backup: false,
+            se_debug: false,
+        };
+        let recs = PrefetchCollector::default()
+            .collect(&ctx)
+            .expect("collect ok");
+        assert!(!recs.is_empty(), "a real host has prefetch entries");
+        let mut any_run = false;
+        for r in &recs {
+            if let Record::Execution(e) = r {
+                assert_eq!(e.source, "prefetch");
+                assert!(!e.path.is_empty(), "every entry has an exe name");
+                assert_eq!(e.execution_confirmed, Some(true));
+                assert!(e.run_count.is_some(), "prefetch carries a run count");
+                if e.last_run.is_some() {
+                    any_run = true;
+                }
+            } else {
+                panic!("prefetch must only emit Execution records");
+            }
+        }
+        assert!(
+            any_run,
+            "at least one entry should have a real last_run (offset sanity)"
+        );
+        eprintln!("prefetch_e2e_real_dir: parsed {} entries", recs.len());
+    }
 }
