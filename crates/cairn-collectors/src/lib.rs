@@ -12,6 +12,7 @@ pub mod hive_reader;
 pub mod mft;
 pub mod net;
 pub mod persist;
+pub mod prefetch;
 pub mod proc;
 pub mod shimcache;
 pub mod usn;

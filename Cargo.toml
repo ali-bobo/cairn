@@ -40,6 +40,7 @@ winresource = "0.1.31" # embed PE version/manifest resource (legitimacy; Windows
 windows = "0.62.2"    # native WinAPI for live collectors (cairn-collectors-win only; S2)
 winreg = "0.56.0"    # safe Windows Registry wrapper (cairn-collectors persist, Windows-only)
 notatin = { version = "1.0.1", default-features = false } # Offline Windows registry hive parser (Apache-2.0, 100% safe Rust). default-features = false drops binary-only deps (clap/xlsxwriter/walkdir). Used by hive_reader for locked-hive parse + .LOG1/.LOG2 replay. Last upstream release 2023-08 (mature, stale); cargo audit gates advisories.
+compcol = { version = "0.6", default-features = false, features = ["xpress_huffman"] } # Windows MAM / Xpress-Huffman decompression for Prefetch .pf files. 100% safe Rust (forbids unsafe_code crate-wide). Used by cairn-collectors prefetch module.
 
 [profile.release]
 # legitimacy: NO strip, NO panic=abort tricks for "small/low-entropy" binary.

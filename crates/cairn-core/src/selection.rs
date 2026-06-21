@@ -29,20 +29,22 @@ fn canonical_only_name(raw: &str) -> String {
     }
 }
 
-/// Collector names that are raw-NTFS reads (admin + heavy). `--profile minimal` skips
-/// these (SRS §19.1). Grows as S2-N/O/P add modules — the single place that knowledge lives.
-const RAW_NTFS: &[&str] = &["mft", "usn", "shimcache", "amcache"];
+/// Heavy offline collectors (raw-NTFS modules + prefetch + future srum/userassist).
+/// `--profile minimal` skips ALL of these (SRS §19.1). The single place the
+/// profile→heavy-set mapping lives. Not all are raw-NTFS (prefetch uses the file API),
+/// hence the name HEAVY_OFFLINE rather than RAW_NTFS.
+const HEAVY_OFFLINE: &[&str] = &["mft", "usn", "shimcache", "amcache", "prefetch"];
 
 /// Modules a profile selects from `available`, BEFORE the `--only` intersection.
-/// `minimal` = the light live set (raw-NTFS excluded, SRS §19.1). `standard`/`verbose`
+/// `minimal` = the light live set (HEAVY_OFFLINE excluded, SRS §19.1). `standard`/`verbose`
 /// currently select everything available. The mechanism is here; profiles diverge as
-/// heavier collectors register into `RAW_NTFS`.
+/// heavier collectors register into `HEAVY_OFFLINE`.
 fn profile_base<'a>(profile: Profile, available: &[&'a str]) -> Vec<&'a str> {
     match profile {
         Profile::Minimal => available
             .iter()
             .copied()
-            .filter(|name| !RAW_NTFS.contains(name))
+            .filter(|name| !HEAVY_OFFLINE.contains(name))
             .collect(),
         Profile::Standard | Profile::Verbose => available.to_vec(),
     }
@@ -249,5 +251,23 @@ mod tests {
         assert_eq!(out.selected, vec!["proc", "net", "persist"]); // no raw-NTFS
         let std = select_modules(Profile::Standard, None, &available);
         assert!(std.selected.contains(&"amcache".to_string())); // standard keeps amcache
+    }
+
+    #[test]
+    fn minimal_excludes_prefetch() {
+        let available = vec![
+            "proc",
+            "net",
+            "persist",
+            "mft",
+            "usn",
+            "shimcache",
+            "amcache",
+            "prefetch",
+        ];
+        let out = select_modules(Profile::Minimal, None, &available);
+        assert_eq!(out.selected, vec!["proc", "net", "persist"]);
+        let std = select_modules(Profile::Standard, None, &available);
+        assert!(std.selected.contains(&"prefetch".to_string()));
     }
 }

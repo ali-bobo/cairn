@@ -36,3 +36,7 @@ desktop.ini
 .vscode/
 .idea/
 *.swp
+
+# Local debug artifacts — real host prefetch files, never commit
+*.pf
+sample.pf
