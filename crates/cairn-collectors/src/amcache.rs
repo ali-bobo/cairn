@@ -496,7 +496,11 @@ mod tests {
         assert!(!recs.is_empty(), "expected at least one amcache entry");
         for r in &recs {
             if let Record::Execution(e) = r {
-                assert_eq!(e.source, "amcache");
+                assert!(
+                    e.source == "amcache" || e.source == "amcache_driver",
+                    "unexpected source: {}",
+                    e.source
+                );
                 assert!(!e.path.is_empty(), "every entry must have a path");
                 assert_eq!(e.execution_confirmed, Some(true));
                 // NFR12: amcache never fabricates an exec time into last_run.
@@ -519,6 +523,11 @@ mod tests {
                 panic!("amcache must only emit Execution records");
             }
         }
+        let drivers = recs
+            .iter()
+            .filter(|r| matches!(r, Record::Execution(e) if e.source == "amcache_driver"))
+            .count();
+        eprintln!("amcache_e2e_real_system_hive: {} driver entries", drivers);
         eprintln!(
             "amcache_e2e_real_system_hive: parsed {} entries",
             recs.len()
