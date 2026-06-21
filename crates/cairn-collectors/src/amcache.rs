@@ -19,6 +19,14 @@ use cairn_core::{CairnError, Result};
 
 use crate::hive_reader::{get_value_string, list_subkeys, open_hive, LogStatus, AMCACHE_HIVE};
 
+/// Spec for the InventoryDriverBinary inventory key (driver binaries — BYOVD evidence).
+const DRIVER_SPEC: InventorySpec = InventorySpec {
+    key_path: "Root\\InventoryDriverBinary",
+    source: "amcache_driver",
+    sha1_value: "DriverId",
+    path_values: &["DriverName"],
+};
+
 /// Spec for the InventoryApplicationFile inventory key.
 const APP_FILE_SPEC: InventorySpec = InventorySpec {
     key_path: "Root\\InventoryApplicationFile",
@@ -38,6 +46,8 @@ pub struct AmcacheCollector {
     app_key_absent: AtomicBool,
     /// A transaction log (.LOG1/.LOG2) existed but could not be read; primary-only parse.
     log_replay_failed: AtomicBool,
+    /// The InventoryDriverBinary key was absent (build variance — abstained). NFR12.
+    driver_key_absent: AtomicBool,
     /// At least one subkey's value read failed mid-hive; that entry was skipped and the
     /// rest still collected (graceful degrade — golden rule 8). Surfaced so the analyst
     /// knows the result is partial rather than silently dropping evidence (NFR12).
@@ -79,6 +89,16 @@ impl Collector for AmcacheCollector {
             &self.entry_read_errors,
         )?;
 
+        // Driver binaries (BYOVD evidence). Independent per-key degrade: an absent
+        // driver key does NOT suppress the app records already collected, and vice versa.
+        let driver_records = collect_inventory(
+            &mut opened.parser,
+            &DRIVER_SPEC,
+            &self.driver_key_absent,
+            &self.entry_read_errors,
+        )?;
+        records.extend(driver_records);
+
         // Determinism (NFR4): subkey enumeration order is physical; sort by path.
         records.sort_by(|a, b| match (a, b) {
             (Record::Execution(x), Record::Execution(y)) => x.path.cmp(&y.path),
@@ -99,6 +119,11 @@ impl Collector for AmcacheCollector {
         if self.app_key_absent.load(Ordering::Relaxed) {
             errors.push(
                 "abstained: InventoryApplicationFile key absent (build variance/NFR12)".to_string(),
+            );
+        }
+        if self.driver_key_absent.load(Ordering::Relaxed) {
+            errors.push(
+                "abstained: InventoryDriverBinary key absent (build variance/NFR12)".to_string(),
             );
         }
         if self.log_replay_failed.load(Ordering::Relaxed) {
@@ -357,6 +382,17 @@ mod tests {
     fn first_non_empty_read_empty_names_is_ok_none() {
         let mut read = |_name: &str| -> std::result::Result<Option<String>, ()> { Ok(None) };
         assert_eq!(first_non_empty_read(&[], &mut read), Ok(None));
+    }
+
+    #[test]
+    fn sources_reports_driver_key_absent() {
+        let c = AmcacheCollector::default();
+        c.driver_key_absent.store(true, Ordering::Relaxed);
+        let s = c.sources();
+        assert!(s[0]
+            .errors
+            .iter()
+            .any(|e| e.contains("InventoryDriverBinary key absent")));
     }
 
     #[test]
