@@ -197,6 +197,29 @@ fn parse_sha1_from_fileid(field: &str) -> Option<String> {
     Some(body.to_ascii_lowercase())
 }
 
+/// A pure-data description of one Amcache inventory key, so one helper can serve both
+/// InventoryApplicationFile and InventoryDriverBinary (and future keys) — the only
+/// difference between them is data, not logic.
+#[allow(dead_code)] // wired in Task 2
+struct InventorySpec {
+    /// notatin key path (key_path_has_root = false).
+    key_path: &'static str,
+    /// ExecutionRecord.source tag for entries from this key.
+    source: &'static str,
+    /// REG_SZ value holding the "0000"+40hex SHA1.
+    sha1_value: &'static str,
+    /// Path candidates, tried in order; first non-empty wins, else the entry is dropped.
+    path_values: &'static [&'static str],
+}
+
+/// Return the first non-empty string from a slice of already-read candidates (in
+/// order). All empty/absent → None (the caller drops the entry). Pure — the values are
+/// read by the caller, so this is unit-testable without a hive and has no borrow tangle.
+#[allow(dead_code)] // wired in Task 2
+fn first_non_empty(candidates: &[Option<String>]) -> Option<String> {
+    candidates.iter().flatten().find(|v| !v.is_empty()).cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -373,5 +396,34 @@ mod tests {
             "amcache_e2e_real_system_hive: parsed {} entries",
             recs.len()
         );
+    }
+
+    // ── first_non_empty unit tests ────────────────────────────────────────
+
+    #[test]
+    fn first_non_empty_returns_first_non_empty_in_order() {
+        let candidates = vec![Some(String::new()), Some(r"C:\drivers\x.sys".to_string())];
+        assert_eq!(
+            first_non_empty(&candidates).as_deref(),
+            Some(r"C:\drivers\x.sys")
+        );
+    }
+
+    #[test]
+    fn first_non_empty_all_empty_or_absent_is_none() {
+        let candidates = vec![Some(String::new()), None];
+        assert_eq!(first_non_empty(&candidates), None);
+    }
+
+    #[test]
+    fn first_non_empty_single_value() {
+        let candidates = vec![Some(r"C:\d.sys".to_string())];
+        assert_eq!(first_non_empty(&candidates).as_deref(), Some(r"C:\d.sys"));
+    }
+
+    #[test]
+    fn first_non_empty_empty_slice_is_none() {
+        let candidates: Vec<Option<String>> = vec![];
+        assert_eq!(first_non_empty(&candidates), None);
     }
 }
