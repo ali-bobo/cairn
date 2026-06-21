@@ -19,6 +19,13 @@ pub(crate) const SYSTEM_HIVE: HivePath = HivePath {
     components: &["Windows", "System32", "config", "SYSTEM"],
 };
 
+/// Amcache.hve — programs/files inventory (FR12 amcache_collector).
+// TODO(Task 3): remove #[allow(dead_code)] when amcache_collector wires this const.
+#[allow(dead_code)]
+pub(crate) const AMCACHE_HIVE: HivePath = HivePath {
+    components: &["Windows", "AppCompat", "Programs", "Amcache.hve"],
+};
+
 /// 512 MiB hard ceiling on a single hive's in-memory size (NFR10). A boot sector or
 /// attribute length lying about size cannot force a larger allocation than this.
 pub(crate) const HIVE_HARD_CEILING: u64 = 512 * 1024 * 1024;
@@ -40,6 +47,17 @@ pub(crate) struct OpenedHive {
     pub log_status: LogStatus,
     /// True if the primary hive read hit HIVE_HARD_CEILING (abstain signal).
     pub truncated: bool,
+}
+
+/// One enumerated subkey: its name and last-write time. hive_reader's OWN pure type —
+/// it deliberately does NOT expose notatin's CellKeyNode, so a notatin upgrade cannot
+/// break consumers (same encapsulation as get_value_bytes returning (Vec<u8>, DateTime)).
+// TODO(Task 3): remove #[allow(dead_code)] when amcache_collector uses SubKey.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SubKey {
+    pub name: String,
+    pub last_write: DateTime<Utc>,
 }
 
 /// Build a Collector-variant CairnError (mirrors usn_err/mft_err).
@@ -329,10 +347,90 @@ pub(crate) fn get_value_bytes(
     Ok(Some((bytes, last_write)))
 }
 
+/// Enumerate the direct child keys of `key_path`, returning each child's name and
+/// last-write time. Absent key => Ok(vec![]) (graceful — golden rule 8).
+///
+/// Index-based enumeration (get_sub_key_by_index over 0..number_of_sub_keys). Order
+/// is the hive's physical order, NOT sorted — the CALLER sorts for determinism.
+/// `parser` is &mut because notatin traverses lazily (mutates state per lookup).
+///
+/// TODO(Task 3): remove #[allow(dead_code)] when amcache_collector calls list_subkeys.
+#[allow(dead_code)]
+pub(crate) fn list_subkeys(
+    parser: &mut notatin::parser::Parser,
+    key_path: &str,
+) -> Result<Vec<SubKey>> {
+    let mut parent = match parser
+        .get_key(key_path, false)
+        .map_err(|e| hive_err(format!("get_key({key_path}) failed: {e}")))?
+    {
+        Some(k) => k,
+        None => return Ok(Vec::new()),
+    };
+    let n = parent.detail.number_of_sub_keys() as usize;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        if let Some(child) = parent.get_sub_key_by_index(parser, i) {
+            out.push(SubKey {
+                name: child.key_name.clone(),
+                last_write: child.last_key_written_date_and_time(),
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Fetch a single REG_SZ value as a String. Returns Ok(None) when the key or value is
+/// absent, or when the value is not a string type (graceful — golden rule 8).
+///
+/// Companion to get_value_bytes (which handles REG_BINARY). `parser` is &mut for the
+/// same lazy-cursor reason.
+///
+/// TODO(Task 3): remove #[allow(dead_code)] when amcache_collector calls get_value_string.
+#[allow(dead_code)]
+pub(crate) fn get_value_string(
+    parser: &mut notatin::parser::Parser,
+    key_path: &str,
+    value_name: &str,
+) -> Result<Option<String>> {
+    let key = match parser
+        .get_key(key_path, false)
+        .map_err(|e| hive_err(format!("get_key({key_path}) failed: {e}")))?
+    {
+        Some(k) => k,
+        None => return Ok(None),
+    };
+    let value = match key.get_value(value_name) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    match value.get_content().0 {
+        notatin::cell_value::CellValue::String(s) => Ok(Some(s)),
+        _ => Ok(None),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn amcache_hive_path_joins_to_appcompat_programs() {
+        let joined = AMCACHE_HIVE.components.join("\\");
+        assert_eq!(joined, r"Windows\AppCompat\Programs\Amcache.hve");
+    }
+
+    #[test]
+    fn subkey_holds_name_and_time() {
+        let t = chrono::Utc::now();
+        let sk = SubKey {
+            name: "0006...".into(),
+            last_write: t,
+        };
+        assert_eq!(sk.name, "0006...");
+        assert_eq!(sk.last_write, t);
+    }
 
     #[test]
     fn open_hive_short_reader_is_err_not_panic() {
