@@ -5,6 +5,7 @@
 //! dependency-free per its contract. Stage 1 ships only `evtx`.
 #![forbid(unsafe_code)]
 
+pub mod amcache;
 pub mod evtx;
 pub mod hash;
 pub mod hive_reader;

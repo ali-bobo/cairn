@@ -271,15 +271,23 @@ fn parse_cap(s: &str) -> Option<u64> {
 /// The collector names that the run arm's construction `if` blocks would build for
 /// this selection, in canonical order. Pure mirror of those blocks, so the
 /// selection→collectors mapping is unit-testable without a live Windows host.
-/// MUST stay in sync with the six `if ... push(...)` blocks in `main` that
-/// construct proc/net/persist/mft/usn/shimcache collectors (search: "S2-L: construct only").
+/// MUST stay in sync with the seven `if ... push(...)` blocks in `main` that
+/// construct proc/net/persist/mft/usn/shimcache/amcache collectors (search: "S2-L: construct only").
 #[cfg(test)]
 fn built_collector_names(selected: &[String]) -> Vec<String> {
-    ["proc", "net", "persist", "mft", "usn", "shimcache"]
-        .iter()
-        .filter(|n| selected.iter().any(|m| m == *n))
-        .map(|s| s.to_string())
-        .collect()
+    [
+        "proc",
+        "net",
+        "persist",
+        "mft",
+        "usn",
+        "shimcache",
+        "amcache",
+    ]
+    .iter()
+    .filter(|n| selected.iter().any(|m| m == *n))
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// Dump collected Records as JSONL so a live run produces usable data even before
@@ -620,7 +628,15 @@ fn main() -> anyhow::Result<()> {
 
             // S2-L: decide which collectors run. AVAILABLE = the live collectors' real
             // Collector::name() strings. Pure decision; logged for transparency (FR6).
-            const AVAILABLE: &[&str] = &["proc", "net", "persist", "mft", "usn", "shimcache"];
+            const AVAILABLE: &[&str] = &[
+                "proc",
+                "net",
+                "persist",
+                "mft",
+                "usn",
+                "shimcache",
+                "amcache",
+            ];
             let selection = cairn_core::select_modules(profile, only.as_deref(), AVAILABLE);
             for name in &selection.unknown_only {
                 tracing::warn!(
@@ -694,6 +710,11 @@ fn main() -> anyhow::Result<()> {
             if selection.selected.iter().any(|m| m == "shimcache") {
                 collectors.push(Box::new(
                     cairn_collectors::shimcache::ShimCollector::default(),
+                ));
+            }
+            if selection.selected.iter().any(|m| m == "amcache") {
+                collectors.push(Box::new(
+                    cairn_collectors::amcache::AmcacheCollector::default(),
                 ));
             }
             let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
@@ -886,7 +907,15 @@ mod tests {
     #[test]
     fn selected_collector_names_follow_selection() {
         use cairn_core::{select_modules, Profile};
-        const AVAILABLE: &[&str] = &["proc", "net", "persist", "mft", "usn", "shimcache"];
+        const AVAILABLE: &[&str] = &[
+            "proc",
+            "net",
+            "persist",
+            "mft",
+            "usn",
+            "shimcache",
+            "amcache",
+        ];
 
         // --only persist => only persist constructed.
         let only = vec!["persist".to_string()];
@@ -894,12 +923,20 @@ mod tests {
         let built = built_collector_names(&sel.selected);
         assert_eq!(built, vec!["persist".to_string()]);
 
-        // no --only => all six in canonical order (minimal skips raw-NTFS).
+        // no --only => all seven in canonical order (minimal skips raw-NTFS).
         let sel = select_modules(Profile::Standard, None, AVAILABLE);
         let built = built_collector_names(&sel.selected);
         assert_eq!(
             built,
-            vec!["proc", "net", "persist", "mft", "usn", "shimcache"]
+            vec![
+                "proc",
+                "net",
+                "persist",
+                "mft",
+                "usn",
+                "shimcache",
+                "amcache"
+            ]
         );
 
         // --profile minimal must NOT select mft (raw-NTFS); standard must.
@@ -933,6 +970,19 @@ mod tests {
         assert!(
             !built.contains(&"shimcache".to_string()),
             "minimal skips shimcache"
+        );
+        // raw-NTFS collectors: standard includes amcache, minimal skips it.
+        let sel = select_modules(Profile::Standard, None, AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert!(
+            built.contains(&"amcache".to_string()),
+            "standard includes amcache"
+        );
+        let sel = select_modules(Profile::Minimal, None, AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert!(
+            !built.contains(&"amcache".to_string()),
+            "minimal skips amcache"
         );
     }
 
