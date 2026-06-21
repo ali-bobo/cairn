@@ -30,23 +30,31 @@ fn prefetch_err(reason: String) -> CairnError {
     }
 }
 
-/// Decompress a .pf outer container. MAM files (magic "MAM\x04", uncompressed size u32 at
-/// offset 4, Xpress-Huffman payload from offset 8) are decompressed via compcol with a hard
-/// memory cap (NFR10 — a malicious .pf cannot force an unbounded allocation). Files without
-/// the MAM magic (older uncompressed .pf) are returned unchanged. A truncated MAM container
-/// or a decompression failure (incl. exceeding the ceiling) yields Err (caller abstains).
+/// Decompress a .pf outer container. A MAM file is `"MAM\x04"` (4 bytes) followed by the
+/// compcol-framed Xpress-Huffman stream. Crucially, compcol's own frame begins with a
+/// 4-byte LE uncompressed-length header — and that is EXACTLY the u32 that sits at MAM
+/// offset 4. So the bytes compcol needs are `raw[4..]` (the MAM length header IS compcol's
+/// length header; the MS-XCA bitstream follows it). We must NOT strip the length u32 —
+/// passing `raw[8..]` would feed compcol the bare bitstream, and its decoder would misread
+/// the first 4 bitstream bytes as the length and decode from the wrong position.
+///
+/// Decompression is capped (NFR10 — a malicious .pf cannot force an unbounded allocation).
+/// Files without the MAM magic (older uncompressed .pf) are returned unchanged. A truncated
+/// MAM container or a decompression failure (incl. exceeding the ceiling) yields Err (caller
+/// abstains).
 fn decompress_mam(raw: &[u8]) -> Result<Vec<u8>> {
     if raw.len() < 4 || &raw[0..4] != MAM_MAGIC {
         return Ok(raw.to_vec()); // not MAM-compressed: pass through
     }
     if raw.len() < 8 {
         return Err(prefetch_err(
-            "MAM header truncated (no uncompressed size)".into(),
+            "MAM header truncated (no length header)".into(),
         ));
     }
-    let payload = &raw[8..];
+    // Keep the offset-4 u32 length header — it IS compcol's frame header.
+    let stream = &raw[4..];
     compcol::vec::decompress_to_vec_capped::<compcol::xpress_huffman::XpressHuffman>(
-        payload,
+        stream,
         PREFETCH_DECOMPRESS_CEILING,
     )
     .map_err(|e| prefetch_err(format!("MAM decompression failed: {e}")))
@@ -316,15 +324,51 @@ mod tests {
 
     #[test]
     fn decompress_mam_decompresses_mam_container() {
+        // A real MAM .pf is "MAM\x04" + the compcol-framed stream. compcol's frame ALREADY
+        // begins with the 4-byte LE uncompressed-length header, so the MAM container is
+        // exactly MAM_MAGIC ++ compcol_output (NO extra size field — the compcol header IS
+        // the offset-4 length). decompress_mam must therefore hand compcol raw[4..].
         let original = b"prefetch decompressed body ".repeat(8);
-        let payload =
+        let compcol_stream =
             compcol::vec::compress_to_vec::<compcol::xpress_huffman::XpressHuffman>(&original)
                 .expect("compress");
         let mut mam = Vec::new();
         mam.extend_from_slice(b"MAM\x04");
-        mam.extend_from_slice(&(original.len() as u32).to_le_bytes());
-        mam.extend_from_slice(&payload);
+        mam.extend_from_slice(&compcol_stream); // compcol_stream[0..4] = LE length header
         assert_eq!(decompress_mam(&mam).expect("decompress"), original);
+    }
+
+    #[test]
+    fn decompress_mam_slices_at_offset_4_not_8() {
+        // Regression guard for the framing bug caught in review: compcol's frame starts with
+        // a u32 LE length header, which sits at MAM offset 4. Feeding raw[8..] (dropping that
+        // header) makes compcol misread the bitstream. This test pins raw[4..] by checking
+        // that the bytes AT offset 4 are what compcol round-trips — i.e. MAM_MAGIC ++ frame
+        // decompresses, and a wrongly-8-sliced variant (frame with its first 4 bytes chopped)
+        // does NOT yield the original.
+        let original = b"the regression vector body, distinct content here".to_vec();
+        let frame =
+            compcol::vec::compress_to_vec::<compcol::xpress_huffman::XpressHuffman>(&original)
+                .expect("compress");
+        // Correct container: MAM + full frame. decompress_mam uses raw[4..] == frame.
+        let mut correct = b"MAM\x04".to_vec();
+        correct.extend_from_slice(&frame);
+        assert_eq!(
+            decompress_mam(&correct).expect("correct decompresses"),
+            original
+        );
+        // If decompress_mam had used raw[8..], it would have fed compcol `frame[4..]` (the
+        // frame minus its length header) — prove that bytes are NOT a valid decode of original.
+        let wrong_input = &frame[4..];
+        let wrong = compcol::vec::decompress_to_vec_capped::<compcol::xpress_huffman::XpressHuffman>(
+            wrong_input,
+            PREFETCH_DECOMPRESS_CEILING,
+        );
+        // Either it errors, or it decodes to something other than the original — never equal.
+        assert!(
+            wrong.as_deref() != Ok(original.as_slice()),
+            "dropping the length header must not coincidentally yield the original"
+        );
     }
 
     #[test]
