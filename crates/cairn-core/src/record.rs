@@ -114,7 +114,7 @@ pub struct RegValueRecord {
 /// Evidence-of-execution from Amcache/Shimcache/Prefetch/UserAssist/BAM/SRUM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRecord {
-    pub source: String, // amcache|shimcache|prefetch|userassist|bam|srum
+    pub source: String, // amcache|amcache_driver|shimcache|prefetch|userassist|bam|srum
     pub path: String,
     pub first_run: Option<DateTime<Utc>>,
     pub last_run: Option<DateTime<Utc>>,

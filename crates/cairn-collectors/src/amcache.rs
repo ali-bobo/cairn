@@ -19,13 +19,21 @@ use cairn_core::{CairnError, Result};
 
 use crate::hive_reader::{get_value_string, list_subkeys, open_hive, LogStatus, AMCACHE_HIVE};
 
-/// The InventoryApplicationFile key: one subkey per executable, holding LowerCaseLongPath
-/// / Name (path) and FileId (SHA1). key_path_has_root = false (no root prefix).
-const INVENTORY_APP_FILE_KEY: &str = "Root\\InventoryApplicationFile";
+/// Spec for the InventoryDriverBinary inventory key (driver binaries — BYOVD evidence).
+const DRIVER_SPEC: InventorySpec = InventorySpec {
+    key_path: "Root\\InventoryDriverBinary",
+    source: "amcache_driver",
+    sha1_value: "DriverId",
+    path_values: &["DriverName"],
+};
 
-const VALUE_PATH: &str = "LowerCaseLongPath";
-const VALUE_NAME: &str = "Name";
-const VALUE_FILE_ID: &str = "FileId";
+/// Spec for the InventoryApplicationFile inventory key.
+const APP_FILE_SPEC: InventorySpec = InventorySpec {
+    key_path: "Root\\InventoryApplicationFile",
+    source: "amcache",
+    sha1_value: "FileId",
+    path_values: &["LowerCaseLongPath", "Name"],
+};
 
 /// AmcacheCollector: privilege-gated, read-only InventoryApplicationFile read from a
 /// locked Amcache.hve. Requires Administrator + SeBackupPrivilege (raw \\.\C: open).
@@ -35,9 +43,11 @@ pub struct AmcacheCollector {
     /// Amcache.hve exceeded the memory ceiling (parse abstained). NFR10/NFR12.
     abstained_truncated: AtomicBool,
     /// The InventoryApplicationFile key was absent (build variance — abstained). NFR12.
-    key_absent: AtomicBool,
+    app_key_absent: AtomicBool,
     /// A transaction log (.LOG1/.LOG2) existed but could not be read; primary-only parse.
     log_replay_failed: AtomicBool,
+    /// The InventoryDriverBinary key was absent (build variance — abstained). NFR12.
+    driver_key_absent: AtomicBool,
     /// At least one subkey's value read failed mid-hive; that entry was skipped and the
     /// rest still collected (graceful degrade — golden rule 8). Surfaced so the analyst
     /// knows the result is partial rather than silently dropping evidence (NFR12).
@@ -72,63 +82,22 @@ impl Collector for AmcacheCollector {
             tracing::warn!(reason = %reason, "amcache: log replay failed; primary-only");
         }
 
-        let subkeys = list_subkeys(&mut opened.parser, INVENTORY_APP_FILE_KEY)?;
-        if subkeys.is_empty() {
-            self.key_absent.store(true, Ordering::Relaxed);
-            tracing::warn!("amcache: InventoryApplicationFile absent/empty; abstaining");
-            return Ok(Vec::new());
-        }
+        let mut records = collect_inventory(
+            &mut opened.parser,
+            &APP_FILE_SPEC,
+            &self.app_key_absent,
+            &self.entry_read_errors,
+        )?;
 
-        let mut records: Vec<Record> = Vec::new();
-        'subkeys: for sk in subkeys {
-            let key_path = format!("{INVENTORY_APP_FILE_KEY}\\{}", sk.name);
-            // Read a value, degrading gracefully: a genuine mid-hive read Err on ONE
-            // subkey skips that entry (flag + continue) rather than aborting the whole
-            // collect — amcache reads thousands of values, so one corrupt cell must not
-            // discard the rest (golden rule 8). Ok(None) (absent/non-string) is NOT an
-            // error and yields None here.
-            let mut read = |name: &str| -> Option<Option<String>> {
-                match get_value_string(&mut opened.parser, &key_path, name) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        self.entry_read_errors.store(true, Ordering::Relaxed);
-                        tracing::warn!(key = %sk.name, err = %e, "amcache: value read error; skipping entry");
-                        None
-                    }
-                }
-            };
-
-            // Path: LowerCaseLongPath, else Name, else drop (no path = no evidence).
-            let path = match read(VALUE_PATH) {
-                None => continue 'subkeys, // read Err — entry skipped (flag already set)
-                Some(Some(p)) if !p.is_empty() => p,
-                Some(_) => match read(VALUE_NAME) {
-                    None => continue 'subkeys,
-                    Some(Some(n)) if !n.is_empty() => n,
-                    Some(_) => continue 'subkeys, // local best-effort drop; no abstain flag
-                },
-            };
-            let sha1 = match read(VALUE_FILE_ID) {
-                None => continue 'subkeys, // read Err — entry skipped
-                Some(opt) => opt.and_then(|id| parse_sha1_from_fileid(&id)),
-            };
-
-            records.push(Record::Execution(ExecutionRecord {
-                source: "amcache".into(),
-                path,
-                // Amcache InventoryApplicationFile has no real exec time; the subkey's
-                // last-write is the industry first-seen approximation (NFR12: documented,
-                // not a fabricated exec time).
-                first_run: Some(sk.last_write),
-                last_run: None,
-                run_count: None,
-                sha1,
-                user_sid: None,
-                // An InventoryApplicationFile entry means the OS registered the file as an
-                // executable — stronger than shimcache "presence". Hence Some(true).
-                execution_confirmed: Some(true),
-            }));
-        }
+        // Driver binaries (BYOVD evidence). Independent per-key degrade: an absent
+        // driver key does NOT suppress the app records already collected, and vice versa.
+        let driver_records = collect_inventory(
+            &mut opened.parser,
+            &DRIVER_SPEC,
+            &self.driver_key_absent,
+            &self.entry_read_errors,
+        )?;
+        records.extend(driver_records);
 
         // Determinism (NFR4): subkey enumeration order is physical; sort by path.
         records.sort_by(|a, b| match (a, b) {
@@ -147,9 +116,14 @@ impl Collector for AmcacheCollector {
                 "abstained: Amcache.hve exceeded memory ceiling (NFR10); not parsed".to_string(),
             );
         }
-        if self.key_absent.load(Ordering::Relaxed) {
+        if self.app_key_absent.load(Ordering::Relaxed) {
             errors.push(
                 "abstained: InventoryApplicationFile key absent (build variance/NFR12)".to_string(),
+            );
+        }
+        if self.driver_key_absent.load(Ordering::Relaxed) {
+            errors.push(
+                "abstained: InventoryDriverBinary key absent (build variance/NFR12)".to_string(),
             );
         }
         if self.log_replay_failed.load(Ordering::Relaxed) {
@@ -195,6 +169,114 @@ fn parse_sha1_from_fileid(field: &str) -> Option<String> {
         return None;
     }
     Some(body.to_ascii_lowercase())
+}
+
+/// A pure-data description of one Amcache inventory key, so one helper can serve both
+/// InventoryApplicationFile and InventoryDriverBinary (and future keys) — the only
+/// difference between them is data, not logic.
+struct InventorySpec {
+    /// notatin key path (key_path_has_root = false).
+    key_path: &'static str,
+    /// ExecutionRecord.source tag for entries from this key.
+    source: &'static str,
+    /// REG_SZ value holding the "0000"+40hex SHA1.
+    sha1_value: &'static str,
+    /// Path candidates, tried in order; first non-empty wins, else the entry is dropped.
+    path_values: &'static [&'static str],
+}
+
+/// Try value names in order, returning the first non-empty value, STOPPING as soon as
+/// one is found (later names are never read). `read` returns `Ok(Some)` = value present,
+/// `Ok(None)` = absent/non-string, `Err(())` = a genuine read error. Result:
+/// - `Ok(Some(v))` — first non-empty value found,
+/// - `Ok(None)`    — every consulted name was empty/absent (caller drops the entry),
+/// - `Err(())`     — a read error on a CONSULTED name (caller skips the entry).
+///
+/// Pure given `read`: the early-stop logic is unit-testable with a fake `read`, and
+/// because `read` is a `&mut` function parameter (not a closure captured inside another
+/// closure) there is no borrow tangle with the caller's parser-borrowing `read`.
+fn first_non_empty_read(
+    names: &[&str],
+    read: &mut impl FnMut(&str) -> std::result::Result<Option<String>, ()>,
+) -> std::result::Result<Option<String>, ()> {
+    for name in names {
+        match read(name)? {
+            Some(v) if !v.is_empty() => return Ok(Some(v)),
+            _ => {} // empty/absent — try the next name
+        }
+    }
+    Ok(None)
+}
+
+/// Enumerate one inventory key's subkeys into Record::Execution. Shared by both the
+/// InventoryApplicationFile and InventoryDriverBinary specs.
+///
+/// Flags: `key_absent` is set when the key has no subkeys (build variance abstain);
+/// `entry_err` is set when a per-subkey value read fails (that entry is skipped, the
+/// rest continue — golden rule 8). The helper knows only "two flags", not which spec.
+fn collect_inventory(
+    parser: &mut notatin::parser::Parser,
+    spec: &InventorySpec,
+    key_absent: &std::sync::atomic::AtomicBool,
+    entry_err: &std::sync::atomic::AtomicBool,
+) -> Result<Vec<Record>> {
+    let subkeys = list_subkeys(parser, spec.key_path)?;
+    if subkeys.is_empty() {
+        key_absent.store(true, Ordering::Relaxed);
+        tracing::warn!(
+            key = spec.key_path,
+            "amcache: inventory key absent/empty; abstaining"
+        );
+        return Ok(Vec::new());
+    }
+
+    let mut records: Vec<Record> = Vec::new();
+    'subkeys: for sk in subkeys {
+        let key_path = format!("{}\\{}", spec.key_path, sk.name);
+        // Read one value, degrading gracefully: a genuine mid-hive read Err on ONE
+        // subkey returns Err(()) here so the caller can skip the entry (flag + continue),
+        // never aborting the whole collect (golden rule 8). Ok(None) = absent/non-string.
+        // The () error type (the detail is logged + flagged here) lets `read` slot
+        // directly into first_non_empty_read without a nested closure.
+        let mut read = |name: &str| -> std::result::Result<Option<String>, ()> {
+            match get_value_string(parser, &key_path, name) {
+                Ok(v) => Ok(v),
+                Err(e) => {
+                    entry_err.store(true, Ordering::Relaxed);
+                    tracing::warn!(key = %sk.name, err = %e, "amcache: value read error; skipping entry");
+                    Err(())
+                }
+            }
+        };
+
+        // Path: try path_values in order, STOPPING at the first non-empty value — a
+        // later candidate is never read once an earlier one succeeds. This matches the
+        // original nested-match semantics exactly (a non-empty LowerCaseLongPath means
+        // Name is never touched, so a corrupt Name cannot drop an otherwise-good entry).
+        // A read Err on a candidate we DO consult skips the entry (golden rule 8).
+        let path = match first_non_empty_read(spec.path_values, &mut read) {
+            Err(()) => continue 'subkeys, // read Err on a consulted candidate — skip
+            Ok(Some(p)) => p,
+            Ok(None) => continue 'subkeys, // all consulted empty/absent — no path, drop
+        };
+
+        let sha1 = match read(spec.sha1_value) {
+            Err(()) => continue 'subkeys, // read Err — entry skipped
+            Ok(opt) => opt.and_then(|id| parse_sha1_from_fileid(&id)),
+        };
+
+        records.push(Record::Execution(ExecutionRecord {
+            source: spec.source.into(),
+            path,
+            first_run: Some(sk.last_write),
+            last_run: None,
+            run_count: None,
+            sha1,
+            user_sid: None,
+            execution_confirmed: Some(true),
+        }));
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
@@ -245,10 +327,78 @@ mod tests {
             .any(|e| e.contains("exceeded memory ceiling")));
     }
 
+    // ── first_non_empty_read unit tests (early-stop selector) ────────────────
+
     #[test]
-    fn sources_reports_key_absent_abstain() {
+    fn first_non_empty_read_stops_at_first_non_empty() {
+        // The second name must NEVER be read once the first is non-empty.
+        let mut reads: Vec<String> = Vec::new();
+        let mut read = |name: &str| -> std::result::Result<Option<String>, ()> {
+            reads.push(name.to_string());
+            match name {
+                "A" => Ok(Some(r"C:\a.sys".to_string())),
+                _ => Ok(Some("should-not-be-read".to_string())),
+            }
+        };
+        let got = first_non_empty_read(&["A", "B"], &mut read);
+        assert_eq!(got, Ok(Some(r"C:\a.sys".to_string())));
+        assert_eq!(reads, vec!["A"], "B must not be read once A is non-empty");
+    }
+
+    #[test]
+    fn first_non_empty_read_skips_empty_then_takes_next() {
+        let mut read = |name: &str| -> std::result::Result<Option<String>, ()> {
+            match name {
+                "A" => Ok(Some(String::new())), // empty → skip
+                "B" => Ok(Some(r"C:\b.sys".to_string())),
+                _ => Ok(None),
+            }
+        };
+        assert_eq!(
+            first_non_empty_read(&["A", "B"], &mut read),
+            Ok(Some(r"C:\b.sys".to_string()))
+        );
+    }
+
+    #[test]
+    fn first_non_empty_read_all_empty_or_absent_is_ok_none() {
+        let mut read = |name: &str| -> std::result::Result<Option<String>, ()> {
+            match name {
+                "A" => Ok(Some(String::new())),
+                _ => Ok(None),
+            }
+        };
+        assert_eq!(first_non_empty_read(&["A", "B"], &mut read), Ok(None));
+    }
+
+    #[test]
+    fn first_non_empty_read_propagates_read_err() {
+        // A read Err on a CONSULTED name short-circuits to Err(()).
+        let mut read = |_name: &str| -> std::result::Result<Option<String>, ()> { Err(()) };
+        assert_eq!(first_non_empty_read(&["A", "B"], &mut read), Err(()));
+    }
+
+    #[test]
+    fn first_non_empty_read_empty_names_is_ok_none() {
+        let mut read = |_name: &str| -> std::result::Result<Option<String>, ()> { Ok(None) };
+        assert_eq!(first_non_empty_read(&[], &mut read), Ok(None));
+    }
+
+    #[test]
+    fn sources_reports_driver_key_absent() {
         let c = AmcacheCollector::default();
-        c.key_absent.store(true, Ordering::Relaxed);
+        c.driver_key_absent.store(true, Ordering::Relaxed);
+        let s = c.sources();
+        assert!(s[0]
+            .errors
+            .iter()
+            .any(|e| e.contains("InventoryDriverBinary key absent")));
+    }
+
+    #[test]
+    fn sources_reports_app_key_absent() {
+        let c = AmcacheCollector::default();
+        c.app_key_absent.store(true, Ordering::Relaxed);
         let s = c.sources();
         assert!(s[0]
             .errors
@@ -346,7 +496,11 @@ mod tests {
         assert!(!recs.is_empty(), "expected at least one amcache entry");
         for r in &recs {
             if let Record::Execution(e) = r {
-                assert_eq!(e.source, "amcache");
+                assert!(
+                    e.source == "amcache" || e.source == "amcache_driver",
+                    "unexpected source: {}",
+                    e.source
+                );
                 assert!(!e.path.is_empty(), "every entry must have a path");
                 assert_eq!(e.execution_confirmed, Some(true));
                 // NFR12: amcache never fabricates an exec time into last_run.
@@ -369,6 +523,11 @@ mod tests {
                 panic!("amcache must only emit Execution records");
             }
         }
+        let drivers = recs
+            .iter()
+            .filter(|r| matches!(r, Record::Execution(e) if e.source == "amcache_driver"))
+            .count();
+        eprintln!("amcache_e2e_real_system_hive: {} driver entries", drivers);
         eprintln!(
             "amcache_e2e_real_system_hive: parsed {} entries",
             recs.len()
