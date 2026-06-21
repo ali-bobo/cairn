@@ -160,11 +160,27 @@ struct InventorySpec {
     path_values: &'static [&'static str],
 }
 
-/// Return the first non-empty string from a slice of already-read candidates (in
-/// order). All empty/absent → None (the caller drops the entry). Pure — the values are
-/// read by the caller, so this is unit-testable without a hive and has no borrow tangle.
-fn first_non_empty(candidates: &[Option<String>]) -> Option<String> {
-    candidates.iter().flatten().find(|v| !v.is_empty()).cloned()
+/// Try value names in order, returning the first non-empty value, STOPPING as soon as
+/// one is found (later names are never read). `read` returns `Ok(Some)` = value present,
+/// `Ok(None)` = absent/non-string, `Err(())` = a genuine read error. Result:
+/// - `Ok(Some(v))` — first non-empty value found,
+/// - `Ok(None)`    — every consulted name was empty/absent (caller drops the entry),
+/// - `Err(())`     — a read error on a CONSULTED name (caller skips the entry).
+///
+/// Pure given `read`: the early-stop logic is unit-testable with a fake `read`, and
+/// because `read` is a `&mut` function parameter (not a closure captured inside another
+/// closure) there is no borrow tangle with the caller's parser-borrowing `read`.
+fn first_non_empty_read(
+    names: &[&str],
+    read: &mut impl FnMut(&str) -> std::result::Result<Option<String>, ()>,
+) -> std::result::Result<Option<String>, ()> {
+    for name in names {
+        match read(name)? {
+            Some(v) if !v.is_empty() => return Ok(Some(v)),
+            _ => {} // empty/absent — try the next name
+        }
+    }
+    Ok(None)
 }
 
 /// Enumerate one inventory key's subkeys into Record::Execution. Shared by both the
@@ -193,36 +209,34 @@ fn collect_inventory(
     'subkeys: for sk in subkeys {
         let key_path = format!("{}\\{}", spec.key_path, sk.name);
         // Read one value, degrading gracefully: a genuine mid-hive read Err on ONE
-        // subkey returns Err here so the caller can skip the entry (flag + continue),
+        // subkey returns Err(()) here so the caller can skip the entry (flag + continue),
         // never aborting the whole collect (golden rule 8). Ok(None) = absent/non-string.
-        let mut read = |name: &str| -> Result<Option<String>> {
+        // The () error type (the detail is logged + flagged here) lets `read` slot
+        // directly into first_non_empty_read without a nested closure.
+        let mut read = |name: &str| -> std::result::Result<Option<String>, ()> {
             match get_value_string(parser, &key_path, name) {
                 Ok(v) => Ok(v),
                 Err(e) => {
                     entry_err.store(true, Ordering::Relaxed);
                     tracing::warn!(key = %sk.name, err = %e, "amcache: value read error; skipping entry");
-                    Err(e)
+                    Err(())
                 }
             }
         };
 
-        // Read every path candidate first (any read Err skips the whole entry), THEN
-        // pick the first non-empty via the pure selector. Reading into a Vec first
-        // avoids nesting the parser-borrowing `read` closure inside another closure.
-        let mut path_candidates: Vec<Option<String>> = Vec::with_capacity(spec.path_values.len());
-        for name in spec.path_values {
-            match read(name) {
-                Ok(v) => path_candidates.push(v),
-                Err(_) => continue 'subkeys, // read Err — entry skipped (flag already set)
-            }
-        }
-        let path = match first_non_empty(&path_candidates) {
-            Some(p) => p,
-            None => continue 'subkeys, // no path = no evidence; local best-effort drop
+        // Path: try path_values in order, STOPPING at the first non-empty value — a
+        // later candidate is never read once an earlier one succeeds. This matches the
+        // original nested-match semantics exactly (a non-empty LowerCaseLongPath means
+        // Name is never touched, so a corrupt Name cannot drop an otherwise-good entry).
+        // A read Err on a candidate we DO consult skips the entry (golden rule 8).
+        let path = match first_non_empty_read(spec.path_values, &mut read) {
+            Err(()) => continue 'subkeys, // read Err on a consulted candidate — skip
+            Ok(Some(p)) => p,
+            Ok(None) => continue 'subkeys, // all consulted empty/absent — no path, drop
         };
 
         let sha1 = match read(spec.sha1_value) {
-            Err(_) => continue 'subkeys, // read Err — entry skipped
+            Err(()) => continue 'subkeys, // read Err — entry skipped
             Ok(opt) => opt.and_then(|id| parse_sha1_from_fileid(&id)),
         };
 
@@ -286,6 +300,63 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("exceeded memory ceiling")));
+    }
+
+    // ── first_non_empty_read unit tests (early-stop selector) ────────────────
+
+    #[test]
+    fn first_non_empty_read_stops_at_first_non_empty() {
+        // The second name must NEVER be read once the first is non-empty.
+        let mut reads: Vec<String> = Vec::new();
+        let mut read = |name: &str| -> std::result::Result<Option<String>, ()> {
+            reads.push(name.to_string());
+            match name {
+                "A" => Ok(Some(r"C:\a.sys".to_string())),
+                _ => Ok(Some("should-not-be-read".to_string())),
+            }
+        };
+        let got = first_non_empty_read(&["A", "B"], &mut read);
+        assert_eq!(got, Ok(Some(r"C:\a.sys".to_string())));
+        assert_eq!(reads, vec!["A"], "B must not be read once A is non-empty");
+    }
+
+    #[test]
+    fn first_non_empty_read_skips_empty_then_takes_next() {
+        let mut read = |name: &str| -> std::result::Result<Option<String>, ()> {
+            match name {
+                "A" => Ok(Some(String::new())), // empty → skip
+                "B" => Ok(Some(r"C:\b.sys".to_string())),
+                _ => Ok(None),
+            }
+        };
+        assert_eq!(
+            first_non_empty_read(&["A", "B"], &mut read),
+            Ok(Some(r"C:\b.sys".to_string()))
+        );
+    }
+
+    #[test]
+    fn first_non_empty_read_all_empty_or_absent_is_ok_none() {
+        let mut read = |name: &str| -> std::result::Result<Option<String>, ()> {
+            match name {
+                "A" => Ok(Some(String::new())),
+                _ => Ok(None),
+            }
+        };
+        assert_eq!(first_non_empty_read(&["A", "B"], &mut read), Ok(None));
+    }
+
+    #[test]
+    fn first_non_empty_read_propagates_read_err() {
+        // A read Err on a CONSULTED name short-circuits to Err(()).
+        let mut read = |_name: &str| -> std::result::Result<Option<String>, ()> { Err(()) };
+        assert_eq!(first_non_empty_read(&["A", "B"], &mut read), Err(()));
+    }
+
+    #[test]
+    fn first_non_empty_read_empty_names_is_ok_none() {
+        let mut read = |_name: &str| -> std::result::Result<Option<String>, ()> { Ok(None) };
+        assert_eq!(first_non_empty_read(&[], &mut read), Ok(None));
     }
 
     #[test]
@@ -416,34 +487,5 @@ mod tests {
             "amcache_e2e_real_system_hive: parsed {} entries",
             recs.len()
         );
-    }
-
-    // ── first_non_empty unit tests ────────────────────────────────────────
-
-    #[test]
-    fn first_non_empty_returns_first_non_empty_in_order() {
-        let candidates = vec![Some(String::new()), Some(r"C:\drivers\x.sys".to_string())];
-        assert_eq!(
-            first_non_empty(&candidates).as_deref(),
-            Some(r"C:\drivers\x.sys")
-        );
-    }
-
-    #[test]
-    fn first_non_empty_all_empty_or_absent_is_none() {
-        let candidates = vec![Some(String::new()), None];
-        assert_eq!(first_non_empty(&candidates), None);
-    }
-
-    #[test]
-    fn first_non_empty_single_value() {
-        let candidates = vec![Some(r"C:\d.sys".to_string())];
-        assert_eq!(first_non_empty(&candidates).as_deref(), Some(r"C:\d.sys"));
-    }
-
-    #[test]
-    fn first_non_empty_empty_slice_is_none() {
-        let candidates: Vec<Option<String>> = vec![];
-        assert_eq!(first_non_empty(&candidates), None);
     }
 }
