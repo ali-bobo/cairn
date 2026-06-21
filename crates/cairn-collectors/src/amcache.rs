@@ -38,6 +38,10 @@ pub struct AmcacheCollector {
     key_absent: AtomicBool,
     /// A transaction log (.LOG1/.LOG2) existed but could not be read; primary-only parse.
     log_replay_failed: AtomicBool,
+    /// At least one subkey's value read failed mid-hive; that entry was skipped and the
+    /// rest still collected (graceful degrade — golden rule 8). Surfaced so the analyst
+    /// knows the result is partial rather than silently dropping evidence (NFR12).
+    entry_read_errors: AtomicBool,
 }
 
 impl Collector for AmcacheCollector {
@@ -76,18 +80,38 @@ impl Collector for AmcacheCollector {
         }
 
         let mut records: Vec<Record> = Vec::new();
-        for sk in subkeys {
+        'subkeys: for sk in subkeys {
             let key_path = format!("{INVENTORY_APP_FILE_KEY}\\{}", sk.name);
+            // Read a value, degrading gracefully: a genuine mid-hive read Err on ONE
+            // subkey skips that entry (flag + continue) rather than aborting the whole
+            // collect — amcache reads thousands of values, so one corrupt cell must not
+            // discard the rest (golden rule 8). Ok(None) (absent/non-string) is NOT an
+            // error and yields None here.
+            let mut read = |name: &str| -> Option<Option<String>> {
+                match get_value_string(&mut opened.parser, &key_path, name) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        self.entry_read_errors.store(true, Ordering::Relaxed);
+                        tracing::warn!(key = %sk.name, err = %e, "amcache: value read error; skipping entry");
+                        None
+                    }
+                }
+            };
+
             // Path: LowerCaseLongPath, else Name, else drop (no path = no evidence).
-            let path = match get_value_string(&mut opened.parser, &key_path, VALUE_PATH)? {
-                Some(p) if !p.is_empty() => p,
-                _ => match get_value_string(&mut opened.parser, &key_path, VALUE_NAME)? {
-                    Some(n) if !n.is_empty() => n,
-                    _ => continue, // local best-effort drop; no abstain flag
+            let path = match read(VALUE_PATH) {
+                None => continue 'subkeys, // read Err — entry skipped (flag already set)
+                Some(Some(p)) if !p.is_empty() => p,
+                Some(_) => match read(VALUE_NAME) {
+                    None => continue 'subkeys,
+                    Some(Some(n)) if !n.is_empty() => n,
+                    Some(_) => continue 'subkeys, // local best-effort drop; no abstain flag
                 },
             };
-            let sha1 = get_value_string(&mut opened.parser, &key_path, VALUE_FILE_ID)?
-                .and_then(|id| parse_sha1_from_fileid(&id));
+            let sha1 = match read(VALUE_FILE_ID) {
+                None => continue 'subkeys, // read Err — entry skipped
+                Some(opt) => opt.and_then(|id| parse_sha1_from_fileid(&id)),
+            };
 
             records.push(Record::Execution(ExecutionRecord {
                 source: "amcache".into(),
@@ -109,7 +133,7 @@ impl Collector for AmcacheCollector {
         // Determinism (NFR4): subkey enumeration order is physical; sort by path.
         records.sort_by(|a, b| match (a, b) {
             (Record::Execution(x), Record::Execution(y)) => x.path.cmp(&y.path),
-            _ => std::cmp::Ordering::Equal,
+            _ => std::cmp::Ordering::Equal, // unreachable: only Execution is emitted above
         });
 
         tracing::info!(amcache_entries = records.len(), "amcache scan");
@@ -131,6 +155,12 @@ impl Collector for AmcacheCollector {
         if self.log_replay_failed.load(Ordering::Relaxed) {
             errors.push(
                 "log_replay_failed: transaction log present but unreadable; primary-only parse"
+                    .to_string(),
+            );
+        }
+        if self.entry_read_errors.load(Ordering::Relaxed) {
+            errors.push(
+                "partial: one or more entries skipped on a value read error (result incomplete)"
                     .to_string(),
             );
         }
@@ -234,6 +264,14 @@ mod tests {
         assert!(s[0].errors.iter().any(|e| e.contains("log_replay_failed")));
     }
 
+    #[test]
+    fn sources_reports_partial_on_entry_read_errors() {
+        let c = AmcacheCollector::default();
+        c.entry_read_errors.store(true, Ordering::Relaxed);
+        let s = c.sources();
+        assert!(s[0].errors.iter().any(|e| e.contains("partial")));
+    }
+
     // ── SHA1 parser unit tests ────────────────────────────────────────────────
 
     #[test]
@@ -313,6 +351,11 @@ mod tests {
                 assert_eq!(e.execution_confirmed, Some(true));
                 // NFR12: amcache never fabricates an exec time into last_run.
                 assert!(e.last_run.is_none(), "amcache must not claim a last_run");
+                // first_run (subkey last-write) must be propagated end-to-end, not dropped.
+                assert!(
+                    e.first_run.is_some(),
+                    "amcache must carry a first_seen time"
+                );
                 // SHA1, when present, is exactly 40 lowercase hex chars (strict parse).
                 if let Some(h) = &e.sha1 {
                     assert_eq!(h.len(), 40, "sha1 must be 40 hex chars");
