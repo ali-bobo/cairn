@@ -505,10 +505,27 @@ mod tests {
             se_backup: false,
             se_debug: false,
         };
-        let recs = PrefetchCollector::default()
-            .collect(&ctx)
-            .expect("collect ok");
-        assert!(!recs.is_empty(), "a real host has prefetch entries");
+        let collector = PrefetchCollector::default();
+        let recs = collector.collect(&ctx).expect("collect ok");
+        // Diagnostic: surface WHY collect returned what it did, so a failure clearly
+        // distinguishes "no real admin rights / dir unreadable" from a parse problem.
+        let src = collector.sources();
+        eprintln!(
+            "prefetch_e2e diagnostics: {} records; sources errors = {:?}",
+            recs.len(),
+            src[0].errors
+        );
+        if recs.is_empty() {
+            // The most common cause is running WITHOUT real OS Administrator rights:
+            // ctx.admin=true passes the gate, but std::fs::read_dir(C:\Windows\Prefetch)
+            // is still denied by the OS unless the PROCESS is elevated.
+            panic!(
+                "collect returned 0 records. If sources errors mention 'Prefetch directory \
+                 absent or unreadable', this test was NOT run from an elevated (Administrator) \
+                 terminal — re-run it as Administrator. Errors: {:?}",
+                src[0].errors
+            );
+        }
         let mut any_run = false;
         for r in &recs {
             if let Record::Execution(e) = r {
