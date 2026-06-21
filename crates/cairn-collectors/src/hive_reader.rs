@@ -368,7 +368,15 @@ pub(crate) fn list_subkeys(
         None => return Ok(Vec::new()),
     };
     let n = parent.detail.number_of_sub_keys() as usize;
-    let mut out = Vec::with_capacity(n);
+    // NFR10 / never-panic: number_of_sub_keys is a u32 read straight from the hive and
+    // could be adversarially huge (e.g. 0xFFFFFFFF on a corrupt/hostile hive). Do NOT
+    // pre-allocate `n` elements — a lying count would trigger a multi-GB allocation
+    // (OOM) BEFORE the loop discovers the real subkeys don't exist. Cap the *initial
+    // capacity* only; the loop still runs the full 0..n and the Vec grows as needed for
+    // a genuinely large (but real) key. notatin guards its own iter path with the same
+    // 1<<20 limit ("Sanity check to prevent OOM with recovered data", cell_key_node.rs).
+    let prealloc = n.min(SUBKEY_PREALLOC_CAP);
+    let mut out = Vec::with_capacity(prealloc);
     for i in 0..n {
         if let Some(child) = parent.get_sub_key_by_index(parser, i) {
             out.push(SubKey {
@@ -380,11 +388,23 @@ pub(crate) fn list_subkeys(
     Ok(out)
 }
 
+/// Upper bound on the initial `Vec` capacity when enumerating subkeys, so a lying
+/// `number_of_sub_keys` cannot force a huge pre-allocation. Mirrors notatin's own
+/// 1<<20 OOM guard. The loop still honours the real count; this only bounds the
+/// up-front reservation.
+#[allow(dead_code)]
+const SUBKEY_PREALLOC_CAP: usize = 1 << 20;
+
 /// Fetch a single REG_SZ value as a String. Returns Ok(None) when the key or value is
 /// absent, or when the value is not a string type (graceful — golden rule 8).
 ///
 /// Companion to get_value_bytes (which handles REG_BINARY). `parser` is &mut for the
 /// same lazy-cursor reason.
+///
+/// Note: notatin maps REG_SZ, REG_EXPAND_SZ and REG_LINK all to `CellValue::String`,
+/// so this accessor does NOT distinguish those three. That is fine for amcache's
+/// target values (all plain REG_SZ); a future consumer needing a strict REG_SZ-only
+/// read must inspect `CellKeyValue.data_type` instead.
 ///
 /// TODO(Task 3): remove #[allow(dead_code)] when amcache_collector calls get_value_string.
 #[allow(dead_code)]
@@ -430,6 +450,17 @@ mod tests {
         };
         assert_eq!(sk.name, "0006...");
         assert_eq!(sk.last_write, t);
+    }
+
+    #[test]
+    fn subkey_prealloc_is_capped_against_lying_count() {
+        // A corrupt/hostile hive can claim number_of_sub_keys == u32::MAX. list_subkeys
+        // pre-allocates n.min(SUBKEY_PREALLOC_CAP), NOT n, so a lying count cannot force
+        // a multi-GB Vec reservation (NFR10 / never-panic). Prove the clamp arithmetic.
+        let lying = u32::MAX as usize;
+        assert_eq!(lying.min(SUBKEY_PREALLOC_CAP), SUBKEY_PREALLOC_CAP);
+        // A real, small count is unaffected.
+        assert_eq!(7usize.min(SUBKEY_PREALLOC_CAP), 7);
     }
 
     #[test]
