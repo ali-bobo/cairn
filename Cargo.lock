@@ -235,6 +235,7 @@ dependencies = [
  "cairn-collectors-win",
  "cairn-core",
  "chrono",
+ "compcol",
  "evtx",
  "notatin",
  "ntfs",
@@ -413,6 +414,12 @@ name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
+
+[[package]]
+name = "compcol"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f7c23cbb4d3ef654210053e2f9d1c335e0e83e23d2044764df7f02b219a10cf"
 
 [[package]]
 name = "console"
