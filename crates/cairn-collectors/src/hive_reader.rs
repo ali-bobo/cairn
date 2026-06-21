@@ -20,8 +20,6 @@ pub(crate) const SYSTEM_HIVE: HivePath = HivePath {
 };
 
 /// Amcache.hve — programs/files inventory (FR12 amcache_collector).
-// TODO(Task 3): remove #[allow(dead_code)] when amcache_collector wires this const.
-#[allow(dead_code)]
 pub(crate) const AMCACHE_HIVE: HivePath = HivePath {
     components: &["Windows", "AppCompat", "Programs", "Amcache.hve"],
 };
@@ -52,8 +50,6 @@ pub(crate) struct OpenedHive {
 /// One enumerated subkey: its name and last-write time. hive_reader's OWN pure type —
 /// it deliberately does NOT expose notatin's CellKeyNode, so a notatin upgrade cannot
 /// break consumers (same encapsulation as get_value_bytes returning (Vec<u8>, DateTime)).
-// TODO(Task 3): remove #[allow(dead_code)] when amcache_collector uses SubKey.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SubKey {
     pub name: String,
@@ -354,8 +350,6 @@ pub(crate) fn get_value_bytes(
 /// is the hive's physical order, NOT sorted — the CALLER sorts for determinism.
 /// `parser` is &mut because notatin traverses lazily (mutates state per lookup).
 ///
-/// TODO(Task 3): remove #[allow(dead_code)] when amcache_collector calls list_subkeys.
-#[allow(dead_code)]
 pub(crate) fn list_subkeys(
     parser: &mut notatin::parser::Parser,
     key_path: &str,
@@ -392,7 +386,6 @@ pub(crate) fn list_subkeys(
 /// `number_of_sub_keys` cannot force a huge pre-allocation. Mirrors notatin's own
 /// 1<<20 OOM guard. The loop still honours the real count; this only bounds the
 /// up-front reservation.
-#[allow(dead_code)]
 const SUBKEY_PREALLOC_CAP: usize = 1 << 20;
 
 /// Fetch a single REG_SZ value as a String. Returns Ok(None) when the key or value is
@@ -406,8 +399,6 @@ const SUBKEY_PREALLOC_CAP: usize = 1 << 20;
 /// target values (all plain REG_SZ); a future consumer needing a strict REG_SZ-only
 /// read must inspect `CellKeyValue.data_type` instead.
 ///
-/// TODO(Task 3): remove #[allow(dead_code)] when amcache_collector calls get_value_string.
-#[allow(dead_code)]
 pub(crate) fn get_value_string(
     parser: &mut notatin::parser::Parser,
     key_path: &str,
