@@ -60,12 +60,19 @@ fn decompress_mam(raw: &[u8]) -> Result<Vec<u8>> {
     .map_err(|e| prefetch_err(format!("MAM decompression failed: {e}")))
 }
 
-// ── Win10 v30 prefetch header layout ─────────────────────────────────────────
-// These constants are the single fix-point for format offsets; the e2e test (Task 6)
-// verifies them against a real .pf file. Wrong offsets = a one-line fix here.
+// ── Prefetch header layout (Win10 v30 / Win11 v31) ───────────────────────────
+// These constants are the single fix-point for format offsets. The v31 values were
+// VERIFIED against a real Windows 11 .pf (decompressed body inspection: version=31 at
+// offset 0, "SCCA" at 4, exe name at 16, 8×FILETIME run-times at 0x80, run-count at
+// 0xC8 — cross-checked: the non-zero run-time count equalled the run-count). The v30
+// run-count offset (0xD0) is the documented historical value and is NOT yet machine-
+// verified here (no v30 host was available); see the residual note. Both versions share
+// the version@0 / signature@4 / exe-name@16 / run-times@0x80 layout.
 
-/// The only supported prefetch format version (Windows 10/11).
+/// Windows 10 prefetch format version.
 const PF_V30: u32 = 30;
+/// Windows 11 prefetch format version (verified on a real host).
+const PF_V31: u32 = 31;
 
 /// Byte offset of the NUL-terminated UTF-16LE executable name field in the header.
 const EXE_NAME_OFFSET: usize = 16;
@@ -73,11 +80,18 @@ const EXE_NAME_OFFSET: usize = 16;
 /// Maximum byte length of the name field (60 bytes = 30 UTF-16 code units).
 const EXE_NAME_MAX_BYTES: usize = 60;
 
-/// Byte offset of the run-times array (8 × u64 FILETIME slots).
+/// Byte offset of the run-times array (8 × u64 FILETIME slots). Same for v30 and v31.
 const RUN_TIMES_OFFSET: usize = 0x80;
 
-/// Byte offset of the u32 run-count field.
-const RUN_COUNT_OFFSET: usize = 0xD0;
+/// Byte offset of the u32 run-count field, by version. v31 (0xC8) is machine-verified;
+/// v30 (0xD0) is the documented historical value (not verified here).
+fn run_count_offset(version: u32) -> Option<usize> {
+    match version {
+        PF_V30 => Some(0xD0),
+        PF_V31 => Some(0xC8),
+        _ => None,
+    }
+}
 
 /// Parsed prefetch header — a pure value type; no parser internals exposed.
 #[derive(Debug, PartialEq)]
@@ -131,17 +145,15 @@ fn read_exe_name(buf: &[u8]) -> String {
 
 /// Parse a decompressed prefetch body into a `PrefetchInfo`.
 ///
-/// Win10 v30 only. Unrecognised version → `None` (abstain, NFR12).
+/// Win10 v30 / Win11 v31. Unrecognised version → `None` (abstain, NFR12).
 /// Never panics: all reads are bounds-checked via `rd_u32`/`rd_u64` (Option-returning);
 /// a truncated buffer returns `None` rather than indexing out of range.
 fn parse_prefetch(buf: &[u8]) -> Option<PrefetchInfo> {
-    // Version field at offset 0; anything other than 30 → abstain.
+    // Version field at offset 0; only v30/v31 are recognised (else abstain).
     let version = rd_u32(buf, 0)?;
-    if version != PF_V30 {
-        return None;
-    }
-    // Buffer must reach at least RUN_COUNT_OFFSET + 4 to be a plausible v30 header.
-    let run_count = rd_u32(buf, RUN_COUNT_OFFSET)?;
+    let rc_offset = run_count_offset(version)?;
+    // Buffer must reach at least rc_offset + 4 to be a plausible header.
+    let run_count = rd_u32(buf, rc_offset)?;
     let exe_name = read_exe_name(buf);
     // Read up to 8 FILETIME slots; filetime_to_utc filters ft==0 (zero-padded slots).
     let mut run_times = Vec::new();
@@ -379,22 +391,22 @@ mod tests {
 
     // ── parse_prefetch tests (Task 3) ─────────────────────────────────────────
 
-    /// Minimum decompressed body length required to read the run-count field.
-    /// Lives here because it is only needed by the `build_v30` test helper.
-    const V30_MIN_LEN: usize = RUN_COUNT_OFFSET + 4;
-
     // FILETIME for 2021-01-01T00:00:00Z (verified: 132_539_328_000_000_000).
     const FT_2021: u64 = 132_539_328_000_000_000;
 
-    /// Build a minimal Win10 v30 body (already decompressed) using the impl's offset consts.
-    fn build_v30(exe: &str, run_count: u32, run_times: &[u64]) -> Vec<u8> {
-        let mut buf = vec![0u8; V30_MIN_LEN];
-        buf[0..4].copy_from_slice(&30u32.to_le_bytes());
+    /// Build a minimal decompressed body for the given version, placing run_count at that
+    /// version's offset (via the impl's `run_count_offset`) so the fixture always matches
+    /// what `parse_prefetch` reads.
+    fn build_pf(version: u32, exe: &str, run_count: u32, run_times: &[u64]) -> Vec<u8> {
+        let rc_off = run_count_offset(version).expect("test version must be recognised");
+        let buf_len = rc_off + 4;
+        let mut buf = vec![0u8; buf_len];
+        buf[0..4].copy_from_slice(&version.to_le_bytes());
         buf[4..8].copy_from_slice(b"SCCA");
         let utf16: Vec<u8> = exe.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         let cap = utf16.len().min(EXE_NAME_MAX_BYTES);
         buf[EXE_NAME_OFFSET..EXE_NAME_OFFSET + cap].copy_from_slice(&utf16[..cap]);
-        buf[RUN_COUNT_OFFSET..RUN_COUNT_OFFSET + 4].copy_from_slice(&run_count.to_le_bytes());
+        buf[rc_off..rc_off + 4].copy_from_slice(&run_count.to_le_bytes());
         for (i, ft) in run_times.iter().take(8).enumerate() {
             let off = RUN_TIMES_OFFSET + i * 8;
             buf[off..off + 8].copy_from_slice(&ft.to_le_bytes());
@@ -404,7 +416,7 @@ mod tests {
 
     #[test]
     fn parse_v30_basic() {
-        let body = build_v30("NOTEPAD.EXE", 5, &[FT_2021, FT_2021 + 10_000_000]);
+        let body = build_pf(30, "NOTEPAD.EXE", 5, &[FT_2021, FT_2021 + 10_000_000]);
         let info = parse_prefetch(&body).expect("v30 parses");
         assert_eq!(info.exe_name, "NOTEPAD.EXE");
         assert_eq!(info.run_count, 5);
@@ -412,20 +424,36 @@ mod tests {
     }
 
     #[test]
+    fn parse_v31_basic() {
+        // Win11 v31: run_count lives at 0xC8, not v30's 0xD0 (machine-verified).
+        let body = build_pf(31, "AGENTS-CLI.EXE", 5, &[FT_2021, FT_2021 + 10_000_000]);
+        let info = parse_prefetch(&body).expect("v31 parses");
+        assert_eq!(info.exe_name, "AGENTS-CLI.EXE");
+        assert_eq!(info.run_count, 5);
+        assert_eq!(info.run_times.len(), 2);
+    }
+
+    #[test]
     fn parse_unknown_version_is_none() {
-        let mut body = build_v30("X.EXE", 1, &[FT_2021]);
+        let mut body = build_pf(30, "X.EXE", 1, &[FT_2021]);
         body[0..4].copy_from_slice(&26u32.to_le_bytes()); // Win8 v26 — unrecognised
+        assert!(parse_prefetch(&body).is_none());
+        // v29 (one below v30) and v32 (one above v31) must also abstain.
+        body[0..4].copy_from_slice(&29u32.to_le_bytes());
+        assert!(parse_prefetch(&body).is_none());
+        body[0..4].copy_from_slice(&32u32.to_le_bytes());
         assert!(parse_prefetch(&body).is_none());
     }
 
     #[test]
     fn parse_truncated_is_none_no_panic() {
         assert!(parse_prefetch(&[30u8, 0, 0, 0]).is_none());
+        assert!(parse_prefetch(&[31u8, 0, 0, 0]).is_none());
     }
 
     #[test]
     fn parse_all_zero_run_times_yields_empty_vec() {
-        let body = build_v30("Z.EXE", 0, &[]);
+        let body = build_pf(31, "Z.EXE", 0, &[]);
         let info = parse_prefetch(&body).expect("parses");
         assert!(info.run_times.is_empty());
     }
