@@ -4,20 +4,24 @@
 //! the MAM (Xpress-Huffman) wrapper, a pure never-panic parser reads the header. Recognised
 //! format versions only (Win10 v30); an unrecognised version ABSTAINS (NFR12).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use cairn_core::manifest::SourceEntry;
+use cairn_core::record::{ExecutionRecord, Record};
 use cairn_core::time::filetime_to_utc;
+use cairn_core::traits::{CollectCtx, Collector};
 use cairn_core::{CairnError, Result};
 use chrono::{DateTime, Utc};
 
-#[allow(dead_code)] // used by decompress_mam; PrefetchCollector wired in a later task
 const MAM_MAGIC: &[u8; 4] = b"MAM\x04";
 
 /// Hard ceiling on a single decompressed .pf (NFR10). Real prefetch files are well under
 /// a few MB; 64 MiB is far above any legitimate .pf yet caps a malicious MAM size lie.
 /// NOTE: compcol 0.6.5 decompress_to_vec_capped takes u64, not usize.
-#[allow(dead_code)] // used by decompress_mam; PrefetchCollector wired in a later task
 const PREFETCH_DECOMPRESS_CEILING: u64 = 64 * 1024 * 1024;
 
-#[allow(dead_code)] // used by decompress_mam; PrefetchCollector wired in a later task
+const PREFETCH_DIR: &str = r"C:\Windows\Prefetch";
+
 #[inline]
 fn prefetch_err(reason: String) -> CairnError {
     CairnError::Collector {
@@ -26,7 +30,6 @@ fn prefetch_err(reason: String) -> CairnError {
     }
 }
 
-#[allow(dead_code)] // PrefetchCollector wired in a later task
 /// Decompress a .pf outer container. MAM files (magic "MAM\x04", uncompressed size u32 at
 /// offset 4, Xpress-Huffman payload from offset 8) are decompressed via compcol with a hard
 /// memory cap (NFR10 — a malicious .pf cannot force an unbounded allocation). Files without
@@ -54,31 +57,21 @@ fn decompress_mam(raw: &[u8]) -> Result<Vec<u8>> {
 // verifies them against a real .pf file. Wrong offsets = a one-line fix here.
 
 /// The only supported prefetch format version (Windows 10/11).
-#[allow(dead_code)] // used only inside parse_prefetch; Task 4 wires PrefetchCollector
 const PF_V30: u32 = 30;
 
 /// Byte offset of the NUL-terminated UTF-16LE executable name field in the header.
-#[allow(dead_code)]
 const EXE_NAME_OFFSET: usize = 16;
 
 /// Maximum byte length of the name field (60 bytes = 30 UTF-16 code units).
-#[allow(dead_code)]
 const EXE_NAME_MAX_BYTES: usize = 60;
 
 /// Byte offset of the run-times array (8 × u64 FILETIME slots).
-#[allow(dead_code)]
 const RUN_TIMES_OFFSET: usize = 0x80;
 
 /// Byte offset of the u32 run-count field.
-#[allow(dead_code)]
 const RUN_COUNT_OFFSET: usize = 0xD0;
 
-/// Minimum decompressed body length required to read the run-count field.
-#[allow(dead_code)]
-const V30_MIN_LEN: usize = RUN_COUNT_OFFSET + 4;
-
 /// Parsed prefetch header — a pure value type; no parser internals exposed.
-#[allow(dead_code)] // PrefetchCollector wired in Task 4
 #[derive(Debug, PartialEq)]
 struct PrefetchInfo {
     /// Executable name from the header NAME field (not a full path).
@@ -90,7 +83,6 @@ struct PrefetchInfo {
 
 /// Bounds-checked little-endian u32 reader (mirrors usn.rs/shimcache.rs rd_u32).
 /// Returns None when `off..off+4` is out of bounds — never panics.
-#[allow(dead_code)]
 #[inline]
 fn rd_u32(buf: &[u8], off: usize) -> Option<u32> {
     buf.get(off..off + 4)?
@@ -101,7 +93,6 @@ fn rd_u32(buf: &[u8], off: usize) -> Option<u32> {
 
 /// Bounds-checked little-endian u64 reader (mirrors usn.rs/shimcache.rs rd_u64).
 /// Returns None when `off..off+8` is out of bounds — never panics.
-#[allow(dead_code)]
 #[inline]
 fn rd_u64(buf: &[u8], off: usize) -> Option<u64> {
     buf.get(off..off + 8)?
@@ -113,7 +104,6 @@ fn rd_u64(buf: &[u8], off: usize) -> Option<u64> {
 /// Read the NUL-terminated UTF-16LE executable name from the header.
 /// Stops at the first NUL code unit or at `EXE_NAME_MAX_BYTES`, whichever comes first.
 /// Lossy on bad surrogate pairs. Never panics.
-#[allow(dead_code)]
 fn read_exe_name(buf: &[u8]) -> String {
     let end = (EXE_NAME_OFFSET + EXE_NAME_MAX_BYTES).min(buf.len());
     let slice = match buf.get(EXE_NAME_OFFSET..end) {
@@ -136,7 +126,6 @@ fn read_exe_name(buf: &[u8]) -> String {
 /// Win10 v30 only. Unrecognised version → `None` (abstain, NFR12).
 /// Never panics: all reads are bounds-checked via `rd_u32`/`rd_u64` (Option-returning);
 /// a truncated buffer returns `None` rather than indexing out of range.
-#[allow(dead_code)]
 fn parse_prefetch(buf: &[u8]) -> Option<PrefetchInfo> {
     // Version field at offset 0; anything other than 30 → abstain.
     let version = rd_u32(buf, 0)?;
@@ -162,9 +151,136 @@ fn parse_prefetch(buf: &[u8]) -> Option<PrefetchInfo> {
     })
 }
 
+/// PrefetchCollector: admin-only, read-only parse of C:\Windows\Prefetch\*.pf into
+/// Record::Execution (source="prefetch") with real run_count + first/last run times.
+#[derive(Default)]
+pub struct PrefetchCollector {
+    dir_unreadable: AtomicBool,
+    file_read_errors: AtomicBool,
+    decompress_errors: AtomicBool,
+    unknown_version: AtomicBool,
+}
+
+impl PrefetchCollector {
+    fn to_record(info: PrefetchInfo) -> Record {
+        let last_run = info.run_times.iter().max().copied();
+        let first_run = info.run_times.iter().min().copied();
+        Record::Execution(ExecutionRecord {
+            source: "prefetch".into(),
+            path: info.exe_name, // header NAME only (design §2)
+            first_run,
+            last_run,
+            run_count: Some(info.run_count),
+            sha1: None,
+            user_sid: None,
+            execution_confirmed: Some(true),
+        })
+    }
+}
+
+impl Collector for PrefetchCollector {
+    fn name(&self) -> &str {
+        "prefetch"
+    }
+
+    fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
+        if !ctx.admin {
+            return Err(CairnError::Privilege {
+                what: "prefetch".into(),
+                need: "Administrator".into(),
+            });
+        }
+
+        let entries = match std::fs::read_dir(PREFETCH_DIR) {
+            Ok(rd) => rd,
+            Err(e) => {
+                self.dir_unreadable.store(true, Ordering::Relaxed);
+                tracing::warn!(err = %e, "prefetch: dir unreadable; abstaining");
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut records: Vec<Record> = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("pf"))
+                != Some(true)
+            {
+                continue;
+            }
+            let raw = match std::fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.file_read_errors.store(true, Ordering::Relaxed);
+                    tracing::warn!(file = ?path, err = %e, "prefetch: read failed; skipping");
+                    continue;
+                }
+            };
+            let decompressed = match decompress_mam(&raw) {
+                Ok(b) => b,
+                Err(e) => {
+                    self.decompress_errors.store(true, Ordering::Relaxed);
+                    tracing::warn!(file = ?path, err = %e, "prefetch: decompress failed; skipping");
+                    continue;
+                }
+            };
+            match parse_prefetch(&decompressed) {
+                Some(info) => records.push(Self::to_record(info)),
+                None => {
+                    self.unknown_version.store(true, Ordering::Relaxed);
+                    tracing::warn!(file = ?path, "prefetch: unrecognised/incomplete; skipping");
+                }
+            }
+        }
+
+        records.sort_by(|a, b| match (a, b) {
+            (Record::Execution(x), Record::Execution(y)) => x.path.cmp(&y.path),
+            _ => std::cmp::Ordering::Equal, // unreachable: only Execution emitted
+        });
+
+        tracing::info!(prefetch_entries = records.len(), "prefetch scan");
+        Ok(records)
+    }
+
+    fn sources(&self) -> Vec<SourceEntry> {
+        let mut errors = Vec::new();
+        if self.dir_unreadable.load(Ordering::Relaxed) {
+            errors.push("abstained: Prefetch directory absent or unreadable".to_string());
+        }
+        if self.file_read_errors.load(Ordering::Relaxed) {
+            errors.push("partial: one or more .pf files unreadable".to_string());
+        }
+        if self.decompress_errors.load(Ordering::Relaxed) {
+            errors.push("partial: one or more .pf files failed MAM decompression".to_string());
+        }
+        if self.unknown_version.load(Ordering::Relaxed) {
+            errors.push(
+                "abstained: one or more .pf files had an unrecognised or incomplete format (NFR12)"
+                    .to_string(),
+            );
+        }
+        vec![SourceEntry {
+            artifact: "prefetch".into(),
+            path: PREFETCH_DIR.into(),
+            method: "file_api".into(),
+            size: 0,
+            sha256: String::new(),
+            errors,
+        }]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use cairn_core::config::Config;
+    use cairn_core::traits::{CollectCtx, Collector};
+    use cairn_core::CairnError;
+    use std::sync::atomic::Ordering;
 
     /// Pins the compcol xpress_huffman one-shot API. If this fails to COMPILE, the function
     /// path/signature below is wrong — fix it from the installed compcol source
@@ -219,6 +335,10 @@ mod tests {
 
     // ── parse_prefetch tests (Task 3) ─────────────────────────────────────────
 
+    /// Minimum decompressed body length required to read the run-count field.
+    /// Lives here because it is only needed by the `build_v30` test helper.
+    const V30_MIN_LEN: usize = RUN_COUNT_OFFSET + 4;
+
     // FILETIME for 2021-01-01T00:00:00Z (verified: 132_539_328_000_000_000).
     const FT_2021: u64 = 132_539_328_000_000_000;
 
@@ -264,5 +384,65 @@ mod tests {
         let body = build_v30("Z.EXE", 0, &[]);
         let info = parse_prefetch(&body).expect("parses");
         assert!(info.run_times.is_empty());
+    }
+
+    // ── PrefetchCollector unit tests (Task 4) ────────────────────────────────
+
+    #[test]
+    fn collect_without_privilege_returns_err() {
+        let cfg = Config::default();
+        let ctx = CollectCtx {
+            config: &cfg,
+            admin: false,
+            se_backup: false,
+            se_debug: false,
+        };
+        assert!(matches!(
+            PrefetchCollector::default().collect(&ctx),
+            Err(CairnError::Privilege { .. })
+        ));
+    }
+
+    #[test]
+    fn name_is_prefetch() {
+        assert_eq!(PrefetchCollector::default().name(), "prefetch");
+    }
+
+    #[test]
+    fn sources_clean_when_not_abstained() {
+        let s = PrefetchCollector::default().sources();
+        assert_eq!(s.len(), 1);
+        assert!(s[0].errors.is_empty());
+        assert_eq!(s[0].artifact, "prefetch");
+    }
+
+    #[test]
+    fn sources_reports_dir_unreadable() {
+        let c = PrefetchCollector::default();
+        c.dir_unreadable.store(true, Ordering::Relaxed);
+        assert!(c.sources()[0]
+            .errors
+            .iter()
+            .any(|e| e.contains("Prefetch directory")));
+    }
+
+    #[test]
+    fn sources_reports_unknown_version() {
+        let c = PrefetchCollector::default();
+        c.unknown_version.store(true, Ordering::Relaxed);
+        assert!(c.sources()[0]
+            .errors
+            .iter()
+            .any(|e| e.contains("unrecognised or incomplete")));
+    }
+
+    #[test]
+    fn sources_reports_partial_read_and_decompress() {
+        let c = PrefetchCollector::default();
+        c.file_read_errors.store(true, Ordering::Relaxed);
+        c.decompress_errors.store(true, Ordering::Relaxed);
+        let errs = c.sources()[0].errors.clone();
+        assert!(errs.iter().any(|e| e.contains("unreadable")));
+        assert!(errs.iter().any(|e| e.contains("MAM decompression")));
     }
 }
