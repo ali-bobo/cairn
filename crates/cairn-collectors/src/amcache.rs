@@ -311,6 +311,17 @@ mod tests {
                 assert_eq!(e.source, "amcache");
                 assert!(!e.path.is_empty(), "every entry must have a path");
                 assert_eq!(e.execution_confirmed, Some(true));
+                // NFR12: amcache never fabricates an exec time into last_run.
+                assert!(e.last_run.is_none(), "amcache must not claim a last_run");
+                // SHA1, when present, is exactly 40 lowercase hex chars (strict parse).
+                if let Some(h) = &e.sha1 {
+                    assert_eq!(h.len(), 40, "sha1 must be 40 hex chars");
+                    assert!(
+                        h.chars()
+                            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                        "sha1 must be lowercase hex"
+                    );
+                }
             } else {
                 panic!("amcache must only emit Execution records");
             }
