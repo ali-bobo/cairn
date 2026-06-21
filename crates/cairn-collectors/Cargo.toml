@@ -8,6 +8,7 @@ license.workspace = true
 cairn-core = { path = "../cairn-core" }
 cairn-collectors-win = { path = "../cairn-collectors-win" }
 ntfs = "=0.4.0"
+notatin = { workspace = true }
 tracing.workspace = true
 evtx.workspace = true
 chrono.workspace = true

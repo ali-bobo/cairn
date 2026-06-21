@@ -31,7 +31,7 @@ fn canonical_only_name(raw: &str) -> String {
 
 /// Collector names that are raw-NTFS reads (admin + heavy). `--profile minimal` skips
 /// these (SRS §19.1). Grows as S2-N/O/P add modules — the single place that knowledge lives.
-const RAW_NTFS: &[&str] = &["mft", "usn"];
+const RAW_NTFS: &[&str] = &["mft", "usn", "shimcache"];
 
 /// Modules a profile selects from `available`, BEFORE the `--only` intersection.
 /// `minimal` = the light live set (raw-NTFS excluded, SRS §19.1). `standard`/`verbose`
@@ -223,5 +223,14 @@ mod tests {
         assert_eq!(out.selected, vec!["proc", "net", "persist"]); // no mft, no usn
         let std = select_modules(Profile::Standard, None, &available);
         assert!(std.selected.contains(&"usn".to_string())); // standard keeps usn (Vec<String>)
+    }
+
+    #[test]
+    fn minimal_excludes_shimcache() {
+        let available = vec!["proc", "net", "persist", "mft", "usn", "shimcache"];
+        let out = select_modules(Profile::Minimal, None, &available);
+        assert_eq!(out.selected, vec!["proc", "net", "persist"]); // no raw-NTFS
+        let std = select_modules(Profile::Standard, None, &available);
+        assert!(std.selected.contains(&"shimcache".to_string())); // standard keeps shimcache
     }
 }

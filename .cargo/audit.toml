@@ -11,4 +11,11 @@ ignore = [
   # we cannot drop it without replacing the EVTX parser. Re-evaluate if evtx removes
   # the dependency or a real CVE is filed against `encoding`.
   "RUSTSEC-2021-0153",
+  # RUSTSEC-2024-0436: the `paste` crate is unmaintained. It is a transitive
+  # dependency of `notatin` (our offline registry-hive parser, used by hive_reader /
+  # shimcache). It is NOT a vulnerability — only an unmaintained flag — and `paste`
+  # is a compile-time-only proc-macro helper (no runtime attack surface). We cannot
+  # drop it without replacing notatin. Re-evaluate if notatin removes the dependency
+  # or a real CVE is filed against `paste`.
+  "RUSTSEC-2024-0436",
 ]
