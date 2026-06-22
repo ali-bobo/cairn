@@ -9,8 +9,11 @@
 //! reverse-lookup against the SOFTWARE hive's ProfileList. On an absent key or
 //! unrecognised structure it ABSTAINS (records the reason) rather than guess (NFR12).
 
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 
+use crate::hive_reader::{get_value_string, list_subkeys};
 use cairn_core::time::filetime_to_utc;
 
 /// Decode a ROT13-encoded ASCII string (UserAssist value names are ROT13). Pure: each
@@ -52,6 +55,43 @@ fn parse_userassist(data: &[u8]) -> Option<(u32, Option<DateTime<Utc>>)> {
         .and_then(filetime_to_utc);
 
     Some((run_count, last_run))
+}
+
+/// Normalize a ProfileImagePath (or a C:\Users\<name> path) to the map key: lowercased.
+/// Pure — the lookup is case-insensitive because Windows paths are.
+#[allow(dead_code)] // wired by UserAssistCollector in T6
+fn profile_map_key(path: &str) -> String {
+    path.to_ascii_lowercase()
+}
+
+/// Build a { lowercased ProfileImagePath -> SID } map from a parsed SOFTWARE hive's
+/// ProfileList. Used to resolve a user folder back to its SID. A read failure on the
+/// ProfileList (or any individual entry) is non-fatal — this is ENRICHMENT, not core
+/// data: callers fall back to user_sid = None and emit records anyway (no abstain flag).
+/// Returns an empty map (not Err) if ProfileList is absent.
+///
+/// `parser` is &mut for notatin's lazy cursor (same as list_subkeys/get_value_string).
+#[allow(dead_code)] // wired by UserAssistCollector in T6
+fn build_profilelist_map(parser: &mut notatin::parser::Parser) -> HashMap<String, String> {
+    const PROFILE_LIST: &str = r"Microsoft\Windows NT\CurrentVersion\ProfileList";
+    let mut map = HashMap::new();
+    // list_subkeys returns Ok(vec![]) on absent key; an Err is a genuine read failure —
+    // treat it as "no enrichment available" (return whatever we have, empty).
+    let sids = match list_subkeys(parser, PROFILE_LIST) {
+        Ok(s) => s,
+        Err(_) => return map,
+    };
+    for sid in sids {
+        let key_path = format!("{PROFILE_LIST}\\{}", sid.name);
+        // ProfileImagePath is REG_EXPAND_SZ; get_value_string maps it to a String.
+        if let Ok(Some(path)) = get_value_string(parser, &key_path, "ProfileImagePath") {
+            if !path.is_empty() {
+                map.insert(profile_map_key(&path), sid.name);
+            }
+        }
+        // A missing/failed ProfileImagePath for one SID just omits that mapping.
+    }
+    map
 }
 
 #[cfg(test)]
@@ -143,5 +183,16 @@ mod tests {
         let (count, last) = parse_userassist(&data).expect("parses despite trailing bytes");
         assert_eq!(count, 3);
         assert_eq!(last, cairn_core::time::filetime_to_utc(FT_2021));
+    }
+
+    #[test]
+    fn profile_map_key_lowercases() {
+        assert_eq!(profile_map_key(r"C:\Users\Alice"), r"c:\users\alice");
+        assert_eq!(profile_map_key(r"C:\Users\Bob"), r"c:\users\bob");
+    }
+
+    #[test]
+    fn profile_map_key_idempotent_on_lowercase() {
+        assert_eq!(profile_map_key(r"c:\users\alice"), r"c:\users\alice");
     }
 }
