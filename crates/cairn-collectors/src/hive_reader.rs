@@ -56,6 +56,16 @@ pub(crate) struct SubKey {
     pub last_write: DateTime<Utc>,
 }
 
+/// One enumerated value: its name and raw REG_BINARY bytes. hive_reader's OWN pure type
+/// (mirrors SubKey) — it deliberately does NOT expose notatin's CellKeyValue, so a
+/// notatin upgrade cannot break consumers. Non-binary values are not represented here
+/// (list_values skips them).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct KeyValue {
+    pub name: String,
+    pub data: Vec<u8>,
+}
+
 /// Build a Collector-variant CairnError (mirrors usn_err/mft_err).
 #[inline]
 fn hive_err(reason: String) -> CairnError {
@@ -388,6 +398,42 @@ pub(crate) fn list_subkeys(
 /// up-front reservation.
 const SUBKEY_PREALLOC_CAP: usize = 1 << 20;
 
+/// Enumerate ALL values of `key_path`, returning each value's name and raw REG_BINARY
+/// bytes. Non-binary values (REG_SZ etc.) are skipped — bam/userassist values are all
+/// REG_BINARY. Absent key => Ok(vec![]) (graceful — golden rule 8).
+///
+/// Order is the hive's physical value order, NOT sorted — the CALLER sorts for
+/// determinism. `parser` is &mut because notatin traverses lazily (mutates state per
+/// lookup). notatin guards its own value vector against a lying number_of_key_values
+/// (> 1<<20 OOM guard, cell_key_node.rs), so no manual pre-alloc cap is needed here.
+/// Caveat: when that guard fires, notatin silently leaves sub_values empty, so
+/// list_values returns Ok(vec![]) — indistinguishable from a legitimately empty key.
+/// Acceptable here: real bam keys hold O(10) values, nowhere near the cap.
+pub(crate) fn list_values(
+    parser: &mut notatin::parser::Parser,
+    key_path: &str,
+) -> Result<Vec<KeyValue>> {
+    let key = match parser
+        .get_key(key_path, false)
+        .map_err(|e| hive_err(format!("get_key({key_path}) failed: {e}")))?
+    {
+        Some(k) => k,
+        None => return Ok(Vec::new()),
+    };
+    let mut out = Vec::new();
+    for value in key.value_iter() {
+        // get_content().0 is the CellValue; only REG_BINARY is kept (bam data is binary).
+        if let notatin::cell_value::CellValue::Binary(data) = value.get_content().0 {
+            // detail.value_name() is the macro-generated accessor; unnamed values return "".
+            out.push(KeyValue {
+                name: value.detail.value_name(),
+                data,
+            });
+        }
+    }
+    Ok(out)
+}
+
 /// Fetch a single REG_SZ value as a String. Returns Ok(None) when the key or value is
 /// absent, or when the value is not a string type (graceful — golden rule 8).
 ///
@@ -480,5 +526,15 @@ mod tests {
         assert_ne!(LogStatus::Applied, LogStatus::NotFound);
         assert_ne!(LogStatus::NotFound, LogStatus::Failed("x".into()));
         assert_eq!(LogStatus::Failed("y".into()), LogStatus::Failed("y".into()));
+    }
+
+    #[test]
+    fn keyvalue_holds_name_and_data() {
+        let kv = KeyValue {
+            name: r"\Device\HarddiskVolume3\Windows\notepad.exe".into(),
+            data: vec![1u8, 2, 3, 4, 5, 6, 7, 8],
+        };
+        assert_eq!(kv.name, r"\Device\HarddiskVolume3\Windows\notepad.exe");
+        assert_eq!(kv.data.len(), 8);
     }
 }

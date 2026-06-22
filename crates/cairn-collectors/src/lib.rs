@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod amcache;
+pub mod bam;
 pub mod evtx;
 pub mod hash;
 pub mod hive_reader;
