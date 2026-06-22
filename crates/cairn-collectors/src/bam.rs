@@ -335,16 +335,36 @@ mod tests {
             se_backup: true,
             se_debug: false,
         };
-        let recs = BamCollector::default()
+        // Bind the collector so sources() reads the SAME instance whose flags collect()
+        // set — a fresh BamCollector::default() would always report empty errors and make
+        // the empty-result diagnostic inert.
+        let collector = BamCollector::default();
+        let recs = collector
             .collect(&ctx)
             .expect("collect should succeed on a real elevated host");
+        eprintln!(
+            "bam_e2e diagnostics: {} records; sources errors = {:?}",
+            recs.len(),
+            collector.sources()[0].errors
+        );
+        if recs.is_empty() {
+            eprintln!(
+                "NOTE: 0 bam records. If you are NOT running as Administrator with \
+                 SeBackupPrivilege, that is the cause; re-run elevated. A genuinely empty \
+                 bam (key_absent abstain) is also legitimate on some builds."
+            );
+        }
         // bam may be empty on some builds; that is legitimate (key_absent abstain).
         for r in &recs {
             if let Record::Execution(e) = r {
                 assert_eq!(e.source, "bam");
                 assert!(!e.path.is_empty(), "every entry must have a path");
                 assert_eq!(e.execution_confirmed, Some(true));
-                assert!(e.user_sid.is_some(), "bam must carry a user_sid");
+                let sid = e.user_sid.as_deref().unwrap_or("");
+                assert!(
+                    sid.starts_with("S-1-"),
+                    "user_sid must be a SID, got {sid:?}"
+                );
                 assert!(e.last_run.is_some(), "bam must carry a last_run time");
                 assert!(e.first_run.is_none(), "bam has no first_run");
                 assert!(e.run_count.is_none(), "bam has no run_count");
@@ -353,6 +373,5 @@ mod tests {
                 panic!("bam must only emit Execution records");
             }
         }
-        eprintln!("bam_e2e_real_system_hive: parsed {} entries", recs.len());
     }
 }
