@@ -9,20 +9,54 @@ use chrono::{DateTime, Utc};
 
 /// A locked hive's on-volume location. Drive prefix is fixed C: (reads \\.\C:),
 /// matching mft/usn — $MFT carries no drive-letter info.
+///
+/// `components` is an OWNED Vec<String> (not &'static) so per-user paths (e.g.
+/// Users\<name>\NTUSER.DAT) can be built at runtime. The well-known hives expose
+/// builder fns (SYSTEM_HIVE()/AMCACHE_HIVE()) rather than consts because a const
+/// cannot hold an owned Vec.
 pub(crate) struct HivePath {
     /// Volume-relative path components, last element is the hive filename.
-    pub components: &'static [&'static str],
+    pub components: Vec<String>,
 }
 
-/// SYSTEM hive — the only path wired this segment.
-pub(crate) const SYSTEM_HIVE: HivePath = HivePath {
-    components: &["Windows", "System32", "config", "SYSTEM"],
-};
+impl HivePath {
+    /// Build the per-user NTUSER.DAT path: Users\<user_dir_name>\NTUSER.DAT.
+    // allow(dead_code): first used in T6 userassist collector; remove when wired.
+    #[allow(dead_code)]
+    pub(crate) fn user_ntuser(user_dir_name: &str) -> HivePath {
+        HivePath {
+            components: vec![
+                "Users".to_string(),
+                user_dir_name.to_string(),
+                "NTUSER.DAT".to_string(),
+            ],
+        }
+    }
+}
 
-/// Amcache.hve — programs/files inventory (FR12 amcache_collector).
-pub(crate) const AMCACHE_HIVE: HivePath = HivePath {
-    components: &["Windows", "AppCompat", "Programs", "Amcache.hve"],
-};
+/// SYSTEM hive (Windows\System32\config\SYSTEM). A fn (not const) because HivePath
+/// now holds an owned Vec.
+#[allow(non_snake_case)]
+pub(crate) fn SYSTEM_HIVE() -> HivePath {
+    HivePath {
+        components: ["Windows", "System32", "config", "SYSTEM"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
+/// Amcache.hve — programs/files inventory (FR12 amcache_collector). A fn (not const)
+/// because HivePath now holds an owned Vec.
+#[allow(non_snake_case)]
+pub(crate) fn AMCACHE_HIVE() -> HivePath {
+    HivePath {
+        components: ["Windows", "AppCompat", "Programs", "Amcache.hve"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
 
 /// 512 MiB hard ceiling on a single hive's in-memory size (NFR10). A boot sector or
 /// attribute length lying about size cannot force a larger allocation than this.
@@ -125,7 +159,7 @@ fn open_hive_inner<R: std::io::Read + std::io::Seek>(
 
     let mut cur = root;
     for comp in dir_components {
-        cur = find_child_dir(&ntfs, reader, &cur, comp)?;
+        cur = find_child_dir(&ntfs, reader, &cur, comp.as_str())?;
     }
     // Read primary hive via the DEFAULT (unnamed, empty-string) data stream.
     // ntfs::NtfsFile::data(reader, "") uses a simple is_empty() check and does NOT
@@ -474,8 +508,20 @@ mod tests {
 
     #[test]
     fn amcache_hive_path_joins_to_appcompat_programs() {
-        let joined = AMCACHE_HIVE.components.join("\\");
+        let joined = AMCACHE_HIVE().components.join("\\");
         assert_eq!(joined, r"Windows\AppCompat\Programs\Amcache.hve");
+    }
+
+    #[test]
+    fn user_ntuser_builds_users_name_ntuser_dat() {
+        let p = HivePath::user_ntuser("alice");
+        assert_eq!(p.components, vec!["Users", "alice", "NTUSER.DAT"]);
+    }
+
+    #[test]
+    fn user_ntuser_handles_names_with_spaces() {
+        let p = HivePath::user_ntuser("John Doe");
+        assert_eq!(p.components, vec!["Users", "John Doe", "NTUSER.DAT"]);
     }
 
     #[test]
@@ -505,13 +551,13 @@ mod tests {
         // A reader far shorter than a boot sector: ntfs cannot parse a volume.
         // Must return Err (contained), never panic (golden rule 8).
         let mut reader = Cursor::new(vec![0u8; 16]);
-        let r = open_hive(&mut reader, &SYSTEM_HIVE);
+        let r = open_hive(&mut reader, &SYSTEM_HIVE());
         assert!(r.is_err(), "short reader must yield Err, got Ok");
     }
 
     #[test]
     fn system_hive_path_joins_to_config_system() {
-        let joined = SYSTEM_HIVE.components.join("\\");
+        let joined = SYSTEM_HIVE().components.join("\\");
         assert_eq!(joined, r"Windows\System32\config\SYSTEM");
     }
 
