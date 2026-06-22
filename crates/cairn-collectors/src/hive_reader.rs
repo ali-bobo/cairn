@@ -295,6 +295,92 @@ fn find_child_dir<'n, R: std::io::Read + std::io::Seek>(
         .map_err(|e| hive_err(format!("to_file for {name} failed: {e}")))
 }
 
+/// Enumerate the immediate SUBDIRECTORY names of an on-volume directory (e.g. the user
+/// folders under C:\Users). Returns hive_reader-owned Vec<String> — no ntfs type leaks
+/// to callers. This walks the NTFS $I30 directory index, NOT a registry hive (contrast
+/// list_subkeys, which enumerates keys inside a parsed hive).
+///
+/// Wrapped in catch_unwind (mirroring open_hive): ntfs panics on some inputs
+/// (short sources in Ntfs::new, named lookups without read_upcase_table). Contain any
+/// third-party panic and convert to Err so it never escapes the collector.
+///
+/// Only directories are returned (files skipped via NtfsFileName::is_directory); the
+/// "." / ".." self/parent entries and the NTFS short-name (8.3) duplicate entries would
+/// pollute the list, so we keep only the Win32/POSIX namespace long names and drop "."
+/// and "..". Order is the index's ascending key order; we sort + dedup here for
+/// determinism since the set is small.
+// allow(dead_code): first used in T6 userassist collector; remove when wired.
+#[allow(dead_code)]
+pub(crate) fn list_dir_names<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    dir_path: &HivePath,
+) -> Result<Vec<String>> {
+    use std::panic::{self, AssertUnwindSafe};
+    // Same AssertUnwindSafe rationale as open_hive: `reader` is the only captured mut
+    // ref; on a caught panic we never reuse it, we return Err immediately.
+    let result = panic::catch_unwind(AssertUnwindSafe(|| list_dir_names_inner(reader, dir_path)));
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err(hive_err(
+            "ntfs panicked during directory enumeration (contained)".into(),
+        )),
+    }
+}
+
+/// Inner enumeration (only called inside catch_unwind).
+fn list_dir_names_inner<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    dir_path: &HivePath,
+) -> Result<Vec<String>> {
+    use ntfs::Ntfs;
+
+    let mut ntfs = Ntfs::new(reader).map_err(|e| hive_err(format!("Ntfs::new failed: {e}")))?;
+    ntfs.read_upcase_table(reader)
+        .map_err(|e| hive_err(format!("read_upcase_table failed: {e}")))?;
+    let root = ntfs
+        .root_directory(reader)
+        .map_err(|e| hive_err(format!("root_directory failed: {e}")))?;
+
+    // Navigate to the target directory (all components are directories here).
+    let mut cur = root;
+    for comp in &dir_path.components {
+        cur = find_child_dir(&ntfs, reader, &cur, comp.as_str())?;
+    }
+
+    // Stream the directory index. directory_index() returns Err if `cur` is not a
+    // directory (NtfsError::NotADirectory) — surfaced as Err (caller abstains).
+    let index = cur
+        .directory_index(reader)
+        .map_err(|e| hive_err(format!("directory_index failed: {e}")))?;
+    let mut entries = index.entries();
+    let mut out: Vec<String> = Vec::new();
+    while let Some(entry) = entries.next(reader) {
+        let entry = entry.map_err(|e| hive_err(format!("index entry read failed: {e}")))?;
+        // key() is Option<Result<NtfsFileName>>: None = no $FILE_NAME key on this entry
+        // (skip); Err = a corrupt entry (skip it, do not abort the whole listing).
+        let file_name = match entry.key() {
+            Some(Ok(fnm)) => fnm,
+            Some(Err(_)) | None => continue,
+        };
+        if !file_name.is_directory() {
+            continue; // files are not user folders
+        }
+        let name = file_name.name().to_string_lossy();
+        if name == "." || name == ".." {
+            continue; // self / parent
+        }
+        out.push(name);
+    }
+
+    // A directory's index yields each child under BOTH its long (Win32) and short (8.3)
+    // names, so the same folder can appear twice (e.g. "DefaultUser" + "DEFAUL~1").
+    // De-dup after sorting so the result is deterministic and each user folder appears
+    // once.
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 /// Honest LogStatus from the two tri-state log reads:
 /// - any genuine read error (Err) => Failed (a log existed but couldn't be read)
 /// - both absent (Ok(None), Ok(None)) => NotFound
@@ -552,6 +638,17 @@ mod tests {
         // Must return Err (contained), never panic (golden rule 8).
         let mut reader = Cursor::new(vec![0u8; 16]);
         let r = open_hive(&mut reader, &SYSTEM_HIVE());
+        assert!(r.is_err(), "short reader must yield Err, got Ok");
+    }
+
+    #[test]
+    fn list_dir_names_on_short_reader_is_err_not_panic() {
+        // A reader too short to be a volume must yield Err (contained), never panic.
+        let mut reader = Cursor::new(vec![0u8; 16]);
+        let users = HivePath {
+            components: vec!["Users".to_string()],
+        };
+        let r = list_dir_names(&mut reader, &users);
         assert!(r.is_err(), "short reader must yield Err, got Ok");
     }
 
