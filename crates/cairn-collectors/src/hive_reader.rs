@@ -304,11 +304,12 @@ fn find_child_dir<'n, R: std::io::Read + std::io::Seek>(
 /// (short sources in Ntfs::new, named lookups without read_upcase_table). Contain any
 /// third-party panic and convert to Err so it never escapes the collector.
 ///
-/// Only directories are returned (files skipped via NtfsFileName::is_directory); the
-/// "." / ".." self/parent entries and the NTFS short-name (8.3) duplicate entries would
-/// pollute the list, so we keep only the Win32/POSIX namespace long names and drop "."
-/// and "..". Order is the index's ascending key order; we sort + dedup here for
-/// determinism since the set is small.
+/// Only directories are returned (files skipped via NtfsFileName::is_directory). The
+/// "." / ".." self/parent entries are dropped. NTFS short-name (8.3) duplicate index
+/// entries (Dos namespace, e.g. "DEFAUL~1" alongside "DefaultUser") are SKIPPED via a
+/// namespace filter — only Win32, Win32AndDos, and Posix entries are kept. (Win32AndDos
+/// is the single-record case where long == short, so it represents one real entry.)
+/// The result is sorted for determinism.
 // allow(dead_code): first used in T6 userassist collector; remove when wired.
 #[allow(dead_code)]
 pub(crate) fn list_dir_names<R: std::io::Read + std::io::Seek>(
@@ -332,6 +333,7 @@ fn list_dir_names_inner<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
     dir_path: &HivePath,
 ) -> Result<Vec<String>> {
+    use ntfs::structured_values::NtfsFileNamespace;
     use ntfs::Ntfs;
 
     let mut ntfs = Ntfs::new(reader).map_err(|e| hive_err(format!("Ntfs::new failed: {e}")))?;
@@ -355,7 +357,12 @@ fn list_dir_names_inner<R: std::io::Read + std::io::Seek>(
     let mut entries = index.entries();
     let mut out: Vec<String> = Vec::new();
     while let Some(entry) = entries.next(reader) {
-        let entry = entry.map_err(|e| hive_err(format!("index entry read failed: {e}")))?;
+        // A corrupt index entry is skipped, not fatal — one bad $I30 node must not lose
+        // the entire user listing (golden rule 8: graceful degrade).
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
         // key() is Option<Result<NtfsFileName>>: None = no $FILE_NAME key on this entry
         // (skip); Err = a corrupt entry (skip it, do not abort the whole listing).
         let file_name = match entry.key() {
@@ -365,6 +372,13 @@ fn list_dir_names_inner<R: std::io::Read + std::io::Seek>(
         if !file_name.is_directory() {
             continue; // files are not user folders
         }
+        // Skip the MS-DOS 8.3 short-name index entry. A directory with a long name has
+        // TWO $FILE_NAME entries (Win32 long + Dos 8.3, e.g. "DefaultUser" + "DEFAUL~1");
+        // keeping both would make the caller open NTUSER.DAT under a bogus short name.
+        // Win32AndDos is the single-record case (long == short) — keep it.
+        if file_name.namespace() == NtfsFileNamespace::Dos {
+            continue;
+        }
         let name = file_name.name().to_string_lossy();
         if name == "." || name == ".." {
             continue; // self / parent
@@ -372,10 +386,9 @@ fn list_dir_names_inner<R: std::io::Read + std::io::Seek>(
         out.push(name);
     }
 
-    // A directory's index yields each child under BOTH its long (Win32) and short (8.3)
-    // names, so the same folder can appear twice (e.g. "DefaultUser" + "DEFAUL~1").
-    // De-dup after sorting so the result is deterministic and each user folder appears
-    // once.
+    // Sort for deterministic output. dedup() is a cheap belt-and-suspenders guard
+    // against any exact-duplicate that slips through (the Dos namespace filter above
+    // is the primary mechanism for removing 8.3 short-name entries).
     out.sort();
     out.dedup();
     Ok(out)
