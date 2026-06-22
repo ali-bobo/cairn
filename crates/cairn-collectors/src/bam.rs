@@ -22,6 +22,22 @@ fn parse_bam_value(data: &[u8]) -> Option<DateTime<Utc>> {
     filetime_to_utc(ft)
 }
 
+/// Format a ControlSet key name from the `Select\Current` DWORD value, e.g.
+/// 1 -> "ControlSet001". Zero-padded to 3 digits (the on-disk convention). Values >999
+/// are not expected in practice (Windows uses 1-2, rarely 3) and produce wider output by
+/// design — we do NOT clamp, since silently mapping a corrupt DWORD to a valid-looking
+/// name would be harder to diagnose than honest wider output.
+#[allow(dead_code)] // removed in Task 4 (BamCollector consumes it)
+fn controlset_name(current: u32) -> String {
+    format!("ControlSet{current:03}")
+}
+
+/// The ControlSet to use when `Select\Current` is unreadable/absent — the
+/// overwhelmingly common active set. We proceed with this rather than abstain the whole
+/// collect for a missing Select value (graceful degrade, golden rule 8).
+#[allow(dead_code)] // removed in Task 4 (BamCollector consumes it)
+const DEFAULT_CONTROLSET: &str = "ControlSet001";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +73,14 @@ mod tests {
         // Zero FILETIME is legitimate "no time" padding, not an error.
         assert_eq!(parse_bam_value(&[0u8; 8]), None);
         assert_eq!(parse_bam_value(&[0u8; 24]), None);
+    }
+
+    #[test]
+    fn controlset_name_zero_pads_to_three_digits() {
+        assert_eq!(controlset_name(0), "ControlSet000"); // honest output, not clamped
+        assert_eq!(controlset_name(1), "ControlSet001");
+        assert_eq!(controlset_name(2), "ControlSet002");
+        assert_eq!(controlset_name(10), "ControlSet010");
+        assert_eq!(controlset_name(123), "ControlSet123");
     }
 }
