@@ -60,7 +60,6 @@ pub(crate) struct SubKey {
 /// (mirrors SubKey) — it deliberately does NOT expose notatin's CellKeyValue, so a
 /// notatin upgrade cannot break consumers. Non-binary values are not represented here
 /// (list_values skips them).
-#[allow(dead_code)] // removed in Task 4 (bam consumes it)
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct KeyValue {
     pub name: String,
@@ -410,7 +409,6 @@ const SUBKEY_PREALLOC_CAP: usize = 1 << 20;
 /// Caveat: when that guard fires, notatin silently leaves sub_values empty, so
 /// list_values returns Ok(vec![]) — indistinguishable from a legitimately empty key.
 /// Acceptable here: real bam keys hold O(10) values, nowhere near the cap.
-#[allow(dead_code)] // removed in Task 4 (bam consumes it)
 pub(crate) fn list_values(
     parser: &mut notatin::parser::Parser,
     key_path: &str,
