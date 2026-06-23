@@ -192,7 +192,7 @@ impl Collector for ShimCollector {
         }
 
         let mut reader = VolumeReader::open(r"\\.\C:")?;
-        let mut opened = open_hive(&mut reader, &SYSTEM_HIVE)?;
+        let mut opened = open_hive(&mut reader, &SYSTEM_HIVE())?;
 
         if opened.truncated {
             // Hive exceeded the memory ceiling — abstain rather than parse a partial.

@@ -9,20 +9,64 @@ use chrono::{DateTime, Utc};
 
 /// A locked hive's on-volume location. Drive prefix is fixed C: (reads \\.\C:),
 /// matching mft/usn — $MFT carries no drive-letter info.
+///
+/// `components` is an OWNED Vec<String> (not &'static) so per-user paths (e.g.
+/// Users\<name>\NTUSER.DAT) can be built at runtime. The well-known hives expose
+/// builder fns (SYSTEM_HIVE()/AMCACHE_HIVE()) rather than consts because a const
+/// cannot hold an owned Vec.
 pub(crate) struct HivePath {
     /// Volume-relative path components, last element is the hive filename.
-    pub components: &'static [&'static str],
+    pub components: Vec<String>,
 }
 
-/// SYSTEM hive — the only path wired this segment.
-pub(crate) const SYSTEM_HIVE: HivePath = HivePath {
-    components: &["Windows", "System32", "config", "SYSTEM"],
-};
+impl HivePath {
+    /// Build the per-user NTUSER.DAT path: Users\<user_dir_name>\NTUSER.DAT.
+    pub(crate) fn user_ntuser(user_dir_name: &str) -> HivePath {
+        HivePath {
+            components: vec![
+                "Users".to_string(),
+                user_dir_name.to_string(),
+                "NTUSER.DAT".to_string(),
+            ],
+        }
+    }
+}
 
-/// Amcache.hve — programs/files inventory (FR12 amcache_collector).
-pub(crate) const AMCACHE_HIVE: HivePath = HivePath {
-    components: &["Windows", "AppCompat", "Programs", "Amcache.hve"],
-};
+/// SYSTEM hive (Windows\System32\config\SYSTEM). A fn (not const) because HivePath
+/// now holds an owned Vec.
+#[allow(non_snake_case)]
+pub(crate) fn SYSTEM_HIVE() -> HivePath {
+    HivePath {
+        components: ["Windows", "System32", "config", "SYSTEM"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
+/// Amcache.hve — programs/files inventory (FR12 amcache_collector). A fn (not const)
+/// because HivePath now holds an owned Vec.
+#[allow(non_snake_case)]
+pub(crate) fn AMCACHE_HIVE() -> HivePath {
+    HivePath {
+        components: ["Windows", "AppCompat", "Programs", "Amcache.hve"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
+/// SOFTWARE hive (Windows\System32\config\SOFTWARE) — holds ProfileList (SID -> user
+/// folder), used by userassist to resolve user_sid. A fn (HivePath holds an owned Vec).
+#[allow(non_snake_case)]
+pub(crate) fn SOFTWARE_HIVE() -> HivePath {
+    HivePath {
+        components: ["Windows", "System32", "config", "SOFTWARE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
 
 /// 512 MiB hard ceiling on a single hive's in-memory size (NFR10). A boot sector or
 /// attribute length lying about size cannot force a larger allocation than this.
@@ -125,7 +169,7 @@ fn open_hive_inner<R: std::io::Read + std::io::Seek>(
 
     let mut cur = root;
     for comp in dir_components {
-        cur = find_child_dir(&ntfs, reader, &cur, comp)?;
+        cur = find_child_dir(&ntfs, reader, &cur, comp.as_str())?;
     }
     // Read primary hive via the DEFAULT (unnamed, empty-string) data stream.
     // ntfs::NtfsFile::data(reader, "") uses a simple is_empty() check and does NOT
@@ -259,6 +303,103 @@ fn find_child_dir<'n, R: std::io::Read + std::io::Seek>(
     entry
         .to_file(ntfs, reader)
         .map_err(|e| hive_err(format!("to_file for {name} failed: {e}")))
+}
+
+/// Enumerate the immediate SUBDIRECTORY names of an on-volume directory (e.g. the user
+/// folders under C:\Users). Returns hive_reader-owned Vec<String> — no ntfs type leaks
+/// to callers. This walks the NTFS $I30 directory index, NOT a registry hive (contrast
+/// list_subkeys, which enumerates keys inside a parsed hive).
+///
+/// Wrapped in catch_unwind (mirroring open_hive): ntfs panics on some inputs
+/// (short sources in Ntfs::new, named lookups without read_upcase_table). Contain any
+/// third-party panic and convert to Err so it never escapes the collector.
+///
+/// Only directories are returned (files skipped via NtfsFileName::is_directory). The
+/// "." / ".." self/parent entries are dropped. NTFS short-name (8.3) duplicate index
+/// entries (Dos namespace, e.g. "DEFAUL~1" alongside "DefaultUser") are SKIPPED via a
+/// namespace filter — only Win32, Win32AndDos, and Posix entries are kept. (Win32AndDos
+/// is the single-record case where long == short, so it represents one real entry.)
+/// The result is sorted for determinism.
+pub(crate) fn list_dir_names<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    dir_path: &HivePath,
+) -> Result<Vec<String>> {
+    use std::panic::{self, AssertUnwindSafe};
+    // Same AssertUnwindSafe rationale as open_hive: `reader` is the only captured mut
+    // ref; on a caught panic we never reuse it, we return Err immediately.
+    let result = panic::catch_unwind(AssertUnwindSafe(|| list_dir_names_inner(reader, dir_path)));
+    match result {
+        Ok(inner) => inner,
+        Err(_) => Err(hive_err(
+            "ntfs panicked during directory enumeration (contained)".into(),
+        )),
+    }
+}
+
+/// Inner enumeration (only called inside catch_unwind).
+fn list_dir_names_inner<R: std::io::Read + std::io::Seek>(
+    reader: &mut R,
+    dir_path: &HivePath,
+) -> Result<Vec<String>> {
+    use ntfs::structured_values::NtfsFileNamespace;
+    use ntfs::Ntfs;
+
+    let mut ntfs = Ntfs::new(reader).map_err(|e| hive_err(format!("Ntfs::new failed: {e}")))?;
+    ntfs.read_upcase_table(reader)
+        .map_err(|e| hive_err(format!("read_upcase_table failed: {e}")))?;
+    let root = ntfs
+        .root_directory(reader)
+        .map_err(|e| hive_err(format!("root_directory failed: {e}")))?;
+
+    // Navigate to the target directory (all components are directories here).
+    let mut cur = root;
+    for comp in &dir_path.components {
+        cur = find_child_dir(&ntfs, reader, &cur, comp.as_str())?;
+    }
+
+    // Stream the directory index. directory_index() returns Err if `cur` is not a
+    // directory (NtfsError::NotADirectory) — surfaced as Err (caller abstains).
+    let index = cur
+        .directory_index(reader)
+        .map_err(|e| hive_err(format!("directory_index failed: {e}")))?;
+    let mut entries = index.entries();
+    let mut out: Vec<String> = Vec::new();
+    while let Some(entry) = entries.next(reader) {
+        // A corrupt index entry is skipped, not fatal — one bad $I30 node must not lose
+        // the entire user listing (golden rule 8: graceful degrade).
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        // key() is Option<Result<NtfsFileName>>: None = no $FILE_NAME key on this entry
+        // (skip); Err = a corrupt entry (skip it, do not abort the whole listing).
+        let file_name = match entry.key() {
+            Some(Ok(fnm)) => fnm,
+            Some(Err(_)) | None => continue,
+        };
+        if !file_name.is_directory() {
+            continue; // files are not user folders
+        }
+        // Skip the MS-DOS 8.3 short-name index entry. A directory with a long name has
+        // TWO $FILE_NAME entries (Win32 long + Dos 8.3, e.g. "DefaultUser" + "DEFAUL~1");
+        // keeping both would make the caller open NTUSER.DAT under a bogus short name.
+        // Win32AndDos is the single-record case (long == short) — keep it.
+        if file_name.namespace() == NtfsFileNamespace::Dos {
+            continue;
+        }
+        let name = file_name.name().to_string_lossy();
+        if name == "." || name == ".." {
+            continue; // self / parent
+        }
+        out.push(name);
+    }
+
+    // Sort for deterministic output. dedup() is a cheap belt-and-suspenders guard
+    // against any exact-duplicate that slips through (the Dos namespace filter above
+    // is the primary mechanism for removing 8.3 short-name entries).
+    out.sort();
+    out.dedup();
+    Ok(out)
 }
 
 /// Honest LogStatus from the two tri-state log reads:
@@ -474,8 +615,20 @@ mod tests {
 
     #[test]
     fn amcache_hive_path_joins_to_appcompat_programs() {
-        let joined = AMCACHE_HIVE.components.join("\\");
+        let joined = AMCACHE_HIVE().components.join("\\");
         assert_eq!(joined, r"Windows\AppCompat\Programs\Amcache.hve");
+    }
+
+    #[test]
+    fn user_ntuser_builds_users_name_ntuser_dat() {
+        let p = HivePath::user_ntuser("alice");
+        assert_eq!(p.components, vec!["Users", "alice", "NTUSER.DAT"]);
+    }
+
+    #[test]
+    fn user_ntuser_handles_names_with_spaces() {
+        let p = HivePath::user_ntuser("John Doe");
+        assert_eq!(p.components, vec!["Users", "John Doe", "NTUSER.DAT"]);
     }
 
     #[test]
@@ -505,14 +658,31 @@ mod tests {
         // A reader far shorter than a boot sector: ntfs cannot parse a volume.
         // Must return Err (contained), never panic (golden rule 8).
         let mut reader = Cursor::new(vec![0u8; 16]);
-        let r = open_hive(&mut reader, &SYSTEM_HIVE);
+        let r = open_hive(&mut reader, &SYSTEM_HIVE());
+        assert!(r.is_err(), "short reader must yield Err, got Ok");
+    }
+
+    #[test]
+    fn list_dir_names_on_short_reader_is_err_not_panic() {
+        // A reader too short to be a volume must yield Err (contained), never panic.
+        let mut reader = Cursor::new(vec![0u8; 16]);
+        let users = HivePath {
+            components: vec!["Users".to_string()],
+        };
+        let r = list_dir_names(&mut reader, &users);
         assert!(r.is_err(), "short reader must yield Err, got Ok");
     }
 
     #[test]
     fn system_hive_path_joins_to_config_system() {
-        let joined = SYSTEM_HIVE.components.join("\\");
+        let joined = SYSTEM_HIVE().components.join("\\");
         assert_eq!(joined, r"Windows\System32\config\SYSTEM");
+    }
+
+    #[test]
+    fn software_hive_path_joins_to_config_software() {
+        let joined = SOFTWARE_HIVE().components.join("\\");
+        assert_eq!(joined, r"Windows\System32\config\SOFTWARE");
     }
 
     #[test]

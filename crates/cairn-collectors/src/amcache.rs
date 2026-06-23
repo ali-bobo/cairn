@@ -70,7 +70,7 @@ impl Collector for AmcacheCollector {
         }
 
         let mut reader = VolumeReader::open(r"\\.\C:")?;
-        let mut opened = open_hive(&mut reader, &AMCACHE_HIVE)?;
+        let mut opened = open_hive(&mut reader, &AMCACHE_HIVE())?;
 
         if opened.truncated {
             self.abstained_truncated.store(true, Ordering::Relaxed);

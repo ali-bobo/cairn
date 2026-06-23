@@ -16,4 +16,5 @@ pub mod persist;
 pub mod prefetch;
 pub mod proc;
 pub mod shimcache;
+pub mod userassist;
 pub mod usn;

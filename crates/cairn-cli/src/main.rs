@@ -271,8 +271,8 @@ fn parse_cap(s: &str) -> Option<u64> {
 /// The collector names that the run arm's construction `if` blocks would build for
 /// this selection, in canonical order. Pure mirror of those blocks, so the
 /// selection→collectors mapping is unit-testable without a live Windows host.
-/// MUST stay in sync with the nine `if ... push(...)` blocks in `main` that
-/// construct proc/net/persist/mft/usn/shimcache/amcache/prefetch/bam collectors (search: "S2-L: construct only").
+/// MUST stay in sync with the ten `if ... push(...)` blocks in `main` that
+/// construct proc/net/persist/mft/usn/shimcache/amcache/prefetch/bam/userassist collectors (search: "S2-L: construct only").
 #[cfg(test)]
 fn built_collector_names(selected: &[String]) -> Vec<String> {
     [
@@ -285,6 +285,7 @@ fn built_collector_names(selected: &[String]) -> Vec<String> {
         "amcache",
         "prefetch",
         "bam",
+        "userassist",
     ]
     .iter()
     .filter(|n| selected.iter().any(|m| m == *n))
@@ -640,6 +641,7 @@ fn main() -> anyhow::Result<()> {
                 "amcache",
                 "prefetch",
                 "bam",
+                "userassist",
             ];
             let selection = cairn_core::select_modules(profile, only.as_deref(), AVAILABLE);
             for name in &selection.unknown_only {
@@ -728,6 +730,11 @@ fn main() -> anyhow::Result<()> {
             }
             if selection.selected.iter().any(|m| m == "bam") {
                 collectors.push(Box::new(cairn_collectors::bam::BamCollector::default()));
+            }
+            if selection.selected.iter().any(|m| m == "userassist") {
+                collectors.push(Box::new(
+                    cairn_collectors::userassist::UserAssistCollector::default(),
+                ));
             }
             let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
@@ -929,6 +936,7 @@ mod tests {
             "amcache",
             "prefetch",
             "bam",
+            "userassist",
         ];
 
         // --only persist => only persist constructed.
@@ -937,7 +945,7 @@ mod tests {
         let built = built_collector_names(&sel.selected);
         assert_eq!(built, vec!["persist".to_string()]);
 
-        // no --only => all nine in canonical order (minimal skips raw-NTFS).
+        // no --only => all ten in canonical order (minimal skips raw-NTFS).
         let sel = select_modules(Profile::Standard, None, AVAILABLE);
         let built = built_collector_names(&sel.selected);
         assert_eq!(
@@ -951,7 +959,8 @@ mod tests {
                 "shimcache",
                 "amcache",
                 "prefetch",
-                "bam"
+                "bam",
+                "userassist"
             ]
         );
 
@@ -1018,6 +1027,18 @@ mod tests {
         let sel = select_modules(Profile::Minimal, None, AVAILABLE);
         let built = built_collector_names(&sel.selected);
         assert!(!built.contains(&"bam".to_string()), "minimal skips bam");
+        let sel = select_modules(Profile::Standard, None, AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert!(
+            built.contains(&"userassist".to_string()),
+            "standard includes userassist"
+        );
+        let sel = select_modules(Profile::Minimal, None, AVAILABLE);
+        let built = built_collector_names(&sel.selected);
+        assert!(
+            !built.contains(&"userassist".to_string()),
+            "minimal skips userassist"
+        );
     }
 
     #[test]
