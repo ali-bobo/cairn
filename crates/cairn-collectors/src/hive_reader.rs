@@ -21,8 +21,6 @@ pub(crate) struct HivePath {
 
 impl HivePath {
     /// Build the per-user NTUSER.DAT path: Users\<user_dir_name>\NTUSER.DAT.
-    // allow(dead_code): first used in T6 userassist collector; remove when wired.
-    #[allow(dead_code)]
     pub(crate) fn user_ntuser(user_dir_name: &str) -> HivePath {
         HivePath {
             components: vec![
@@ -52,6 +50,18 @@ pub(crate) fn SYSTEM_HIVE() -> HivePath {
 pub(crate) fn AMCACHE_HIVE() -> HivePath {
     HivePath {
         components: ["Windows", "AppCompat", "Programs", "Amcache.hve"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    }
+}
+
+/// SOFTWARE hive (Windows\System32\config\SOFTWARE) — holds ProfileList (SID -> user
+/// folder), used by userassist to resolve user_sid. A fn (HivePath holds an owned Vec).
+#[allow(non_snake_case)]
+pub(crate) fn SOFTWARE_HIVE() -> HivePath {
+    HivePath {
+        components: ["Windows", "System32", "config", "SOFTWARE"]
             .iter()
             .map(|s| s.to_string())
             .collect(),
@@ -310,8 +320,6 @@ fn find_child_dir<'n, R: std::io::Read + std::io::Seek>(
 /// namespace filter — only Win32, Win32AndDos, and Posix entries are kept. (Win32AndDos
 /// is the single-record case where long == short, so it represents one real entry.)
 /// The result is sorted for determinism.
-// allow(dead_code): first used in T6 userassist collector; remove when wired.
-#[allow(dead_code)]
 pub(crate) fn list_dir_names<R: std::io::Read + std::io::Seek>(
     reader: &mut R,
     dir_path: &HivePath,
@@ -669,6 +677,12 @@ mod tests {
     fn system_hive_path_joins_to_config_system() {
         let joined = SYSTEM_HIVE().components.join("\\");
         assert_eq!(joined, r"Windows\System32\config\SYSTEM");
+    }
+
+    #[test]
+    fn software_hive_path_joins_to_config_software() {
+        let joined = SOFTWARE_HIVE().components.join("\\");
+        assert_eq!(joined, r"Windows\System32\config\SOFTWARE");
     }
 
     #[test]

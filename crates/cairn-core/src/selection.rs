@@ -33,7 +33,15 @@ fn canonical_only_name(raw: &str) -> String {
 /// `--profile minimal` skips ALL of these (SRS §19.1). The single place the
 /// profile→heavy-set mapping lives. Not all are raw-NTFS (prefetch uses the file API),
 /// hence the name HEAVY_OFFLINE rather than RAW_NTFS.
-const HEAVY_OFFLINE: &[&str] = &["mft", "usn", "shimcache", "amcache", "prefetch", "bam"];
+const HEAVY_OFFLINE: &[&str] = &[
+    "mft",
+    "usn",
+    "shimcache",
+    "amcache",
+    "prefetch",
+    "bam",
+    "userassist",
+];
 
 /// Modules a profile selects from `available`, BEFORE the `--only` intersection.
 /// `minimal` = the light live set (HEAVY_OFFLINE excluded, SRS §19.1). `standard`/`verbose`
@@ -288,5 +296,25 @@ mod tests {
         assert_eq!(out.selected, vec!["proc", "net", "persist"]);
         let std = select_modules(Profile::Standard, None, &available);
         assert!(std.selected.contains(&"bam".to_string()));
+    }
+
+    #[test]
+    fn minimal_excludes_userassist() {
+        let available = vec![
+            "proc",
+            "net",
+            "persist",
+            "mft",
+            "usn",
+            "shimcache",
+            "amcache",
+            "prefetch",
+            "bam",
+            "userassist",
+        ];
+        let out = select_modules(Profile::Minimal, None, &available);
+        assert_eq!(out.selected, vec!["proc", "net", "persist"]);
+        let std = select_modules(Profile::Standard, None, &available);
+        assert!(std.selected.contains(&"userassist".to_string()));
     }
 }
