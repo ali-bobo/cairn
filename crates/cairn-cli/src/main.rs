@@ -9,7 +9,7 @@ use cairn_core::finding::Finding;
 use cairn_core::manifest::{Counts, HostInfo, Manifest, Privileges, RunInfo, ToolInfo};
 use cairn_core::traits::OutputSink;
 use cairn_core::{Config, OutputKind, Target};
-use cairn_report::DirSink;
+use cairn_report::{AgeSink, DirSink, DryRunSink, ZipSink};
 use cairn_sigma::{engine::Engine, SigmaMatcher};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -307,15 +307,32 @@ fn write_records_jsonl(
     Ok(())
 }
 
-/// Set manifest.outputs from the data files written so far, then write the manifest.
-fn manifest_outputs_then_write(sink: &mut DirSink, mut manifest: Manifest) -> anyhow::Result<()> {
-    manifest.outputs = sink.outputs_so_far();
+/// Write the manifest via the sink, then finalize and log each output entry.
+/// For non-DirSink types, outputs_so_far() is not available; the manifest's
+/// outputs field stays empty (acceptable for S3, which tracks the archive as a whole).
+fn manifest_outputs_then_write(sink: &mut dyn OutputSink, manifest: Manifest) -> anyhow::Result<()> {
     sink.write_manifest(&manifest)?;
     let outputs = sink.finalize()?;
     for o in &outputs {
         tracing::info!(file = %o.file, sha256 = %o.sha256, "wrote output");
     }
     Ok(())
+}
+
+/// Construct the correct OutputSink variant from the resolved OutputKind (FR15/FR16).
+/// AgeSink::new may return Err on an invalid pubkey — propagated to the caller.
+fn build_sink(output: &OutputKind) -> anyhow::Result<Box<dyn OutputSink + Send>> {
+    use anyhow::Context as _;
+    Ok(match output {
+        OutputKind::Dir(p) => Box::new(DirSink::new(p)),
+        OutputKind::Zip(p) => Box::new(ZipSink::new(p)),
+        OutputKind::EncryptedZip { path, pubkey } => {
+            let key = std::fs::read_to_string(pubkey)
+                .with_context(|| format!("reading age public key file: {}", pubkey.display()))?;
+            Box::new(AgeSink::new(path, key.trim()).map_err(|e| anyhow::anyhow!("{}", e))?)
+        }
+        OutputKind::DryRun => Box::new(DryRunSink),
+    })
 }
 
 /// Off-target output directory for a Stage-1 evtx run (golden rule 4). Resolved from
@@ -556,17 +573,6 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(2);
             }
 
-            // --zip / --encrypt are not implemented yet (ZipSink / EncryptedZipSink are an S3
-            // sub-segment). Reject explicitly rather than silently producing a plain directory:
-            // a flag that is accepted but ignored is worse than one that is absent.
-            if args.zip || args.encrypt.is_some() {
-                eprintln!(
-                    "cairn run --zip / --encrypt are not implemented yet (output-packaging \
-                     sub-segment); re-run without them to write a plain output directory."
-                );
-                std::process::exit(2);
-            }
-
             // S2-L: parse --profile into the typed enum FIRST; an invalid value is a
             // clean CLI error (exit non-zero) before we create any output or start a
             // run — not a silent Standard fallback.
@@ -656,10 +662,25 @@ fn main() -> anyhow::Result<()> {
                 "collector selection"
             );
 
+            // Resolve the OutputKind from CLI flags: --dry-run > --encrypt > --zip > plain dir.
+            let output_kind = if dry_run {
+                OutputKind::DryRun
+            } else if let Some(ref pubkey) = args.encrypt {
+                OutputKind::EncryptedZip {
+                    path: args.output.clone(),
+                    pubkey: pubkey.clone(),
+                }
+            } else if args.zip {
+                OutputKind::Zip(args.output.clone())
+            } else {
+                OutputKind::Dir(args.output.clone())
+            };
+
             let mut cfg = Config {
                 max_mft_records: args.max_mft_records,
                 max_usn_records: args.max_usn_records,
                 profile,
+                output: output_kind,
                 ..Config::default()
             };
 
@@ -817,13 +838,14 @@ fn main() -> anyhow::Result<()> {
                 governance: governance_report,
             };
 
+            let mut sink = build_sink(&cfg.output)?;
+            sink.write_timeline_csv(&outcome.findings)?;
+            sink.write_findings_jsonl(&outcome.findings)?;
+            if let OutputKind::Dir(ref d) = cfg.output {
+                write_records_jsonl(d, &outcome.records)?;
+            }
+            manifest_outputs_then_write(&mut *sink, manifest)?;
             if dry_run {
-                // Golden rule 4: write NOTHING. Report what WOULD have been produced.
-                tracing::info!(
-                    records = outcome.records.len(),
-                    findings = outcome.findings.len(),
-                    "dry-run complete; no files written"
-                );
                 println!(
                     "dry-run: {} records, {} findings — no files written (would have gone to {})",
                     outcome.records.len(),
@@ -831,12 +853,7 @@ fn main() -> anyhow::Result<()> {
                     dir.display()
                 );
             } else {
-                let mut sink = DirSink::new(dir.clone());
-                sink.write_timeline_csv(&outcome.findings)?;
-                sink.write_findings_jsonl(&outcome.findings)?;
-                write_records_jsonl(&dir, &outcome.records)?;
-                manifest_outputs_then_write(&mut sink, manifest)?;
-                tracing::info!(dir = %dir.display(), "live run complete");
+                tracing::info!(output = ?cfg.output, "run complete");
             }
             drop(_guard);
         }
