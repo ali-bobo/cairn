@@ -130,9 +130,7 @@ impl Collector for SrumCollector {
     fn sources(&self) -> Vec<SourceEntry> {
         let mut errors: Vec<String> = Vec::new();
         if self.truncated.load(Ordering::Relaxed) {
-            errors.push(
-                "abstained: SRUDB.dat exceeded 512 MiB ceiling (NFR10); not parsed".into(),
-            );
+            errors.push("abstained: SRUDB.dat exceeded 512 MiB ceiling (NFR10); not parsed".into());
         }
         if self.db_absent.load(Ordering::Relaxed) {
             errors.push("abstained: SRUDB.dat not found (build variance/NFR12)".into());
@@ -195,21 +193,20 @@ pub(crate) fn extract_srudb(
             reason: format!("root_directory: {e}"),
         })?;
 
-    let (file_name, dir_components) = hive
-        .components
-        .split_last()
-        .ok_or_else(|| CairnError::Collector {
-            collector: "srum".into(),
-            reason: "empty path".into(),
-        })?;
+    let (file_name, dir_components) =
+        hive.components
+            .split_last()
+            .ok_or_else(|| CairnError::Collector {
+                collector: "srum".into(),
+                reason: "empty path".into(),
+            })?;
 
     let mut cur = root;
     for comp in dir_components {
         cur = crate::hive_reader::find_child_dir_pub(&ntfs, reader, &cur, comp.as_str())?;
     }
 
-    let file =
-        crate::hive_reader::find_child_file_pub(&ntfs, reader, &cur, file_name.as_str())?;
+    let file = crate::hive_reader::find_child_file_pub(&ntfs, reader, &cur, file_name.as_str())?;
     let data_item = file
         .data(reader, "")
         .ok_or_else(|| CairnError::Collector {
@@ -255,11 +252,10 @@ pub(crate) fn extract_srudb(
         collector: "srum".into(),
         reason: format!("tempfile::new: {e}"),
     })?;
-    tmp.write_all(&buf)
-        .map_err(|e| CairnError::Collector {
-            collector: "srum".into(),
-            reason: format!("tempfile write: {e}"),
-        })?;
+    tmp.write_all(&buf).map_err(|e| CairnError::Collector {
+        collector: "srum".into(),
+        reason: format!("tempfile write: {e}"),
+    })?;
     tmp.flush().map_err(|e| CairnError::Collector {
         collector: "srum".into(),
         reason: format!("tempfile flush: {e}"),
@@ -300,8 +296,14 @@ mod tests {
     #[test]
     fn build_id_map_entries_indexed_by_id() {
         let entries = vec![
-            srum_core::IdMapEntry { id: 1, name: "svchost.exe".to_string() },
-            srum_core::IdMapEntry { id: 5, name: "explorer.exe".to_string() },
+            srum_core::IdMapEntry {
+                id: 1,
+                name: "svchost.exe".to_string(),
+            },
+            srum_core::IdMapEntry {
+                id: 5,
+                name: "explorer.exe".to_string(),
+            },
         ];
         let map = build_id_map(entries);
         assert_eq!(map.get(&1).map(|s| s.as_str()), Some("svchost.exe"));
@@ -323,10 +325,20 @@ mod tests {
         use cairn_core::traits::{CollectCtx, Collector};
 
         let c = SrumCollector::default();
-        let ctx = CollectCtx { admin: true, se_backup: true, se_debug: true, config: &Default::default() };
-        let records = c.collect(&ctx).expect("collect must not error on real host");
+        let ctx = CollectCtx {
+            admin: true,
+            se_backup: true,
+            se_debug: true,
+            config: &Default::default(),
+        };
+        let records = c
+            .collect(&ctx)
+            .expect("collect must not error on real host");
 
-        assert!(!records.is_empty(), "expected at least one SRUM record on a real Win host");
+        assert!(
+            !records.is_empty(),
+            "expected at least one SRUM record on a real Win host"
+        );
 
         let app_count = records
             .iter()

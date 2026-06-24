@@ -322,8 +322,17 @@ mod tests {
     #[test]
     fn minimal_excludes_srum() {
         let available = vec![
-            "proc", "net", "persist", "mft", "usn",
-            "shimcache", "amcache", "prefetch", "bam", "userassist", "srum",
+            "proc",
+            "net",
+            "persist",
+            "mft",
+            "usn",
+            "shimcache",
+            "amcache",
+            "prefetch",
+            "bam",
+            "userassist",
+            "srum",
         ];
         let out = select_modules(Profile::Minimal, None, &available);
         assert_eq!(out.selected, vec!["proc", "net", "persist"]);
