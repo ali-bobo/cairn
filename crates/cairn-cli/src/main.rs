@@ -670,6 +670,7 @@ fn main() -> anyhow::Result<()> {
                 "prefetch",
                 "bam",
                 "userassist",
+                "srum",
             ];
             let selection = cairn_core::select_modules(profile, only.as_deref(), AVAILABLE);
             for name in &selection.unknown_only {
@@ -778,6 +779,9 @@ fn main() -> anyhow::Result<()> {
                 collectors.push(Box::new(
                     cairn_collectors::userassist::UserAssistCollector::default(),
                 ));
+            }
+            if selection.selected.iter().any(|m| m == "srum") {
+                collectors.push(Box::new(cairn_collectors::srum::SrumCollector::default()));
             }
             let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
@@ -976,6 +980,7 @@ mod tests {
             "prefetch",
             "bam",
             "userassist",
+            "srum",
         ];
 
         // --only persist => only persist constructed.

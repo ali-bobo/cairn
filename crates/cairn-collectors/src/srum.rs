@@ -313,4 +313,38 @@ mod tests {
     fn net_reason_formats_bytes() {
         assert_eq!(net_reason(1024, 512), "bytes_sent=1024 bytes_recv=512");
     }
+
+    /// ELEVATED E2E (manual): run as Administrator with SeBackupPrivilege:
+    ///   cargo test -p cairn-collectors srum::tests::elevated_e2e_srum -- --ignored
+    #[ignore = "requires Administrator + SeBackupPrivilege and a real NTFS C: volume"]
+    #[test]
+    fn elevated_e2e_srum() {
+        use cairn_core::record::Record;
+        use cairn_core::traits::{CollectCtx, Collector};
+
+        let c = SrumCollector::default();
+        let ctx = CollectCtx { admin: true, se_backup: true, se_debug: true, config: &Default::default() };
+        let records = c.collect(&ctx).expect("collect must not error on real host");
+
+        assert!(!records.is_empty(), "expected at least one SRUM record on a real Win host");
+
+        let app_count = records
+            .iter()
+            .filter(|r| matches!(r, Record::Execution(e) if e.source == "srum_app"))
+            .count();
+        let net_count = records
+            .iter()
+            .filter(|r| matches!(r, Record::Execution(e) if e.source == "srum_net"))
+            .count();
+        assert!(app_count > 0, "expected srum_app records; got {app_count}");
+        assert!(net_count > 0, "expected srum_net records; got {net_count}");
+
+        let sources = c.sources();
+        assert_eq!(sources.len(), 1);
+        assert!(
+            sources[0].errors.is_empty(),
+            "sources errors must be empty on real host: {:?}",
+            sources[0].errors
+        );
+    }
 }

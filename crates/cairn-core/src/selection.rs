@@ -41,6 +41,7 @@ const HEAVY_OFFLINE: &[&str] = &[
     "prefetch",
     "bam",
     "userassist",
+    "srum",
 ];
 
 /// Modules a profile selects from `available`, BEFORE the `--only` intersection.
@@ -316,5 +317,17 @@ mod tests {
         assert_eq!(out.selected, vec!["proc", "net", "persist"]);
         let std = select_modules(Profile::Standard, None, &available);
         assert!(std.selected.contains(&"userassist".to_string()));
+    }
+
+    #[test]
+    fn minimal_excludes_srum() {
+        let available = vec![
+            "proc", "net", "persist", "mft", "usn",
+            "shimcache", "amcache", "prefetch", "bam", "userassist", "srum",
+        ];
+        let out = select_modules(Profile::Minimal, None, &available);
+        assert_eq!(out.selected, vec!["proc", "net", "persist"]);
+        let std = select_modules(Profile::Standard, None, &available);
+        assert!(std.selected.contains(&"srum".to_string()));
     }
 }
