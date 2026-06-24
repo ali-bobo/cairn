@@ -17,6 +17,8 @@ thiserror.workspace = true
 quick-xml = { version = "0.40.1", default-features = false }
 sha2.workspace = true
 compcol = { workspace = true }
+srum-parser.workspace = true
+tempfile.workspace    = true
 
 [target.'cfg(windows)'.dependencies]
 winreg.workspace = true
