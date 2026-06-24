@@ -1,5 +1,14 @@
 //! cairn-report: timeline + summary + manifest + output sinks. SRS §5.2, §6, §12.
 #![forbid(unsafe_code)] // pure formatting + hashing + file I/O; no raw-volume/WinAPI.
+
+pub mod age_sink;
+pub mod dry_run;
+pub mod zip_sink;
+
+pub use age_sink::AgeSink;
+pub use dry_run::DryRunSink;
+pub use zip_sink::ZipSink;
+
 use cairn_core::{
     finding::Finding,
     manifest::{Manifest, OutputEntry},
@@ -140,6 +149,24 @@ impl Summary {
         }
         s
     }
+}
+
+/// Write `bytes` to `path`, refusing to follow a pre-planted symlink (threat-model §3).
+/// Returns Err if path is a symlink; otherwise creates parent dirs and writes.
+pub(crate) fn write_output_safe(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(cairn_core::CairnError::Other(format!(
+                "refusing to write through a symlinked output: {}",
+                path.display()
+            )));
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, bytes)?;
+    Ok(())
 }
 
 /// Writes results to a plain directory. S1 default. Off-target path recommended (FR16).
