@@ -18,12 +18,7 @@ impl ZipSink {
         ZipSink { path: path.into(), files: Vec::new() }
     }
 
-    /// Consume self and return the assembled zip bytes (without writing to disk).
-    /// Used by AgeSink to encrypt before landing (wired in T3).
-    #[allow(dead_code)]
-    pub(crate) fn into_zip_bytes(self) -> Result<Vec<u8>> {
-        build_zip(self.files)
-    }
+
 }
 
 pub(crate) fn build_zip(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>> {
