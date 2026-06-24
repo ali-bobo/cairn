@@ -18,4 +18,11 @@ ignore = [
   # drop it without replacing notatin. Re-evaluate if notatin removes the dependency
   # or a real CVE is filed against `paste`.
   "RUSTSEC-2024-0436",
+  # RUSTSEC-2026-0173: the `proc-macro-error2` crate is unmaintained. It is a
+  # transitive dependency of `age` (our output encryption crate, used by AgeSink).
+  # It is NOT a vulnerability — only an unmaintained flag — and proc-macro-error2 is
+  # a compile-time-only proc-macro helper (no runtime attack surface). We cannot drop
+  # it without replacing the age crate. Re-evaluate if age removes the dependency or
+  # a real CVE is filed against `proc-macro-error2`.
+  "RUSTSEC-2026-0173",
 ]
