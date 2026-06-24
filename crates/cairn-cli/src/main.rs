@@ -311,7 +311,10 @@ fn write_records_jsonl(
 /// manifest.outputs is left empty for all sink types (S3 design decision):
 /// DirSink records per-file sha256 via finalize() log; zip/age sinks are
 /// self-contained and track integrity at the archive level.
-fn manifest_outputs_then_write(sink: &mut dyn OutputSink, manifest: Manifest) -> anyhow::Result<()> {
+fn manifest_outputs_then_write(
+    sink: &mut dyn OutputSink,
+    manifest: Manifest,
+) -> anyhow::Result<()> {
     sink.write_manifest(&manifest)?;
     let outputs = sink.finalize()?;
     for o in &outputs {

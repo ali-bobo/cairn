@@ -28,15 +28,18 @@ impl AgeSink {
         let pubkey: age::x25519::Recipient = pubkey_str
             .parse()
             .map_err(|e: &str| CairnError::Other(format!("invalid age public key: {e}")))?;
-        Ok(AgeSink { age_path, pubkey, files: Vec::new() })
+        Ok(AgeSink {
+            age_path,
+            pubkey,
+            files: Vec::new(),
+        })
     }
 }
 
 /// Encrypt `data` to the given X25519 recipient using the age binary format.
 /// Module-private; callers use AgeSink which handles the OutputSink protocol.
 fn age_encrypt(recipient: &age::x25519::Recipient, data: &[u8]) -> Result<Vec<u8>> {
-    age::encrypt(recipient, data)
-        .map_err(|e| CairnError::Other(format!("age encrypt: {e}")))
+    age::encrypt(recipient, data).map_err(|e| CairnError::Other(format!("age encrypt: {e}")))
 }
 
 impl OutputSink for AgeSink {
@@ -80,8 +83,7 @@ mod tests {
     use cairn_core::traits::OutputSink;
 
     // 測試專用 X25519 keypair（公開已知，無敏感資料）
-    const TEST_PUBKEY: &str =
-        "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
+    const TEST_PUBKEY: &str = "age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p";
 
     fn mk_dir(suffix: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("cairn_age_{suffix}"));
@@ -108,7 +110,11 @@ mod tests {
             &bytes[..22.min(bytes.len())]
         );
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].file.ends_with(".zip.age"), "file entry: {}", entries[0].file);
+        assert!(
+            entries[0].file.ends_with(".zip.age"),
+            "file entry: {}",
+            entries[0].file
+        );
         assert_eq!(entries[0].sha256, crate::sha256_hex(&bytes));
     }
 

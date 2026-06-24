@@ -15,10 +15,11 @@ pub struct ZipSink {
 
 impl ZipSink {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        ZipSink { path: path.into(), files: Vec::new() }
+        ZipSink {
+            path: path.into(),
+            files: Vec::new(),
+        }
     }
-
-
 }
 
 pub(crate) fn build_zip(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>> {
@@ -33,7 +34,8 @@ pub(crate) fn build_zip(files: Vec<(String, Vec<u8>)>) -> Result<Vec<u8>> {
         zip.write_all(&bytes)
             .map_err(|e| cairn_core::CairnError::Other(e.to_string()))?;
     }
-    zip.finish().map_err(|e| cairn_core::CairnError::Other(e.to_string()))?;
+    zip.finish()
+        .map_err(|e| cairn_core::CairnError::Other(e.to_string()))?;
     Ok(buf)
 }
 
@@ -96,10 +98,32 @@ mod tests {
         use chrono::Utc;
         let manifest = Manifest {
             schema: cairn_core::schema::MANIFEST.to_string(),
-            tool: ToolInfo { name: "cairn".into(), version: "0.1.0".into(), build_sha: "abc".into(), sigma_ruleset_ver: String::new() },
-            run: RunInfo { started_utc: Utc::now(), finished_utc: None, cmdline: "test".into(), operator: String::new(), case_id: String::new(), profile: "standard".into(), selected_modules: vec![] },
-            host: HostInfo { hostname: "WS01".into(), os_build: String::new(), timezone: "UTC".into(), wall_clock_utc_skew: "+0s".into() },
-            privileges: Privileges { admin: false, se_backup: false, se_debug: false },
+            tool: ToolInfo {
+                name: "cairn".into(),
+                version: "0.1.0".into(),
+                build_sha: "abc".into(),
+                sigma_ruleset_ver: String::new(),
+            },
+            run: RunInfo {
+                started_utc: Utc::now(),
+                finished_utc: None,
+                cmdline: "test".into(),
+                operator: String::new(),
+                case_id: String::new(),
+                profile: "standard".into(),
+                selected_modules: vec![],
+            },
+            host: HostInfo {
+                hostname: "WS01".into(),
+                os_build: String::new(),
+                timezone: "UTC".into(),
+                wall_clock_utc_skew: "+0s".into(),
+            },
+            privileges: Privileges {
+                admin: false,
+                se_backup: false,
+                se_debug: false,
+            },
             sources: vec![],
             outputs: vec![],
             counts: Counts::default(),
@@ -116,9 +140,18 @@ mod tests {
         let names: Vec<String> = (0..archive.len())
             .map(|i| archive.by_index(i).unwrap().name().to_string())
             .collect();
-        assert!(names.iter().any(|n| n == "timeline.csv"), "timeline.csv: {names:?}");
-        assert!(names.iter().any(|n| n == "findings.jsonl"), "findings.jsonl: {names:?}");
-        assert!(names.iter().any(|n| n == "manifest.json"), "manifest.json: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "timeline.csv"),
+            "timeline.csv: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "findings.jsonl"),
+            "findings.jsonl: {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "manifest.json"),
+            "manifest.json: {names:?}"
+        );
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].sha256, crate::sha256_hex(&bytes));

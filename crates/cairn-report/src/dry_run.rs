@@ -11,10 +11,18 @@ use cairn_core::{
 pub struct DryRunSink;
 
 impl OutputSink for DryRunSink {
-    fn write_timeline_csv(&mut self, _: &[Finding]) -> Result<()> { Ok(()) }
-    fn write_findings_jsonl(&mut self, _: &[Finding]) -> Result<()> { Ok(()) }
-    fn write_manifest(&mut self, _: &Manifest) -> Result<()> { Ok(()) }
-    fn finalize(&mut self) -> Result<Vec<OutputEntry>> { Ok(vec![]) }
+    fn write_timeline_csv(&mut self, _: &[Finding]) -> Result<()> {
+        Ok(())
+    }
+    fn write_findings_jsonl(&mut self, _: &[Finding]) -> Result<()> {
+        Ok(())
+    }
+    fn write_manifest(&mut self, _: &Manifest) -> Result<()> {
+        Ok(())
+    }
+    fn finalize(&mut self) -> Result<Vec<OutputEntry>> {
+        Ok(vec![])
+    }
 }
 
 #[cfg(test)]
@@ -35,10 +43,32 @@ mod tests {
         use chrono::Utc;
         let manifest = Manifest {
             schema: cairn_core::schema::MANIFEST.to_string(),
-            tool: ToolInfo { name: "cairn".into(), version: "0.1.0".into(), build_sha: "abc".into(), sigma_ruleset_ver: String::new() },
-            run: RunInfo { started_utc: Utc::now(), finished_utc: None, cmdline: "test".into(), operator: String::new(), case_id: String::new(), profile: "standard".into(), selected_modules: vec![] },
-            host: HostInfo { hostname: "WS01".into(), os_build: String::new(), timezone: "UTC".into(), wall_clock_utc_skew: "+0s".into() },
-            privileges: Privileges { admin: false, se_backup: false, se_debug: false },
+            tool: ToolInfo {
+                name: "cairn".into(),
+                version: "0.1.0".into(),
+                build_sha: "abc".into(),
+                sigma_ruleset_ver: String::new(),
+            },
+            run: RunInfo {
+                started_utc: Utc::now(),
+                finished_utc: None,
+                cmdline: "test".into(),
+                operator: String::new(),
+                case_id: String::new(),
+                profile: "standard".into(),
+                selected_modules: vec![],
+            },
+            host: HostInfo {
+                hostname: "WS01".into(),
+                os_build: String::new(),
+                timezone: "UTC".into(),
+                wall_clock_utc_skew: "+0s".into(),
+            },
+            privileges: Privileges {
+                admin: false,
+                se_backup: false,
+                se_debug: false,
+            },
             sources: vec![],
             outputs: vec![],
             counts: Counts::default(),
@@ -49,7 +79,10 @@ mod tests {
         let entries = sink.finalize().unwrap();
 
         assert!(!dir.exists(), "DryRunSink must not create any dir or file");
-        assert!(entries.is_empty(), "DryRunSink finalize must return empty vec");
+        assert!(
+            entries.is_empty(),
+            "DryRunSink finalize must return empty vec"
+        );
     }
 
     #[test]
