@@ -340,6 +340,7 @@ dependencies = [
  "quick-xml",
  "serde_json",
  "sha2",
+ "srum-core",
  "srum-parser",
  "tempfile",
  "thiserror 2.0.18",
