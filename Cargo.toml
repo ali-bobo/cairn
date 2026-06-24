@@ -43,6 +43,8 @@ notatin = { version = "1.0.1", default-features = false } # Offline Windows regi
 compcol = { version = "0.6", default-features = false, features = ["xpress_huffman"] } # Windows MAM / Xpress-Huffman decompression for Prefetch .pf files. 100% safe Rust (forbids unsafe_code crate-wide). Used by cairn-collectors prefetch module.
 zip = { version = "2.4", default-features = false, features = ["deflate"] }  # FR15 archive sink (cairn-report only)
 age = { version = "0.11", default-features = false }                          # FR15 age-X25519 encryption (cairn-report only)
+srum-parser = { version = "0.1.0", default-features = false }  # FR12 srum (cairn-collectors only)
+tempfile    = { version = "3",     default-features = false }   # srum scratchpad temp file (cairn-collectors only)
 
 [profile.release]
 # legitimacy: NO strip, NO panic=abort tricks for "small/low-entropy" binary.

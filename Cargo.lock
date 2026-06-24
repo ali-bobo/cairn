@@ -340,6 +340,9 @@ dependencies = [
  "quick-xml",
  "serde_json",
  "sha2",
+ "srum-core",
+ "srum-parser",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "winreg",
@@ -968,6 +971,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ese-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e295c6ac0a4a2233ee98a520cda35eb91ff98bab752baa6af2d53ec3e78677b1"
+dependencies = [
+ "memmap2",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "evtx"
 version = "0.11.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1092,6 +1106,12 @@ checksum = "2a530c4694a6a8d528794ee9bbd8ba0122e779629ac908d15ad5a7ae7763a33d"
 dependencies = [
  "thiserror 1.0.69",
 ]
+
+[[package]]
+name = "forensicnomicon"
+version = "0.5.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "005a0dacb6ccfb071cbff1ef2ce802abc40e049e125f0b4ab57821c8ca0eac20"
 
 [[package]]
 name = "futures"
@@ -1544,6 +1564,15 @@ name = "memchr"
 version = "2.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88904434abc2901f197fe8cc55f0445e7ded921dba5911dad2e2b39b48e663c4"
+
+[[package]]
+name = "memmap2"
+version = "0.9.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
+dependencies = [
+ "libc",
+]
 
 [[package]]
 name = "memoffset"
@@ -2548,6 +2577,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f99e664ecd2d85a68c87e3c7a3cfe691f647ea9e835de984aba4d54a41f817d4"
 dependencies = [
  "cfg-if",
+]
+
+[[package]]
+name = "srum-core"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6300a5e5a3008eecbd5c8c5e6acf7f01205fb5111f61d9bfc6d2f39d43a67784"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "srum-parser"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e67306d7c3219f6a83c36a0b7195b6f285cdc600399fb97006b7a077b535a089"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "ese-core",
+ "forensicnomicon",
+ "srum-core",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
