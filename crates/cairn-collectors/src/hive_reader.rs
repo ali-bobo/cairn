@@ -305,6 +305,32 @@ fn find_child_dir<'n, R: std::io::Read + std::io::Seek>(
         .map_err(|e| hive_err(format!("to_file for {name} failed: {e}")))
 }
 
+/// pub(crate) wrapper so srum_collector can reuse the same NTFS navigation
+/// without duplicating the find logic. Delegates directly to find_child_dir,
+/// which works for any NTFS entry type (files and directories share the same
+/// index). read_upcase_table MUST already have been called on `ntfs`.
+pub(crate) fn find_child_dir_pub<'n, R: std::io::Read + std::io::Seek>(
+    ntfs: &'n ntfs::Ntfs,
+    reader: &mut R,
+    parent: &ntfs::NtfsFile<'n>,
+    name: &str,
+) -> cairn_core::Result<ntfs::NtfsFile<'n>> {
+    find_child_dir(ntfs, reader, parent, name)
+}
+
+/// pub(crate) wrapper to locate a file (not just a directory) inside a directory.
+/// NTFS index entries carry all file types; find_child_dir walks the $I30 index
+/// which covers both files and subdirectories. read_upcase_table MUST already
+/// have been called on `ntfs`.
+pub(crate) fn find_child_file_pub<'n, R: std::io::Read + std::io::Seek>(
+    ntfs: &'n ntfs::Ntfs,
+    reader: &mut R,
+    parent: &ntfs::NtfsFile<'n>,
+    name: &str,
+) -> cairn_core::Result<ntfs::NtfsFile<'n>> {
+    find_child_dir(ntfs, reader, parent, name)
+}
+
 /// Enumerate the immediate SUBDIRECTORY names of an on-volume directory (e.g. the user
 /// folders under C:\Users). Returns hive_reader-owned Vec<String> — no ntfs type leaks
 /// to callers. This walks the NTFS $I30 directory index, NOT a registry hive (contrast
