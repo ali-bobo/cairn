@@ -308,8 +308,9 @@ fn write_records_jsonl(
 }
 
 /// Write the manifest via the sink, then finalize and log each output entry.
-/// For non-DirSink types, outputs_so_far() is not available; the manifest's
-/// outputs field stays empty (acceptable for S3, which tracks the archive as a whole).
+/// manifest.outputs is left empty for all sink types (S3 design decision):
+/// DirSink records per-file sha256 via finalize() log; zip/age sinks are
+/// self-contained and track integrity at the archive level.
 fn manifest_outputs_then_write(sink: &mut dyn OutputSink, manifest: Manifest) -> anyhow::Result<()> {
     sink.write_manifest(&manifest)?;
     let outputs = sink.finalize()?;
@@ -603,9 +604,27 @@ fn main() -> anyhow::Result<()> {
                     .init();
                 None
             } else {
-                let dir = &args.output;
-                std::fs::create_dir_all(dir)?;
-                let file_appender = tracing_appender::rolling::never(dir, "run.log");
+                // For archive modes (--zip / --encrypt), run.log goes to the archive's
+                // parent directory, NOT to args.output itself.  create_dir_all on a .zip
+                // path would create a directory named "cairn_out.zip", which then
+                // conflicts when ZipSink / AgeSink tries to open that path as a file.
+                let log_dir: std::path::PathBuf = if args.zip || args.encrypt.is_some() {
+                    args.output
+                        .parent()
+                        .map(|p| {
+                            if p == std::path::Path::new("") {
+                                std::path::Path::new(".")
+                            } else {
+                                p
+                            }
+                        })
+                        .unwrap_or(std::path::Path::new("."))
+                        .to_path_buf()
+                } else {
+                    args.output.clone()
+                };
+                std::fs::create_dir_all(&log_dir)?;
+                let file_appender = tracing_appender::rolling::never(&log_dir, "run.log");
                 let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
                 tracing_subscriber::fmt()
                     .with_env_filter(log_filter())
