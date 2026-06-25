@@ -22,16 +22,16 @@
   - userassist（PR #25，main `df29f72`，2026-06-23）
   - governance：NFR9（--max-threads / --full-speed / --profile minimal / below-normal 優先權）、
     NFR10（per-artifact 記憶體上限 + truncation 表面化）
-- **Stage 3 部分完成**（main `9c0f2a4`，2026-06-25）：
+- **Stage 3 完成**（main `5b210b7`，2026-06-25）：
   - srum_collector（PR #27，FR12）✅
   - output_sink（DirSink / ZipSink / AgeSink / DryRunSink，FR15/16/17）✅
-  - details_client（FR18）⏳ **下一段**
+  - details_client（FR18，`2fa6b03`）✅
+  - bodyfile/plaso export（FR20，`5b210b7`）✅
 - **Stage 4**：未動。
-- 測試：**420 pass，7 ignored（elevated e2e）**，零 clippy 警告，schema 零變動。
+- 測試：**434 pass，7 ignored（elevated e2e）**，零 clippy 警告，schema 零變動。
 
-SRS §16 的 S2 gate（admin 跑、非 admin 降級、零 target 寫入、persistence 涵蓋
-WMI/sched/service/Run/IFEO）**全部達標**。S3 gate 部分達標（srum+output_sink；
-待 details_client）。
+SRS §16 的 S3 gate（srum+output_sink+details_client+bodyfile）**全部達標**。
+S4 gate 待 update-rules（FR19）。
 
 ---
 
@@ -58,15 +58,13 @@ NamedTempFile 暫存 → parse → `srum_app` + `srum_net` 兩個 source。420 t
 FR15/16/17：DirSink / ZipSink（zip crate）/ AgeSink（age X25519 非對稱加密）/ DryRunSink。
 `--dry-run` 零寫入測試通過。`--encrypt` 只嵌公鑰，私鑰永不進 binary。symlink 拒寫測試通過。
 
-### 段 5 — details_client（S3，i18n）
+### ~~段 5 — details_client~~（✅ 完成，`2fa6b03`，2026-06-25）
 
-- **SRS**：FR18（每個 medium 以上 Finding 產 `details_client` zh-TW 白話說明）。
-- **產出**：Finding → 客戶可讀的繁中說明欄位 + 渲染。
-- **安全注意**：**禁止把 Finding 內的外部字串（rule 內容、樣本路徑）直接拼接進任何 LLM
-  prompt**（若用 LLM 生說明）——須 XML 標籤隔離 + 去活性化（全域 Prompt Injection 防禦
-  框架）。若改用**模板**（無 LLM）則無此風險，且更可重現——brainstorm 時優先評估模板路線。
-- **已知風險**：低（模板路線）/ 中（LLM 路線，安全審查重）。
-- **估**：1 段。
+FR18：`fill_details_client` 靜態模板分發，`f.artifact` dispatch，zh-TW 白話說明。9 unit tests。
+
+### ~~段 5b — bodyfile/plaso export~~（✅ 完成，`5b210b7`，2026-06-25）
+
+FR20：`cairn-report/src/bodyfile.rs`，`write_bodyfile<W: Write>`，mactime 11 欄格式。`--bodyfile <path>` CLI flag，live run 專用，`--dry-run` 自動跳過。5 unit tests。
 
 ---
 
@@ -107,9 +105,9 @@ FR15/16/17：DirSink / ZipSink（zip crate）/ AgeSink（age X25519 非對稱加
 |---|---|---|
 | S2 正式封頂（段 1+2） | ✅ **已完成** | |
 | S3 srum + output_sink（段 3+4） | ✅ **已完成** | |
-| S3 details_client（段 5） | ⏳ **進行中** | 下一段 |
+| S3 details_client + bodyfile（段 5+5b） | ✅ **已完成** | |
 | S4 全功能（段 6+7） | 未動 | update-rules 安全審查最重 |
-| **剩餘（自用，含 S4）** | **約 3~4 段** | details_client(1) + update-rules(1~2) + bodyfile(1) |
+| **剩餘（自用，含 S4）** | **約 1~2 段** | update-rules(1~2) |
 
 ---
 
