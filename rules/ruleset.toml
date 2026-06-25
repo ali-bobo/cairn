@@ -1,0 +1,17 @@
+# Cairn bundled Sigma rule subset (FR19 / ADR-0003).
+# `cairn update-rules` fetches these from SigmaHQ at the pinned commit.
+# Add paths from https://github.com/SigmaHQ/sigma/tree/main/rules to grow the bundle.
+# All paths are relative to the SigmaHQ `rules/` directory.
+# All listed rules MUST carry an `author:` field (DRL 1.1).
+
+[sigma]
+pin = "98781da19cf60c48ce6e7f2d3ad11c9ba389191a"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_hh_chm_execution.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_msxsl_execution.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_mshta_susp_execution.yml"

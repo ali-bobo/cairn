@@ -9,6 +9,7 @@ members = [
     "crates/cairn-report",
     "crates/cairn-heur",
     "crates/cairn-cli",
+    "crates/cairn-updater",
 ]
 
 [workspace.package]
@@ -45,6 +46,8 @@ zip = { version = "2.4", default-features = false, features = ["deflate"] }  # F
 age = { version = "0.11", default-features = false }                          # FR15 age-X25519 encryption (cairn-report only)
 srum-parser = { version = "0.1.0", default-features = false }  # FR12 srum (cairn-collectors only)
 tempfile    = { version = "3",     default-features = false }   # srum scratchpad temp file (cairn-collectors only)
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls", "rustls-native-certs"] }
+toml    = { version = "0.8",  default-features = false, features = ["parse"] }
 
 [profile.release]
 # legitimacy: NO strip, NO panic=abort tricks for "small/low-entropy" binary.

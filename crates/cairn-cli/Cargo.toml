@@ -24,6 +24,12 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 rayon.workspace = true
 
+cairn-updater = { path = "../cairn-updater", optional = true }
+
+[features]
+default = ["updater"]
+updater = ["dep:cairn-updater"]
+
 # Windows-only: embed PE version/manifest resource (ProductName, FileDescription,
 # version) so the binary self-identifies in file properties + to EDR/SOC (legitimacy,
 # SRS §13). No effect on non-Windows builds.
