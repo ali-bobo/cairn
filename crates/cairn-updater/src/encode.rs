@@ -52,28 +52,46 @@ pub fn write_encoded_rule_to_dir(
     rule_bytes: &[u8],
     rule_path: &str,
 ) -> Result<()> {
+    // Reject absolute paths and any `..` / prefix / root components before joining.
+    // This blocks lexical traversal before we ever touch the filesystem.
+    let rel = Path::new(rule_path);
+    if rel.is_absolute()
+        || rel.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::Prefix(_)
+                    | std::path::Component::RootDir
+            )
+        })
+    {
+        return Err(CairnError::Other(format!(
+            "unsafe rule path (absolute or contains '..'): {rule_path}"
+        )));
+    }
+
     // Canonicalize the rules output directory to prevent symlink traversal.
     let rules_dir = rules_dir
         .canonicalize()
         .map_err(|e| CairnError::Other(format!("canonicalize rules_dir: {e}")))?;
 
-    // Construct the target file path. Use `join()` which is safe against `../` sequences
-    // on most filesystems, but double-check afterward.
-    let target = rules_dir.join(rule_path);
+    let target = rules_dir.join(rel);
 
-    // Verify the target is actually under rules_dir (defense in depth).
-    if !target.starts_with(&rules_dir) {
-        return Err(CairnError::Other(format!(
-            "path traversal attempt: {} is not under {}",
-            target.display(),
-            rules_dir.display()
-        )));
-    }
-
-    // Create parent directories.
+    // Create parent directories, then canonicalize the parent and re-check containment
+    // to catch symlink-based escapes created after our lexical check.
     if let Some(parent) = target.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| CairnError::Other(format!("create parent dirs: {e}")))?;
+        let canon_parent = parent
+            .canonicalize()
+            .map_err(|e| CairnError::Other(format!("canonicalize parent: {e}")))?;
+        if !canon_parent.starts_with(&rules_dir) {
+            return Err(CairnError::Other(format!(
+                "path traversal via symlink: {} escapes {}",
+                canon_parent.display(),
+                rules_dir.display()
+            )));
+        }
     }
 
     // XOR-encode the rule bytes.
@@ -152,12 +170,22 @@ mod tests {
         let dir = std::env::temp_dir().join("cairn_traverse_test");
         std::fs::create_dir_all(&dir).unwrap();
 
+        // `..` components must be rejected before any filesystem access.
         let result = write_encoded_rule_to_dir(&dir, b"test", "../../../etc/passwd");
-        // Should either fail or write within the safe directory.
-        // (Exact behavior depends on the filesystem; on most POSIX systems,
-        // `../` is normalized by `join()`, so this test may pass but with the
-        // file landing in a safe location. The important thing is that the
-        // canonicalize + starts_with check catches actual symlink traversal.)
-        let _ = result;
+        assert!(result.is_err(), "path traversal must be rejected");
+        let msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            msg.contains("unsafe rule path"),
+            "error must mention 'unsafe rule path': {msg}"
+        );
+    }
+
+    #[test]
+    fn path_traversal_absolute_blocked() {
+        let dir = std::env::temp_dir().join("cairn_traverse_abs_test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = write_encoded_rule_to_dir(&dir, b"test", "/etc/passwd");
+        assert!(result.is_err(), "absolute path must be rejected");
     }
 }
