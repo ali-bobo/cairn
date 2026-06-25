@@ -9,6 +9,7 @@ use cairn_core::finding::Finding;
 use cairn_core::manifest::{Counts, HostInfo, Manifest, Privileges, RunInfo, ToolInfo};
 use cairn_core::traits::OutputSink;
 use cairn_core::{Config, OutputKind, Target};
+use cairn_report::client_text;
 use cairn_report::{AgeSink, DirSink, DryRunSink, ZipSink};
 use cairn_sigma::{engine::Engine, SigmaMatcher};
 use clap::{Parser, Subcommand};
@@ -551,6 +552,9 @@ fn main() -> anyhow::Result<()> {
                 .map(|r| r.computer.clone())
                 .unwrap_or_default();
             let mut manifest = build_manifest(&cfg, &hostname, records.len() as u64, &findings);
+            for f in &mut findings {
+                client_text::fill_details_client(f);
+            }
             let mut sink = DirSink::new(dir.clone());
             sink.write_timeline_csv(&findings)?;
             sink.write_findings_jsonl(&findings)?;
@@ -864,6 +868,9 @@ fn main() -> anyhow::Result<()> {
                 governance: governance_report,
             };
 
+            for f in &mut outcome.findings {
+                client_text::fill_details_client(f);
+            }
             let mut sink = build_sink(&cfg.output)?;
             sink.write_timeline_csv(&outcome.findings)?;
             sink.write_findings_jsonl(&outcome.findings)?;
