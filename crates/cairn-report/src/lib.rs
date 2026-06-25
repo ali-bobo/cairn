@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)] // pure formatting + hashing + file I/O; no raw-volume/WinAPI.
 
 pub mod age_sink;
+pub mod bodyfile;
 pub mod client_text;
 pub mod dry_run;
 pub mod zip_sink;
