@@ -1,6 +1,6 @@
 # Cairn — 最後補齊路線圖 (Remaining Work)
 
-> 盤點日期：2026-06-25（更新）。本檔是**待辦索引 + 排序 + 已知風險登記**，不是設計 spec，
+> 盤點日期：2026-06-26（更新）。本檔是**待辦索引 + 排序 + 已知風險登記**，不是設計 spec，
 > 也不是逐步實作計畫。每一段（segment）開工前**仍須各自跑 brainstorming → writing-plans
 > → subagent-driven-development**；本檔只決定「做哪些、什麼順序、各自的已知坑」。
 >
@@ -27,11 +27,13 @@
   - output_sink（DirSink / ZipSink / AgeSink / DryRunSink，FR15/16/17）✅
   - details_client（FR18，`2fa6b03`）✅
   - bodyfile/plaso export（FR20，`5b210b7`）✅
-- **Stage 4**：未動。
-- 測試：**434 pass，7 ignored（elevated e2e）**，零 clippy 警告，schema 零變動。
+- **Stage 4**：update-rules（FR19）✅ **完成**（main `f4bab7e`，2026-06-26）。
+  - cairn-updater crate：config / fetch（SSRF whitelist + DRL 1.1）/ encode（XOR + PROVENANCE）/ run()
+  - CLI `cairn update-rules [--pin <sha>]` 已接線；`cfg(not(feature="updater"))` 路徑有明確 bail
+  - 壞 pin 在觸網前就 error（驗收通過）
+- 測試：**448 pass，7 ignored（elevated e2e），1 ignored（network）**，零 clippy 警告，schema 零變動。
 
-SRS §16 的 S3 gate（srum+output_sink+details_client+bodyfile）**全部達標**。
-S4 gate 待 update-rules（FR19）。
+SRS §16 的 S3 gate 全達標；S4 gate（FR19 update-rules）**已達標**。
 
 ---
 
