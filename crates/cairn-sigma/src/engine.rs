@@ -118,18 +118,30 @@ fn level_to_severity<L: std::fmt::Debug>(level: &Option<L>) -> Severity {
     }
 }
 
+/// Recursively collect decoded rule YAML strings from `dir` and all subdirectories.
+/// Bundled rules are XOR-encoded (`plain=false`); `--rules-plain` passes `true`.
+/// A directory that cannot be read is skipped (graceful degrade, golden rule 8).
+fn collect_rule_yamls(dir: &Path, plain: bool, out: &mut Vec<String>) -> Result<()> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(()),
+    };
+    for entry in rd {
+        let path = entry?.path();
+        if path.is_dir() {
+            collect_rule_yamls(&path, plain, out)?;
+        } else if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
+            let bytes = crate::codec::load_rule_bytes(&path, plain)?;
+            out.push(String::from_utf8_lossy(&bytes).into_owned());
+        }
+    }
+    Ok(())
+}
+
 impl SigmaMatcher for Engine {
     fn load(&mut self, rules_dir: &Path, plain: bool) -> Result<usize> {
         let mut yamls: Vec<String> = Vec::new();
-        for entry in std::fs::read_dir(rules_dir)? {
-            let path = entry?.path();
-            if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
-                // Bundled rules are XOR-encoded (plain=false); --rules-plain passes
-                // plain=true to read un-encoded `.yml`. load_rule_bytes honors both.
-                let bytes = crate::codec::load_rule_bytes(&path, plain)?;
-                yamls.push(String::from_utf8_lossy(&bytes).into_owned());
-            }
-        }
+        collect_rule_yamls(rules_dir, plain, &mut yamls)?;
         let refs: Vec<&str> = yamls.iter().map(String::as_str).collect();
         *self = Engine::from_rules(&refs)?;
         Ok(self.rules.len())
