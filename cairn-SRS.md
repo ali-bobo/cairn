@@ -312,18 +312,23 @@ cairn/
 ```
 
 ## 16. Stage roadmap + acceptance gates
-- S1 EVTX+Sigma+timeline+manifest. Gate: correct hits on EVTX-ATTACK-SAMPLES; throughput ≤2× Hayabusa; manifest verifies.
-- S2 live(proc/net/persist)+heuristics+raw-NTFS+offline hives. Gate: runs admin & degrades non-admin; zero target writes with off-target output; persistence covers WMI subs+sched tasks+services+Run+IFEO.
-- S3 archive+encryption+dry-run+client-text+footprint-min. Gate: `verify` passes; dry-run writes nothing; client text reviewed for no-overstatement.
-- S4 update-rules+tuning+bodyfile/plaso+velociraptor-packaging. Gate: rule refresh reproducible; plaso ingest works.
-- Legitimacy work (sign/README/WDSI/runbook) completed BEFORE first real client use, regardless of stage.
+
+> **Status as of 2026-06-26 (commit `1717a19`):** S1–S4 all complete. 448 tests pass.
+
+- **S1** ✅ EVTX+Sigma+timeline+manifest. Gate: correct hits on EVTX-ATTACK-SAMPLES; throughput ≤2× Hayabusa; manifest verifies.
+- **S2** ✅ live(proc/net/persist)+heuristics+raw-NTFS+offline hives. Collectors: proc / net / persist / $MFT / $J / shimcache / amcache / amcache_driver / prefetch / bam / userassist / srum; governance NFR9/10. Gate: runs admin & degrades non-admin; zero target writes with off-target output; persistence covers WMI subs+sched tasks+services+Run+IFEO.
+- **S3** ✅ archive+encryption+dry-run+client-text+bodyfile. DirSink / ZipSink / AgeSink / DryRunSink; `details_client` zh-TW; `--bodyfile` mactime export. Gate: `verify` passes; dry-run writes nothing; client text reviewed for no-overstatement.
+- **S4** ✅ update-rules (FR19). `cairn-updater` crate: SSRF whitelist + DRL 1.1 + XOR encode + PROVENANCE. Gate: rule refresh reproducible; `cairn update-rules --pin <bad>` errors before network; real-network fetch test passes.
+- **Remaining / optional:** Velociraptor collector packaging; `--collect-raw` full artifact bundle; heuristic calibration (D7); binary_path normalization (D6).
+- **Legitimacy work** (sign/WDSI/runbook) required BEFORE first real client use, regardless of stage. Currently skipped for self-use (decided 2026-06-22).
 
 ## 17. Open decisions (log)
 - D1 Sigma engine choice — **RESOLVED (ADR-0001, Accepted): `sigma-rust` 0.7.** Native
   Sigma 2.0, exposes author/id/level/tags (DRL 1.1 reachable). tau-engine kept as the
   behind-the-trait fallback. Parity covered by the T8 harness (docs/perf-harness.md).
-- D2 ESE/SRUM crate maturity — may slip to S3/cut. (still open; S3 concern)
-- D3 raw-NTFS vs VSS default — default raw, VSS flag. (S2+ concern; no S1 code yet)
+- D2 ESE/SRUM crate maturity — **RESOLVED (S3, Accepted): `srum-parser 0.1.0` (MIT, pure Rust) + `tempfile`.**
+  VolumeReader reads SRUDB.dat raw → NamedTempFile → srum-parser → `srum_app` + `srum_net` records. Shipped in PR #27.
+- D3 raw-NTFS vs VSS default — **RESOLVED: default raw (`\\.\C:` via VolumeReader), `--use-vss` flag defined but not yet implemented.** (VSS implementation remains optional backlog.)
 - D4 rule-encoding on disk (XOR) vs plain — **RESOLVED (ADR-0002, Accepted): encode.**
   Public XOR key (codec.rs), decoded-as-data-never-executed, `--rules-plain` SOC bypass.
   Ruleset integrity is separately proven by the ADR-0003 aggregate hash, recorded in the
