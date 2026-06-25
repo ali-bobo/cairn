@@ -19,9 +19,9 @@ pub fn write_bodyfile<W: Write>(records: &[Record], mut w: W) -> Result<()> {
 }
 
 fn write_filemeta_line<W: Write>(fm: &FileMetaRecord, w: &mut W) -> Result<()> {
-    let atime  = ts_unix(fm.si_mtime);
-    let mtime  = ts_unix(fm.si_mtime);
-    let ctime  = ts_unix(fm.fn_mtime);
+    let atime = ts_unix(fm.si_mtime);
+    let mtime = ts_unix(fm.si_mtime);
+    let ctime = ts_unix(fm.fn_mtime);
     let crtime = ts_unix(fm.si_btime);
     writeln!(
         w,
@@ -50,7 +50,13 @@ mod tests {
         Utc.timestamp_opt(secs, 0).unwrap()
     }
 
-    fn filemeta(path: &str, size: u64, si_mtime: Option<i64>, fn_mtime: Option<i64>, si_btime: Option<i64>) -> Record {
+    fn filemeta(
+        path: &str,
+        size: u64,
+        si_mtime: Option<i64>,
+        fn_mtime: Option<i64>,
+        si_btime: Option<i64>,
+    ) -> Record {
         Record::FileMeta(FileMetaRecord {
             path: path.to_string(),
             size,
@@ -95,14 +101,19 @@ mod tests {
         )]);
         assert_eq!(lines.len(), 1, "expected exactly 1 line");
         let fields: Vec<&str> = lines[0].split('|').collect();
-        assert_eq!(fields.len(), 11, "bodyfile must have 11 fields: {}", lines[0]);
-        assert_eq!(fields[0], "0",              "MD5 must be 0");
+        assert_eq!(
+            fields.len(),
+            11,
+            "bodyfile must have 11 fields: {}",
+            lines[0]
+        );
+        assert_eq!(fields[0], "0", "MD5 must be 0");
         assert_eq!(fields[1], "C:\\foo\\bar.exe", "name field");
-        assert_eq!(fields[6], "4096",           "size field");
-        assert_eq!(fields[7], "1000000",        "atime = si_mtime");
-        assert_eq!(fields[8], "1000000",        "mtime = si_mtime");
-        assert_eq!(fields[9], "900000",         "ctime = fn_mtime");
-        assert_eq!(fields[10], "800000",        "crtime = si_btime");
+        assert_eq!(fields[6], "4096", "size field");
+        assert_eq!(fields[7], "1000000", "atime = si_mtime");
+        assert_eq!(fields[8], "1000000", "mtime = si_mtime");
+        assert_eq!(fields[9], "900000", "ctime = fn_mtime");
+        assert_eq!(fields[10], "800000", "crtime = si_btime");
     }
 
     #[test]
@@ -112,11 +123,11 @@ mod tests {
         let fields: Vec<&str> = lines[0].split('|').collect();
         assert_eq!(fields.len(), 11);
         assert_eq!(fields[1], "C:\\Windows\\temp.tmp");
-        assert_eq!(fields[6], "0",       "size = 0 for USN");
-        assert_eq!(fields[7], "0",       "atime = 0 for USN");
+        assert_eq!(fields[6], "0", "size = 0 for USN");
+        assert_eq!(fields[7], "0", "atime = 0 for USN");
         assert_eq!(fields[8], "1234567", "mtime = ts.timestamp()");
-        assert_eq!(fields[9], "0",       "ctime = 0 for USN");
-        assert_eq!(fields[10], "0",      "crtime = 0 for USN");
+        assert_eq!(fields[9], "0", "ctime = 0 for USN");
+        assert_eq!(fields[10], "0", "crtime = 0 for USN");
     }
 
     #[test]
@@ -133,7 +144,10 @@ mod tests {
             record_id: 1,
         })];
         let lines = bodyfile_lines(&records);
-        assert!(lines.is_empty(), "Event records must produce zero bodyfile lines");
+        assert!(
+            lines.is_empty(),
+            "Event records must produce zero bodyfile lines"
+        );
     }
 
     #[test]

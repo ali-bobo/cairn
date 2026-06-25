@@ -22,8 +22,7 @@ pub struct RuleEntry {
 pub fn load(toml_path: &Path) -> Result<RulesetConfig> {
     let text = std::fs::read_to_string(toml_path)
         .map_err(|e| CairnError::Other(format!("ruleset.toml read: {e}")))?;
-    toml::from_str(&text)
-        .map_err(|e| CairnError::Other(format!("ruleset.toml parse: {e}")))
+    toml::from_str(&text).map_err(|e| CairnError::Other(format!("ruleset.toml parse: {e}")))
 }
 
 #[cfg(test)]
@@ -40,7 +39,9 @@ mod tests {
     fn parse_ruleset_toml() {
         let dir = std::env::temp_dir().join("cairn_config_test");
         std::fs::create_dir_all(&dir).unwrap();
-        let p = write_toml(&dir, r#"
+        let p = write_toml(
+            &dir,
+            r#"
 [sigma]
 pin = "98781da19cf60c48ce6e7f2d3ad11c9ba389191a"
 
@@ -49,7 +50,8 @@ path = "windows/process_creation/rule_a.yml"
 
 [[rules]]
 path = "windows/process_creation/rule_b.yml"
-"#);
+"#,
+        );
         let cfg = load(&p).unwrap();
         assert_eq!(cfg.sigma.pin, "98781da19cf60c48ce6e7f2d3ad11c9ba389191a");
         assert_eq!(cfg.rules.len(), 2);
