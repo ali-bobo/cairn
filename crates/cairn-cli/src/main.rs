@@ -9,6 +9,7 @@ use cairn_core::finding::Finding;
 use cairn_core::manifest::{Counts, HostInfo, Manifest, Privileges, RunInfo, ToolInfo};
 use cairn_core::traits::OutputSink;
 use cairn_core::{Config, OutputKind, Target};
+use cairn_report::bodyfile;
 use cairn_report::client_text;
 use cairn_report::{AgeSink, DirSink, DryRunSink, ZipSink};
 use cairn_sigma::{engine::Engine, SigmaMatcher};
@@ -109,6 +110,9 @@ struct RunArgs {
     case_id: Option<String>,
     #[arg(long)]
     operator: Option<String>,
+    /// Write mactime bodyfile to PATH (FR20). Skipped with --dry-run.
+    #[arg(long)]
+    bodyfile: Option<PathBuf>,
     #[arg(long)]
     use_vss: bool,
     /// Hard cap on $MFT records the mft collector scans (NFR10). Default 1,000,000.
@@ -878,6 +882,14 @@ fn main() -> anyhow::Result<()> {
                 write_records_jsonl(d, &outcome.records)?;
             }
             manifest_outputs_then_write(&mut *sink, manifest)?;
+            if !dry_run {
+                if let Some(bf_path) = &args.bodyfile {
+                    let bf = std::fs::File::create(bf_path)
+                        .map_err(|e| anyhow::anyhow!("bodyfile create: {e}"))?;
+                    bodyfile::write_bodyfile(&outcome.records, bf)?;
+                    tracing::info!(path = %bf_path.display(), "bodyfile written");
+                }
+            }
             if dry_run {
                 println!(
                     "dry-run: {} records, {} findings — no files written (would have gone to {})",
