@@ -1,7 +1,7 @@
 //! heur_netconn (FR11, SRS §10): bare public-IP remote, rare remote port, owning-proc
 //! in temp, unsigned owner, suspicious high-port listener. Pure scoring + Analyzer impl.
 use crate::score::{is_public_ipv4, is_rare_port, is_suspicious_path, severity_for, Score};
-use cairn_core::finding::EntityNetConn;
+use cairn_core::finding::{EntityNetConn, EntityProcess};
 use cairn_core::record::{NetConnRecord, ProcessRecord, Record};
 use cairn_core::traits::Analyzer;
 use cairn_core::{Entity, Finding, FindingSource, Result};
@@ -127,6 +127,14 @@ impl Analyzer for NetConnHeuristic {
                     raddr: c.raddr.clone(),
                     rport: c.rport,
                     pid: c.pid,
+                }),
+                process: owner.map(|o| EntityProcess {
+                    pid: o.pid,
+                    ppid: o.ppid,
+                    image: o.image.clone(),
+                    cmdline: o.cmdline.clone(),
+                    signed: o.signed,
+                    integrity: o.integrity.clone(),
                 }),
                 ..Entity::default()
             };
@@ -409,6 +417,43 @@ mod tests {
         assert!(
             findings.is_empty(),
             "own PID connections must never produce findings"
+        );
+    }
+
+    #[test]
+    fn entity_process_populated_when_owner_known() {
+        let bad = Record::NetConn(NetConnRecord {
+            proto: "tcp".into(),
+            laddr: "192.168.0.1".into(),
+            lport: 50000,
+            raddr: Some("104.18.0.1".into()),
+            rport: Some(4444),
+            state: Some("established".into()),
+            pid: Some(42),
+        });
+        let proc_rec = Record::Process(ProcessRecord {
+            pid: 42,
+            ppid: 4,
+            image: r"C:\Users\x\AppData\Local\Temp\beacon.exe".into(),
+            cmdline: String::new(),
+            signed: Some(false),
+            signer: None,
+            binary_sha256: None,
+            integrity: None,
+            user: None,
+            start_time: None,
+        });
+        let findings = NetConnHeuristic.analyze(&[bad, proc_rec]).expect("analyze");
+        assert!(!findings.is_empty(), "must produce a finding");
+        let f = &findings[0];
+        assert!(
+            f.entity.process.is_some(),
+            "entity.process must be populated when owner is known"
+        );
+        assert_eq!(
+            f.entity.process.as_ref().unwrap().pid,
+            42,
+            "entity.process.pid must match owner"
         );
     }
 
