@@ -118,6 +118,55 @@ fn normalize_winlogon_command(command: &str) -> String {
     s
 }
 
+/// Collapses Windows env-var / path-root prefixes to a canonical `<win>\` prefix
+/// (case-insensitive), so the inbox-pattern check only needs one code path.
+fn normalise_service_cmd(cmd: &str) -> String {
+    let lower = cmd.trim().to_ascii_lowercase();
+    for prefix in [r"%systemroot%\", r"%windir%\"] {
+        if let Some(rest) = lower.strip_prefix(prefix) {
+            return format!(r"<win>\{rest}");
+        }
+    }
+    if let Some(rest) = lower.strip_prefix(r"\systemroot\") {
+        return format!(r"<win>\{rest}");
+    }
+    // Drive-letter form: exactly one letter + ":\windows\" (11 chars total)
+    if lower.len() > 11 {
+        let (head, rest) = lower.split_at(11);
+        let chars: Vec<char> = head.chars().collect();
+        if chars[0].is_ascii_alphabetic()
+            && chars[1] == ':'
+            && &head[2..] == r"\windows\"
+        {
+            return format!(r"<win>\{rest}");
+        }
+    }
+    lower
+}
+
+/// Returns `true` when `cmd` is a Windows inbox service binary (System32 / SysWOW64),
+/// excluding DriverStore paths (OEM drivers are not suppressed).
+pub fn is_inbox_service_command(cmd: &str) -> bool {
+    if cmd.trim().is_empty() {
+        return false;
+    }
+    let norm = normalise_service_cmd(cmd);
+    // DriverStore OEM drivers are NOT suppressed even if under System32
+    if norm.contains(r"\driverstore\") {
+        return false;
+    }
+    // Absolute canonical form
+    if norm.starts_with(r"<win>\system32\") || norm.starts_with(r"<win>\syswow64\") {
+        return true;
+    }
+    // Relative bare form (may have a leading quote from registry ImagePath)
+    let stripped = norm.strip_prefix('"').unwrap_or(&norm);
+    if stripped.starts_with(r"system32\") || stripped.starts_with(r"syswow64\") {
+        return true;
+    }
+    false
+}
+
 /// Accumulates weighted signals + human-readable reasons + ATT&CK tags for one finding.
 #[derive(Debug, Default)]
 pub struct Score {
@@ -270,5 +319,84 @@ mod tests {
         assert!(!winlogon_value_is_default("Shell", "userinit.exe"));
         // unknown value name
         assert!(!winlogon_value_is_default("Notify", "explorer.exe"));
+    }
+
+    #[test]
+    fn inbox_svchost_pct_systemroot_suppressed() {
+        assert!(is_inbox_service_command(
+            r"%SystemRoot%\system32\svchost.exe -k DcomLaunch -p"
+        ));
+    }
+
+    #[test]
+    fn inbox_svchost_pct_windir_suppressed() {
+        assert!(is_inbox_service_command(
+            r"%windir%\system32\svchost.exe -k netsvcs"
+        ));
+    }
+
+    #[test]
+    fn inbox_backslash_systemroot_suppressed() {
+        assert!(is_inbox_service_command(
+            r"\SystemRoot\system32\lsass.exe"
+        ));
+    }
+
+    #[test]
+    fn inbox_absolute_cwindows_suppressed() {
+        assert!(is_inbox_service_command(
+            r"C:\Windows\system32\SearchIndexer.exe /Embedding"
+        ));
+    }
+
+    #[test]
+    fn inbox_relative_system32_suppressed() {
+        assert!(is_inbox_service_command(r"System32\drivers\tcpip.sys"));
+    }
+
+    #[test]
+    fn inbox_relative_syswow64_suppressed() {
+        assert!(is_inbox_service_command(r"SysWOW64\some32bitbin.exe"));
+    }
+
+    #[test]
+    fn inbox_case_insensitive() {
+        assert!(is_inbox_service_command(r"SYSTEM32\DRIVERS\WDF01000.SYS"));
+        assert!(is_inbox_service_command(
+            r"%SYSTEMROOT%\SYSTEM32\SVCHOST.EXE -k LocalService"
+        ));
+    }
+
+    #[test]
+    fn driverstore_not_suppressed_abs() {
+        assert!(!is_inbox_service_command(
+            r"%SystemRoot%\System32\DriverStore\FileRepository\asusptpfilter.inf_amd64_e109\AsusPTPService.exe"
+        ));
+    }
+
+    #[test]
+    fn driverstore_not_suppressed_rel() {
+        assert!(!is_inbox_service_command(
+            r"System32\DriverStore\FileRepository\genpass.inf_amd64_0c82d80c\genpass.sys"
+        ));
+    }
+
+    #[test]
+    fn program_files_not_suppressed() {
+        assert!(!is_inbox_service_command(
+            r#""C:\Program Files\Trend Micro\AMSP\coreServiceShell.exe""#
+        ));
+    }
+
+    #[test]
+    fn windowsapps_not_suppressed() {
+        assert!(!is_inbox_service_command(
+            r#""C:\Program Files\WindowsApps\Claude_1.15\app\resources\cowork-svc.exe""#
+        ));
+    }
+
+    #[test]
+    fn empty_command_not_suppressed() {
+        assert!(!is_inbox_service_command(""));
     }
 }
