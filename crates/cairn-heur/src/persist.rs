@@ -2,7 +2,8 @@
 //! suspicious binary path + recent LastWrite. Emits a Finding per record that clears the
 //! noise floor (weight >= 15). See score.rs for severity thresholds.
 use crate::score::{
-    is_suspicious_path, is_trusted_appdata_location, severity_for, winlogon_value_is_default, Score,
+    is_inbox_service_command, is_suspicious_path, is_trusted_appdata_location, severity_for,
+    winlogon_value_is_default, Score,
 };
 use cairn_core::finding::{EntityFile, EntityRegistry};
 use cairn_core::record::{PersistenceRecord, Record};
@@ -25,7 +26,17 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
             &["T1546.012"],
         ),
         "winlogon" => s.add(35, "Winlogon Shell/Userinit persistence", &["T1547.004"]),
-        "service" => s.add(20, "service autostart persistence", &["T1543.003"]),
+        "service" => {
+            let cmd = p.command.as_deref().unwrap_or("");
+            let recently_modified = p.last_write.map(|lw| {
+                let age = now.signed_duration_since(lw);
+                age >= Duration::zero() && age <= Duration::days(RECENT_DAYS)
+            }).unwrap_or(false);
+            if is_inbox_service_command(cmd) && !recently_modified {
+                return Score::default();
+            }
+            s.add(20, "service autostart persistence", &["T1543.003"]);
+        }
         "scheduled_task" => s.add(20, "scheduled task persistence", &["T1053.005"]),
         "run_key" => s.add(10, "Run/RunOnce key persistence", &["T1547.001"]),
         "startup" => s.add(10, "Startup folder persistence", &["T1547.001"]),
@@ -629,6 +640,86 @@ mod tests {
         assert_eq!(f.artifact, "persistence");
         assert!(f.entity.registry.is_some(), "ifeo is registry-backed");
         assert!(f.mitre.contains(&"T1546.012".to_string()));
+    }
+
+    // --- R1b: inbox-service suppress gate ---
+
+    fn svc(command: &str, last_write: Option<DateTime<Utc>>) -> PersistenceRecord {
+        PersistenceRecord {
+            mechanism: "service".into(),
+            location: r"HKLM\SYSTEM\CurrentControlSet\Services\TestSvc".into(),
+            value: Some("TestSvc".into()),
+            command: Some(command.into()),
+            binary_path: None,
+            binary_sha256: None,
+            signed: None,
+            signer: None,
+            last_write,
+        }
+    }
+
+    #[test]
+    fn old_inbox_svchost_suppressed() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::days(400);
+        let p = svc(r"%SystemRoot%\system32\svchost.exe -k DcomLaunch -p", Some(old));
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 0, "inbox svchost must be suppressed, weight={}", s.weight);
+        assert!(s.reasons.is_empty());
+    }
+
+    #[test]
+    fn old_inbox_driver_suppressed() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::days(30);
+        let p = svc(r"System32\drivers\tcpip.sys", Some(old));
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 0, "inbox driver must be suppressed");
+    }
+
+    #[test]
+    fn recent_inbox_svchost_not_suppressed() {
+        let now = chrono::Utc::now();
+        let recent = now - chrono::Duration::days(3);
+        let p = svc(
+            r"%SystemRoot%\system32\svchost.exe -k ClipboardSvcGroup -p",
+            Some(recent),
+        );
+        let s = score_persistence(&p, now);
+        assert!(s.weight >= 15, "recent inbox svchost must NOT be suppressed, weight={}", s.weight);
+        assert!(s.reasons.iter().any(|r| r.contains("service autostart")));
+    }
+
+    #[test]
+    fn driverstore_oem_not_suppressed() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::days(400);
+        let p = svc(
+            r"%SystemRoot%\System32\DriverStore\FileRepository\asusatp.inf_amd64\AsusATP.exe",
+            Some(old),
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 20, "DriverStore must not be suppressed, weight={}", s.weight);
+    }
+
+    #[test]
+    fn program_files_service_not_suppressed() {
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::days(400);
+        let p = svc(
+            r#""C:\Program Files\WindowsApps\Claude_1.15\app\resources\cowork-svc.exe""#,
+            Some(old),
+        );
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 20, "non-inbox service must score normally, weight={}", s.weight);
+    }
+
+    #[test]
+    fn no_last_write_treated_as_not_recent() {
+        let now = chrono::Utc::now();
+        let p = svc(r"%SystemRoot%\system32\sppsvc.exe", None);
+        let s = score_persistence(&p, now);
+        assert_eq!(s.weight, 0, "inbox with no last_write must suppress");
     }
 
     /// A startup (file) mechanism populates entity.file, not entity.registry.
