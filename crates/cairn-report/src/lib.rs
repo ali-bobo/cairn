@@ -52,28 +52,48 @@ pub const TIMELINE_COLS: &[&str] = &[
     "DetailsClient",
 ];
 
-/// Compact one-line summary of the entity implicated in a Finding, for the Entity
-/// column of timeline.csv. Precedence: process > registry > netconn > file > "".
+/// Human-readable entity description for the Entity column of timeline.csv.
+/// Goal: analyst can understand WHAT is involved without opening findings.jsonl.
+/// Precedence: process > registry > netconn > file > "".
 fn entity_summary(f: &Finding) -> String {
     if let Some(p) = &f.entity.process {
+        // e.g. "beacon.exe (pid=1234) 父行程=explorer.exe [未簽章]"
         let name = p.image.rsplit(['\\', '/']).next().unwrap_or(&p.image);
-        return format!("pid={} image={}", p.pid, name);
+        let signed = match p.signed {
+            Some(true) => " [已簽章]",
+            Some(false) => " [未簽章]",
+            None => "",
+        };
+        let mut s = format!("{} (pid={}){}", name, p.pid, signed);
+        if !p.cmdline.is_empty() {
+            s.push_str(&format!(" cmd={}", &p.cmdline[..p.cmdline.len().min(60)]));
+        }
+        return s;
     }
     if let Some(r) = &f.entity.registry {
+        // e.g. "服務 CoworkVMService → C:\Program Files\...\cowork-svc.exe"
         let key_name = r.key.rsplit('\\').next().unwrap_or(&r.key);
         let bin = r.data.trim_matches('"');
-        let bin_name = bin.rsplit(['\\', '/']).next().unwrap_or(bin);
-        return format!("svc={} bin={}", key_name, bin_name);
+        return format!("服務 {} → {}", key_name, bin);
     }
     if let Some(c) = &f.entity.netconn {
+        // e.g. "chrome.exe (pid=3040) → 142.251.8.188:5228"
+        let proc_part = f
+            .entity
+            .process
+            .as_ref()
+            .map(|p| {
+                let name = p.image.rsplit(['\\', '/']).next().unwrap_or(&p.image);
+                format!("{} (pid={})", name, p.pid)
+            })
+            .or_else(|| c.pid.map(|pid| format!("pid={}", pid)))
+            .unwrap_or_else(|| "未知程式".into());
         let raddr = c.raddr.as_deref().unwrap_or("-");
         let rport = c.rport.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-        let pid = c.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
-        return format!("pid={} {}:{}", pid, raddr, rport);
+        return format!("{} → {}:{}", proc_part, raddr, rport);
     }
     if let Some(fi) = &f.entity.file {
-        let name = fi.path.rsplit(['\\', '/']).next().unwrap_or(&fi.path);
-        return name.to_owned();
+        return fi.path.clone();
     }
     String::new()
 }
@@ -121,6 +141,11 @@ pub fn timeline_csv(findings: &[Finding]) -> String {
     rows.sort_by(|a, b| (&a[0], &a[5]).cmp(&(&b[0], &b[5])));
     rows.dedup(); // identical adjacent detections collapse (rows are sorted)
 
+    // UTF-8 BOM (\xEF\xBB\xBF): Excel on Windows auto-detects UTF-8 only when
+    // the BOM is present; without it Excel uses the system ANSI codepage (cp950
+    // on Traditional Chinese Windows), which corrupts all non-ASCII text.
+    let bom = "\u{FEFF}";
+
     let mut wtr = csv::Writer::from_writer(Vec::new());
     let via_csv = wtr
         .write_record(TIMELINE_COLS)
@@ -132,9 +157,10 @@ pub fn timeline_csv(findings: &[Finding]) -> String {
         })
         .ok()
         .and_then(|()| wtr.into_inner().ok())
-        .and_then(|bytes| String::from_utf8(bytes).ok());
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|s| format!("{}{}", bom, s));
 
-    via_csv.unwrap_or_else(|| manual_csv(&rows))
+    via_csv.unwrap_or_else(|| format!("{}{}", bom, manual_csv(&rows)))
 }
 
 /// RFC-4180 fallback used only if the `csv` writer ever errs (it shouldn't for our
@@ -403,7 +429,9 @@ mod tests {
     fn timeline_csv_has_header_and_projects_finding() {
         let csv = timeline_csv(&[finding(1_700_000_000, "Susp PS", 42)]);
         let mut lines = csv.lines();
-        assert_eq!(lines.next().unwrap(), TIMELINE_COLS.join(","));
+        // First line has UTF-8 BOM prefix for Excel compatibility — strip it before comparing.
+        let header = lines.next().unwrap().trim_start_matches('\u{FEFF}');
+        assert_eq!(header, TIMELINE_COLS.join(","));
 
         let row = lines.next().unwrap();
         assert!(row.contains("WS01"), "host: {row}");
