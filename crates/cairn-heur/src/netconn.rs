@@ -87,9 +87,13 @@ impl Analyzer for NetConnHeuristic {
             })
             .collect();
 
+        let own_pid = std::process::id();
         let mut out = Vec::new();
         for r in records {
             let Record::NetConn(c) = r else { continue };
+            if c.pid == Some(own_pid) {
+                continue; // never flag own network connections
+            }
             let owner = c.pid.and_then(|pid| by_pid.get(&pid).copied());
             let score = score_conn(c, owner);
             let Some(severity) = severity_for(score.weight) else {
@@ -387,6 +391,43 @@ mod tests {
 
     use cairn_core::record::Record;
     use cairn_core::traits::Analyzer;
+
+    /// Own PID connections must never produce findings.
+    #[test]
+    fn own_pid_netconn_not_flagged() {
+        use std::process;
+        let own_pid = process::id();
+        let bad_conn = Record::NetConn(conn(
+            "tcp",
+            65146,
+            Some("104.18.38.233"),
+            Some(80),
+            Some("established"),
+            Some(own_pid),
+        ));
+        let findings = NetConnHeuristic.analyze(&[bad_conn]).expect("analyze");
+        assert!(
+            findings.is_empty(),
+            "own PID connections must never produce findings"
+        );
+    }
+
+    /// A different PID on a suspicious connection must still fire.
+    #[test]
+    fn other_pid_netconn_still_flagged() {
+        use std::process;
+        let own_pid = process::id();
+        let bad_conn = Record::NetConn(conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(own_pid + 9999),
+        ));
+        let findings = NetConnHeuristic.analyze(&[bad_conn]).expect("analyze");
+        assert!(!findings.is_empty(), "other PID must still produce findings");
+    }
 
     /// The analyzer emits one Heuristic NetConn finding for the malicious conn, with
     /// reason + netconn entity, and nothing for loopback.

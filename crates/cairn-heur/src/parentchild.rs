@@ -160,9 +160,13 @@ impl Analyzer for ParentChildHeuristic {
             })
             .collect();
 
+        let own_pid = std::process::id();
         let mut out = Vec::new();
         for r in records {
             let Record::Process(p) = r else { continue };
+            if p.pid == own_pid {
+                continue; // never flag the forensic tool itself
+            }
             let parent = by_pid.get(&p.ppid).copied();
             let score = score_process(p, parent);
             let Some(severity) = severity_for(score.weight) else {
@@ -360,6 +364,36 @@ mod tests {
 
     fn rec(p: ProcessRecord) -> Record {
         Record::Process(p)
+    }
+
+    /// Own PID must never produce a finding even when the image path is suspicious.
+    #[test]
+    fn own_process_not_flagged() {
+        use std::process;
+        let own_pid = process::id();
+        let own = Record::Process(proc(
+            own_pid,
+            4,
+            r"C:\Users\x\AppData\Local\cairn-target\release\cairn.exe",
+            "",
+        ));
+        let findings = ParentChildHeuristic.analyze(&[own]).expect("analyze");
+        assert!(findings.is_empty(), "own PID must never produce a finding");
+    }
+
+    /// A different PID at the same suspicious path must still fire.
+    #[test]
+    fn other_pid_suspicious_path_still_flagged() {
+        use std::process;
+        let own_pid = process::id();
+        let other = Record::Process(proc(
+            own_pid + 9999,
+            4,
+            r"C:\Users\x\AppData\Local\cairn-target\release\cairn.exe",
+            "",
+        ));
+        let findings = ParentChildHeuristic.analyze(&[other]).expect("analyze");
+        assert!(!findings.is_empty(), "other PID at same path must still fire");
     }
 
     /// The analyzer emits one Heuristic finding (with reason + entity) for a malicious
