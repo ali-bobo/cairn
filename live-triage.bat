@@ -1,11 +1,14 @@
 @echo off
-net session >nul 2>&1
+cd /d "%~dp0"
+
+:: Check for Administrator privileges using fltMC (reliable on all Windows editions)
+fltMC >nul 2>&1
 if %errorlevel% neq 0 (
-    echo [ERROR] Please run as Administrator (right-click, Run as administrator)
+    echo [ERROR] Please run as Administrator ^(right-click, Run as administrator^)
     pause
     exit /b 1
 )
-cd /d "%~dp0"
+
 set RULES=%~dp0rules\sigma
 set DATESTAMP=%date:~0,4%%date:~5,2%%date:~8,2%
 set OUTPUT=%~dp0out\live-%DATESTAMP%
