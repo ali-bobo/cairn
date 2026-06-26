@@ -799,6 +799,7 @@ fn main() -> anyhow::Result<()> {
                 Box::new(cairn_heur::TimestompHeuristic::new(
                     chrono::Duration::hours(cfg.timestomp_threshold_hours),
                 )),
+                Box::new(cairn_heur::CorrelationAnalyzer),
             ];
             let mut outcome = run_live(&cfg, privileges, hostname, &collectors, &analyzers);
             // Stamp the host onto each finding (analyzers don't know the hostname), then
@@ -1157,9 +1158,9 @@ mod tests {
         assert!(line.contains("output="), "{line}");
     }
 
-    /// The live analyzer set includes the timestomp heuristic (S2-N' wiring).
+    /// The live analyzer set includes all heuristics (timestomp + correlation).
     #[test]
-    fn live_analyzers_include_timestomp() {
+    fn live_analyzers_include_all_heuristics() {
         use cairn_core::traits::Analyzer;
         let threshold = chrono::Duration::hours(24);
         let analyzers: Vec<Box<dyn Analyzer>> = vec![
@@ -1167,8 +1168,16 @@ mod tests {
             Box::new(cairn_heur::NetConnHeuristic),
             Box::new(cairn_heur::PersistHeuristic),
             Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
+            Box::new(cairn_heur::CorrelationAnalyzer),
         ];
-        assert!(analyzers.iter().any(|a| a.name() == "heur_timestomp"));
+        assert!(
+            analyzers.iter().any(|a| a.name() == "heur_timestomp"),
+            "heur_timestomp must be in analyzer set"
+        );
+        assert!(
+            analyzers.iter().any(|a| a.name() == "heur_correlation"),
+            "heur_correlation must be in analyzer set"
+        );
     }
 
     #[test]
