@@ -177,10 +177,12 @@ impl Analyzer for ParentChildHeuristic {
             f.reason = Some(score.reasons.join("; "));
             f.mitre = score.mitre;
             f.artifact = "process".into();
-            f.details = format!(
-                "pid={} ppid={} image={} cmdline={}",
-                p.pid, p.ppid, p.image, p.cmdline
-            );
+            let p_name = p.image.rsplit(['\\', '/']).next().unwrap_or(&p.image);
+            f.details = if p.cmdline.is_empty() {
+                format!("{} (pid={}, parent={})", p_name, p.pid, p.ppid)
+            } else {
+                format!("{} (pid={}, parent={}, cmd={})", p_name, p.pid, p.ppid, p.cmdline)
+            };
             f.ts = p.start_time.unwrap_or_else(chrono::Utc::now);
             f.entity = Entity {
                 process: Some(EntityProcess {
@@ -394,6 +396,47 @@ mod tests {
         ));
         let findings = ParentChildHeuristic.analyze(&[other]).expect("analyze");
         assert!(!findings.is_empty(), "other PID at same path must still fire");
+    }
+
+    // --- R6: human-readable details field ---
+
+    /// details should contain process name + pid, NOT raw "image=" key-value debug format.
+    #[test]
+    fn process_details_format() {
+        // Use Office-spawns-PowerShell to guarantee a finding above the noise floor.
+        let parent = rec(proc(100, 4, r"C:\Program Files\Microsoft Office\winword.exe", ""));
+        let child = rec(proc(
+            200,
+            100,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA",
+        ));
+        let findings = ParentChildHeuristic.analyze(&[parent, child]).expect("analyze");
+        assert!(!findings.is_empty(), "should produce at least one finding");
+        let details = &findings[0].details;
+        // Must contain the process name (last segment of image path).
+        assert!(details.contains("powershell.exe"), "process name missing: {details}");
+        // Must contain the PID.
+        assert!(details.contains("200") || details.contains("pid="), "pid missing: {details}");
+        // Must NOT use raw debug "image=" or "ppid=" key-value format.
+        assert!(!details.contains("image="), "must not use debug key=value format: {details}");
+    }
+
+    /// When cmdline is empty, details omit the cmd= field.
+    #[test]
+    fn process_details_no_cmdline_when_empty() {
+        // A suspicious-path process with no cmdline still produces a finding.
+        let p = rec(proc(
+            400,
+            4,
+            r"C:\Users\a\AppData\Local\Temp\evil.exe",
+            "", // empty cmdline
+        ));
+        let findings = ParentChildHeuristic.analyze(&[p]).expect("analyze");
+        assert!(!findings.is_empty(), "suspicious path should produce a finding");
+        let details = &findings[0].details;
+        assert!(!details.contains("cmd="), "empty cmdline must not produce cmd= field: {details}");
+        assert!(details.contains("evil.exe"), "binary name missing: {details}");
     }
 
     /// The analyzer emits one Heuristic finding (with reason + entity) for a malicious

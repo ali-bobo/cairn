@@ -111,14 +111,18 @@ impl Analyzer for NetConnHeuristic {
             // f.ts intentionally left at Finding::new's default (collection time):
             // NetConnRecord carries no connection-establishment timestamp, and the OS API
             // does not reliably expose one. (parentchild uses process start_time instead.)
+            let proc_label = owner
+                .map(|o| {
+                    let name = o.image.rsplit(['\\', '/']).next().unwrap_or(&o.image);
+                    format!("{} ({})", name, o.pid)
+                })
+                .or_else(|| c.pid.map(|pid| pid.to_string()))
+                .unwrap_or_else(|| "unknown".into());
             f.details = format!(
-                "{} {}:{} -> {}:{} pid={:?}",
-                c.proto,
-                c.laddr,
-                c.lport,
+                "{} → {}:{}",
+                proc_label,
                 c.raddr.as_deref().unwrap_or("-"),
                 c.rport.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-                c.pid
             );
             f.entity = Entity {
                 netconn: Some(EntityNetConn {
@@ -472,6 +476,61 @@ mod tests {
         ));
         let findings = NetConnHeuristic.analyze(&[bad_conn]).expect("analyze");
         assert!(!findings.is_empty(), "other PID must still produce findings");
+    }
+
+    // --- R6: human-readable details field ---
+
+    /// details should show "<proc_name> (<pid>) → <raddr>:<rport>", not debug pid={:?} format.
+    #[test]
+    fn netconn_details_format() {
+        let bad = Record::NetConn(NetConnRecord {
+            proto: "tcp".into(),
+            laddr: "192.168.0.11".into(),
+            lport: 50000,
+            raddr: Some("104.18.0.1".into()),
+            rport: Some(4444),
+            state: Some("established".into()),
+            pid: Some(1234),
+        });
+        let proc_rec = Record::Process(ProcessRecord {
+            pid: 1234,
+            ppid: 4,
+            image: r"C:\Users\x\AppData\Local\Temp\beacon.exe".into(),
+            cmdline: String::new(),
+            signed: Some(false),
+            signer: None,
+            binary_sha256: None,
+            integrity: None,
+            user: None,
+            start_time: None,
+        });
+        let findings = NetConnHeuristic.analyze(&[bad, proc_rec]).expect("analyze");
+        assert!(!findings.is_empty(), "should produce at least one finding");
+        let details = &findings[0].details;
+        assert!(details.contains("beacon.exe"), "process name missing: {details}");
+        assert!(details.contains("1234"), "pid missing: {details}");
+        assert!(details.contains("104.18.0.1"), "remote addr missing: {details}");
+        assert!(!details.contains("pid=Some("), "must not use debug format: {details}");
+    }
+
+    /// When owner is unknown, details show the raw pid as the label.
+    #[test]
+    fn netconn_details_no_owner() {
+        let bad = Record::NetConn(conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(9999),
+        ));
+        let findings = NetConnHeuristic.analyze(&[bad]).expect("analyze");
+        assert!(!findings.is_empty());
+        let details = &findings[0].details;
+        // pid should appear as a plain number in the label
+        assert!(details.contains("9999"), "pid label missing: {details}");
+        assert!(details.contains("104.18.0.1"), "remote addr missing: {details}");
+        assert!(!details.contains("pid=Some("), "no debug format: {details}");
     }
 
     /// The analyzer emits one Heuristic NetConn finding for the malicious conn, with

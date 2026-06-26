@@ -102,6 +102,35 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
     s
 }
 
+/// Return the bare file name from a command/path string (strips surrounding quotes too).
+fn short_name_persist(path: &str) -> String {
+    path.trim_matches('"')
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(path)
+        .to_owned()
+}
+
+/// Build a human-readable details string for a persistence finding.
+fn format_persist_details(p: &PersistenceRecord) -> String {
+    let svc_name = p.location.rsplit('\\').next().unwrap_or(&p.location);
+    let cmd = p.command.as_deref().unwrap_or("-");
+    let bin_short = short_name_persist(cmd);
+    let date = p
+        .last_write
+        .map(|lw| lw.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| "unknown".into());
+    match p.mechanism.as_str() {
+        "service"        => format!("服務 {} → {} ({})", svc_name, bin_short, date),
+        "run_key"        => format!("Run 鍵: {} → {} ({})", svc_name, bin_short, date),
+        "scheduled_task" => format!("排程工作: {} → {} ({})", svc_name, bin_short, date),
+        "winlogon"       => format!("Winlogon {}: {}", p.value.as_deref().unwrap_or("?"), cmd),
+        "ifeo"           => format!("IFEO {}: {} → {}", svc_name, svc_name, bin_short),
+        "startup"        => format!("Startup: {} ({})", bin_short, date),
+        _                => format!("{}: {} → {}", p.mechanism, svc_name, bin_short),
+    }
+}
+
 /// Analyzer: ranks persistence records, emitting findings above the noise floor.
 pub struct PersistHeuristic;
 
@@ -128,12 +157,7 @@ impl Analyzer for PersistHeuristic {
             f.reason = Some(score.reasons.join("; "));
             f.mitre = score.mitre;
             f.artifact = "persistence".into();
-            f.details = format!(
-                "mechanism={} location={} command={}",
-                p.mechanism,
-                p.location,
-                p.command.as_deref().unwrap_or("-")
-            );
+            f.details = format_persist_details(p);
             f.ts = p.last_write.unwrap_or(now);
             f.entity = persistence_entity(p);
             out.push(f);
@@ -739,5 +763,90 @@ mod tests {
         let f = &findings[0];
         assert!(f.entity.file.is_some());
         assert!(f.entity.registry.is_none());
+    }
+
+    // --- R6: human-readable details field ---
+
+    #[test]
+    fn service_details_format() {
+        let now = Utc::now();
+        let p = PersistenceRecord {
+            mechanism: "service".into(),
+            location: r"HKLM\SYSTEM\CurrentControlSet\Services\CoworkVMService".into(),
+            value: Some("CoworkVMService".into()),
+            command: Some(r#""C:\Program Files\WindowsApps\Claude\cowork-svc.exe""#.into()),
+            binary_path: None,
+            binary_sha256: None,
+            signed: None,
+            signer: None,
+            last_write: Some(now - Duration::days(2)),
+        };
+        // This service is non-inbox and recently modified — it will score and produce a finding.
+        let details = format_persist_details(&p);
+        assert!(details.contains("CoworkVMService"), "service name missing: {details}");
+        assert!(details.contains("cowork-svc.exe"), "binary short name missing: {details}");
+        assert!(!details.contains("mechanism="), "must not use debug key=value format: {details}");
+    }
+
+    #[test]
+    fn winlogon_details_format() {
+        let p = PersistenceRecord {
+            mechanism: "winlogon".into(),
+            location: r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon".into(),
+            value: Some("Shell".into()),
+            command: Some("explorer.exe,evil.exe".into()),
+            binary_path: None,
+            binary_sha256: None,
+            signed: None,
+            signer: None,
+            last_write: None,
+        };
+        let details = format_persist_details(&p);
+        assert!(
+            details.contains("Winlogon") || details.contains("Shell"),
+            "must mention Winlogon or the value name: {details}"
+        );
+        assert!(!details.contains("mechanism="), "must not use debug format: {details}");
+    }
+
+    #[test]
+    fn ifeo_details_format() {
+        let now = Utc::now();
+        let p = rec("ifeo", Some(r"C:\Users\a\AppData\Local\Temp\dbg.exe"), Some(now));
+        let details = format_persist_details(&p);
+        assert!(details.starts_with("IFEO"), "must start with IFEO: {details}");
+        assert!(details.contains("dbg.exe"), "must contain binary name: {details}");
+        assert!(!details.contains("mechanism="), "no debug format: {details}");
+    }
+
+    #[test]
+    fn run_key_details_format() {
+        let now = Utc::now();
+        let p = rec("run_key", Some(r"C:\Users\x\AppData\Local\Temp\updater.exe"), Some(now));
+        let details = format_persist_details(&p);
+        assert!(details.starts_with("Run 鍵:"), "must start with Run 鍵: {details}");
+        assert!(details.contains("updater.exe"), "must contain binary name: {details}");
+        assert!(!details.contains("mechanism="), "no debug format: {details}");
+    }
+
+    #[test]
+    fn analyzer_finding_details_is_human_readable() {
+        let now = Utc::now();
+        let bad = Record::Persistence(PersistenceRecord {
+            mechanism: "ifeo".into(),
+            location: r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\calc.exe".into(),
+            value: Some("Debugger".into()),
+            command: Some(r"C:\Users\a\AppData\Local\Temp\dbg.exe".into()),
+            binary_path: Some(r"C:\Users\a\AppData\Local\Temp\dbg.exe".into()),
+            binary_sha256: None,
+            signed: None,
+            signer: None,
+            last_write: Some(now),
+        });
+        let findings = PersistHeuristic.analyze(&[bad]).expect("analyze");
+        assert_eq!(findings.len(), 1);
+        let details = &findings[0].details;
+        assert!(details.starts_with("IFEO"), "must start with IFEO: {details}");
+        assert!(!details.contains("mechanism="), "must not use debug format: {details}");
     }
 }
