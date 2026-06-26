@@ -151,6 +151,38 @@ fn netconn_client_text(host: &str, f: &Finding) -> String {
     )
 }
 
+/// zh-TW sentence for cross-artifact correlation findings.
+///
+/// Identifies the implicated binary from `entity.file` and picks the
+/// persistence mechanism label from keywords in `f.details`.
+fn correlation_client_text(host: &str, f: &Finding) -> String {
+    let name = f
+        .entity
+        .file
+        .as_ref()
+        .map(|fi| short_name(&fi.path))
+        .unwrap_or_else(|| "未知程式".to_owned());
+    let mechanism_zh = if f.details.contains("run_key") {
+        "登錄檔自動啟動"
+    } else if f.details.contains("service") {
+        "系統服務"
+    } else if f.details.contains("startup") {
+        "啟動資料夾"
+    } else if f.details.contains("scheduled_task") {
+        "排程工作"
+    } else if f.details.contains("winlogon") {
+        "Winlogon 持久化"
+    } else if f.details.contains("ifeo") {
+        "IFEO 除錯器劫持"
+    } else {
+        "持久化機制"
+    };
+    format!(
+        "在 {host} 上偵測到 {name} 同時存在於{mechanism_zh}及執行記錄中，\
+         代表該程式曾被執行且可能持續存在於系統中。"
+    )
+}
+
 pub fn fill_details_client(f: &mut Finding) {
     if !is_medium_or_above(f.severity) {
         return;
@@ -176,6 +208,7 @@ pub fn fill_details_client(f: &mut Finding) {
                     host, name
                 )
             }
+            "correlation" => correlation_client_text(&host, f),
             _ => format!("主機 {} 上偵測到疑似異常行為，建議分析師確認詳情。", host),
         },
         FindingSource::Sigma => {
@@ -438,6 +471,37 @@ mod tests {
         let text = f.details_client.unwrap();
         assert!(text.contains("beacon.exe"), "must name process: {text}");
         assert!(text.contains("WS01"), "must name host: {text}");
+    }
+
+    // ── correlation: zh-TW text for cross-artifact correlation findings ──────
+
+    #[test]
+    fn correlation_client_text_in_zh_tw() {
+        use cairn_core::finding::EntityFile;
+        let mut f = Finding::new(
+            Severity::High,
+            "Confirmed persistence + execution: notion",
+            FindingSource::Heuristic,
+        );
+        f.host = "WS01".into();
+        f.artifact = "correlation".into();
+        f.entity.file = Some(EntityFile {
+            path: r"C:\Users\bosen\AppData\Local\Programs\Notion\Notion.exe".into(),
+            sha256: None,
+            mtime: None,
+            si_btime: None,
+            fn_btime: None,
+            si_mtime: None,
+            fn_mtime: None,
+            path_complete: None,
+        });
+        f.details = r"notion persisted via run_key (HKLM\...\Run); confirmed executed [prefetch] last_run=2026-06-25T22:00:00Z".into();
+        fill_details_client(&mut f);
+        let client = f.details_client.as_deref().unwrap_or("");
+        assert!(client.contains("WS01"), "host in text: {client}");
+        assert!(client.contains("Notion"), "binary name in text: {client}");
+        assert!(client.contains("登錄檔自動啟動"), "mechanism zh: {client}");
+        assert!(client.contains("執行記錄"), "execution ref: {client}");
     }
 
     // ── R5: netconn without owning process still produces text ───────────────
