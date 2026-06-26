@@ -47,10 +47,39 @@ pub const TIMELINE_COLS: &[&str] = &[
     "RuleAuthor",
     "MITRE",
     "Details",
+    "Reason",
+    "Entity",
+    "DetailsClient",
 ];
 
+/// Compact one-line summary of the entity implicated in a Finding, for the Entity
+/// column of timeline.csv. Precedence: process > registry > netconn > file > "".
+fn entity_summary(f: &Finding) -> String {
+    if let Some(p) = &f.entity.process {
+        let name = p.image.rsplit(['\\', '/']).next().unwrap_or(&p.image);
+        return format!("pid={} image={}", p.pid, name);
+    }
+    if let Some(r) = &f.entity.registry {
+        let key_name = r.key.rsplit('\\').next().unwrap_or(&r.key);
+        let bin = r.data.trim_matches('"');
+        let bin_name = bin.rsplit(['\\', '/']).next().unwrap_or(bin);
+        return format!("svc={} bin={}", key_name, bin_name);
+    }
+    if let Some(c) = &f.entity.netconn {
+        let raddr = c.raddr.as_deref().unwrap_or("-");
+        let rport = c.rport.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        let pid = c.pid.map(|p| p.to_string()).unwrap_or_else(|| "?".into());
+        return format!("pid={} {}:{}", pid, raddr, rport);
+    }
+    if let Some(fi) = &f.entity.file {
+        let name = fi.path.rsplit(['\\', '/']).next().unwrap_or(&fi.path);
+        return name.to_owned();
+    }
+    String::new()
+}
+
 /// Project a Finding into the TIMELINE_COLS row (detection timeline, SRS §5.2).
-fn timeline_row(f: &Finding) -> [String; 10] {
+fn timeline_row(f: &Finding) -> [String; 13] {
     let channel = f
         .artifact
         .strip_prefix("evtx:")
@@ -71,6 +100,9 @@ fn timeline_row(f: &Finding) -> [String; 10] {
         f.rule_author.clone().unwrap_or_default(),
         f.mitre.join(";"),
         f.details.clone(),
+        f.reason.clone().unwrap_or_default(),
+        entity_summary(f),
+        f.details_client.clone().unwrap_or_default(),
     ]
 }
 
@@ -84,7 +116,7 @@ fn timeline_row(f: &Finding) -> [String; 10] {
 /// which the manual path quotes safely), so the worst case is a slightly less optimal
 /// quoting, never a panic.
 pub fn timeline_csv(findings: &[Finding]) -> String {
-    let mut rows: Vec<[String; 10]> = findings.iter().map(timeline_row).collect();
+    let mut rows: Vec<[String; 13]> = findings.iter().map(timeline_row).collect();
     // Deterministic order: Timestamp then RecordID (cols 0 and 5).
     rows.sort_by(|a, b| (&a[0], &a[5]).cmp(&(&b[0], &b[5])));
     rows.dedup(); // identical adjacent detections collapse (rows are sorted)
@@ -108,7 +140,7 @@ pub fn timeline_csv(findings: &[Finding]) -> String {
 /// RFC-4180 fallback used only if the `csv` writer ever errs (it shouldn't for our
 /// owned-String inputs). Quotes a field when it contains `,`, `"`, CR or LF; doubles
 /// embedded quotes. Keeps `timeline_csv` total (never panics).
-fn manual_csv(rows: &[[String; 10]]) -> String {
+fn manual_csv(rows: &[[String; 13]]) -> String {
     fn field(s: &str) -> std::borrow::Cow<'_, str> {
         if s.contains([',', '"', '\n', '\r']) {
             std::borrow::Cow::Owned(format!("\"{}\"", s.replace('"', "\"\"")))
@@ -391,7 +423,7 @@ mod tests {
         // "Name, oscd.community") — must be quoted in the fallback path.
         let mut f = finding(100, "t", 1);
         f.rule_author = Some("Alice, Bob".into());
-        let rows: Vec<[String; 10]> = std::iter::once(&f).map(timeline_row).collect();
+        let rows: Vec<[String; 13]> = std::iter::once(&f).map(timeline_row).collect();
         let csv = manual_csv(&rows);
 
         let mut lines = csv.lines();
@@ -424,6 +456,114 @@ mod tests {
             1,
             "identical detections should dedupe: {body:?}"
         );
+    }
+
+    /// New columns Reason, Entity, DetailsClient appear in the header.
+    #[test]
+    fn timeline_csv_has_enriched_columns() {
+        let csv = timeline_csv(&[finding(1_700_000_000, "Susp PS", 42)]);
+        let header = csv.lines().next().unwrap();
+        assert!(header.contains("Reason"), "Reason missing: {header}");
+        assert!(header.contains("Entity"), "Entity missing: {header}");
+        assert!(header.contains("DetailsClient"), "DetailsClient missing: {header}");
+    }
+
+    /// Reason column carries finding.reason content.
+    #[test]
+    fn timeline_csv_reason_column_populated() {
+        let mut f = finding(1_700_000_000, "Test", 1);
+        f.reason = Some("service autostart persistence; recently created".into());
+        let csv = timeline_csv(&[f]);
+        let row = csv.lines().nth(1).unwrap();
+        assert!(
+            row.contains("service autostart persistence"),
+            "reason not in row: {row}"
+        );
+    }
+
+    /// DetailsClient column carries finding.details_client content.
+    #[test]
+    fn timeline_csv_details_client_column_populated() {
+        let mut f = finding(1_700_000_000, "Test", 1);
+        f.details_client = Some("主機 WS01 上偵測到可疑活動".into());
+        let csv = timeline_csv(&[f]);
+        let row = csv.lines().nth(1).unwrap();
+        assert!(
+            row.contains("主機 WS01 上偵測到可疑活動"),
+            "details_client not in row: {row}"
+        );
+    }
+
+    /// Entity column: process entity → "pid=N image=<name>".
+    #[test]
+    fn timeline_csv_entity_process() {
+        use cairn_core::finding::EntityProcess;
+        let mut f = finding(1_700_000_000, "Test", 1);
+        f.entity.process = Some(EntityProcess {
+            pid: 1234,
+            ppid: 4,
+            image: r"C:\Windows\System32\cmd.exe".into(),
+            cmdline: "cmd /c whoami".into(),
+            signed: None,
+            integrity: None,
+        });
+        let csv = timeline_csv(&[f]);
+        let row = csv.lines().nth(1).unwrap();
+        assert!(row.contains("1234"), "pid in entity: {row}");
+        assert!(row.contains("cmd.exe"), "image name in entity: {row}");
+    }
+
+    /// Entity column: registry entity → "svc=<key_last> bin=<data_last>".
+    #[test]
+    fn timeline_csv_entity_registry() {
+        use cairn_core::finding::EntityRegistry;
+        let mut f = finding(1_700_000_000, "Test", 1);
+        f.entity.registry = Some(EntityRegistry {
+            hive: "HKLM".into(),
+            key: r"HKLM\SYSTEM\CurrentControlSet\Services\EvilSvc".into(),
+            value: "EvilSvc".into(),
+            data: r"C:\Temp\evil.exe".into(),
+            last_write: None,
+        });
+        let csv = timeline_csv(&[f]);
+        let row = csv.lines().nth(1).unwrap();
+        assert!(row.contains("EvilSvc"), "registry key name in entity: {row}");
+        assert!(row.contains("evil.exe"), "binary name in entity: {row}");
+    }
+
+    /// Entity column: netconn entity → "pid=N raddr:rport".
+    #[test]
+    fn timeline_csv_entity_netconn() {
+        use cairn_core::finding::EntityNetConn;
+        let mut f = finding(1_700_000_000, "Test", 1);
+        f.entity.netconn = Some(EntityNetConn {
+            laddr: "192.168.0.1".into(),
+            lport: 50000,
+            raddr: Some("185.0.0.1".into()),
+            rport: Some(4444),
+            pid: Some(999),
+        });
+        let csv = timeline_csv(&[f]);
+        let row = csv.lines().nth(1).unwrap();
+        assert!(row.contains("185.0.0.1"), "raddr in entity: {row}");
+        assert!(row.contains("4444"), "rport in entity: {row}");
+    }
+
+    /// manual_csv fallback also has 13 columns and quotes correctly.
+    #[test]
+    fn manual_csv_fallback_has_13_cols() {
+        let mut f = finding(100, "t", 1);
+        f.rule_author = Some("Alice, Bob".into());
+        f.reason = Some("test reason".into());
+        let rows: Vec<[String; 13]> = std::iter::once(&f).map(timeline_row).collect();
+        let csv = manual_csv(&rows);
+        let header = csv.lines().next().unwrap();
+        assert_eq!(
+            header.split(',').count(),
+            13,
+            "must have 13 columns: {header}"
+        );
+        assert!(header.contains("DetailsClient"));
     }
 
     use cairn_core::manifest::{Counts, HostInfo, Manifest, Privileges, RunInfo, ToolInfo};
