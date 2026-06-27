@@ -1,5 +1,6 @@
 //! Live EVTX collector: reads C:\Windows\System32\winevt\Logs\ filtered by
 //! the Sigma engine's referenced channels and a time window.
+#![allow(dead_code)]
 
 use cairn_core::manifest::SourceEntry;
 use chrono::{DateTime, Utc};
@@ -42,16 +43,6 @@ impl EvtxLiveCollector {
 }
 
 // Collector impl will be added in Task 2.
-// Suppress dead_code warnings until then.
-#[allow(dead_code)]
-fn _use_fields(c: &EvtxLiveCollector) {
-    let _ = &c.channels;
-    let _ = &c.since;
-    let _ = &c.sources;
-}
-
-#[allow(dead_code)]
-const _WINEVT_LOGS_DIR: &str = WINEVT_LOGS_DIR;
 
 #[cfg(test)]
 mod tests {
@@ -115,5 +106,21 @@ mod tests {
     fn since_filter_keeps_exact_boundary() {
         let since = chrono::Utc.with_ymd_and_hms(2026, 6, 27, 0, 0, 0).unwrap();
         assert!(event_is_recent(since, since));
+    }
+
+    #[test]
+    fn channel_filename_roundtrip() {
+        let channels = &[
+            "Security",
+            "Microsoft-Windows-PowerShell/Operational",
+            "Microsoft-Windows-Sysmon/Operational",
+        ];
+        for ch in channels {
+            assert_eq!(
+                filename_to_channel(&channel_to_filename(ch)),
+                Some(ch.to_string()),
+                "roundtrip failed for channel: {ch}"
+            );
+        }
     }
 }
