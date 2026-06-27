@@ -8,6 +8,7 @@
 pub mod amcache;
 pub mod bam;
 pub mod evtx;
+pub mod evtx_live;
 pub mod hash;
 pub mod hive_reader;
 pub mod mft;
