@@ -84,9 +84,11 @@ embed version/manifest resources; publish hashes; open-source; produce the SOC
 pre-allowlist runbook (docs/SOC-runbook-template.md); submit binary to MS WDSI.
 
 ## Local dev environment notes
-- Build artifacts are kept OUT of the OneDrive-synced tree. Set `CARGO_TARGET_DIR`
-  to a local path (or recreate `.cargo/config.toml`, which is gitignored as it holds
-  a machine-specific absolute path). This avoids OneDrive syncing/locking `target/`.
+- Build artifacts are kept OUT of the OneDrive-synced tree. `.cargo/config.toml` is
+  committed — it contains the CRT static link rustflags. The `target-dir` line was
+  intentionally removed; set `CARGO_TARGET_DIR` env var if you need a custom build
+  artifact path (e.g. `$env:CARGO_TARGET_DIR = "C:\Users\<you>\AppData\Local\cairn-target"`).
+  This avoids OneDrive syncing/locking `target/`.
 - On Windows with real-time AV (e.g. PC-cillin), cargo build-probe executables
   (serde/anyhow/thiserror build scripts) can trip a scan and surface `os error 5` on
   cleanup. Exclude the target dir from AV scanning; if a `cargo clean` rebuild ever

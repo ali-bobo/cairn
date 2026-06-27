@@ -1,21 +1,14 @@
 # Cargo configuration for the Cairn workspace.
 #
-# Build artifacts are kept OUT of the OneDrive-synced source tree:
-#   - avoids OneDrive uploading ~hundreds of MB of churning build output, and
-#   - sidesteps OneDrive holding file handles on target/ during a build.
-#
-# This path is machine-specific (absolute, under the local profile). If you clone
-# this repo on another machine, adjust `target-dir` or set CARGO_TARGET_DIR in the
-# environment (the env var overrides this setting).
-#
 # Note (build environment): cargo build-probe executables (serde/anyhow/thiserror
 # build scripts) can trip real-time AV scanning, surfacing as `os error 5` on
-# cleanup. The target dir is excluded from AV scanning to prevent this. After a
+# cleanup. Exclude the target dir from AV scanning to prevent this. After a
 # `cargo clean`, the first build re-creates the probes; if AV ever re-locks them,
 # simply re-run the build.
-
-[build]
-target-dir = "C:/Users/bosen/AppData/Local/cairn-target"
+#
+# Build artifact location: set the CARGO_TARGET_DIR environment variable to a
+# path outside OneDrive (e.g. $env:CARGO_TARGET_DIR = "C:\Users\<you>\AppData\Local\cairn-target")
+# to avoid OneDrive syncing/locking the target/ directory.
 
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
