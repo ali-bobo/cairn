@@ -25,9 +25,10 @@
 # Decoded plain rules (the encoded form is the bundled one; ADR-0002)
 /rules/plain/
 
-# Machine-specific cargo config (absolute target-dir outside OneDrive — per-machine).
-# Set CARGO_TARGET_DIR or recreate .cargo/config.toml locally; see CLAUDE.md dev notes.
-/.cargo/config.toml
+# Machine-specific cargo target-dir override. The committed .cargo/config.toml contains
+# cross-machine settings (CRT static link rustflags). The target-dir line in that file is
+# a sensible default; override with CARGO_TARGET_DIR env var on other machines.
+# See CLAUDE.md "Local dev environment notes".
 
 # OS / editor
 .DS_Store

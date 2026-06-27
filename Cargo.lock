@@ -410,6 +410,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "cairn-launcher"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "cairn-core",
+ "cairn-sigma",
+ "chrono",
+ "serde_json",
+ "tempfile",
+ "zip",
+]
+
+[[package]]
 name = "cairn-report"
 version = "0.1.0"
 dependencies = [

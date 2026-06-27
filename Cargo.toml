@@ -10,6 +10,7 @@ members = [
     "crates/cairn-heur",
     "crates/cairn-cli",
     "crates/cairn-updater",
+    "crates/cairn-launcher",
 ]
 
 [workspace.package]

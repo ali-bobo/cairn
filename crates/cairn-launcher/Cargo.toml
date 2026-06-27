@@ -1,0 +1,20 @@
+[package]
+name = "cairn-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cairn-launcher"
+path = "src/main.rs"
+
+[dependencies]
+cairn-core = { path = "../cairn-core" }
+cairn-sigma = { path = "../cairn-sigma" }
+serde_json.workspace = true
+chrono.workspace = true
+zip.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
