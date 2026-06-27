@@ -427,3 +427,195 @@ they MUST be honored when the owning stage is built.
   `manifest.sources[].errors`) instead of emitting guessed values.
 - The `update-rules` channel (FR19) is the maintenance lever for keeping parsers and
   tuning current as Microsoft ships new builds; ongoing tracking is an accepted cost.
+
+---
+
+## 20. Development history (decision log + known-good lessons)
+
+This section records the implementation journey for future maintainers: what was decided,
+what broke, and why. Design specs and implementation plans live in `docs/dev-history/`
+(one file per segment). The git log is the authoritative line-by-line record; this section
+captures the *why* that git messages omit.
+
+### 20.1 Stage 1 — EVTX + Sigma + timeline + manifest (2026-06 early)
+
+**Commit range:** `341d1f8` (initial) → `1fc3374` (S1 wrap-up)
+
+**Key decisions:**
+- `sigma-rust 0.7` chosen over `tau-engine` / `sigmars` (ADR-0001): native Sigma 2.0
+  modifiers, exposes `author`/`id`/`level`/`tags` needed for DRL 1.1 compliance.
+- Rules XOR-encoded on disk (ADR-0002): public key, decoded-as-data-never-executed,
+  prevents byte-pattern AV FP on bundled `.yml`. `--rules-plain` provides SOC bypass.
+- ADR-0003: aggregate SHA-256 of decoded rules stored as `sigma_ruleset_ver` in manifest;
+  `cairn verify` re-checks it. Prevents silent rule tampering.
+- Logsource de-abstraction (Hayabusa model): precompiled Channel/EventID/field-alias map
+  (`eventkey_alias`, `channel_abbreviations`) rather than runtime resolution.
+- `cairn verify` subcommand: re-hash outputs+sources against manifest, independent of scan.
+
+**Lessons learned:**
+- Sigma engine's logsource gate must be enforced or it over-fires on unrelated channels
+  (`eb9e766`: enforce logsource gate fix).
+- Windows PE version resource embedded at build time (`a95c74c`) — a self-identifying
+  binary is a legitimacy requirement, not optional polish.
+
+---
+
+### 20.2 Stage 2 — live proc/net/persist + heuristics + raw-NTFS + offline hives (2026-06-12 to 2026-06-23)
+
+**Commit range:** `5395192` (collectors-win scaffold) → `df29f72` (userassist, S2 sealed)
+
+**Segment sequence (36 plan files, see `docs/dev-history/`):**
+- S2-A: orchestrator + proc/net collectors (PR #1)
+- S2-B: heuristics (parent-child, netconn)
+- S2-C/D: persistence (Run/IFEO/service/sched-task/WMI/winlogon/startup), signer path
+- S2-E/F/G/H: binary path normalization, catalog-signed, heuristic calibration
+- S2-I/J/K: scheduled tasks, signer identity, binary hashing
+- S2-L/M: profile wiring, raw-NTFS volume primitive (`VolumeReader`)
+- S2-N: $MFT MACB + timestomp detection + path reconstruction (`resolve_path`)
+- S2-O: path map (parent reference chain → full path, PR #17)
+- governance (PR #18, NFR9/10): `--max-threads`, `--full-speed`, below-normal IO priority
+- hive reader + shimcache (PR #20): `notatin` with `.LOG1/.LOG2` replay in-memory (no
+  temp file). **Key discovery:** `notatin` has `from_file<R:ReadSeek>` — no path needed.
+  `nt_hive2` excluded (GPL-3.0 licence contagion). `nom` pinned to 7.1.3 (notatin
+  declared `>=6`, cargo resolved to 8 which broke builds).
+- USN $J (PR #19): ntfs crate reads `$UsnJrnl:$J` as ADS — zero new deps. Sparse runs
+  auto-filled with zeros; `RecordLength==0` is the authoritative "no record" sentinel.
+- amcache collector (PR #21): `InventoryApplicationFile` key; SHA-1 from `FileId` 40-hex
+  suffix. **Bug caught in review:** `Vec::with_capacity(u32::MAX)` OOM risk — capped to
+  `1<<20` for pre-alloc only (loop runs full count). Per-entry `continue` on value-read
+  error (golden rule 8).
+- amcache_driver (PR #22, BYOVD): `InventoryDriverBinary` → `Record::Execution
+  source="amcache_driver"`. Refactored to `InventorySpec` + shared `collect_inventory()`
+  helper; `first_non_empty_read()` pure early-stop selector catches non-equivalence bug.
+- prefetch collector (PR #23): `compcol 0.6.5` (MIT, forbid-unsafe) for MAM
+  Xpress-Huffman. **Two real bugs caught:**
+  (a) MAM frame = `[u32 LE length][bitstream]`; original code sliced `raw[8..]` but
+      correct offset is `raw[4..]` — unit tests false-positived because fixture was
+      self-framed. Fixed + regression guard added.
+  (b) This machine's prefetch is **v31** not v30; `run_count` offset is `0xC8` not
+      `0xD0`. Found via live probe. **Lesson: medium-confidence format offsets MUST be
+      validated on a real machine — unit tests with self-made fixtures will false-positive.**
+- BAM collector (PR #24): SYSTEM hive `{ControlSet}\Services\bam\State\UserSettings\<SID>`
+  ACL-protected; raw `\\.\C:` read bypasses ACL. `list_values` ground truth from notatin
+  source: `detail.value_name()` (not a public field — accessor only). ControlSet number
+  from `Select\Current` REG_DWORD = `CellValue::U32` (verified in cell_value.rs:30).
+- userassist (PR #25, S2 sealed): per-user NTUSER.DAT, ROT-13 decode, 72-byte struct
+  (`run_count`@4, FILETIME@60), SID reverse-lookup via SOFTWARE ProfileList. `list_dir_names`
+  filters `NtfsFileNamespace::Dos` to avoid 8.3 short-name duplication — `dedup()` alone
+  insufficient because `"DEFAUL~1" != "DefaultUser"`.
+
+**Heuristic calibration lessons (S2-H/noise-reduction segment):**
+- Inbox Windows services (DcomLaunch, Dhcp, tcpip.sys…) flood findings — suppressed via
+  `is_inbox_service_command()` gate before scoring (not a whitelist, a structural check).
+- cairn.exe itself scored Medium (AppData path); suppressed by excluding own PID.
+- `details_client` said "未知程式" even when path known — template dispatch by `f.artifact`.
+- Timeline `Details` was debug-format key=value — replaced with human-readable sentences.
+
+---
+
+### 20.3 Stage 3 — archive + encryption + dry-run + client text + bodyfile (2026-06-24/25)
+
+**Commit range:** `9c0f2a4` (srum) → `5b210b7` (bodyfile, S3 sealed)
+
+**Segments:**
+- srum_collector (PR #27): `srum-parser 0.1.0` (MIT, pure Rust). VolumeReader reads
+  SRUDB.dat raw → `tempfile::NamedTempFile` → parse → `srum_app` + `srum_net`. SRUDB.dat
+  is an ESE database; no pure-Rust ESE crate was mature enough to write from scratch.
+- output_sink (FR15/16/17): `DirSink` / `ZipSink` (`zip 2.4`) / `AgeSink` (age X25519
+  asymmetric encryption, public key embedded only) / `DryRunSink` (zero writes). Symlink
+  write guard tested. `zip::write::FileOptions::<()>::default()` requires turbofish in
+  zip 2.4 API.
+- details_client (FR18): static template dispatch by `f.artifact`; zh-TW plain-language,
+  no overstatement, preserves uncertainty language ("assessed", "likely").
+- bodyfile / plaso export (FR20): mactime 11-column format, `--bodyfile <path>` CLI flag,
+  live-run only, auto-skipped on `--dry-run`.
+
+---
+
+### 20.4 Stage 4 — update-rules (2026-06-25/26)
+
+**Commit range:** `f4bab7e` (update-rules, S4 sealed). PR: `cairn-updater` crate.
+
+**Design:** `cairn update-rules [--pin <sha>]`. SSRF whitelist gates all fetch URLs to
+`raw.githubusercontent.com/SigmaHQ/sigma`. DRL 1.1 `author:` field validated before
+accept. XOR-encodes output into `rules/sigma/`, writes `PROVENANCE` file (pin SHA +
+aggregate hash). Bad pin errors before any network request.
+
+**Security review:**
+- Whitelist domain check prevents redirect-based SSRF.
+- Rules are data, never executed (ADR-0002).
+- Network only on explicit `update-rules` subcommand (NFR6).
+
+---
+
+### 20.5 Post-S4 features — live EVTX integration + cairn-launcher + HTML report (2026-06-27)
+
+**Commit range:** `776ec21` (live EVTX spec) → `c030a69` (HTML report wired)
+
+**Live EVTX integration:**
+- `EvtxLiveCollector` reads `C:\Windows\System32\winevt\Logs\` — only Sigma-referenced
+  channels, filtered by `cfg.since` (default 24 h). Per-file graceful degrade.
+- `SigmaAnalyzer` wraps `Engine` as an `Analyzer` trait implementor.
+- `Engine` gains `ruleset_ver: String` field; `sigma_ruleset_ver` in manifest now filled
+  from live ruleset rather than hardcoded empty string.
+
+**cairn-launcher** (`crates/cairn-launcher`, commits `6038c7c`→`440abed`):
+- Problem: `cairn.exe` requires typing `--rules`, `--output`, `--since` in ISO8601; not
+  usable by non-technical responders. Solution: double-click `cairn-launcher.exe`.
+- 5 modules: `main.rs` (env check + loop) / `menu.rs` (box UI) / `runner.rs` (arg build
+  + subprocess) / `summary.rs` (reads `manifest.json` + `findings.jsonl`) / `package.rs`
+  (zip + `explorer.exe`).
+- CRT static link via `.cargo/config.toml` `[target.x86_64-pc-windows-msvc] rustflags =
+  ["-C", "target-feature=+crt-static"]`. Virtual workspace manifests cannot hold
+  `[target.*]` — must go in `.cargo/config.toml`, not `Cargo.toml`.
+- Box UI truncates hostname and rules version string to prevent box overflow on FQDNs
+  (`truncate()` uses `chars().count()` for CJK correctness).
+- `zip::write::FileOptions::<()>::default()` turbofish required (zip 2.4 API).
+
+**HTML report** (`crates/cairn-report/src/html.rs`, commits `b8aaa5f`→`c030a69`):
+- Every scan now auto-generates `report.html` (self-contained, inlined CSS, no JS).
+- XSS escape: `esc()` escapes `&` first, then `<>'"` — order matters to prevent
+  double-encoding.
+- `OutputSink::write_html_report()` default no-op in `cairn-core` (trait); `DirSink`
+  overrides in `cairn-report` (avoids circular dep: `cairn-core` cannot depend on
+  `cairn-report`).
+- Placement in `cairn-cli/src/main.rs`: after `write_findings_jsonl`, before
+  `manifest_outputs_then_write` (which moves `manifest`).
+
+---
+
+### 20.6 Cross-artifact correlation analyzer (2026-06-26)
+
+**Commits:** `ce80533`→`a495dd0`
+
+**Design:** `CorrelationAnalyzer` emits `High` Finding when the same binary appears in
+≥2 artifact categories simultaneously:
+- Category A: `PersistenceRecord` (any autorun mechanism)
+- Category B: `ExecutionRecord` (prefetch / amcache / BAM / userassist / shimcache)
+- Optional C: live `ProcessRecord` (binary also currently running — added to `reason`)
+
+Inbox services suppressed (the `PersistHeuristic` already covers them; a correlation
+Finding on `svchost.exe` would be noise). Key: `normalized_basename()` is the join key
+across artifact types — full path may vary by hive/artifact.
+
+---
+
+### 20.7 Deployment package
+
+**Location:** `dist/cairn-forensics/` (not git-tracked; regenerate with `scripts/package.ps1`)
+
+```
+dist/cairn-forensics/
+├── cairn-launcher.exe   # double-click entry for non-technical responders
+├── cairn.exe            # forensics engine
+└── rules/sigma/         # XOR-encoded Sigma rules
+```
+
+`output/` is created by the launcher in the same directory on first scan.
+
+**Build command (from workspace root, Admin PowerShell):**
+```powershell
+$env:CARGO_TARGET_DIR = "C:\Users\$env:USERNAME\AppData\Local\cairn-target"
+cargo build --release -p cairn-cli -p cairn-launcher
+# then run scripts/package.ps1 to copy to dist/
+```
