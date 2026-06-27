@@ -5,6 +5,7 @@ pub mod age_sink;
 pub mod bodyfile;
 pub mod client_text;
 pub mod dry_run;
+pub mod html;
 pub mod zip_sink;
 
 pub use age_sink::AgeSink;
