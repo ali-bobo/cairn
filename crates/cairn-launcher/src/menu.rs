@@ -29,8 +29,8 @@ pub fn print_main_menu(hostname: &str, rules_ver: &str, rules_loaded: bool) {
     println!("╔══════════════════════════════════════════╗");
     println!("║    Cairn 威脅鑑識工具                    ║");
     println!("╠══════════════════════════════════════════╣");
-    println!("║  主機名稱：{:<30}║", hostname);
-    println!("║  {:<40}║", rules_info);
+    println!("║  主機名稱：{:<30}║", truncate(hostname, 28));
+    println!("║  {:<40}║", truncate(&rules_info, 38));
     println!("╠══════════════════════════════════════════╣");
     println!("║  [1] 快速掃描（最近 24 小時）            ║");
     println!("║  [2] 自訂時間範圍                        ║");
