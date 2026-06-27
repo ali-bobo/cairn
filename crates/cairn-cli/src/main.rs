@@ -567,6 +567,7 @@ fn main() -> anyhow::Result<()> {
             let mut sink = DirSink::new(dir.clone());
             sink.write_timeline_csv(&findings)?;
             sink.write_findings_jsonl(&findings)?;
+            sink.write_html_report(&findings, &manifest)?;
             manifest.outputs = sink.outputs_so_far();
             sink.write_manifest(&manifest)?;
             let outputs = sink.finalize()?;
@@ -934,6 +935,7 @@ fn main() -> anyhow::Result<()> {
             let mut sink = build_sink(&cfg.output)?;
             sink.write_timeline_csv(&outcome.findings)?;
             sink.write_findings_jsonl(&outcome.findings)?;
+            sink.write_html_report(&outcome.findings, &manifest)?;
             if let OutputKind::Dir(ref d) = cfg.output {
                 write_records_jsonl(d, &outcome.records)?;
             }
