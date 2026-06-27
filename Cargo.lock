@@ -403,7 +403,10 @@ name = "cairn-heur"
 version = "0.1.0"
 dependencies = [
  "cairn-core",
+ "cairn-sigma",
  "chrono",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]

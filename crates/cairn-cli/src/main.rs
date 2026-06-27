@@ -1514,4 +1514,83 @@ mod tests {
         }];
         assert!(collect_truncations(&sources).is_empty());
     }
+
+    /// Integration: SigmaAnalyzer wired into run_live receives Record::Event and produces findings.
+    #[test]
+    fn sigma_analyzer_findings_appear_in_live_outcome() {
+        use cairn_core::manifest::Privileges;
+        use cairn_core::orchestrator::run_live;
+        use cairn_core::record::{EventRecord, Record};
+        use cairn_core::traits::{CollectCtx, Collector};
+        use cairn_heur::SigmaAnalyzer;
+        use cairn_sigma::engine::Engine;
+        use chrono::Utc;
+
+        const RULE: &str = r#"
+title: Test PowerShell detection
+id: 22222222-2222-2222-2222-222222222222
+status: test
+logsource:
+    category: process_creation
+    product: windows
+detection:
+    selection:
+        Image|endswith: '\powershell.exe'
+    condition: selection
+level: high
+author: test-integration
+"#;
+
+        struct EventCollector(EventRecord);
+        impl Collector for EventCollector {
+            fn name(&self) -> &str {
+                "fake_event"
+            }
+            fn collect(&self, _ctx: &CollectCtx<'_>) -> cairn_core::Result<Vec<Record>> {
+                Ok(vec![Record::Event(self.0.clone())])
+            }
+        }
+
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "Image".to_string(),
+            serde_json::Value::String(
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe".to_string(),
+            ),
+        );
+        let ev = EventRecord {
+            ts: Utc::now(),
+            channel: "Security".to_string(),
+            event_id: 4688,
+            provider: "Microsoft-Windows-Security-Auditing".to_string(),
+            computer: "TEST".to_string(),
+            record_id: 42,
+            data,
+        };
+
+        let engine = Engine::from_rules(&[RULE]).expect("rule must parse");
+        let analyzer = SigmaAnalyzer::new(engine);
+
+        let cfg = cairn_core::Config::default();
+        let privs = Privileges {
+            admin: false,
+            se_backup: false,
+            se_debug: false,
+        };
+        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(EventCollector(ev))];
+        let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![Box::new(analyzer)];
+
+        let outcome = run_live(&cfg, privs, "TEST".into(), &collectors, &analyzers);
+
+        assert_eq!(outcome.records.len(), 1, "event record must be collected");
+        assert!(
+            !outcome.findings.is_empty(),
+            "sigma finding must be present in RunOutcome"
+        );
+        assert_eq!(
+            outcome.findings[0].rule_author.as_deref(),
+            Some("test-integration"),
+            "finding must carry DRL 1.1 rule_author"
+        );
+    }
 }
