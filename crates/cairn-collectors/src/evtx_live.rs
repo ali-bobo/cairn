@@ -13,25 +13,25 @@ const WINEVT_LOGS_DIR: &str = r"C:\Windows\System32\winevt\Logs";
 
 /// Map a Sigma channel name to its on-disk `.evtx` filename.
 /// Windows EVTX filenames encode `/` as `%4`.
-pub fn channel_to_filename(channel: &str) -> String {
+pub(crate) fn channel_to_filename(channel: &str) -> String {
     format!("{}.evtx", channel.replace('/', "%4"))
 }
 
 /// Map an on-disk `.evtx` filename back to a channel name (inverse of `channel_to_filename`).
 /// Returns None if the file does not have a `.evtx` extension.
-pub fn filename_to_channel(filename: &str) -> Option<String> {
+pub(crate) fn filename_to_channel(filename: &str) -> Option<String> {
     let stem = filename.strip_suffix(".evtx")?;
     Some(stem.replace("%4", "/"))
 }
 
 /// True if `ts` is at or after `since`.
-pub fn event_is_recent(ts: DateTime<Utc>, since: DateTime<Utc>) -> bool {
+pub(crate) fn event_is_recent(ts: DateTime<Utc>, since: DateTime<Utc>) -> bool {
     ts >= since
 }
 
 /// Internal: collect EventRecords from a given EVTX directory.
 /// Extracted for testability (allows injecting a non-standard dir path).
-pub fn collect_from_dir(
+pub(crate) fn collect_from_dir(
     dir: &Path,
     channels: &[String],
     since: DateTime<Utc>,
@@ -142,7 +142,7 @@ impl Collector for EvtxLiveCollector {
     }
 
     fn sources(&self) -> Vec<SourceEntry> {
-        self.sources.lock().unwrap().clone()
+        self.sources.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
