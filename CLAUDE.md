@@ -36,6 +36,7 @@ split)+Velociraptor offline-collector(packaging), fused in one process.
 - `crates/cairn-sigma` — SigmaMatcher trait + chosen engine + LogsourceMap (de-abstraction).
 - `crates/cairn-report`— timeline(csv)/findings(jsonl)/manifest, sha256, output sinks.
 - `crates/cairn-cli`   — `cairn` binary, clap CLI (SRS §6).
+- `crates/cairn-launcher` — interactive CLI launcher for end users; double-click entry point that wraps cairn.exe.
 - `rules/`             — bundled Sigma (DRL 1.1) + config maps. May be XOR-encoded on disk (avoid AV FP on .yml; encode RULES, never the tool).
 - `docs/`              — stage1-plan, threat-model, SOC-runbook, sigma benchmark plan.
 - `tests/`             — EVTX-ATTACK-SAMPLES fixtures + Sigma match-parity tests.

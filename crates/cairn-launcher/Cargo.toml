@@ -8,6 +8,7 @@ license.workspace = true
 name = "cairn-launcher"
 path = "src/main.rs"
 
+# Dependencies used by modules added in subsequent tasks (T2-T6).
 [dependencies]
 cairn-core = { path = "../cairn-core" }
 cairn-sigma = { path = "../cairn-sigma" }
