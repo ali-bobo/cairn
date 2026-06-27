@@ -299,6 +299,15 @@ impl OutputSink for DirSink {
         self.write_file("manifest.json", &json)
     }
 
+    fn write_html_report(
+        &mut self,
+        findings: &[Finding],
+        manifest: &Manifest,
+    ) -> Result<()> {
+        let html = crate::html::html_report(findings, manifest);
+        self.write_file("report.html", html.as_bytes())
+    }
+
     fn finalize(&mut self) -> Result<Vec<OutputEntry>> {
         Ok(std::mem::take(&mut self.outputs))
     }

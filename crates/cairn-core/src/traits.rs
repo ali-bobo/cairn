@@ -52,6 +52,15 @@ pub trait OutputSink: Send {
     fn write_timeline_csv(&mut self, findings: &[Finding]) -> Result<()>;
     fn write_findings_jsonl(&mut self, findings: &[Finding]) -> Result<()>;
     fn write_manifest(&mut self, manifest: &crate::manifest::Manifest) -> Result<()>;
+    /// Generate a self-contained HTML report alongside other outputs.
+    /// Default is a no-op; DirSink overrides to write report.html.
+    fn write_html_report(
+        &mut self,
+        _findings: &[Finding],
+        _manifest: &crate::manifest::Manifest,
+    ) -> Result<()> {
+        Ok(())
+    }
     /// Finalize (e.g. zip + hash). Returns output file list with hashes.
     fn finalize(&mut self) -> Result<Vec<crate::manifest::OutputEntry>>;
 }
