@@ -1,7 +1,4 @@
 //! 選單渲染與使用者輸入。純 I/O，無業務邏輯。
-// T6 的 main.rs 會直接呼叫所有 pub fn，此時骨架 main.rs 尚未接線故暫 allow。
-#![allow(dead_code)]
-
 use std::io::{self, BufRead, Write};
 
 /// 清除終端畫面（ANSI escape sequence，支援 Windows Terminal / PowerShell）
@@ -66,12 +63,16 @@ pub fn print_summary(s: &crate::summary::ScanSummary) {
     use crate::summary::Verdict;
     println!("\n╔══════════════════════════════════════════╗");
     println!("║  掃描完成                                ║");
+    println!("║  主機名稱：{:<30}║", truncate(&s.hostname, 28));
     println!("║  時間範圍：{:<30}║", s.time_window_desc);
     println!("║  掃描時間：{:<30}║", s.started_utc);
     println!(
         "║  管理員權限：{:<28}║",
         if s.admin { "是" } else { "否（部分功能受限）" }
     );
+    if !s.sigma_ruleset_ver.is_empty() {
+        println!("║  規則版本：{:<30}║", truncate(&s.sigma_ruleset_ver, 28));
+    }
     println!("╠══════════════════════════════════════════╣");
     match s.verdict {
         Verdict::Clean => {

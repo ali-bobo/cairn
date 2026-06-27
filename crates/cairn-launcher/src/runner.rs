@@ -1,9 +1,5 @@
 //! 組合 cairn.exe 的執行參數並啟動子程序。
 //!
-//! `RunConfig` 和 `run_scan` 尚未接入 main.rs（將在後續 task 整合），
-//! 暫以 `#[allow(dead_code)]` 抑制 warning，與 summary.rs / package.rs 一致。
-#![allow(dead_code)]
-
 use std::path::{Path, PathBuf};
 
 /// cairn.exe 執行所需的所有參數。

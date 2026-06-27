@@ -1,9 +1,5 @@
 //! 把掃描結果目錄壓縮成 .zip，並開啟所在資料夾。
 
-// package 模組目前僅由 cairn-launcher 其他 task（T4+）消費；
-// 此 allow 在整個 crate 接線完成後移除。
-#![allow(dead_code)]
-
 use std::io::Write;
 use std::path::{Path, PathBuf};
 

@@ -1,9 +1,5 @@
 //! 讀取掃描結果 manifest.json + findings.jsonl，產生人類可讀摘要。
 
-// summary 模組目前僅由 cairn-launcher 其他 task（T3+）消費；
-// 此 allow 在整個 crate 接線完成後移除。
-#![allow(dead_code)]
-
 use std::path::Path;
 
 #[derive(Debug, PartialEq)]
