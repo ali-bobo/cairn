@@ -17,6 +17,16 @@ impl SigmaAnalyzer {
     pub fn new(engine: Engine) -> Self {
         SigmaAnalyzer { engine }
     }
+
+    /// Ruleset version string from the loaded Engine (`"<pin>+<aggregate>"` or `""`).
+    pub fn ruleset_ver(&self) -> &str {
+        self.engine.ruleset_ver()
+    }
+
+    /// Channels referenced by the loaded rules (load-optimization hint for EvtxLiveCollector).
+    pub fn channels(&self) -> &[String] {
+        self.engine.referenced_channels()
+    }
 }
 
 impl Analyzer for SigmaAnalyzer {

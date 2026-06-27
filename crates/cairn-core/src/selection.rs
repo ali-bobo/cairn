@@ -29,7 +29,8 @@ fn canonical_only_name(raw: &str) -> String {
     }
 }
 
-/// Heavy offline collectors (raw-NTFS modules + prefetch + future srum/userassist).
+/// Heavy offline collectors (raw-NTFS modules + prefetch + future srum/userassist)
+/// and conditional collectors like evtx_live (requires --rules; skipped in minimal).
 /// `--profile minimal` skips ALL of these (SRS §19.1). The single place the
 /// profile→heavy-set mapping lives. Not all are raw-NTFS (prefetch uses the file API),
 /// hence the name HEAVY_OFFLINE rather than RAW_NTFS.
@@ -42,6 +43,7 @@ const HEAVY_OFFLINE: &[&str] = &[
     "bam",
     "userassist",
     "srum",
+    "evtx_live",
 ];
 
 /// Modules a profile selects from `available`, BEFORE the `--only` intersection.
@@ -338,5 +340,27 @@ mod tests {
         assert_eq!(out.selected, vec!["proc", "net", "persist"]);
         let std = select_modules(Profile::Standard, None, &available);
         assert!(std.selected.contains(&"srum".to_string()));
+    }
+
+    #[test]
+    fn minimal_excludes_evtx_live() {
+        let available = vec![
+            "proc",
+            "net",
+            "persist",
+            "mft",
+            "usn",
+            "shimcache",
+            "amcache",
+            "prefetch",
+            "bam",
+            "userassist",
+            "srum",
+            "evtx_live",
+        ];
+        let out = select_modules(Profile::Minimal, None, &available);
+        assert_eq!(out.selected, vec!["proc", "net", "persist"]);
+        let std = select_modules(Profile::Standard, None, &available);
+        assert!(std.selected.contains(&"evtx_live".to_string()));
     }
 }

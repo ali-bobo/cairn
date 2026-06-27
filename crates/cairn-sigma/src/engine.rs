@@ -20,6 +20,7 @@ pub struct Engine {
     rules: Vec<Rule>,
     channels: Vec<String>,
     logsource: LogsourceMap,
+    ruleset_ver: String,
 }
 
 impl Engine {
@@ -48,7 +49,14 @@ impl Engine {
             rules,
             channels,
             logsource: LogsourceMap::windows_builtin(),
+            ruleset_ver: String::new(),
         }
+    }
+
+    /// Version string recorded by `load()` from the PROVENANCE file in the rules dir.
+    /// Format: `"<pin>+<aggregate>"` (ADR-0003). Empty when no rules were loaded via `load()`.
+    pub fn ruleset_ver(&self) -> &str {
+        &self.ruleset_ver
     }
 
     /// Logsource gate: does `ev` belong to the EVTX channel/event_id that `rule`'s
@@ -144,6 +152,9 @@ impl SigmaMatcher for Engine {
         collect_rule_yamls(rules_dir, plain, &mut yamls)?;
         let refs: Vec<&str> = yamls.iter().map(String::as_str).collect();
         *self = Engine::from_rules(&refs)?;
+        // Populate ruleset_ver from the PROVENANCE file for manifest integrity (ADR-0003).
+        self.ruleset_ver =
+            crate::ruleset::ruleset_version(rules_dir, plain).unwrap_or_default();
         Ok(self.rules.len())
     }
 

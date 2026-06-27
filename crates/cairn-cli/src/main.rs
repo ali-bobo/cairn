@@ -99,6 +99,9 @@ struct RunArgs {
     admin_features: bool,
     #[arg(long)]
     rules: Option<PathBuf>,
+    /// Load un-encoded `.yml` rules instead of the XOR-encoded bundle (ADR-0002).
+    #[arg(long)]
+    rules_plain: bool,
     #[arg(long, default_value = "standard")]
     profile: String,
     /// comma-separated module allow-list, e.g. evtx,process,persist
@@ -276,8 +279,10 @@ fn parse_cap(s: &str) -> Option<u64> {
 /// The collector names that the run arm's construction `if` blocks would build for
 /// this selection, in canonical order. Pure mirror of those blocks, so the
 /// selection→collectors mapping is unit-testable without a live Windows host.
-/// MUST stay in sync with the ten `if ... push(...)` blocks in `main` that
+/// MUST stay in sync with the ten unconditional `if ... push(...)` blocks in `main` that
 /// construct proc/net/persist/mft/usn/shimcache/amcache/prefetch/bam/userassist collectors (search: "S2-L: construct only").
+/// NOTE: `evtx_live` and `srum` are NOT included — they are conditionally constructed
+/// (evtx_live requires sigma_analyzer, srum has its own stub path).
 #[cfg(test)]
 fn built_collector_names(selected: &[String]) -> Vec<String> {
     [
@@ -679,6 +684,7 @@ fn main() -> anyhow::Result<()> {
                 "bam",
                 "userassist",
                 "srum",
+                "evtx_live",
             ];
             let selection = cairn_core::select_modules(profile, only.as_deref(), AVAILABLE);
             for name in &selection.unknown_only {
@@ -714,6 +720,8 @@ fn main() -> anyhow::Result<()> {
                 output: output_kind,
                 ..Config::default()
             };
+            cfg.rules_dir = args.rules.clone();
+            cfg.rules_plain = args.rules_plain;
 
             // ── Resource governance (NFR9/NFR10) ──────────────────────────────────────
             // Always true in this handler (a non-live --target exits earlier); kept to
@@ -722,6 +730,14 @@ fn main() -> anyhow::Result<()> {
             cfg.governance.max_threads = args.max_threads;
             cfg.governance.low_priority = is_live && !args.full_speed;
             cfg.normalize_for_profile();
+
+            // Default 24h window for live EVTX; overridable with --since (ISO8601 UTC).
+            cfg.since = Some(match args.since.as_deref() {
+                Some(s) => s
+                    .parse::<chrono::DateTime<chrono::Utc>>()
+                    .map_err(|e| anyhow::anyhow!("--since parse error: {e}"))?,
+                None => chrono::Utc::now() - chrono::Duration::hours(24),
+            });
 
             let available = std::thread::available_parallelism()
                 .map(|n| n.get())
@@ -744,6 +760,31 @@ fn main() -> anyhow::Result<()> {
             } else {
                 false
             };
+
+            // Load Sigma engine if --rules was given. Built before collector construction so
+            // we can pass referenced_channels() to EvtxLiveCollector.
+            let sigma_analyzer: Option<cairn_heur::SigmaAnalyzer> =
+                if let Some(ref rules_dir) = cfg.rules_dir {
+                    let mut engine = Engine::default();
+                    match engine.load(rules_dir, cfg.rules_plain) {
+                        Ok(n) => {
+                            tracing::info!(
+                                rules = n,
+                                dir = %rules_dir.display(),
+                                plain = cfg.rules_plain,
+                                "loaded sigma rules"
+                            );
+                            Some(cairn_heur::SigmaAnalyzer::new(engine))
+                        }
+                        Err(e) => {
+                            tracing::warn!(error = %e, dir = %rules_dir.display(), "rule load failed; skipping Sigma");
+                            None
+                        }
+                    }
+                } else {
+                    tracing::info!("no --rules; skipping Sigma and live EVTX");
+                    None
+                };
 
             // S2-L: construct only the selected collectors, matching the real
             // Collector::name() strings; order follows AVAILABLE (deterministic).
@@ -791,7 +832,18 @@ fn main() -> anyhow::Result<()> {
             if selection.selected.iter().any(|m| m == "srum") {
                 collectors.push(Box::new(cairn_collectors::srum::SrumCollector::default()));
             }
-            let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
+            if selection.selected.iter().any(|m| m == "evtx_live") {
+                if let Some(ref sa) = sigma_analyzer {
+                    let channels = sa.channels().to_vec();
+                    let since = cfg
+                        .since
+                        .unwrap_or_else(|| chrono::Utc::now() - chrono::Duration::hours(24));
+                    collectors.push(Box::new(
+                        cairn_collectors::evtx_live::EvtxLiveCollector::new(channels, since),
+                    ));
+                }
+            }
+            let mut analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
                 Box::new(cairn_heur::NetConnHeuristic),
                 Box::new(cairn_heur::PersistHeuristic),
@@ -801,6 +853,9 @@ fn main() -> anyhow::Result<()> {
                 )),
                 Box::new(cairn_heur::CorrelationAnalyzer),
             ];
+            if let Some(sa) = sigma_analyzer {
+                analyzers.push(Box::new(sa));
+            }
             let mut outcome = run_live(&cfg, privileges, hostname, &collectors, &analyzers);
             // Stamp the host onto each finding (analyzers don't know the hostname), then
             // sort for deterministic output (NFR4).
@@ -845,7 +900,7 @@ fn main() -> anyhow::Result<()> {
                     name: "cairn".into(),
                     version: env!("CARGO_PKG_VERSION").into(),
                     build_sha: BUILD_SHA.into(),
-                    sigma_ruleset_ver: String::new(),
+                    sigma_ruleset_ver: ruleset_ver(&cfg),
                 },
                 run: RunInfo {
                     started_utc: chrono::Utc::now(),
@@ -1021,6 +1076,7 @@ mod tests {
             "bam",
             "userassist",
             "srum",
+            "evtx_live",
         ];
 
         // --only persist => only persist constructed.
@@ -1029,7 +1085,8 @@ mod tests {
         let built = built_collector_names(&sel.selected);
         assert_eq!(built, vec!["persist".to_string()]);
 
-        // no --only => all ten in canonical order (minimal skips raw-NTFS).
+        // no --only => unconditional collectors in canonical order (minimal skips raw-NTFS;
+        // evtx_live and srum are not in built_collector_names as they are conditional).
         let sel = select_modules(Profile::Standard, None, AVAILABLE);
         let built = built_collector_names(&sel.selected);
         assert_eq!(
