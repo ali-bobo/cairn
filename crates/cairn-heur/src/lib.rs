@@ -3,6 +3,7 @@
 //! (golden rule 6). The only analysis source besides Sigma.
 #![forbid(unsafe_code)]
 
+pub mod account;
 pub mod correlation;
 pub mod netconn;
 pub mod parentchild;
@@ -12,6 +13,7 @@ pub mod sigma;
 pub mod timestomp;
 
 // Public API: the analyzers wired into the CLI live run (and reusable elsewhere).
+pub use account::AccountHeuristic;
 pub use correlation::CorrelationAnalyzer;
 pub use netconn::NetConnHeuristic;
 pub use parentchild::ParentChildHeuristic;

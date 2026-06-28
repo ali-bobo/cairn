@@ -853,6 +853,7 @@ fn main() -> anyhow::Result<()> {
                     chrono::Duration::hours(cfg.timestomp_threshold_hours),
                 )),
                 Box::new(cairn_heur::CorrelationAnalyzer),
+                Box::new(cairn_heur::AccountHeuristic),
             ];
             if let Some(sa) = sigma_analyzer {
                 analyzers.push(Box::new(sa));
@@ -1228,6 +1229,7 @@ mod tests {
             Box::new(cairn_heur::PersistHeuristic),
             Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
             Box::new(cairn_heur::CorrelationAnalyzer),
+            Box::new(cairn_heur::AccountHeuristic),
         ];
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_timestomp"),
@@ -1236,6 +1238,10 @@ mod tests {
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_correlation"),
             "heur_correlation must be in analyzer set"
+        );
+        assert!(
+            analyzers.iter().any(|a| a.name() == "heur_account"),
+            "heur_account must be in analyzer set"
         );
     }
 
