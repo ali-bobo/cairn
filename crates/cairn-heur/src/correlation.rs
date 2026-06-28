@@ -8,9 +8,78 @@ use cairn_core::{Finding, Result};
 use chrono::Utc;
 use std::collections::{BTreeSet, HashMap};
 
-/// Cross-artifact correlation: emit High Finding when the same binary
+/// Cross-artifact correlation: emit Finding when the same binary
 /// appears in both persistence and execution artifact sources.
+/// Severity is determined by path trust and signature status rather than a fixed High.
 pub struct CorrelationAnalyzer;
+
+/// From a group of PersistenceRecords, derive a representative signed status.
+/// Any entry explicitly unsigned → Some(false); all signed → Some(true); otherwise → None.
+fn group_signed(group: &[&&PersistenceRecord]) -> Option<bool> {
+    let mut any_false = false;
+    let mut all_true = true;
+    for p in group {
+        match p.signed {
+            Some(false) => any_false = true,
+            Some(true) => {}
+            None => all_true = false,
+        }
+    }
+    if any_false {
+        Some(false)
+    } else if all_true {
+        Some(true)
+    } else {
+        None
+    }
+}
+
+/// Decide severity and a human-readable rationale for a correlation finding.
+///
+/// Decision matrix (from most to least dangerous):
+/// - Suspicious path (Temp/Downloads/ProgramData/Public) → High regardless of signature
+/// - Explicitly unsigned (signed=Some(false)) → High; legitimate software is always signed
+/// - Signature unknown (signed=None, typical in EVTX-only/offline mode) → High; fail-loud
+/// - Signed + non-suspicious path → Medium; consistent with legitimate autostart software
+// Directories genuinely suspicious as persistence binary locations.
+// Narrower than score::SUSPICIOUS_DIRS: we exclude the broad `\appdata\` match because
+// `\AppData\Local\<vendor>\` is a legitimate per-user install path. Only specific
+// sub-paths that are drop-zones for malware are listed here.
+const CORRELATION_SUSPICIOUS_DIRS: &[&str] = &[
+    r"\temp\",
+    r"\appdata\roaming\",
+    r"\appdata\local\temp\",
+    r"\downloads\",
+    r"\public\",
+    r"\programdata\",
+];
+
+fn is_correlation_suspicious_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    CORRELATION_SUSPICIOUS_DIRS.iter().any(|d| lower.contains(d))
+}
+
+fn correlation_severity(best_path: &str, signed: Option<bool>) -> (Severity, &'static str) {
+    if is_correlation_suspicious_path(best_path) {
+        (Severity::High, "binary path is in a suspicious directory")
+    } else if signed == Some(false) {
+        (
+            Severity::High,
+            "binary is explicitly unsigned; legitimate software is always signed",
+        )
+    } else if signed.is_none() {
+        (
+            Severity::High,
+            "signature status unknown (offline/EVTX-only mode); cannot exclude risk",
+        )
+    } else {
+        // signed == Some(true) && non-suspicious path
+        (
+            Severity::Medium,
+            "signed binary in a normal path; consistent with legitimate autostart software",
+        )
+    }
+}
 
 fn mechanism_to_mitre(mechanism: &str) -> &'static str {
     match mechanism {
@@ -118,6 +187,8 @@ impl Analyzer for CorrelationAnalyzer {
                     .unwrap_or(key.as_str())
                     .to_string();
 
+                let signed = group_signed(group);
+                let (sev, sev_reason) = correlation_severity(&best_path, signed);
                 let mitre = mechanism_to_mitre(mechanism);
 
                 let last_run_str = last_run
@@ -140,10 +211,10 @@ impl Analyzer for CorrelationAnalyzer {
                         .join(", ");
                     reason_parts.push(format!("and currently running (pid={pid_str})"));
                 }
-                let reason = reason_parts.join(" ");
+                let reason = format!("{} — {}", reason_parts.join(" "), sev_reason);
 
                 let mut f = Finding::new(
-                    Severity::High,
+                    sev,
                     format!("Confirmed persistence + execution: {key}"),
                     FindingSource::Heuristic,
                 );
@@ -469,5 +540,152 @@ mod tests {
         let combined = format!("{reason} {details}");
         assert!(combined.contains("prefetch"), "prefetch source: {combined}");
         assert!(combined.contains("amcache"), "amcache source: {combined}");
+    }
+
+    // ── severity tuning tests ────────────────────────────────────────────────
+
+    fn with_signed(records: Vec<Record>, signed: Option<bool>) -> Vec<Record> {
+        records
+            .into_iter()
+            .map(|r| match r {
+                Record::Persistence(mut p) => {
+                    p.signed = signed;
+                    Record::Persistence(p)
+                }
+                other => other,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn signed_normal_path_is_medium() {
+        let records = with_signed(
+            vec![
+                persist(
+                    "run_key",
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                    r"C:\Users\bosen\AppData\Local\Google\Chrome\Application\chrome.exe",
+                    Some(r"C:\Users\bosen\AppData\Local\Google\Chrome\Application\chrome.exe"),
+                ),
+                exec(
+                    r"C:\Users\bosen\AppData\Local\Google\Chrome\Application\chrome.exe",
+                    "amcache",
+                ),
+            ],
+            Some(true),
+        );
+        let findings = CorrelationAnalyzer.analyze(&records).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].severity,
+            Severity::Medium,
+            "signed binary in normal path must be Medium, got {:?}",
+            findings[0].severity
+        );
+    }
+
+    #[test]
+    fn signed_appdata_local_programs_is_medium() {
+        let records = with_signed(
+            vec![
+                persist(
+                    "run_key",
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                    r"C:\Users\bosen\AppData\Local\Programs\Notion\Notion.exe",
+                    Some(r"C:\Users\bosen\AppData\Local\Programs\Notion\Notion.exe"),
+                ),
+                exec("NOTION.EXE-AABBCCDD.pf", "prefetch"),
+            ],
+            Some(true),
+        );
+        let findings = CorrelationAnalyzer.analyze(&records).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn unsigned_normal_path_is_high() {
+        let records = with_signed(
+            vec![
+                persist(
+                    "run_key",
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                    r"C:\Users\bosen\AppData\Local\Google\Chrome\Application\chrome.exe",
+                    Some(r"C:\Users\bosen\AppData\Local\Google\Chrome\Application\chrome.exe"),
+                ),
+                exec(
+                    r"C:\Users\bosen\AppData\Local\Google\Chrome\Application\chrome.exe",
+                    "amcache",
+                ),
+            ],
+            Some(false),
+        );
+        let findings = CorrelationAnalyzer.analyze(&records).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn unknown_signed_normal_path_is_high() {
+        // signed = None (EVTX-only / offline) — fail-loud
+        let records = vec![
+            persist(
+                "run_key",
+                r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                r"C:\Program Files\SomeApp\app.exe",
+                Some(r"C:\Program Files\SomeApp\app.exe"),
+            ),
+            exec(r"C:\Program Files\SomeApp\app.exe", "prefetch"),
+        ];
+        // signed defaults to None in persist() helper
+        let findings = CorrelationAnalyzer.analyze(&records).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn suspicious_path_signed_is_high() {
+        // 路徑在 Temp，即使已簽章也應維持 High
+        let records = with_signed(
+            vec![
+                persist(
+                    "run_key",
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                    r"C:\Users\x\AppData\Local\Temp\evil.exe",
+                    Some(r"C:\Users\x\AppData\Local\Temp\evil.exe"),
+                ),
+                exec(r"C:\Users\x\AppData\Local\Temp\evil.exe", "prefetch"),
+            ],
+            Some(true),
+        );
+        let findings = CorrelationAnalyzer.analyze(&records).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(
+            findings[0].severity,
+            Severity::High,
+            "suspicious path must stay High even if signed"
+        );
+    }
+
+    #[test]
+    fn reason_contains_severity_rationale() {
+        let records = with_signed(
+            vec![
+                persist(
+                    "run_key",
+                    r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
+                    r"C:\Users\bosen\AppData\Local\Programs\Notion\Notion.exe",
+                    Some(r"C:\Users\bosen\AppData\Local\Programs\Notion\Notion.exe"),
+                ),
+                exec("NOTION.EXE-AABBCCDD.pf", "prefetch"),
+            ],
+            Some(true),
+        );
+        let findings = CorrelationAnalyzer.analyze(&records).unwrap();
+        let reason = findings[0].reason.as_deref().unwrap_or("");
+        assert!(
+            reason.contains("signed") || reason.contains("legitimate"),
+            "reason must explain severity rationale: {reason}"
+        );
     }
 }
