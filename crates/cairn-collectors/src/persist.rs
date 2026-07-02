@@ -771,6 +771,40 @@ impl FileVerifier for NoopVerifier {
     }
 }
 
+/// Resolve a RELATIVE binary_path against the Windows standard search order
+/// (System32, then the Windows root) BEFORE signature verification (spec §5).
+/// Winlogon stores `explorer.exe` as a bare name; without this the verifier gets an
+/// unresolvable path, returns None, and the finding can't be honestly classified.
+/// Absolute paths (drive-colon or UNC) are left untouched. Unresolvable stays as-is
+/// (verifier will yield None — honest "could not verify").
+fn resolve_relative_binary_paths_with(
+    records: &mut [PersistenceRecord],
+    sysroot: &str,
+    exists: impl Fn(&str) -> bool,
+) {
+    for r in records.iter_mut() {
+        let Some(p) = r.binary_path.as_deref() else { continue };
+        let is_absolute = p.get(1..).is_some_and(|rest| rest.starts_with(":\\"))
+            || p.starts_with("\\\\");
+        if is_absolute || p.contains('\\') || p.is_empty() {
+            continue; // absolute, UNC, or already dir-qualified relative — leave alone
+        }
+        for base in [format!(r"{sysroot}\System32"), sysroot.to_string()] {
+            let cand = format!(r"{base}\{p}");
+            if exists(&cand) {
+                r.binary_path = Some(cand);
+                break;
+            }
+        }
+    }
+}
+
+/// Process-env wrapper: %SystemRoot% with the conventional fallback.
+fn resolve_relative_binary_paths(records: &mut [PersistenceRecord]) {
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    resolve_relative_binary_paths_with(records, &sysroot, |p| std::path::Path::new(p).exists());
+}
+
 /// Fill each record's `signed` from the verifier, for records that have a binary_path.
 /// Pure wiring (no OS code); the verifier abstracts the platform. A binary_path of None is
 /// left untouched (signed stays None).
@@ -821,6 +855,7 @@ impl Collector for PersistCollector {
         records.extend(read_ifeo());
         records.extend(read_startup_folders());
         records.extend(read_scheduled_tasks());
+        resolve_relative_binary_paths(&mut records);
         apply_signatures(&mut records, self.verifier.as_ref());
         Ok(records.into_iter().map(Record::Persistence).collect())
     }
@@ -1504,5 +1539,54 @@ mod tests {
             acts[0].uri.as_deref(),
             Some(r"\Microsoft\Windows\Defrag\ScheduledDefrag")
         );
+    }
+
+    // ── resolve_relative_binary_paths_with ─────────────────────────────────
+
+    fn rec_with_path(p: Option<&str>) -> PersistenceRecord {
+        PersistenceRecord {
+            mechanism: "winlogon".into(),
+            location: r"HKLM\...\Winlogon".into(),
+            value: Some("Shell".into()),
+            command: p.map(|s| s.to_string()),
+            binary_path: p.map(|s| s.to_string()),
+            binary_sha256: None,
+            signed: None,
+            signer: None,
+            last_write: None,
+        }
+    }
+
+    #[test]
+    fn bare_name_resolves_via_system32_then_root() {
+        let mut recs = vec![rec_with_path(Some("explorer.exe"))];
+        resolve_relative_binary_paths_with(&mut recs, r"C:\Windows", |p| {
+            p == r"C:\Windows\explorer.exe" // not in System32, found at root
+        });
+        assert_eq!(recs[0].binary_path.as_deref(), Some(r"C:\Windows\explorer.exe"));
+
+        let mut recs2 = vec![rec_with_path(Some("userinit.exe"))];
+        resolve_relative_binary_paths_with(&mut recs2, r"C:\Windows", |p| {
+            p == r"C:\Windows\System32\userinit.exe"
+        });
+        assert_eq!(
+            recs2[0].binary_path.as_deref(),
+            Some(r"C:\Windows\System32\userinit.exe")
+        );
+    }
+
+    #[test]
+    fn absolute_unc_and_unresolvable_left_untouched() {
+        let mut recs = vec![
+            rec_with_path(Some(r"C:\Windows\explorer.exe")),
+            rec_with_path(Some(r"\\srv\share\x.exe")),
+            rec_with_path(Some("ghost.exe")),
+            rec_with_path(None),
+        ];
+        resolve_relative_binary_paths_with(&mut recs, r"C:\Windows", |_| false);
+        assert_eq!(recs[0].binary_path.as_deref(), Some(r"C:\Windows\explorer.exe"));
+        assert_eq!(recs[1].binary_path.as_deref(), Some(r"\\srv\share\x.exe"));
+        assert_eq!(recs[2].binary_path.as_deref(), Some("ghost.exe")); // stays; verifier -> None
+        assert_eq!(recs[3].binary_path, None);
     }
 }
