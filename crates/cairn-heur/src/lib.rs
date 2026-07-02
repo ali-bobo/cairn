@@ -11,6 +11,7 @@ pub mod persist;
 pub mod score;
 pub mod sigma;
 pub mod timestomp;
+pub mod trust;
 
 // Public API: the analyzers wired into the CLI live run (and reusable elsewhere).
 pub use account::AccountHeuristic;
