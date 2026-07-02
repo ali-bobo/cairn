@@ -321,6 +321,15 @@ impl Analyzer for PersistHeuristic {
     }
 
     fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+        // NOTE: `observe()` below independently samples its own `now`. The orchestrator
+        // calls analyze() then observe() as two separate trait-method calls, so these two
+        // timestamps can differ by however long analysis takes. S4's 7-day recency gate
+        // is the only signal sensitive to `now`; a record whose age crosses exactly the
+        // 7-day boundary during that gap could in theory appear in BOTH findings and
+        // observations (or neither). Sharing one timestamp would require threading `now`
+        // through the Analyzer trait signature for all six analyzers — out of proportion
+        // to a sub-second race on a 7-day window. Accepted residual risk (see
+        // docs/REMAINING-WORK.md).
         let now = Utc::now();
         let idx = build_cross_index(records);
         let mut out = Vec::new();

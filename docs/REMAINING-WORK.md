@@ -32,6 +32,15 @@
     驗收後乾淨。**待辦 C（correlation 時間標注）視為已被 S4 recency 條件 + observation details
     帶 last_write 涵蓋，關閉**。全 workspace 測試綠、clippy 零警告。**待辦事項：merge 回 main**
     （finishing-a-development-branch）。
+  - **Opus 整體審查殘留風險（接受，已文件化於 `persist.rs::analyze` 註解）**：
+    `analyze()`/`observe()` 各自獨立呼叫 `Utc::now()`（orchestrator 分兩次呼叫），S4 的 7 天
+    recency 邊界理論上可能在極窄時間窗（毫秒級）內漂移，導致單一 persistence record 同時
+    出現在 findings 與 observations（或都不出現）。真正修復需改 `Analyzer` trait 簽名讓
+    analyze/observe 共享時間戳，波及全部 6 個 analyzer + orchestrator，與影響面（非告警類
+    盤點通道偶爾重複/遺漏一筆）不成比例——評估後採小範圍緩解（誠實註解 + 此處記錄），不修
+    trait。另一低優先殘留項：`trust.rs` 的 `is_masquerade`/`is_under_windows_tree` 只認反斜線
+    絕對路徑，正斜線或 UNC 路徑會abstain；目前所有 persistence collector 只產生反斜線路徑，
+    屬理論風險。
 
 ## 前次位置（2026-06-28）
 
