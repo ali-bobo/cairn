@@ -853,7 +853,6 @@ fn main() -> anyhow::Result<()> {
                 Box::new(cairn_heur::TimestompHeuristic::new(
                     chrono::Duration::hours(cfg.timestomp_threshold_hours),
                 )),
-                Box::new(cairn_heur::CorrelationAnalyzer),
                 Box::new(cairn_heur::AccountHeuristic),
             ];
             if let Some(sa) = sigma_analyzer {
@@ -1220,7 +1219,7 @@ mod tests {
         assert!(line.contains("output="), "{line}");
     }
 
-    /// The live analyzer set includes all heuristics (timestomp + correlation).
+    /// The live analyzer set includes all heuristics.
     #[test]
     fn live_analyzers_include_all_heuristics() {
         use cairn_core::traits::Analyzer;
@@ -1230,16 +1229,11 @@ mod tests {
             Box::new(cairn_heur::NetConnHeuristic),
             Box::new(cairn_heur::PersistHeuristic),
             Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
-            Box::new(cairn_heur::CorrelationAnalyzer),
             Box::new(cairn_heur::AccountHeuristic),
         ];
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_timestomp"),
             "heur_timestomp must be in analyzer set"
-        );
-        assert!(
-            analyzers.iter().any(|a| a.name() == "heur_correlation"),
-            "heur_correlation must be in analyzer set"
         );
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_account"),
