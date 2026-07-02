@@ -144,6 +144,12 @@ impl Analyzer for TimestompHeuristic {
                 }),
                 ..Entity::default()
             };
+            f.evidence = vec![cairn_core::finding::EvidenceItem {
+                artifact: "mft".into(),
+                path: Some(m.path.clone()),
+                ts: m.fn_btime.or(m.fn_mtime),
+                detail: format!("$MFT SI/FN delta: {}", axes_detail(&hit)),
+            }];
             out.push(f);
         }
         Ok(out)
@@ -364,6 +370,25 @@ mod tests {
         assert!(ef.si_btime.is_some() && ef.fn_btime.is_some());
         assert!(ef.si_mtime.is_some() && ef.fn_mtime.is_some());
         assert_eq!(ef.path, r"C:\Users\a\evil.exe");
+    }
+
+    #[test]
+    fn timestomp_finding_carries_mft_evidence() {
+        use cairn_core::record::Record;
+        use cairn_core::traits::Analyzer;
+        // Same known-good stomped fixture as analyzer_emits_finding_with_four_axis_entity.
+        let stomped = Record::FileMeta(meta(
+            Some(t("2011-01-01T00:00:00Z")),
+            Some(t("2013-01-05T18:15:00Z")),
+            Some(t("2011-01-01T00:00:00Z")),
+            Some(t("2013-01-05T18:15:00Z")),
+        ));
+        let records = vec![stomped];
+
+        let h = TimestompHeuristic::new(Duration::hours(24));
+        let f = &h.analyze(&records).unwrap()[0];
+        assert_eq!(f.evidence[0].artifact, "mft");
+        assert!(f.evidence[0].path.is_some());
     }
 
     #[test]

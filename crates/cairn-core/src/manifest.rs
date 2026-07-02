@@ -76,6 +76,9 @@ pub struct OutputEntry {
 pub struct Counts {
     pub records: u64,
     pub findings_by_sev: std::collections::BTreeMap<String, u64>,
+    /// Inventory items written to observations.jsonl (spec §6). Additive.
+    #[serde(default)]
+    pub observations: u64,
 }
 
 /// Resource-governance report (NFR9/NFR10): what the run throttled or truncated.
@@ -160,6 +163,7 @@ mod tests {
             counts: Counts {
                 records: 5000,
                 findings_by_sev: by_sev,
+                observations: 0,
             },
             integrity_note: "All hashes SHA-256 over bytes as collected.".into(),
             governance: GovernanceReport::default(),

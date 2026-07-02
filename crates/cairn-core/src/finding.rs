@@ -77,6 +77,24 @@ pub struct EntityRegistry {
     pub last_write: Option<DateTime<Utc>>,
 }
 
+/// One corroborating source for a Finding (spec §7): which artifact saw the binary,
+/// at what path, when. `path` is honest — prefetch carries only a file name and says so
+/// in `detail`. Additive to the finding schema (old JSON deserializes to an empty vec).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EvidenceItem {
+    /// Source artifact: "run_key" | "service" | "prefetch" | "shimcache" | "amcache"
+    /// | "bam" | "userassist" | "process" | "evtx:Security" | "mft" | ...
+    pub artifact: String,
+    /// Full path as seen by that source (None when the source has no path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// That source's own timestamp (last_run / last_write / event time).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ts: Option<DateTime<Utc>>,
+    /// Human-readable one-liner, e.g. "prefetch: run_count=12 last_run=2026-06-27T23:31Z".
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Finding {
     pub schema: String, // crate::schema::FINDING
@@ -109,6 +127,10 @@ pub struct Finding {
     /// explainability: heuristics MUST state why (SRS §10). Never opaque scores.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Corroborating sources (spec §7). Empty for findings with a single self-evident
+    /// source (most Sigma hits). Old JSON without the field deserializes to empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<EvidenceItem>,
 }
 
 impl Finding {
@@ -134,6 +156,7 @@ impl Finding {
             details: String::new(),
             details_client: None,
             reason: None,
+            evidence: vec![],
         }
     }
 }
@@ -266,5 +289,34 @@ mod tests {
         let j = serde_json::to_string(&full).unwrap();
         let back: EntityFile = serde_json::from_str(&j).unwrap();
         assert_eq!(back.path_complete, Some(false));
+    }
+
+    #[test]
+    fn evidence_roundtrips_and_old_json_defaults_empty() {
+        let mut f = Finding::new(Severity::High, "x", FindingSource::Heuristic);
+        f.evidence.push(EvidenceItem {
+            artifact: "prefetch".into(),
+            path: Some("EVIL.EXE".into()),
+            ts: None,
+            detail: "prefetch: run_count=3".into(),
+        });
+        let j = serde_json::to_string(&f).unwrap();
+        assert!(j.contains("\"evidence\""));
+        let back: Finding = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.evidence.len(), 1);
+        assert_eq!(back.evidence[0].artifact, "prefetch");
+
+        // Old JSON (no evidence field) -> empty vec, and empty vec is omitted on write.
+        let f2 = Finding::new(Severity::Low, "y", FindingSource::Heuristic);
+        let j2 = serde_json::to_string(&f2).unwrap();
+        assert!(!j2.contains("evidence"));
+        let back2: Finding = serde_json::from_str(&j2).unwrap();
+        assert!(back2.evidence.is_empty());
+    }
+
+    #[test]
+    fn finding_schema_string_unchanged_by_evidence() {
+        let f = Finding::new(Severity::Info, "z", FindingSource::Sigma);
+        assert_eq!(f.schema, "cairn.finding/1");
     }
 }

@@ -1,5 +1,8 @@
 //! Core traits: the seams Claude Code implements per stage. SRS §3-§4.
-use crate::{config::Config, finding::Finding, manifest::SourceEntry, record::Record, Result};
+use crate::{
+    config::Config, finding::Finding, manifest::SourceEntry, observation::Observation,
+    record::Record, Result,
+};
 
 /// Context handed to every collector: privilege state, target, output policy.
 #[derive(Debug, Clone)]
@@ -42,6 +45,11 @@ pub trait Collector: Send + Sync {
 pub trait Analyzer: Send + Sync {
     fn name(&self) -> &str;
     fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>>;
+    /// Inventory items that did NOT clear the dispositive-signal gate (spec §6).
+    /// Default empty: only analyzers that own an inventory (persist) override.
+    fn observe(&self, _records: &[Record]) -> Result<Vec<Observation>> {
+        Ok(vec![])
+    }
 }
 
 /// Where results go. Default writes OFF-TARGET; `--dry-run` writes nothing (FR16).
@@ -51,12 +59,17 @@ pub trait OutputSink: Send {
     /// Record. There is no separate raw-event timeline (decided: detection-only).
     fn write_timeline_csv(&mut self, findings: &[Finding]) -> Result<()>;
     fn write_findings_jsonl(&mut self, findings: &[Finding]) -> Result<()>;
+    /// Host-inventory channel (observations.jsonl). Default no-op.
+    fn write_observations(&mut self, _observations: &[Observation]) -> Result<()> {
+        Ok(())
+    }
     fn write_manifest(&mut self, manifest: &crate::manifest::Manifest) -> Result<()>;
     /// Generate a self-contained HTML report alongside other outputs.
     /// Default is a no-op; DirSink overrides to write report.html.
     fn write_html_report(
         &mut self,
         _findings: &[Finding],
+        _observations: &[Observation],
         _manifest: &crate::manifest::Manifest,
     ) -> Result<()> {
         Ok(())

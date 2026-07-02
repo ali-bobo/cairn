@@ -7,6 +7,11 @@ use cairn_core::traits::Analyzer;
 use cairn_core::{Entity, Finding, FindingSource, Result};
 use std::collections::HashMap;
 
+/// Gate floor (spec §4.2 S7): single weak signals (rare port 20, public+rare 45,
+/// suspicious-path owner 30) are inventory-grade and never emit alone; a finding
+/// requires a corroborated combo (e.g. public+rare+unsigned = 65).
+const NETCONN_GATE_FLOOR: u32 = 50;
+
 /// Score one connection against its (optional) owning process.
 fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
     let mut s = Score::default();
@@ -96,6 +101,9 @@ impl Analyzer for NetConnHeuristic {
             }
             let owner = c.pid.and_then(|pid| by_pid.get(&pid).copied());
             let score = score_conn(c, owner);
+            if score.weight < NETCONN_GATE_FLOOR {
+                continue;
+            }
             let Some(severity) = severity_for(score.weight) else {
                 continue;
             };
@@ -185,9 +193,11 @@ mod tests {
         }
     }
 
-    /// Unsigned proc in Temp connecting to a public IP on a rare port scores high.
+    /// Unsigned proc in Temp connecting to a public IP on a rare port scores Critical
+    /// (weight 95 = public-ip 25 + rare-port 20 + suspicious-path 30 + unsigned 20;
+    /// severity_for(95) = Critical, per the 70.. band — see score.rs).
     #[test]
-    fn unsigned_temp_to_public_rare_port_scores_high() {
+    fn unsigned_temp_to_public_rare_port_scores_critical() {
         let c = conn(
             "tcp",
             50000,
@@ -275,9 +285,13 @@ mod tests {
 
     /// Public-IP gating is independent of the rare-port signal: a PRIVATE (RFC1918)
     /// address on a rare port fires ONLY the rare-port signal (+20), never the
-    /// public-IP signal — proving the public-IP gate works on its own.
+    /// public-IP signal — proving the public-IP gate works on its own. At the
+    /// `score_conn` level this weight (20) is below NETCONN_GATE_FLOOR (50), so
+    /// `analyze()` must produce no finding at all (renamed from
+    /// `private_ip_rare_port_fires_rare_port_only`, which asserted a bare score
+    /// value under the pre-gate-floor model).
     #[test]
-    fn private_ip_rare_port_fires_rare_port_only() {
+    fn private_ip_rare_port_below_gate_floor_no_finding() {
         let c = conn(
             "tcp",
             50000,
@@ -292,6 +306,14 @@ mod tests {
             "only the rare-port signal should fire for a private dest"
         );
         assert!(!s.reasons.iter().any(|r| r.contains("public IP")));
+
+        let findings = NetConnHeuristic
+            .analyze(&[Record::NetConn(c)])
+            .expect("analyze");
+        assert!(
+            findings.is_empty(),
+            "weight 20 must not clear the gate floor (50)"
+        );
     }
 
     /// A listening socket reports remote port 0 / no remote — it must NOT fire the
@@ -461,20 +483,27 @@ mod tests {
         );
     }
 
-    /// A different PID on a suspicious connection must still fire.
+    /// A different PID on a suspicious connection (with a corroborating owner signal
+    /// clearing the gate floor) must still fire.
     #[test]
     fn other_pid_netconn_still_flagged() {
         use std::process;
         let own_pid = process::id();
+        let other_pid = own_pid + 9999;
         let bad_conn = Record::NetConn(conn(
             "tcp",
             50000,
             Some("104.18.0.1"),
             Some(4444),
             Some("established"),
-            Some(own_pid + 9999),
+            Some(other_pid),
         ));
-        let findings = NetConnHeuristic.analyze(&[bad_conn]).expect("analyze");
+        let mut o = owner(r"C:\Users\a\AppData\Local\Temp\evil.exe", Some(false));
+        o.pid = other_pid;
+        let proc_rec = Record::Process(o);
+        let findings = NetConnHeuristic
+            .analyze(&[bad_conn, proc_rec])
+            .expect("analyze");
         assert!(!findings.is_empty(), "other PID must still produce findings");
     }
 
@@ -513,9 +542,14 @@ mod tests {
         assert!(!details.contains("pid=Some("), "must not use debug format: {details}");
     }
 
-    /// When owner is unknown, details show the raw pid as the label.
+    /// With no owning process record, connection-only signals (public-IP 25 + rare-port
+    /// 20 = 45) cannot clear the NETCONN_GATE_FLOOR (50) alone — no finding is produced.
+    /// (Renamed from `netconn_details_no_owner`: that test's premise — a no-owner
+    /// connection still producing a finding — is no longer reachable post-gate-floor,
+    /// since connection-only signals cap at 45. The pid-as-label details format for a
+    /// known owner is already covered by `netconn_details_format`.)
     #[test]
-    fn netconn_details_no_owner() {
+    fn netconn_no_owner_below_gate_floor_no_finding() {
         let bad = Record::NetConn(conn(
             "tcp",
             50000,
@@ -525,12 +559,10 @@ mod tests {
             Some(9999),
         ));
         let findings = NetConnHeuristic.analyze(&[bad]).expect("analyze");
-        assert!(!findings.is_empty());
-        let details = &findings[0].details;
-        // pid should appear as a plain number in the label
-        assert!(details.contains("9999"), "pid label missing: {details}");
-        assert!(details.contains("104.18.0.1"), "remote addr missing: {details}");
-        assert!(!details.contains("pid=Some("), "no debug format: {details}");
+        assert!(
+            findings.is_empty(),
+            "connection-only signals (45) must not clear the gate floor (50)"
+        );
     }
 
     /// The analyzer emits one Heuristic NetConn finding for the malicious conn, with
@@ -566,5 +598,44 @@ mod tests {
         assert!(matches!(f.source, cairn_core::FindingSource::Heuristic));
         assert!(f.reason.is_some());
         assert!(f.entity.netconn.is_some());
+    }
+
+    /// public+rare (25+20=45) + unsigned amplifier (20) = 65, clearing the gate floor
+    /// (50). severity_for(65) = High (the 50..=69 band).
+    #[test]
+    fn public_rare_plus_unsigned_owner_clears_gate() {
+        let bad = Record::NetConn(conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        ));
+        let proc = Record::Process(owner(r"C:\Windows\System32\svc.exe", Some(false)));
+        let findings = NetConnHeuristic
+            .analyze(&[bad, proc])
+            .expect("analyze");
+        assert_eq!(findings.len(), 1, "combo (65) must clear the gate floor");
+        assert_eq!(findings[0].severity, cairn_core::Severity::High);
+    }
+
+    /// public+rare alone (25+20=45) stays below the gate floor (50) with no owning
+    /// process to supply the unsigned amplifier: analyze() must return nothing.
+    #[test]
+    fn public_rare_alone_is_dropped_by_gate() {
+        let bad = Record::NetConn(conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            None,
+        ));
+        let findings = NetConnHeuristic.analyze(&[bad]).expect("analyze");
+        assert!(
+            findings.is_empty(),
+            "weight 45 must not clear the gate floor (50)"
+        );
     }
 }

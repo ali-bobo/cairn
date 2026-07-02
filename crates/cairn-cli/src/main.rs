@@ -413,6 +413,7 @@ fn build_manifest(cfg: &Config, hostname: &str, records: u64, findings: &[Findin
         counts: Counts {
             records,
             findings_by_sev: by_sev,
+            observations: 0,
         },
         integrity_note: "All hashes SHA-256 over bytes as collected.".into(),
         governance: cairn_core::manifest::GovernanceReport::default(),
@@ -567,7 +568,7 @@ fn main() -> anyhow::Result<()> {
             let mut sink = DirSink::new(dir.clone());
             sink.write_timeline_csv(&findings)?;
             sink.write_findings_jsonl(&findings)?;
-            sink.write_html_report(&findings, &manifest)?;
+            sink.write_html_report(&findings, &[], &manifest)?;
             manifest.outputs = sink.outputs_so_far();
             sink.write_manifest(&manifest)?;
             let outputs = sink.finalize()?;
@@ -852,7 +853,6 @@ fn main() -> anyhow::Result<()> {
                 Box::new(cairn_heur::TimestompHeuristic::new(
                     chrono::Duration::hours(cfg.timestomp_threshold_hours),
                 )),
-                Box::new(cairn_heur::CorrelationAnalyzer),
                 Box::new(cairn_heur::AccountHeuristic),
             ];
             if let Some(sa) = sigma_analyzer {
@@ -865,6 +865,13 @@ fn main() -> anyhow::Result<()> {
                 f.host = outcome.hostname.clone();
             }
             sort_findings(&mut outcome.findings);
+            // Stamp host + deterministic sort onto observations too (spec §11).
+            for o in &mut outcome.observations {
+                o.host = outcome.hostname.clone();
+            }
+            outcome.observations.sort_by(|a, b| {
+                (a.category.as_str(), a.title.as_str()).cmp(&(b.category.as_str(), b.title.as_str()))
+            });
             // FR14: hash the binaries behind findings (streaming, size-capped) and fill
             // binary_sha256 so each suspicious record carries an IOC hash. In-memory only —
             // for --dry-run nothing is written (golden rule 4).
@@ -925,6 +932,7 @@ fn main() -> anyhow::Result<()> {
                 counts: Counts {
                     records: outcome.records.len() as u64,
                     findings_by_sev: by_sev,
+                    observations: outcome.observations.len() as u64,
                 },
                 integrity_note: "All hashes SHA-256 over bytes as collected.".into(),
                 governance: governance_report,
@@ -936,7 +944,8 @@ fn main() -> anyhow::Result<()> {
             let mut sink = build_sink(&cfg.output)?;
             sink.write_timeline_csv(&outcome.findings)?;
             sink.write_findings_jsonl(&outcome.findings)?;
-            sink.write_html_report(&outcome.findings, &manifest)?;
+            sink.write_observations(&outcome.observations)?;
+            sink.write_html_report(&outcome.findings, &outcome.observations, &manifest)?;
             if let OutputKind::Dir(ref d) = cfg.output {
                 write_records_jsonl(d, &outcome.records)?;
             }
@@ -1218,7 +1227,7 @@ mod tests {
         assert!(line.contains("output="), "{line}");
     }
 
-    /// The live analyzer set includes all heuristics (timestomp + correlation).
+    /// The live analyzer set includes all heuristics.
     #[test]
     fn live_analyzers_include_all_heuristics() {
         use cairn_core::traits::Analyzer;
@@ -1228,16 +1237,11 @@ mod tests {
             Box::new(cairn_heur::NetConnHeuristic),
             Box::new(cairn_heur::PersistHeuristic),
             Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
-            Box::new(cairn_heur::CorrelationAnalyzer),
             Box::new(cairn_heur::AccountHeuristic),
         ];
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_timestomp"),
             "heur_timestomp must be in analyzer set"
-        );
-        assert!(
-            analyzers.iter().any(|a| a.name() == "heur_correlation"),
-            "heur_correlation must be in analyzer set"
         );
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_account"),

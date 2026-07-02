@@ -3,6 +3,7 @@
 //! a failing collector is logged + recorded but never aborts the run (FR13, golden rule 8).
 use crate::finding::Finding;
 use crate::manifest::{Privileges, SourceEntry};
+use crate::observation::Observation;
 use crate::record::Record;
 use crate::traits::{Analyzer, CollectCtx, Collector};
 use crate::Config;
@@ -12,6 +13,7 @@ use crate::Config;
 pub struct RunOutcome {
     pub records: Vec<Record>,
     pub findings: Vec<Finding>,
+    pub observations: Vec<Observation>,
     pub sources: Vec<SourceEntry>,
     pub privileges: Privileges,
     pub hostname: String,
@@ -66,9 +68,21 @@ pub fn run_live(
             }
         }
     }
+    // Observation fan-in (spec §6): inventory from analyzers that own one. A failing
+    // observe is logged + skipped, mirroring the analyze contract.
+    let mut observations = Vec::new();
+    for a in analyzers {
+        match a.observe(&records) {
+            Ok(mut os) => observations.append(&mut os),
+            Err(e) => {
+                tracing::warn!(analyzer = a.name(), error = %e, "observe failed; skipping");
+            }
+        }
+    }
     RunOutcome {
         records,
         findings,
+        observations,
         sources,
         privileges,
         hostname,

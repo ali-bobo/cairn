@@ -27,6 +27,8 @@ struct AccountEvent {
     subject: String,
     ts: DateTime<Utc>,
     mitre: &'static str,
+    /// Source EVTX EventID (4720/4726/4732/4728), kept for evidence detail.
+    event_id: u32,
 }
 
 fn extract_str(data: &serde_json::Map<String, serde_json::Value>, key: &str) -> String {
@@ -50,6 +52,7 @@ fn parse_account_event(ev: &EventRecord) -> Option<AccountEvent> {
             subject: extract_str(d, "SubjectUserName"),
             ts: ev.ts,
             mitre: "T1136.001",
+            event_id: ev.event_id,
         }),
         4726 => Some(AccountEvent {
             kind: AccountEventKind::Deleted,
@@ -58,6 +61,7 @@ fn parse_account_event(ev: &EventRecord) -> Option<AccountEvent> {
             subject: extract_str(d, "SubjectUserName"),
             ts: ev.ts,
             mitre: "T1531",
+            event_id: ev.event_id,
         }),
         4732 | 4728 => Some(AccountEvent {
             kind: AccountEventKind::AddedToGroup,
@@ -66,6 +70,7 @@ fn parse_account_event(ev: &EventRecord) -> Option<AccountEvent> {
             subject: extract_str(d, "SubjectUserName"),
             ts: ev.ts,
             mitre: "T1098.001",
+            event_id: ev.event_id,
         }),
         _ => None,
     }
@@ -162,6 +167,18 @@ impl Analyzer for AccountHeuristic {
             f.mitre = vec![ae.mitre.into()];
             f.details = details;
             f.reason = Some(reason);
+            f.evidence = vec![cairn_core::finding::EvidenceItem {
+                artifact: "evtx:Security".into(),
+                path: None,
+                ts: Some(ae.ts),
+                detail: format!(
+                    "EID {}: target={} subject={}{}",
+                    ae.event_id,
+                    ae.target,
+                    ae.subject,
+                    ae.group.as_deref().map(|g| format!(" group={g}")).unwrap_or_default()
+                ),
+            }];
 
             findings.push(f);
         }
@@ -345,6 +362,15 @@ mod tests {
             reason.contains("90") || reason.contains("近期"),
             "reason must mention window: {reason}"
         );
+    }
+
+    #[test]
+    fn account_finding_carries_evtx_evidence() {
+        let records = vec![make_event(4720, "Security", recent(), account_data("u", "admin"))];
+        let f = &AccountHeuristic.analyze(&records).unwrap()[0];
+        assert_eq!(f.evidence.len(), 1);
+        assert_eq!(f.evidence[0].artifact, "evtx:Security");
+        assert!(f.evidence[0].detail.contains("EID 4720"));
     }
 
     #[test]
