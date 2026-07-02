@@ -4,7 +4,7 @@ use cairn_core::{
     finding::Finding,
     manifest::{Manifest, OutputEntry},
     traits::OutputSink,
-    CairnError, Result,
+    CairnError, Observation, Result,
 };
 use std::path::PathBuf;
 
@@ -56,6 +56,12 @@ impl OutputSink for AgeSink {
             buf.push('\n');
         }
         self.files.push(("findings.jsonl".into(), buf.into_bytes()));
+        Ok(())
+    }
+
+    fn write_observations(&mut self, observations: &[Observation]) -> Result<()> {
+        let buf = crate::observations_jsonl(observations)?;
+        self.files.push(("observations.jsonl".into(), buf.into_bytes()));
         Ok(())
     }
 

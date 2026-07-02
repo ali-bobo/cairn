@@ -187,6 +187,16 @@ fn manual_csv(rows: &[[String; 13]]) -> String {
     out
 }
 
+/// Serialize observations to JSONL (one Observation per line).
+pub fn observations_jsonl(observations: &[cairn_core::Observation]) -> Result<String> {
+    let mut buf = String::new();
+    for o in observations {
+        buf.push_str(&serde_json::to_string(o)?);
+        buf.push('\n');
+    }
+    Ok(buf)
+}
+
 /// Detection summary built from Findings (counts by severity, tops). Summary-first (FR4).
 #[derive(Debug, Default)]
 pub struct Summary {
@@ -295,6 +305,11 @@ impl OutputSink for DirSink {
         self.write_file("findings.jsonl", buf.as_bytes())
     }
 
+    fn write_observations(&mut self, observations: &[cairn_core::Observation]) -> Result<()> {
+        let buf = crate::observations_jsonl(observations)?;
+        self.write_file("observations.jsonl", buf.as_bytes())
+    }
+
     fn write_manifest(&mut self, manifest: &Manifest) -> Result<()> {
         let json = serde_json::to_vec_pretty(manifest)?;
         self.write_file("manifest.json", &json)
@@ -303,10 +318,10 @@ impl OutputSink for DirSink {
     fn write_html_report(
         &mut self,
         findings: &[Finding],
-        _observations: &[Observation],
+        observations: &[Observation],
         manifest: &Manifest,
     ) -> Result<()> {
-        let html = crate::html::html_report(findings, manifest);
+        let html = crate::html::html_report(findings, observations, manifest);
         self.write_file("report.html", html.as_bytes())
     }
 
@@ -676,6 +691,32 @@ mod tests {
         let je = outputs.iter().find(|o| o.file == "findings.jsonl").unwrap();
         assert_eq!(je.sha256, sha256_hex(jsonl.as_bytes()));
         assert_eq!(je.sha256.len(), 64);
+    }
+
+    /// observations_jsonl emits one JSON object per line, tagged with the observation
+    /// schema string.
+    #[test]
+    fn observations_jsonl_one_line_each() {
+        let mut o = cairn_core::Observation::new("service", "服務 X → x.exe");
+        o.source_artifact = "persistence".into();
+        let s = observations_jsonl(&[o.clone(), o]).unwrap();
+        assert_eq!(s.lines().count(), 2);
+        assert!(s.contains("cairn.observation/1"));
+    }
+
+    /// DirSink writes observations.jsonl and records its SHA-256 like the other outputs.
+    #[test]
+    fn dirsink_writes_observations_jsonl_with_hash() {
+        let dir = std::env::temp_dir().join("cairn_dirsink_observations_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(dir.clone());
+        let o = cairn_core::Observation::new("run_key", "run_key: chrome.exe");
+        sink.write_observations(&[o]).unwrap();
+        assert!(dir.join("observations.jsonl").exists());
+        assert!(sink
+            .outputs_so_far()
+            .iter()
+            .any(|e| e.file == "observations.jsonl"));
     }
 
     /// `outputs_so_far` returns the data outputs' hashes without consuming them, so the

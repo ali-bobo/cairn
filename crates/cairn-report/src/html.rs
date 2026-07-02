@@ -60,8 +60,12 @@ fn short_ts(ts: &str) -> &str {
     }
 }
 
-/// Generate a self-contained HTML report from findings and manifest.
-pub fn html_report(findings: &[Finding], manifest: &Manifest) -> String {
+/// Generate a self-contained HTML report from findings, observations and manifest.
+pub fn html_report(
+    findings: &[Finding],
+    observations: &[cairn_core::Observation],
+    manifest: &Manifest,
+) -> String {
     let critical = count_sev(findings, Severity::Critical);
     let high = count_sev(findings, Severity::High);
     let medium = count_sev(findings, Severity::Medium);
@@ -109,6 +113,30 @@ pub fn html_report(findings: &[Finding], manifest: &Manifest) -> String {
                     cairn_core::finding::FindingSource::Heuristic => "啟發式",
                 });
                 let desc = esc(f.details_client.as_deref().unwrap_or(&f.details));
+                let ev_html = if f.evidence.is_empty() {
+                    String::new()
+                } else {
+                    let items: String = f
+                        .evidence
+                        .iter()
+                        .map(|e| {
+                            format!(
+                                "<li><b>{}</b> {} {}<br>{}</li>",
+                                esc(&e.artifact),
+                                e.path.as_deref().map(esc).unwrap_or_default(),
+                                e.ts
+                                    .map(|t| t.format("%Y-%m-%d %H:%MZ").to_string())
+                                    .unwrap_or_default(),
+                                esc(&e.detail),
+                            )
+                        })
+                        .collect();
+                    format!(
+                        "<details><summary>佐證來源 ({})</summary><ul>{}</ul></details>",
+                        f.evidence.len(),
+                        items
+                    )
+                };
                 format!(
                     "<tr>\
                   <td style=\"white-space:nowrap;color:#6b7280;font-size:0.85em\">{ts}</td>\
@@ -117,13 +145,48 @@ pub fn html_report(findings: &[Finding], manifest: &Manifest) -> String {
                   <td style=\"font-weight:500\">{title}</td>\
                   <td style=\"font-size:0.85em;color:#6b7280\">{mitre}</td>\
                   <td style=\"font-size:0.85em\">{src}</td>\
-                  <td style=\"font-size:0.85em;color:#374151\">{desc}</td>\
+                  <td style=\"font-size:0.85em;color:#374151\">{desc}{ev_html}</td>\
                 </tr>"
                 )
             })
             .collect::<Vec<_>>()
             .join("\n")
     };
+
+    // Host inventory (observations) — collapsed by default, grouped by category.
+    let mut obs_html = String::new();
+    if !observations.is_empty() {
+        use std::collections::BTreeMap;
+        let mut by_cat: BTreeMap<&str, Vec<&cairn_core::Observation>> = BTreeMap::new();
+        for o in observations {
+            by_cat.entry(o.category.as_str()).or_default().push(o);
+        }
+        let mut groups = String::new();
+        for (cat, items) in &by_cat {
+            let rows: String = items
+                .iter()
+                .map(|o| {
+                    format!(
+                        "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                        esc(&o.title),
+                        o.path.as_deref().map(esc).unwrap_or_default(),
+                        esc(&o.details),
+                    )
+                })
+                .collect();
+            groups.push_str(&format!(
+                "<h3>{} ({})</h3><table><tr><th>項目</th><th>路徑</th><th>詳細</th></tr>{}</table>",
+                esc(cat),
+                items.len(),
+                rows
+            ));
+        }
+        obs_html = format!(
+            "<details class=\"inventory\"><summary><h2 style=\"display:inline\">主機盤點 Host Inventory ({} 項)</h2></summary>{}</details>",
+            observations.len(),
+            groups
+        );
+    }
 
     format!(
         r#"<!DOCTYPE html>
@@ -198,6 +261,8 @@ tr:hover td{{background:#f9fafb}}
 </div>
 </div>
 
+{obs_html}
+
 <div class="footer">
   <p>{int_note}</p>
   <p style="margin-top:.25rem">cairn v{tool_ver} &nbsp;·&nbsp; 報告產生時間：{generated}</p>
@@ -258,13 +323,13 @@ mod tests {
 
     #[test]
     fn html_report_contains_hostname() {
-        let html = html_report(&[], &minimal_manifest());
+        let html = html_report(&[], &[], &minimal_manifest());
         assert!(html.contains("TEST-PC"), "should contain hostname");
     }
 
     #[test]
     fn html_report_clean_verdict_when_no_high() {
-        let html = html_report(&[], &minimal_manifest());
+        let html = html_report(&[], &[], &minimal_manifest());
         assert!(html.contains("未發現高風險威脅"));
         assert!(!html.contains("發現高風險事件"));
     }
@@ -274,7 +339,7 @@ mod tests {
         let mut f = Finding::new(Severity::High, "Test High", FindingSource::Sigma);
         f.host = "TEST-PC".into();
         f.artifact = "evtx:Security".into();
-        let html = html_report(&[f], &minimal_manifest());
+        let html = html_report(&[f], &[], &minimal_manifest());
         assert!(html.contains("發現高風險事件"));
     }
 
@@ -282,14 +347,50 @@ mod tests {
     fn html_report_escapes_xss() {
         let mut m = minimal_manifest();
         m.host.hostname = "<script>alert(1)</script>".into();
-        let html = html_report(&[], &m);
+        let html = html_report(&[], &[], &m);
         assert!(!html.contains("<script>"), "raw script tag should be escaped");
         assert!(html.contains("&lt;script&gt;"));
     }
 
     #[test]
     fn html_report_no_findings_shows_empty_message() {
-        let html = html_report(&[], &minimal_manifest());
+        let html = html_report(&[], &[], &minimal_manifest());
         assert!(html.contains("本次掃描無 finding"));
+    }
+
+    /// Findings render their evidence list (collapsible "佐證來源"), and observations
+    /// render as a collapsible host-inventory block, both with the evidence/observation
+    /// path escaped for HTML.
+    #[test]
+    fn html_contains_inventory_block_and_evidence_details() {
+        use cairn_core::finding::EvidenceItem;
+
+        let mut f = Finding::new(Severity::High, "Test High", FindingSource::Sigma);
+        f.host = "TEST-PC".into();
+        f.artifact = "evtx:Security".into();
+        f.evidence.push(EvidenceItem {
+            artifact: "prefetch".into(),
+            path: Some(r"C:\Windows\Prefetch\EVIL.EXE-1234.pf".into()),
+            ts: Some(Utc.with_ymd_and_hms(2026, 6, 27, 23, 31, 0).unwrap()),
+            detail: "run_count=12 last_run=2026-06-27T23:31Z".into(),
+        });
+
+        let mut o = cairn_core::Observation::new("service", "服務 X → x.exe");
+        o.host = "TEST-PC".into();
+        o.path = Some(r"C:\Program Files\X\x.exe".into());
+        o.details = "位置=HKLM\\...\\Services\\X".into();
+        o.source_artifact = "persistence".into();
+
+        let html = html_report(&[f], &[o], &minimal_manifest());
+
+        assert!(html.contains("主機盤點"), "missing host-inventory heading: {html}");
+        assert!(
+            html.contains("佐證來源 (1)"),
+            "missing evidence summary: {html}"
+        );
+        assert!(
+            html.contains(r"C:\Program Files\X\x.exe"),
+            "missing observation path: {html}"
+        );
     }
 }
