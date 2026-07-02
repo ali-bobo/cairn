@@ -865,6 +865,13 @@ fn main() -> anyhow::Result<()> {
                 f.host = outcome.hostname.clone();
             }
             sort_findings(&mut outcome.findings);
+            // Stamp host + deterministic sort onto observations too (spec §11).
+            for o in &mut outcome.observations {
+                o.host = outcome.hostname.clone();
+            }
+            outcome.observations.sort_by(|a, b| {
+                (a.category.as_str(), a.title.as_str()).cmp(&(b.category.as_str(), b.title.as_str()))
+            });
             // FR14: hash the binaries behind findings (streaming, size-capped) and fill
             // binary_sha256 so each suspicious record carries an IOC hash. In-memory only —
             // for --dry-run nothing is written (golden rule 4).
@@ -937,6 +944,7 @@ fn main() -> anyhow::Result<()> {
             let mut sink = build_sink(&cfg.output)?;
             sink.write_timeline_csv(&outcome.findings)?;
             sink.write_findings_jsonl(&outcome.findings)?;
+            sink.write_observations(&outcome.observations)?;
             sink.write_html_report(&outcome.findings, &outcome.observations, &manifest)?;
             if let OutputKind::Dir(ref d) = cfg.output {
                 write_records_jsonl(d, &outcome.records)?;

@@ -123,8 +123,16 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
         });
     }
 
+    // The Startup folder (%APPDATA%\...\Startup or the all-users ProgramData twin) IS the
+    // persistence location itself, not an arbitrary drop zone — every mechanism's binary_path
+    // signal (S2/S3/S4) assumes the path is where an attacker CHOSE to hide the binary. For
+    // `startup`, Windows already put it in ProgramData/AppData by design, so those same
+    // path-trust checks would flag every legitimate startup shortcut (e.g. AnyDesk.lnk).
+    // Mirrors the pre-gate model's `mechanism != "startup"` path-signal exemption.
+    let path_signals_apply = p.mechanism != "startup";
+
     // S2: explicitly unsigned + user-writable drop zone.
-    if p.signed == Some(false) && is_user_writable_path(path) {
+    if path_signals_apply && p.signed == Some(false) && is_user_writable_path(path) {
         hits.push(GateHit {
             severity: Severity::High,
             label: "未簽章執行檔於使用者可寫路徑",
@@ -134,7 +142,7 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     }
 
     // S3: system-name masquerade (absolute path outside C:\Windows).
-    if is_masquerade(path) {
+    if path_signals_apply && is_masquerade(path) {
         hits.push(GateHit {
             severity: Severity::High,
             label: "系統程式名稱偽裝",
@@ -145,7 +153,7 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
 
     // S4: recent + unverifiable + outside system/vendor dirs — all three required.
     // Recency ALONE is dead (update-day mass rewrites, per-user service instances).
-    if p.signed.is_none() && !path.is_empty() && !is_system_or_program_files(path) {
+    if path_signals_apply && p.signed.is_none() && !path.is_empty() && !is_system_or_program_files(path) {
         if let Some(lw) = p.last_write {
             let age = now.signed_duration_since(lw);
             if age >= Duration::zero() && age <= Duration::days(RECENT_DAYS) {
@@ -508,15 +516,23 @@ mod tests {
     }
 
     /// A startup (file) mechanism populates entity.file, not entity.registry.
+    /// Uses an S9 script-persistence signal (not a path signal) to clear the gate,
+    /// since startup is deliberately exempt from S2/S3/S4 path-trust checks (the
+    /// Startup folder IS the persistence location, not a suspicious drop zone).
     #[test]
     fn startup_mechanism_uses_file_entity() {
         let now = Utc::now();
-        let mut r = rec(
-            "startup",
-            Some(r"C:\Users\a\AppData\Roaming\...\Startup\x.exe"),
-            Some(now),
-        );
-        r.location = r"C:\Users\a\...\Startup".into();
+        let r = PersistenceRecord {
+            mechanism: "startup".into(),
+            location: r"C:\Users\a\...\Startup".into(),
+            value: Some("Updater".into()),
+            command: Some("powershell.exe -NoP -Enc SQBFAFgA".into()),
+            binary_path: None,
+            binary_sha256: None,
+            signed: None,
+            signer: None,
+            last_write: Some(now),
+        };
         let findings = PersistHeuristic
             .analyze(&[Record::Persistence(r)])
             .expect("analyze");
@@ -590,6 +606,27 @@ mod tests {
         let pf = full_rec("run_key", Some("V"), Some(r"C:\Program Files\V\v.exe"),
             Some(r"C:\Program Files\V\v.exe"), Some(false), None);
         assert!(evaluate_gate(&pf, now).is_empty());
+    }
+
+    /// The Startup folder IS the persistence location, not a suspicious drop zone —
+    /// S2/S3/S4's path-trust checks must not fire on it (real-machine e2e regression:
+    /// AnyDesk.lnk in the all-users ProgramData Startup folder, unsigned .lnk, recent
+    /// last_write — previously fired S2 as a false positive).
+    #[test]
+    fn gate_startup_mechanism_exempt_from_path_signals() {
+        let now = Utc::now();
+        let startup_shortcut = full_rec(
+            "startup",
+            None,
+            Some(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\AnyDesk.lnk"),
+            Some(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\AnyDesk.lnk"),
+            Some(false),
+            Some(now),
+        );
+        assert!(
+            evaluate_gate(&startup_shortcut, now).is_empty(),
+            "startup mechanism must be exempt from S2/S3/S4 path-trust checks"
+        );
     }
 
     #[test]
