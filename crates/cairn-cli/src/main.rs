@@ -413,6 +413,7 @@ fn build_manifest(cfg: &Config, hostname: &str, records: u64, findings: &[Findin
         counts: Counts {
             records,
             findings_by_sev: by_sev,
+            observations: 0,
         },
         integrity_note: "All hashes SHA-256 over bytes as collected.".into(),
         governance: cairn_core::manifest::GovernanceReport::default(),
@@ -567,7 +568,7 @@ fn main() -> anyhow::Result<()> {
             let mut sink = DirSink::new(dir.clone());
             sink.write_timeline_csv(&findings)?;
             sink.write_findings_jsonl(&findings)?;
-            sink.write_html_report(&findings, &manifest)?;
+            sink.write_html_report(&findings, &[], &manifest)?;
             manifest.outputs = sink.outputs_so_far();
             sink.write_manifest(&manifest)?;
             let outputs = sink.finalize()?;
@@ -925,6 +926,7 @@ fn main() -> anyhow::Result<()> {
                 counts: Counts {
                     records: outcome.records.len() as u64,
                     findings_by_sev: by_sev,
+                    observations: outcome.observations.len() as u64,
                 },
                 integrity_note: "All hashes SHA-256 over bytes as collected.".into(),
                 governance: governance_report,
@@ -936,7 +938,7 @@ fn main() -> anyhow::Result<()> {
             let mut sink = build_sink(&cfg.output)?;
             sink.write_timeline_csv(&outcome.findings)?;
             sink.write_findings_jsonl(&outcome.findings)?;
-            sink.write_html_report(&outcome.findings, &manifest)?;
+            sink.write_html_report(&outcome.findings, &outcome.observations, &manifest)?;
             if let OutputKind::Dir(ref d) = cfg.output {
                 write_records_jsonl(d, &outcome.records)?;
             }

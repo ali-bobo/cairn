@@ -15,6 +15,7 @@ pub use zip_sink::ZipSink;
 use cairn_core::{
     finding::Finding,
     manifest::{Manifest, OutputEntry},
+    observation::Observation,
     traits::OutputSink,
     Result,
 };
@@ -302,6 +303,7 @@ impl OutputSink for DirSink {
     fn write_html_report(
         &mut self,
         findings: &[Finding],
+        _observations: &[Observation],
         manifest: &Manifest,
     ) -> Result<()> {
         let html = crate::html::html_report(findings, manifest);
