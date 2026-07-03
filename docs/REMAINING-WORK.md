@@ -9,7 +9,49 @@
 
 ---
 
-## 目前位置（2026-07-02）
+## 目前位置（2026-07-03）
+
+- **IR Snapshot Panels**（`feature/ir-snapshot-panels` 分支，10 task subagent-driven）✅
+  **完成**——把已收集但埋在 records.jsonl 的 IR 關鍵資料攤成 report.html 的折疊面板。
+  設計：`docs/dev-history/specs/2026-07-03-ir-snapshot-panels-design.md`；
+  計畫：`docs/dev-history/plans/2026-07-03-ir-snapshot-panels.md`。
+  - **起因**：使用者反饋「跑完看不到有用資訊」；查證後發現根因是呈現層問題，不是收集層——
+    proc/net/execution/USN/MOTW 全部已收集，只是 `html_report()` 拿不到 records。
+  - `html_report()` 簽名加 `records: &[Record]` 參數（連帶 `OutputSink` trait + 全部 caller），
+    解鎖五個純呈現面板：
+    1. **對外連線**（established/listening，公網連線排前）
+    2. **執行中程序**（未簽章排前）
+    3. **近期執行證據**（末次執行新的排前，prefetch 誠實標「僅檔名」）
+    4. **可疑檔案活動**（MOTW 標記檔案排前 + USN create/rename，200 筆量控 + 總數誠實註記）
+    5. **登入 session**（新 `LogonSessionCollector`，RDP/RemoteInteractive 排前）
+  - 新增 `Record::LogonSession` 變體 + `LogonSessionRecord`（`user`/`logon_type`/`logon_time`/
+    `source`/`session_id`）；`cairn-collectors-win/src/logon.rs`（WTS API `WTSEnumerateSessionsW`
+    unsafe FFI，唯讀官方 API，符合 golden rule 1/3）+ `cairn-collectors/src/logon_session.rs`
+    安全包裝，forbid-unsafe 維持。
+  - **零新偵測邏輯**——五個面板全部純呈現，findings 數量不受影響（真機驗收全程維持 0）。
+  - **真機驗收**（2026-07-03，分兩階段）：非 admin 掃描確認對外連線（168 條/93 條公網）+
+    執行中程序（278 個/4 個未簽章）正確渲染；admin 掃描（有 Administrator 但無 SeBackupPrivilege）
+    確認近期執行證據（365→381 條，來自 prefetch 部分成功）+ 登入 session（1 條，接進
+    `selected_modules`）正確渲染；可疑檔案面板因本機無 USN record（缺 SeBackupPrivilege）+
+    無 MOTW 檔案而空白，屬正確的「無資料不輸出」行為，非缺陷。
+  - **開發中修正**：`WTS_CLIENT_ADDRESS` 的 IPv4 位元組配置無法在此環境驗證，`client_address`
+    誠實留 `None`（NFR12 精神：寧可不猜，不可猜錯）——**已知殘留項**，未來若需要遠端登入來源
+    IP，需找到 windows crate 該版本的權威位元組配置文件再補上。
+  - **既有殘留限制（非本次引入，記錄延續）**：`mft`/`usn`/`shimcache`/`amcache`/`bam`/
+    `userassist`/`srum` 除了 Administrator 還需額外的 **SeBackupPrivilege**（一般「以系統管理員
+    身分執行」不會自動附帶，需 `psexec -s` 或群組原則另外授予）。這導致一般 admin 掃描仍看不到
+    完整的可疑檔案活動面板；不在本次計畫範圍內。
+  - 全 workspace 測試綠、clippy 零警告。**待辦事項：merge 回 main**（finishing-a-development-branch）。
+  - **Opus 整體審查抓到並修正的真缺陷**：`logon_session.rs` 原本用永遠是 `None` 的
+    `client_address` 判斷 `logon_type`，導致「RDP 排前」這個面板核心功能在真機上永遠失效
+    （每個 session 都被標成 Interactive）。修正：改讀 `WTS_SESSION_INFOW.pWinStationName`
+    （官方可靠、免猜位元組配置，RDP session 站名固定為 `RDP-Tcp#N`）。
+  - **審查殘留項（低優先，未修）**：(1) `WtsSession.state_active`（session 是否為 Active
+    連線狀態）已收集但目前沒有任何面板/邏輯讀取，可考慮未來顯示；(2)「對外連線」面板標題
+    涵蓋 listener（其實是入站）與所有 UDP socket（`state=None`），標題語意略寬於實際內容，
+    低影響的命名精確度問題。
+
+## 前次位置（2026-07-02）
 
 - **Heuristic Gate Redesign**（`feature/heuristic-gate-redesign` 分支，11 task subagent-driven）✅
   **完成**——修正 >90% 誤報率。設計：`docs/dev-history/specs/2026-07-02-heuristic-gate-redesign-design.md`；

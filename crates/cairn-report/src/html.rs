@@ -17,6 +17,17 @@ fn esc(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Minimal public-IPv4 test for panel sorting only (cairn-report doesn't depend on
+/// cairn-heur's score::is_public_ipv4). Non-parseable or private/loopback/link-local
+/// → false. This is a sort hint, not a security judgement, so the simplified check is fine.
+fn is_public_ipv4_hint(addr: &str) -> bool {
+    use std::net::Ipv4Addr;
+    match addr.parse::<Ipv4Addr>() {
+        Ok(ip) => !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
 fn sev_label(s: Severity) -> &'static str {
     match s {
         Severity::Critical => "Critical",
@@ -60,12 +71,284 @@ fn short_ts(ts: &str) -> &str {
     }
 }
 
+/// Outbound-connections panel: established + listening only; public-remote sorted first.
+fn netconn_panel(records: &[cairn_core::Record]) -> String {
+    use cairn_core::record::Record;
+    let mut conns: Vec<&cairn_core::record::NetConnRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::NetConn(c) => Some(c),
+            _ => None,
+        })
+        .filter(|c| {
+            let st = c.state.as_deref().unwrap_or("").to_ascii_uppercase();
+            st.is_empty() || st == "ESTABLISHED" || st == "LISTEN" || st == "LISTENING"
+        })
+        .collect();
+    if conns.is_empty() {
+        return String::new();
+    }
+    let public_count = conns
+        .iter()
+        .filter(|c| c.raddr.as_deref().is_some_and(is_public_ipv4_hint))
+        .count();
+    // Public-remote first, then by remote addr.
+    conns.sort_by(|a, b| {
+        let ap = a.raddr.as_deref().is_some_and(is_public_ipv4_hint);
+        let bp = b.raddr.as_deref().is_some_and(is_public_ipv4_hint);
+        bp.cmp(&ap).then_with(|| a.raddr.cmp(&b.raddr))
+    });
+    let rows: String = conns
+        .iter()
+        .map(|c| {
+            let remote = match (c.raddr.as_deref(), c.rport) {
+                (Some(a), Some(p)) => format!("{a}:{p}"),
+                (Some(a), None) => a.to_string(),
+                _ => "-".into(),
+            };
+            format!(
+                "<tr><td>{}</td><td>{}:{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&c.proto),
+                esc(&c.laddr),
+                c.lport,
+                esc(&remote),
+                esc(c.state.as_deref().unwrap_or("-")),
+                c.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            )
+        })
+        .collect();
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">對外連線 ({} 條，其中 {} 條連往公網)</h2></summary>\
+         <table><tr><th>協定</th><th>本地</th><th>遠端</th><th>狀態</th><th>PID</th></tr>{}</table></details>",
+        conns.len(),
+        public_count,
+        rows
+    )
+}
+
+/// Running-processes panel: unsigned first, then signature-unknown.
+fn process_panel(records: &[cairn_core::Record]) -> String {
+    use cairn_core::record::Record;
+    let mut procs: Vec<&cairn_core::record::ProcessRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Process(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    if procs.is_empty() {
+        return String::new();
+    }
+    let unsigned_count = procs.iter().filter(|p| p.signed == Some(false)).count();
+    // rank: unsigned(0) < unknown(1) < signed(2)
+    fn sig_rank(s: Option<bool>) -> u8 {
+        match s {
+            Some(false) => 0,
+            None => 1,
+            Some(true) => 2,
+        }
+    }
+    procs.sort_by(|a, b| sig_rank(a.signed).cmp(&sig_rank(b.signed)).then_with(|| a.pid.cmp(&b.pid)));
+    let rows: String = procs
+        .iter()
+        .map(|p| {
+            let sig = match p.signed {
+                Some(true) => "已簽章",
+                Some(false) => "未簽章",
+                None => "未知",
+            };
+            let cmd = p.cmdline.chars().take(120).collect::<String>();
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td style=\"font-size:0.8em;color:#6b7280\">{}</td></tr>",
+                p.pid,
+                p.ppid,
+                esc(&p.image),
+                esc(sig),
+                esc(p.integrity.as_deref().unwrap_or("-")),
+                esc(&cmd),
+            )
+        })
+        .collect();
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">執行中程序 ({} 個，其中 {} 個未簽章)</h2></summary>\
+         <table><tr><th>PID</th><th>PPID</th><th>映像路徑</th><th>簽章</th><th>完整性</th><th>命令列</th></tr>{}</table></details>",
+        procs.len(),
+        unsigned_count,
+        rows
+    )
+}
+
+/// Recent-execution panel: last_run newest first; prefetch flagged filename-only.
+fn execution_panel(records: &[cairn_core::Record]) -> String {
+    use cairn_core::record::Record;
+    use std::collections::BTreeSet;
+    let mut execs: Vec<&cairn_core::record::ExecutionRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Execution(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    if execs.is_empty() {
+        return String::new();
+    }
+    let sources: BTreeSet<&str> = execs.iter().map(|e| e.source.as_str()).collect();
+    // newest last_run first (None sorts last)
+    execs.sort_by_key(|e| std::cmp::Reverse(e.last_run));
+    let rows: String = execs
+        .iter()
+        .map(|e| {
+            let path = if e.source == "prefetch" {
+                format!("{}（僅檔名）", e.path)
+            } else {
+                e.path.clone()
+            };
+            let fmt_ts = |t: &Option<chrono::DateTime<chrono::Utc>>| {
+                t.map(|t| t.format("%Y-%m-%d %H:%MZ").to_string()).unwrap_or_else(|| "-".into())
+            };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&e.source),
+                esc(&path),
+                e.run_count.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+                esc(&fmt_ts(&e.first_run)),
+                esc(&fmt_ts(&e.last_run)),
+            )
+        })
+        .collect();
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">近期執行證據 ({} 筆，來自 {} 種來源)</h2></summary>\
+         <table><tr><th>來源</th><th>路徑</th><th>執行次數</th><th>首次</th><th>末次</th></tr>{}</table></details>",
+        execs.len(),
+        sources.len(),
+        rows
+    )
+}
+
+/// Suspicious-file-activity panel: MOTW-tagged files first (download provenance),
+/// then recent USN create/rename events (capped at 200; total noted in summary).
+fn file_activity_panel(records: &[cairn_core::Record]) -> String {
+    use cairn_core::record::Record;
+    const USN_CAP: usize = 200;
+
+    let motw: Vec<&cairn_core::record::FileMetaRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::FileMeta(m) if m.zone_identifier.is_some() => Some(m),
+            _ => None,
+        })
+        .collect();
+
+    let mut usn: Vec<&cairn_core::record::UsnEventRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::UsnEvent(u) => Some(u),
+            _ => None,
+        })
+        .filter(|u| {
+            let re = u.reason.to_ascii_lowercase();
+            re.contains("create") || re.contains("rename")
+        })
+        .collect();
+
+    if motw.is_empty() && usn.is_empty() {
+        return String::new();
+    }
+    let usn_total = usn.len();
+    usn.sort_by_key(|u| std::cmp::Reverse(u.ts)); // newest first
+    usn.truncate(USN_CAP);
+
+    let motw_rows: String = motw
+        .iter()
+        .map(|m| {
+            format!(
+                "<tr><td>MOTW</td><td>{}</td><td>{}</td></tr>",
+                esc(&m.path),
+                esc(m.zone_identifier.as_deref().unwrap_or("-")),
+            )
+        })
+        .collect();
+    let usn_rows: String = usn
+        .iter()
+        .map(|u| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&u.reason),
+                esc(&u.path),
+                esc(&u.ts.format("%Y-%m-%d %H:%MZ").to_string()),
+            )
+        })
+        .collect();
+    let usn_note = if usn_total > USN_CAP {
+        format!("（顯示前 {USN_CAP} 筆，共 {usn_total} 筆，完整見 records.jsonl）")
+    } else {
+        String::new()
+    };
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">可疑檔案活動 ({} 個 MOTW 檔案 / {} 筆近期檔案事件)</h2></summary>\
+         <p style=\"font-size:0.8em;color:#6b7280\">{}</p>\
+         <table><tr><th>類型/動作</th><th>路徑</th><th>詳細</th></tr>{}{}</table></details>",
+        motw.len(),
+        usn_total,
+        usn_note,
+        motw_rows,
+        usn_rows,
+    )
+}
+
+/// Logon-session panel: RemoteInteractive (RDP) first.
+fn logon_panel(records: &[cairn_core::Record]) -> String {
+    use cairn_core::record::Record;
+    let mut sessions: Vec<&cairn_core::record::LogonSessionRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::LogonSession(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    if sessions.is_empty() {
+        return String::new();
+    }
+    let remote_count = sessions
+        .iter()
+        .filter(|s| s.logon_type.contains("Remote"))
+        .count();
+    // remote first, then by user. `sort_by_key` (not `sort_by`) to satisfy
+    // clippy::unnecessary_sort_by; invert the bool so "is remote" (false) sorts first.
+    sessions.sort_by_key(|s| (!s.logon_type.contains("Remote"), s.user.clone()));
+    let rows: String = sessions
+        .iter()
+        .map(|s| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&s.user),
+                esc(&s.logon_type),
+                s.session_id.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
+                esc(s.source.as_deref().unwrap_or("-")),
+            )
+        })
+        .collect();
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">登入 session ({} 個，其中 {} 個遠端)</h2></summary>\
+         <table><tr><th>使用者</th><th>類型</th><th>Session ID</th><th>來源</th></tr>{}</table></details>",
+        sessions.len(),
+        remote_count,
+        rows
+    )
+}
+
 /// Generate a self-contained HTML report from findings, observations and manifest.
 pub fn html_report(
     findings: &[Finding],
     observations: &[cairn_core::Observation],
+    records: &[cairn_core::Record],
     manifest: &Manifest,
 ) -> String {
+    let netconn_html = netconn_panel(records);
+    let process_html = process_panel(records);
+    let execution_html = execution_panel(records);
+    let file_activity_html = file_activity_panel(records);
+    let logon_html = logon_panel(records);
     let critical = count_sev(findings, Severity::Critical);
     let high = count_sev(findings, Severity::High);
     let medium = count_sev(findings, Severity::Medium);
@@ -261,6 +544,16 @@ tr:hover td{{background:#f9fafb}}
 </div>
 </div>
 
+{netconn_html}
+
+{process_html}
+
+{execution_html}
+
+{file_activity_html}
+
+{logon_html}
+
 {obs_html}
 
 <div class="footer">
@@ -323,13 +616,13 @@ mod tests {
 
     #[test]
     fn html_report_contains_hostname() {
-        let html = html_report(&[], &[], &minimal_manifest());
+        let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(html.contains("TEST-PC"), "should contain hostname");
     }
 
     #[test]
     fn html_report_clean_verdict_when_no_high() {
-        let html = html_report(&[], &[], &minimal_manifest());
+        let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(html.contains("未發現高風險威脅"));
         assert!(!html.contains("發現高風險事件"));
     }
@@ -339,7 +632,7 @@ mod tests {
         let mut f = Finding::new(Severity::High, "Test High", FindingSource::Sigma);
         f.host = "TEST-PC".into();
         f.artifact = "evtx:Security".into();
-        let html = html_report(&[f], &[], &minimal_manifest());
+        let html = html_report(&[f], &[], &[], &minimal_manifest());
         assert!(html.contains("發現高風險事件"));
     }
 
@@ -347,14 +640,14 @@ mod tests {
     fn html_report_escapes_xss() {
         let mut m = minimal_manifest();
         m.host.hostname = "<script>alert(1)</script>".into();
-        let html = html_report(&[], &[], &m);
+        let html = html_report(&[], &[], &[], &m);
         assert!(!html.contains("<script>"), "raw script tag should be escaped");
         assert!(html.contains("&lt;script&gt;"));
     }
 
     #[test]
     fn html_report_no_findings_shows_empty_message() {
-        let html = html_report(&[], &[], &minimal_manifest());
+        let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(html.contains("本次掃描無 finding"));
     }
 
@@ -381,7 +674,7 @@ mod tests {
         o.details = "位置=HKLM\\...\\Services\\X".into();
         o.source_artifact = "persistence".into();
 
-        let html = html_report(&[f], &[o], &minimal_manifest());
+        let html = html_report(&[f], &[o], &[], &minimal_manifest());
 
         assert!(html.contains("主機盤點"), "missing host-inventory heading: {html}");
         assert!(
@@ -392,5 +685,201 @@ mod tests {
             html.contains(r"C:\Program Files\X\x.exe"),
             "missing observation path: {html}"
         );
+    }
+
+    fn netconn(
+        proto: &str,
+        raddr: Option<&str>,
+        rport: Option<u16>,
+        state: &str,
+        pid: Option<u32>,
+    ) -> cairn_core::Record {
+        cairn_core::Record::NetConn(cairn_core::record::NetConnRecord {
+            proto: proto.into(),
+            laddr: "0.0.0.0".into(),
+            lport: 1234,
+            raddr: raddr.map(String::from),
+            rport,
+            state: Some(state.into()),
+            pid,
+        })
+    }
+
+    #[test]
+    fn netconn_panel_lists_and_counts_public() {
+        let recs = vec![
+            netconn("tcp", Some("8.8.8.8"), Some(443), "ESTABLISHED", Some(100)),
+            netconn("tcp", Some("192.168.1.5"), Some(445), "ESTABLISHED", Some(200)),
+            netconn("tcp", None, None, "TIME_WAIT", None), // filtered out
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(
+            html.contains("對外連線 (2 條，其中 1 條連往公網)"),
+            "html: missing panel"
+        );
+        assert!(html.contains("8.8.8.8:443"));
+        // public remote sorted first: 8.8.8.8 row appears before 192.168 row
+        let pub_pos = html.find("8.8.8.8").unwrap();
+        let priv_pos = html.find("192.168.1.5").unwrap();
+        assert!(pub_pos < priv_pos, "public conn must sort first");
+    }
+
+    #[test]
+    fn netconn_panel_absent_when_no_conns() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        assert!(!html.contains("對外連線"));
+    }
+
+    fn proc(pid: u32, image: &str, signed: Option<bool>) -> cairn_core::Record {
+        cairn_core::Record::Process(cairn_core::record::ProcessRecord {
+            pid,
+            ppid: 4,
+            image: image.into(),
+            cmdline: format!("{image} --run"),
+            signed,
+            signer: None,
+            binary_sha256: None,
+            integrity: Some("medium".into()),
+            user: None,
+            start_time: None,
+        })
+    }
+
+    #[test]
+    fn process_panel_lists_unsigned_first() {
+        let recs = vec![
+            proc(100, r"C:\Windows\System32\svchost.exe", Some(true)),
+            proc(200, r"C:\Users\a\AppData\Roaming\x.exe", Some(false)),
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("執行中程序 (2 個，其中 1 個未簽章)"));
+        let unsigned_pos = html.find("x.exe").unwrap();
+        let signed_pos = html.find("svchost.exe").unwrap();
+        assert!(unsigned_pos < signed_pos, "unsigned proc must sort first");
+    }
+
+    #[test]
+    fn process_panel_absent_when_no_processes() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        assert!(!html.contains("執行中程序"));
+    }
+
+    fn exec(source: &str, path: &str, last: Option<(i32, u32, u32, u32, u32)>) -> cairn_core::Record {
+        let last_run = last.map(|(y, mo, d, h, mi)| Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap());
+        cairn_core::Record::Execution(cairn_core::record::ExecutionRecord {
+            source: source.into(),
+            path: path.into(),
+            first_run: None,
+            last_run,
+            run_count: Some(3),
+            sha1: None,
+            user_sid: None,
+            execution_confirmed: Some(true),
+        })
+    }
+
+    #[test]
+    fn execution_panel_newest_first_and_prefetch_flagged() {
+        let recs = vec![
+            exec("shimcache", r"C:\old.exe", Some((2026, 1, 1, 0, 0))),
+            exec("prefetch", "NEW.EXE", Some((2026, 6, 1, 0, 0))),
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("近期執行證據 (2 筆，來自 2 種來源)"));
+        assert!(html.contains("NEW.EXE（僅檔名）"));
+        let new_pos = html.find("NEW.EXE").unwrap();
+        let old_pos = html.find("old.exe").unwrap();
+        assert!(new_pos < old_pos, "newest last_run must sort first");
+    }
+
+    #[test]
+    fn execution_panel_absent_when_no_executions() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        assert!(!html.contains("近期執行證據"));
+    }
+
+    fn usn(reason: &str, path: &str, ymd: (i32, u32, u32)) -> cairn_core::Record {
+        cairn_core::Record::UsnEvent(cairn_core::record::UsnEventRecord {
+            ts: Utc.with_ymd_and_hms(ymd.0, ymd.1, ymd.2, 0, 0, 0).unwrap(),
+            path: path.into(),
+            reason: reason.into(),
+            mft_ref: 1,
+        })
+    }
+    fn motw_file(path: &str, zone: &str) -> cairn_core::Record {
+        cairn_core::Record::FileMeta(cairn_core::record::FileMetaRecord {
+            path: path.into(),
+            size: 0,
+            sha256: None,
+            si_btime: None,
+            si_mtime: None,
+            fn_btime: None,
+            fn_mtime: None,
+            zone_identifier: Some(zone.into()),
+            path_complete: None,
+        })
+    }
+
+    #[test]
+    fn file_activity_panel_motw_and_usn_filtered() {
+        let recs = vec![
+            usn("File_Create", r"C:\Users\a\Downloads\dropper.exe", (2026, 6, 1)),
+            usn("Basic_Info_Change", r"C:\noise.txt", (2026, 6, 2)), // filtered (not create/rename)
+            motw_file(r"C:\Users\a\Downloads\dropper.exe", "ZoneId=3"),
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("可疑檔案活動 (1 個 MOTW 檔案 / 1 筆近期檔案事件)"));
+        assert!(html.contains("ZoneId=3"));
+        assert!(!html.contains("noise.txt"), "non-create/rename USN filtered");
+        // MOTW row before USN row
+        let motw_pos = html.find("ZoneId=3").unwrap();
+        let usn_pos = html.rfind("File_Create").unwrap();
+        assert!(motw_pos < usn_pos, "MOTW must sort before USN events");
+    }
+
+    #[test]
+    fn file_activity_panel_caps_usn_at_200() {
+        let mut recs = Vec::new();
+        for i in 0..250 {
+            recs.push(usn("File_Create", &format!(r"C:\f{i}.exe"), (2026, 6, 1)));
+        }
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("共 250 筆"), "must note total when capped");
+        assert!(html.contains("顯示前 200 筆"));
+    }
+
+    #[test]
+    fn file_activity_panel_absent_when_no_data() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        assert!(!html.contains("可疑檔案活動"));
+    }
+
+    fn session(user: &str, ltype: &str, sid: u32, source: Option<&str>) -> cairn_core::Record {
+        cairn_core::Record::LogonSession(cairn_core::record::LogonSessionRecord {
+            user: user.into(),
+            logon_type: ltype.into(),
+            logon_time: None,
+            source: source.map(String::from),
+            session_id: Some(sid),
+        })
+    }
+
+    #[test]
+    fn logon_panel_remote_first() {
+        let recs = vec![
+            session(r"PC\alice", "Interactive", 1, None),
+            session(r"DOM\bob", "RemoteInteractive", 2, Some("10.0.0.5")),
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("登入 session (2 個，其中 1 個遠端)"));
+        let remote_pos = html.find("bob").unwrap();
+        let local_pos = html.find("alice").unwrap();
+        assert!(remote_pos < local_pos, "remote session must sort first");
+    }
+
+    #[test]
+    fn logon_panel_absent_when_no_sessions() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        assert!(!html.contains("登入 session"));
     }
 }

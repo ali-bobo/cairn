@@ -70,6 +70,7 @@ pub trait OutputSink: Send {
         &mut self,
         _findings: &[Finding],
         _observations: &[Observation],
+        _records: &[Record],
         _manifest: &crate::manifest::Manifest,
     ) -> Result<()> {
         Ok(())

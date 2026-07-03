@@ -9,6 +9,7 @@
 #![allow(unsafe_code)] // EXPECTED: this is the isolated FFI boundary (NFR3, CLAUDE.md).
 
 pub mod host;
+pub mod logon;
 pub mod net;
 pub mod priority;
 pub mod privilege;
