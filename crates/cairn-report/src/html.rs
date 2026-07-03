@@ -178,6 +178,53 @@ fn process_panel(records: &[cairn_core::Record]) -> String {
     )
 }
 
+/// Recent-execution panel: last_run newest first; prefetch flagged filename-only.
+fn execution_panel(records: &[cairn_core::Record]) -> String {
+    use cairn_core::record::Record;
+    use std::collections::BTreeSet;
+    let mut execs: Vec<&cairn_core::record::ExecutionRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Execution(e) => Some(e),
+            _ => None,
+        })
+        .collect();
+    if execs.is_empty() {
+        return String::new();
+    }
+    let sources: BTreeSet<&str> = execs.iter().map(|e| e.source.as_str()).collect();
+    // newest last_run first (None sorts last)
+    execs.sort_by_key(|e| std::cmp::Reverse(e.last_run));
+    let rows: String = execs
+        .iter()
+        .map(|e| {
+            let path = if e.source == "prefetch" {
+                format!("{}（僅檔名）", e.path)
+            } else {
+                e.path.clone()
+            };
+            let fmt_ts = |t: &Option<chrono::DateTime<chrono::Utc>>| {
+                t.map(|t| t.format("%Y-%m-%d %H:%MZ").to_string()).unwrap_or_else(|| "-".into())
+            };
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&e.source),
+                esc(&path),
+                e.run_count.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+                esc(&fmt_ts(&e.first_run)),
+                esc(&fmt_ts(&e.last_run)),
+            )
+        })
+        .collect();
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">近期執行證據 ({} 筆，來自 {} 種來源)</h2></summary>\
+         <table><tr><th>來源</th><th>路徑</th><th>執行次數</th><th>首次</th><th>末次</th></tr>{}</table></details>",
+        execs.len(),
+        sources.len(),
+        rows
+    )
+}
+
 /// Generate a self-contained HTML report from findings, observations and manifest.
 pub fn html_report(
     findings: &[Finding],
@@ -187,6 +234,7 @@ pub fn html_report(
 ) -> String {
     let netconn_html = netconn_panel(records);
     let process_html = process_panel(records);
+    let execution_html = execution_panel(records);
     let critical = count_sev(findings, Severity::Critical);
     let high = count_sev(findings, Severity::High);
     let medium = count_sev(findings, Severity::Medium);
@@ -385,6 +433,8 @@ tr:hover td{{background:#f9fafb}}
 {netconn_html}
 
 {process_html}
+
+{execution_html}
 
 {obs_html}
 
@@ -594,5 +644,39 @@ mod tests {
     fn process_panel_absent_when_no_processes() {
         let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(!html.contains("執行中程序"));
+    }
+
+    fn exec(source: &str, path: &str, last: Option<(i32, u32, u32, u32, u32)>) -> cairn_core::Record {
+        let last_run = last.map(|(y, mo, d, h, mi)| Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap());
+        cairn_core::Record::Execution(cairn_core::record::ExecutionRecord {
+            source: source.into(),
+            path: path.into(),
+            first_run: None,
+            last_run,
+            run_count: Some(3),
+            sha1: None,
+            user_sid: None,
+            execution_confirmed: Some(true),
+        })
+    }
+
+    #[test]
+    fn execution_panel_newest_first_and_prefetch_flagged() {
+        let recs = vec![
+            exec("shimcache", r"C:\old.exe", Some((2026, 1, 1, 0, 0))),
+            exec("prefetch", "NEW.EXE", Some((2026, 6, 1, 0, 0))),
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("近期執行證據 (2 筆，來自 2 種來源)"));
+        assert!(html.contains("NEW.EXE（僅檔名）"));
+        let new_pos = html.find("NEW.EXE").unwrap();
+        let old_pos = html.find("old.exe").unwrap();
+        assert!(new_pos < old_pos, "newest last_run must sort first");
+    }
+
+    #[test]
+    fn execution_panel_absent_when_no_executions() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        assert!(!html.contains("近期執行證據"));
     }
 }
