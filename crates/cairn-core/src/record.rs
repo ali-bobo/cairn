@@ -23,6 +23,7 @@ pub enum Record {
     UsnEvent(UsnEventRecord),
     RegValue(RegValueRecord),
     Execution(ExecutionRecord),
+    LogonSession(LogonSessionRecord),
 }
 
 /// EVTX event normalized to JSON-ish fields (Stage 1 primary input).
@@ -123,6 +124,16 @@ pub struct ExecutionRecord {
     pub user_sid: Option<String>,
     /// shimcache presence != execution; this flags engine-provided exec evidence.
     pub execution_confirmed: Option<bool>,
+}
+
+/// A live logon session (LSA/WTS enumeration). "Who is using the host right now."
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogonSessionRecord {
+    pub user: String,           // domain\username
+    pub logon_type: String,     // Interactive|RemoteInteractive|Network|Service|...
+    pub logon_time: Option<DateTime<Utc>>,
+    pub source: Option<String>, // source host/IP for network/RDP sessions
+    pub session_id: Option<u32>,
 }
 
 #[cfg(test)]
@@ -295,5 +306,20 @@ mod tests {
         let old = r#"{"path":"x","size":0,"sha256":null,"si_btime":null,"si_mtime":null,"fn_btime":null,"fn_mtime":null,"zone_identifier":null}"#;
         let parsed: FileMetaRecord = serde_json::from_str(old).unwrap();
         assert_eq!(parsed.path_complete, None);
+    }
+
+    #[test]
+    fn logon_session_record_kind_tag() {
+        let rec = Record::LogonSession(LogonSessionRecord {
+            user: r"DOMAIN\alice".into(),
+            logon_type: "RemoteInteractive".into(),
+            logon_time: None,
+            source: Some("10.0.0.5".into()),
+            session_id: Some(2),
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"kind\":\"logon_session\""));
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 }
