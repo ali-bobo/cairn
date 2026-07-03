@@ -52,40 +52,53 @@ BYOVD（Bring Your Own Vulnerable Driver，T1068）是當紅的提權 / EDR-kill
 ## 3. 架構總覽
 
 ```
-rules/loldrivers/known-vulnerable-drivers.txt   ← 側檔：小寫 40-hex SHA1，一行一個
-        │                                           （隨 binary 打包，載入機制仿 Sigma bundled）
+crates/cairn-heur/src/known-vulnerable-drivers.txt  ← 清單：小寫 40-hex SHA1，一行一個
+        │  （include_str! 編譯時內嵌；--driver-list <path> 可選覆寫）
         ▼
-   load_driver_hashes(path) → HashSet<String>   ← 載入 + 正規化 + 格式驗證（純函式）
+   parse_driver_hashes(text) → HashSet<String>  ← 解析 + 正規化 + 格式驗證（純函式）
         │
         ▼
-   ByovdHeuristic (cairn-heur/src/byovd.rs)      ← 純邏輯 analyzer
+   ByovdHeuristic::new(hashset) (cairn-heur/src/byovd.rs)  ← 帶狀態 analyzer（清單注入）
         │   掃 Record::Execution where source=="amcache_driver" && sha1.is_some()
         │   比對 HashSet
         ▼
    Finding { severity: High, mitre: [T1068, T1211], reason, evidence }
 ```
 
+**打包決定（brainstorm 查證後定案）**：查證發現本專案**沒有** bundled 資源的自動路徑
+解析機制——Sigma 規則靠使用者明確 `--rules <dir>`，`rules_dir=None` 時直接跳過。故 BYOVD
+清單**不靠側檔自動尋路**，改為 `include_str!` 編譯時內嵌預設清單（純資料嵌入，非邏輯硬編；
+高信心子集僅數十筆，體積影響可忽略），並提供 `--driver-list <path>` 旗標讓進階使用者以外部
+檔案覆寫（免重編即可更新清單）。這兼顧「開箱即用」與「可維護」，且避開專案沒有 bundled
+路徑機制的坑。純函式從此是 `parse_driver_hashes(text: &str)`（吃字串，不吃路徑——內嵌與
+外部檔都先讀成字串再交給它，保持純測試性）。
+
 ## 4. 側檔：驅動雜湊清單
 
 ### 4.1 位置與格式
-- 路徑：`rules/loldrivers/known-vulnerable-drivers.txt`
+- 預設清單檔：`crates/cairn-heur/src/known-vulnerable-drivers.txt`（`include_str!` 內嵌）。
 - 格式：**每行一個小寫 40 字元 SHA1**（對齊 `ExecutionRecord.sha1` 的格式——
   collector 已 `to_ascii_lowercase()`，清單也必須小寫，否則字串比對永遠 miss）。
-- 允許：`#` 開頭的註解行、空行（載入時跳過）。行尾建議加 `# <driver name>` 註記來源。
+- 允許：`#` 開頭的註解行、空行（解析時跳過）。行尾建議加 `# <driver name>` 註記來源。
 - **高信心子集**：只納入 LOLDrivers 專案中標記 known-vulnerable 或 known-malicious、
   且有明確 CVE / 實際攻擊使用記錄的驅動。初版納入業界公認的高頻 BYOVD 驅動雜湊
   （RTCore64/gdrv/dbutil/mhyprot/…），plan 階段列出具體條目與來源註記。
 
-### 4.2 載入（純函式，`load_driver_hashes`）
-- 讀檔 → 逐行處理：trim → 跳過空行與 `#` 開頭 → 取 `#` 前的內容再 trim
-  （容許行內註記）→ 小寫 → **驗證恰好 40 個 ASCII hex 字元**，符合才加入 HashSet，
-  不符合的行 **skip（不讓一行壞資料炸掉整份清單）**，可選擇記一個 warn。
+### 4.2 解析（純函式，`parse_driver_hashes(text: &str) -> HashSet<String>`）
+- 吃**字串**（非路徑）——內嵌清單與 `--driver-list` 外部檔都先讀成字串再交給它，保持純
+  可測性。
+- 逐行處理：trim → 跳過空行與 `#` 開頭 → 取行內 `#` 前的內容再 trim（容許行內註記）→
+  小寫 → **驗證恰好 40 個 ASCII hex 字元**，符合才加入 HashSet，不符合的行 **skip
+  （不讓一行壞資料炸掉整份清單）**。
 - 回傳 `HashSet<String>`（O(1) 比對）。
-- 檔案不存在 / 讀不到 → 回空 HashSet（heuristic 空手而回，graceful，golden rule 8）。
 
-### 4.3 打包（bundled）
-- 側檔隨 `dist/` 打包（同 `rules/`）。載入路徑解析仿現有 bundled Sigma 規則的作法
-  （相對於 binary 或 rules 目錄）——plan 階段對照現有 rules 載入程式碼釘死確切路徑解析。
+### 4.3 載入與覆寫
+- 預設：`include_str!("known-vulnerable-drivers.txt")` 編譯時內嵌 → `parse_driver_hashes`。
+- 覆寫：CLI `--driver-list <path>` 給定時，讀該檔為字串 → `parse_driver_hashes`；讀檔失敗
+  → warn + fallback 回內嵌清單（graceful，golden rule 8，絕不因清單問題中止整段）。
+- 這是本專案唯一的資源嵌入先例；`include_str!` 是編譯時純資料嵌入，非邏輯硬編，且高信心
+  子集僅數十筆，release binary 體積影響可忽略（不觸犯 golden rule 2 的「勿讓 binary
+  小/低熵」——這是加資料非減體積）。
 
 ## 5. Heuristic（`cairn-heur/src/byovd.rs`）
 
