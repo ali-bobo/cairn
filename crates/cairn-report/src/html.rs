@@ -296,6 +296,47 @@ fn file_activity_panel(records: &[cairn_core::Record]) -> String {
     )
 }
 
+/// Logon-session panel: RemoteInteractive (RDP) first.
+fn logon_panel(records: &[cairn_core::Record]) -> String {
+    use cairn_core::record::Record;
+    let mut sessions: Vec<&cairn_core::record::LogonSessionRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::LogonSession(s) => Some(s),
+            _ => None,
+        })
+        .collect();
+    if sessions.is_empty() {
+        return String::new();
+    }
+    let remote_count = sessions
+        .iter()
+        .filter(|s| s.logon_type.contains("Remote"))
+        .count();
+    // remote first, then by user. `sort_by_key` (not `sort_by`) to satisfy
+    // clippy::unnecessary_sort_by; invert the bool so "is remote" (false) sorts first.
+    sessions.sort_by_key(|s| (!s.logon_type.contains("Remote"), s.user.clone()));
+    let rows: String = sessions
+        .iter()
+        .map(|s| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&s.user),
+                esc(&s.logon_type),
+                s.session_id.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
+                esc(s.source.as_deref().unwrap_or("-")),
+            )
+        })
+        .collect();
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">登入 session ({} 個，其中 {} 個遠端)</h2></summary>\
+         <table><tr><th>使用者</th><th>類型</th><th>Session ID</th><th>來源</th></tr>{}</table></details>",
+        sessions.len(),
+        remote_count,
+        rows
+    )
+}
+
 /// Generate a self-contained HTML report from findings, observations and manifest.
 pub fn html_report(
     findings: &[Finding],
@@ -307,6 +348,7 @@ pub fn html_report(
     let process_html = process_panel(records);
     let execution_html = execution_panel(records);
     let file_activity_html = file_activity_panel(records);
+    let logon_html = logon_panel(records);
     let critical = count_sev(findings, Severity::Critical);
     let high = count_sev(findings, Severity::High);
     let medium = count_sev(findings, Severity::Medium);
@@ -509,6 +551,8 @@ tr:hover td{{background:#f9fafb}}
 {execution_html}
 
 {file_activity_html}
+
+{logon_html}
 
 {obs_html}
 
@@ -808,5 +852,34 @@ mod tests {
     fn file_activity_panel_absent_when_no_data() {
         let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(!html.contains("可疑檔案活動"));
+    }
+
+    fn session(user: &str, ltype: &str, sid: u32, source: Option<&str>) -> cairn_core::Record {
+        cairn_core::Record::LogonSession(cairn_core::record::LogonSessionRecord {
+            user: user.into(),
+            logon_type: ltype.into(),
+            logon_time: None,
+            source: source.map(String::from),
+            session_id: Some(sid),
+        })
+    }
+
+    #[test]
+    fn logon_panel_remote_first() {
+        let recs = vec![
+            session(r"PC\alice", "Interactive", 1, None),
+            session(r"DOM\bob", "RemoteInteractive", 2, Some("10.0.0.5")),
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("登入 session (2 個，其中 1 個遠端)"));
+        let remote_pos = html.find("bob").unwrap();
+        let local_pos = html.find("alice").unwrap();
+        assert!(remote_pos < local_pos, "remote session must sort first");
+    }
+
+    #[test]
+    fn logon_panel_absent_when_no_sessions() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        assert!(!html.contains("登入 session"));
     }
 }

@@ -279,8 +279,9 @@ fn parse_cap(s: &str) -> Option<u64> {
 /// The collector names that the run arm's construction `if` blocks would build for
 /// this selection, in canonical order. Pure mirror of those blocks, so the
 /// selection→collectors mapping is unit-testable without a live Windows host.
-/// MUST stay in sync with the ten unconditional `if ... push(...)` blocks in `main` that
-/// construct proc/net/persist/mft/usn/shimcache/amcache/prefetch/bam/userassist collectors (search: "S2-L: construct only").
+/// MUST stay in sync with the eleven unconditional `if ... push(...)` blocks in `main` that
+/// construct proc/net/logon_session/persist/mft/usn/shimcache/amcache/prefetch/bam/userassist
+/// collectors (search: "S2-L: construct only").
 /// NOTE: `evtx_live` and `srum` are NOT included — they are conditionally constructed
 /// (evtx_live requires sigma_analyzer, srum has its own stub path).
 #[cfg(test)]
@@ -288,6 +289,7 @@ fn built_collector_names(selected: &[String]) -> Vec<String> {
     [
         "proc",
         "net",
+        "logon_session",
         "persist",
         "mft",
         "usn",
@@ -677,6 +679,7 @@ fn main() -> anyhow::Result<()> {
             const AVAILABLE: &[&str] = &[
                 "proc",
                 "net",
+                "logon_session",
                 "persist",
                 "mft",
                 "usn",
@@ -796,6 +799,9 @@ fn main() -> anyhow::Result<()> {
             }
             if selection.selected.iter().any(|m| m == "net") {
                 collectors.push(Box::new(cairn_collectors::net::NetCollector));
+            }
+            if selection.selected.iter().any(|m| m == "logon_session") {
+                collectors.push(Box::new(cairn_collectors::logon_session::LogonSessionCollector));
             }
             if selection.selected.iter().any(|m| m == "persist") {
                 collectors.push(Box::new(
@@ -1084,6 +1090,7 @@ mod tests {
         const AVAILABLE: &[&str] = &[
             "proc",
             "net",
+            "logon_session",
             "persist",
             "mft",
             "usn",
@@ -1111,6 +1118,7 @@ mod tests {
             vec![
                 "proc",
                 "net",
+                "logon_session",
                 "persist",
                 "mft",
                 "usn",
