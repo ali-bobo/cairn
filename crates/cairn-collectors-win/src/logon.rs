@@ -119,10 +119,18 @@ mod win {
             .iter()
             .filter_map(|e| {
                 let user = session_user(e.SessionId)?;
-                // pWinStationName is a fixed-size inline array in WTS_SESSION_INFOW
-                // (not a WTSFreeMemory-owned allocation), so no separate buffer/guard
-                // is needed here -- just read the null-terminated wide string.
-                let station_name = unsafe { e.pWinStationName.to_string() }.ok().filter(|s| !s.is_empty());
+                // pWinStationName points into the same buffer WTSEnumerateSessionsW
+                // allocated (freed once by SessionInfoBuf on drop); it is not a
+                // separately-allocated string, so no extra WTSFreeMemory is owed here.
+                // Still null-checked before reading, matching session_user's guard --
+                // WTSEnumerateSessionsW is documented to populate this field for every
+                // session, but a defensive check costs nothing and avoids UB on wcslen.
+                let station_name = if e.pWinStationName.is_null() {
+                    None
+                } else {
+                    // SAFETY: just checked non-null; the API null-terminates the string.
+                    unsafe { e.pWinStationName.to_string() }.ok().filter(|s| !s.is_empty())
+                };
                 Some(WtsSession {
                     session_id: e.SessionId,
                     user,
