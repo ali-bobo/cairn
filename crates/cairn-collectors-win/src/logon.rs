@@ -12,6 +12,12 @@ pub struct WtsSession {
     /// if address parsing isn't straightforward for this session, honestly None
     /// rather than a wrong value.
     pub client_address: Option<String>,
+    /// The session's WinStation name (e.g. "Console" for the local interactive
+    /// session, "RDP-Tcp#N" for an RDP session). This is the reliable, officially
+    /// observable way to tell local vs. remote sessions apart -- unlike
+    /// `client_address` (byte layout unverifiable, see above), the station name is
+    /// a plain null-terminated string with no ambiguous parsing involved.
+    pub station_name: Option<String>,
 }
 
 /// Non-Windows: empty (the live WTS path is Windows-only).
@@ -113,6 +119,10 @@ mod win {
             .iter()
             .filter_map(|e| {
                 let user = session_user(e.SessionId)?;
+                // pWinStationName is a fixed-size inline array in WTS_SESSION_INFOW
+                // (not a WTSFreeMemory-owned allocation), so no separate buffer/guard
+                // is needed here -- just read the null-terminated wide string.
+                let station_name = unsafe { e.pWinStationName.to_string() }.ok().filter(|s| !s.is_empty());
                 Some(WtsSession {
                     session_id: e.SessionId,
                     user,
@@ -123,6 +133,7 @@ mod win {
                     // silently producing a wrong IP, so we honestly abstain (NFR12-style:
                     // never guess, abstain instead) rather than parse it.
                     client_address: None,
+                    station_name,
                 })
             })
             .collect()
