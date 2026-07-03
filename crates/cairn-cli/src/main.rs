@@ -116,6 +116,10 @@ struct RunArgs {
     /// Write mactime bodyfile to PATH (FR20). Skipped with --dry-run.
     #[arg(long)]
     bodyfile: Option<PathBuf>,
+    /// Override the built-in known-vulnerable driver hash list (BYOVD detection).
+    /// One lowercase 40-hex SHA1 per line; '#' comments allowed.
+    #[arg(long)]
+    driver_list: Option<PathBuf>,
     #[arg(long)]
     use_vss: bool,
     /// Hard cap on $MFT records the mft collector scans (NFR10). Default 1,000,000.
@@ -851,6 +855,19 @@ fn main() -> anyhow::Result<()> {
                     ));
                 }
             }
+            // BYOVD driver hash list: --driver-list override, else the bundled list.
+            // Read failure falls back to bundled (graceful, golden rule 8).
+            let driver_hashes = match args.driver_list.as_deref() {
+                Some(p) => match std::fs::read_to_string(p) {
+                    Ok(text) => cairn_heur::byovd::parse_driver_hashes(&text),
+                    Err(e) => {
+                        tracing::warn!(error = %e, path = %p.display(),
+                            "driver-list read failed; using bundled list");
+                        cairn_heur::byovd::parse_driver_hashes(cairn_heur::byovd::BUNDLED_DRIVER_LIST)
+                    }
+                },
+                None => cairn_heur::byovd::parse_driver_hashes(cairn_heur::byovd::BUNDLED_DRIVER_LIST),
+            };
             let mut analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
                 Box::new(cairn_heur::NetConnHeuristic),
@@ -860,6 +877,7 @@ fn main() -> anyhow::Result<()> {
                     chrono::Duration::hours(cfg.timestomp_threshold_hours),
                 )),
                 Box::new(cairn_heur::AccountHeuristic),
+                Box::new(cairn_heur::ByovdHeuristic::new(driver_hashes)),
             ];
             if let Some(sa) = sigma_analyzer {
                 analyzers.push(Box::new(sa));
@@ -1251,6 +1269,7 @@ mod tests {
             Box::new(cairn_heur::PersistHeuristic),
             Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
             Box::new(cairn_heur::AccountHeuristic),
+            Box::new(cairn_heur::ByovdHeuristic::new(std::collections::HashSet::new())),
         ];
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_timestomp"),
@@ -1259,6 +1278,10 @@ mod tests {
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_account"),
             "heur_account must be in analyzer set"
+        );
+        assert!(
+            analyzers.iter().any(|a| a.name() == "heur_byovd"),
+            "heur_byovd must be in analyzer set"
         );
     }
 
