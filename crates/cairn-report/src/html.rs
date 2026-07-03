@@ -64,8 +64,10 @@ fn short_ts(ts: &str) -> &str {
 pub fn html_report(
     findings: &[Finding],
     observations: &[cairn_core::Observation],
+    records: &[cairn_core::Record],
     manifest: &Manifest,
 ) -> String {
+    let _ = records;
     let critical = count_sev(findings, Severity::Critical);
     let high = count_sev(findings, Severity::High);
     let medium = count_sev(findings, Severity::Medium);
@@ -323,13 +325,13 @@ mod tests {
 
     #[test]
     fn html_report_contains_hostname() {
-        let html = html_report(&[], &[], &minimal_manifest());
+        let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(html.contains("TEST-PC"), "should contain hostname");
     }
 
     #[test]
     fn html_report_clean_verdict_when_no_high() {
-        let html = html_report(&[], &[], &minimal_manifest());
+        let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(html.contains("未發現高風險威脅"));
         assert!(!html.contains("發現高風險事件"));
     }
@@ -339,7 +341,7 @@ mod tests {
         let mut f = Finding::new(Severity::High, "Test High", FindingSource::Sigma);
         f.host = "TEST-PC".into();
         f.artifact = "evtx:Security".into();
-        let html = html_report(&[f], &[], &minimal_manifest());
+        let html = html_report(&[f], &[], &[], &minimal_manifest());
         assert!(html.contains("發現高風險事件"));
     }
 
@@ -347,14 +349,14 @@ mod tests {
     fn html_report_escapes_xss() {
         let mut m = minimal_manifest();
         m.host.hostname = "<script>alert(1)</script>".into();
-        let html = html_report(&[], &[], &m);
+        let html = html_report(&[], &[], &[], &m);
         assert!(!html.contains("<script>"), "raw script tag should be escaped");
         assert!(html.contains("&lt;script&gt;"));
     }
 
     #[test]
     fn html_report_no_findings_shows_empty_message() {
-        let html = html_report(&[], &[], &minimal_manifest());
+        let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(html.contains("本次掃描無 finding"));
     }
 
@@ -381,7 +383,7 @@ mod tests {
         o.details = "位置=HKLM\\...\\Services\\X".into();
         o.source_artifact = "persistence".into();
 
-        let html = html_report(&[f], &[o], &minimal_manifest());
+        let html = html_report(&[f], &[o], &[], &minimal_manifest());
 
         assert!(html.contains("主機盤點"), "missing host-inventory heading: {html}");
         assert!(

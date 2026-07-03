@@ -319,9 +319,10 @@ impl OutputSink for DirSink {
         &mut self,
         findings: &[Finding],
         observations: &[Observation],
+        records: &[cairn_core::Record],
         manifest: &Manifest,
     ) -> Result<()> {
-        let html = crate::html::html_report(findings, observations, manifest);
+        let html = crate::html::html_report(findings, observations, records, manifest);
         self.write_file("report.html", html.as_bytes())
     }
 
