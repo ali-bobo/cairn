@@ -9,7 +9,39 @@
 
 ---
 
-## 目前位置（2026-07-03）
+## 目前位置（2026-07-04）
+
+- **BYOVD 驅動偵測**（`feature/byovd-driver-detection` 分支，2 task subagent-driven）✅
+  **完成**——比對 `amcache_driver` 已收集的驅動 SHA1 與內嵌的高信心已知漏洞/惡意驅動清單。
+  設計：`docs/dev-history/specs/2026-07-04-byovd-driver-detection-design.md`；
+  計畫：`docs/dev-history/plans/2026-07-04-byovd-driver-detection.md`。
+  - **重新配置的背景**：原「無檔案攻擊強化」spec 的塊 A（WMI 訂閱）在大腦風暴查證程式碼時
+    發現真實設計缺陷——gate 的 S9 腳本信號只認「被呼叫的直譯器」，抓不到 WMI
+    `ActiveScriptEventConsumer` 內嵌 ScriptText（無被呼叫執行檔），是 WMI 持久化最常見的
+    型態，會被誤放進 Observation 而非 Finding。因此拆成三個獨立 spec 並重排優先序：
+    BYOVD（本次，最高性價比）→ Sigma 規則大擴充（真正的偵測廣度瓶頸）→ WMI（重設計為
+    Observation-first）+ 登入爆破。原 spec 保留為
+    `docs/dev-history/specs/FUTURE-fileless-attack-coverage-design.md` 待後續處理。
+  - **清單**：`crates/cairn-heur/src/known-vulnerable-drivers.txt`，19 個真實 SHA1（直接對照
+    loldrivers.io 官方頁面 + 各自 CVE 查證，非憑空生成）：RTCore64.sys（CVE-2019-16098）×13、
+    gdrv.sys（CVE-2018-19320~19323）×3、dbutil_2_3.sys（CVE-2021-21551）×3。`include_str!`
+    編譯時內嵌（本專案沒有 bundled 資源自動路徑解析機制，Sigma 規則靠 `--rules` 明確指定，
+    brainstorm 查證後修正了 spec 原本假設的「側檔自動尋路」設計），`--driver-list <path>`
+    可選覆寫免重編更新清單。
+  - **ByovdHeuristic**：純邏輯 analyzer（`heur_byovd`），命中即 High（T1068+T1211），`sha1=None`
+    誠實跳過不誤判，非 `amcache_driver` 來源忽略。零 unsafe、零新依賴、零 schema 變動。
+  - **雙重驗收**：(1) 乾淨機器（admin 但無 SeBackupPrivilege）零 byovd finding；
+    (2) 因環境缺 SeBackupPrivilege 無法用真機驗證「比對管線真的通」，改寫**永久整合測試**
+    （`byovd_driver_list_override_pipeline_end_to_end`，仿 `sigma_analyzer_findings_appear_in_live_outcome`
+    範本）——用假 collector 灌真實清單內的 SHA1、走完整 `run_live→ByovdHeuristic→Finding`
+    管線，比一次性手動 e2e 更可靠且會留在套件裡當回歸測試。
+  - 全 workspace 測試綠（含 9 個 byovd 單元測試 + 1 個整合測試）、clippy 零警告。
+    **待辦事項：merge 回 main**（finishing-a-development-branch）。
+  - **殘留項**：清單維護是持續工作（未來可考慮 update-rules 式更新機制，非本次範圍）；
+    精確雜湊比對只抓已知樣本，攻擊者可用未收錄的客製驅動繞過（spec §6 已誠實標示，
+    多層偵測的一環而非唯一防線）。
+
+## 前次位置（2026-07-03）
 
 - **IR Snapshot Panels**（`feature/ir-snapshot-panels` 分支，10 task subagent-driven）✅
   **完成**——把已收集但埋在 records.jsonl 的 IR 關鍵資料攤成 report.html 的折疊面板。
