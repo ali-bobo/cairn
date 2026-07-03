@@ -11,6 +11,7 @@ pub mod evtx;
 pub mod evtx_live;
 pub mod hash;
 pub mod hive_reader;
+pub mod logon_session;
 pub mod mft;
 pub mod net;
 pub mod persist;
