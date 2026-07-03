@@ -225,6 +225,77 @@ fn execution_panel(records: &[cairn_core::Record]) -> String {
     )
 }
 
+/// Suspicious-file-activity panel: MOTW-tagged files first (download provenance),
+/// then recent USN create/rename events (capped at 200; total noted in summary).
+fn file_activity_panel(records: &[cairn_core::Record]) -> String {
+    use cairn_core::record::Record;
+    const USN_CAP: usize = 200;
+
+    let motw: Vec<&cairn_core::record::FileMetaRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::FileMeta(m) if m.zone_identifier.is_some() => Some(m),
+            _ => None,
+        })
+        .collect();
+
+    let mut usn: Vec<&cairn_core::record::UsnEventRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::UsnEvent(u) => Some(u),
+            _ => None,
+        })
+        .filter(|u| {
+            let re = u.reason.to_ascii_lowercase();
+            re.contains("create") || re.contains("rename")
+        })
+        .collect();
+
+    if motw.is_empty() && usn.is_empty() {
+        return String::new();
+    }
+    let usn_total = usn.len();
+    usn.sort_by_key(|u| std::cmp::Reverse(u.ts)); // newest first
+    usn.truncate(USN_CAP);
+
+    let motw_rows: String = motw
+        .iter()
+        .map(|m| {
+            format!(
+                "<tr><td>MOTW</td><td>{}</td><td>{}</td></tr>",
+                esc(&m.path),
+                esc(m.zone_identifier.as_deref().unwrap_or("-")),
+            )
+        })
+        .collect();
+    let usn_rows: String = usn
+        .iter()
+        .map(|u| {
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&u.reason),
+                esc(&u.path),
+                esc(&u.ts.format("%Y-%m-%d %H:%MZ").to_string()),
+            )
+        })
+        .collect();
+    let usn_note = if usn_total > USN_CAP {
+        format!("（顯示前 {USN_CAP} 筆，共 {usn_total} 筆，完整見 records.jsonl）")
+    } else {
+        String::new()
+    };
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">可疑檔案活動 ({} 個 MOTW 檔案 / {} 筆近期檔案事件)</h2></summary>\
+         <p style=\"font-size:0.8em;color:#6b7280\">{}</p>\
+         <table><tr><th>類型/動作</th><th>路徑</th><th>詳細</th></tr>{}{}</table></details>",
+        motw.len(),
+        usn_total,
+        usn_note,
+        motw_rows,
+        usn_rows,
+    )
+}
+
 /// Generate a self-contained HTML report from findings, observations and manifest.
 pub fn html_report(
     findings: &[Finding],
@@ -235,6 +306,7 @@ pub fn html_report(
     let netconn_html = netconn_panel(records);
     let process_html = process_panel(records);
     let execution_html = execution_panel(records);
+    let file_activity_html = file_activity_panel(records);
     let critical = count_sev(findings, Severity::Critical);
     let high = count_sev(findings, Severity::High);
     let medium = count_sev(findings, Severity::Medium);
@@ -435,6 +507,8 @@ tr:hover td{{background:#f9fafb}}
 {process_html}
 
 {execution_html}
+
+{file_activity_html}
 
 {obs_html}
 
@@ -678,5 +752,61 @@ mod tests {
     fn execution_panel_absent_when_no_executions() {
         let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(!html.contains("近期執行證據"));
+    }
+
+    fn usn(reason: &str, path: &str, ymd: (i32, u32, u32)) -> cairn_core::Record {
+        cairn_core::Record::UsnEvent(cairn_core::record::UsnEventRecord {
+            ts: Utc.with_ymd_and_hms(ymd.0, ymd.1, ymd.2, 0, 0, 0).unwrap(),
+            path: path.into(),
+            reason: reason.into(),
+            mft_ref: 1,
+        })
+    }
+    fn motw_file(path: &str, zone: &str) -> cairn_core::Record {
+        cairn_core::Record::FileMeta(cairn_core::record::FileMetaRecord {
+            path: path.into(),
+            size: 0,
+            sha256: None,
+            si_btime: None,
+            si_mtime: None,
+            fn_btime: None,
+            fn_mtime: None,
+            zone_identifier: Some(zone.into()),
+            path_complete: None,
+        })
+    }
+
+    #[test]
+    fn file_activity_panel_motw_and_usn_filtered() {
+        let recs = vec![
+            usn("File_Create", r"C:\Users\a\Downloads\dropper.exe", (2026, 6, 1)),
+            usn("Basic_Info_Change", r"C:\noise.txt", (2026, 6, 2)), // filtered (not create/rename)
+            motw_file(r"C:\Users\a\Downloads\dropper.exe", "ZoneId=3"),
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("可疑檔案活動 (1 個 MOTW 檔案 / 1 筆近期檔案事件)"));
+        assert!(html.contains("ZoneId=3"));
+        assert!(!html.contains("noise.txt"), "non-create/rename USN filtered");
+        // MOTW row before USN row
+        let motw_pos = html.find("ZoneId=3").unwrap();
+        let usn_pos = html.rfind("File_Create").unwrap();
+        assert!(motw_pos < usn_pos, "MOTW must sort before USN events");
+    }
+
+    #[test]
+    fn file_activity_panel_caps_usn_at_200() {
+        let mut recs = Vec::new();
+        for i in 0..250 {
+            recs.push(usn("File_Create", &format!(r"C:\f{i}.exe"), (2026, 6, 1)));
+        }
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("共 250 筆"), "must note total when capped");
+        assert!(html.contains("顯示前 200 筆"));
+    }
+
+    #[test]
+    fn file_activity_panel_absent_when_no_data() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        assert!(!html.contains("可疑檔案活動"));
     }
 }
