@@ -17,6 +17,17 @@ fn esc(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Minimal public-IPv4 test for panel sorting only (cairn-report doesn't depend on
+/// cairn-heur's score::is_public_ipv4). Non-parseable or private/loopback/link-local
+/// → false. This is a sort hint, not a security judgement, so the simplified check is fine.
+fn is_public_ipv4_hint(addr: &str) -> bool {
+    use std::net::Ipv4Addr;
+    match addr.parse::<Ipv4Addr>() {
+        Ok(ip) => !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified(),
+        Err(_) => false,
+    }
+}
+
 fn sev_label(s: Severity) -> &'static str {
     match s {
         Severity::Critical => "Critical",
@@ -60,6 +71,61 @@ fn short_ts(ts: &str) -> &str {
     }
 }
 
+/// Outbound-connections panel: established + listening only; public-remote sorted first.
+fn netconn_panel(records: &[cairn_core::Record]) -> String {
+    use cairn_core::record::Record;
+    let mut conns: Vec<&cairn_core::record::NetConnRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::NetConn(c) => Some(c),
+            _ => None,
+        })
+        .filter(|c| {
+            let st = c.state.as_deref().unwrap_or("").to_ascii_uppercase();
+            st.is_empty() || st == "ESTABLISHED" || st == "LISTEN" || st == "LISTENING"
+        })
+        .collect();
+    if conns.is_empty() {
+        return String::new();
+    }
+    let public_count = conns
+        .iter()
+        .filter(|c| c.raddr.as_deref().is_some_and(is_public_ipv4_hint))
+        .count();
+    // Public-remote first, then by remote addr.
+    conns.sort_by(|a, b| {
+        let ap = a.raddr.as_deref().is_some_and(is_public_ipv4_hint);
+        let bp = b.raddr.as_deref().is_some_and(is_public_ipv4_hint);
+        bp.cmp(&ap).then_with(|| a.raddr.cmp(&b.raddr))
+    });
+    let rows: String = conns
+        .iter()
+        .map(|c| {
+            let remote = match (c.raddr.as_deref(), c.rport) {
+                (Some(a), Some(p)) => format!("{a}:{p}"),
+                (Some(a), None) => a.to_string(),
+                _ => "-".into(),
+            };
+            format!(
+                "<tr><td>{}</td><td>{}:{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                esc(&c.proto),
+                esc(&c.laddr),
+                c.lport,
+                esc(&remote),
+                esc(c.state.as_deref().unwrap_or("-")),
+                c.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            )
+        })
+        .collect();
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">對外連線 ({} 條，其中 {} 條連往公網)</h2></summary>\
+         <table><tr><th>協定</th><th>本地</th><th>遠端</th><th>狀態</th><th>PID</th></tr>{}</table></details>",
+        conns.len(),
+        public_count,
+        rows
+    )
+}
+
 /// Generate a self-contained HTML report from findings, observations and manifest.
 pub fn html_report(
     findings: &[Finding],
@@ -67,7 +133,7 @@ pub fn html_report(
     records: &[cairn_core::Record],
     manifest: &Manifest,
 ) -> String {
-    let _ = records;
+    let netconn_html = netconn_panel(records);
     let critical = count_sev(findings, Severity::Critical);
     let high = count_sev(findings, Severity::High);
     let medium = count_sev(findings, Severity::Medium);
@@ -263,6 +329,8 @@ tr:hover td{{background:#f9fafb}}
 </div>
 </div>
 
+{netconn_html}
+
 {obs_html}
 
 <div class="footer">
@@ -394,5 +462,48 @@ mod tests {
             html.contains(r"C:\Program Files\X\x.exe"),
             "missing observation path: {html}"
         );
+    }
+
+    fn netconn(
+        proto: &str,
+        raddr: Option<&str>,
+        rport: Option<u16>,
+        state: &str,
+        pid: Option<u32>,
+    ) -> cairn_core::Record {
+        cairn_core::Record::NetConn(cairn_core::record::NetConnRecord {
+            proto: proto.into(),
+            laddr: "0.0.0.0".into(),
+            lport: 1234,
+            raddr: raddr.map(String::from),
+            rport,
+            state: Some(state.into()),
+            pid,
+        })
+    }
+
+    #[test]
+    fn netconn_panel_lists_and_counts_public() {
+        let recs = vec![
+            netconn("tcp", Some("8.8.8.8"), Some(443), "ESTABLISHED", Some(100)),
+            netconn("tcp", Some("192.168.1.5"), Some(445), "ESTABLISHED", Some(200)),
+            netconn("tcp", None, None, "TIME_WAIT", None), // filtered out
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(
+            html.contains("對外連線 (2 條，其中 1 條連往公網)"),
+            "html: missing panel"
+        );
+        assert!(html.contains("8.8.8.8:443"));
+        // public remote sorted first: 8.8.8.8 row appears before 192.168 row
+        let pub_pos = html.find("8.8.8.8").unwrap();
+        let priv_pos = html.find("192.168.1.5").unwrap();
+        assert!(pub_pos < priv_pos, "public conn must sort first");
+    }
+
+    #[test]
+    fn netconn_panel_absent_when_no_conns() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        assert!(!html.contains("對外連線"));
     }
 }
