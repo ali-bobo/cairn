@@ -42,6 +42,14 @@
     身分執行」不會自動附帶，需 `psexec -s` 或群組原則另外授予）。這導致一般 admin 掃描仍看不到
     完整的可疑檔案活動面板；不在本次計畫範圍內。
   - 全 workspace 測試綠、clippy 零警告。**待辦事項：merge 回 main**（finishing-a-development-branch）。
+  - **Opus 整體審查抓到並修正的真缺陷**：`logon_session.rs` 原本用永遠是 `None` 的
+    `client_address` 判斷 `logon_type`，導致「RDP 排前」這個面板核心功能在真機上永遠失效
+    （每個 session 都被標成 Interactive）。修正：改讀 `WTS_SESSION_INFOW.pWinStationName`
+    （官方可靠、免猜位元組配置，RDP session 站名固定為 `RDP-Tcp#N`）。
+  - **審查殘留項（低優先，未修）**：(1) `WtsSession.state_active`（session 是否為 Active
+    連線狀態）已收集但目前沒有任何面板/邏輯讀取，可考慮未來顯示；(2)「對外連線」面板標題
+    涵蓋 listener（其實是入站）與所有 UDP socket（`state=None`），標題語意略寬於實際內容，
+    低影響的命名精確度問題。
 
 ## 前次位置（2026-07-02）
 
