@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod byovd;
 pub mod netconn;
 pub mod parentchild;
 pub mod persist;
