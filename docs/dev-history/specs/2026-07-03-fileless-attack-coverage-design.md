@@ -1,11 +1,15 @@
 # Fileless Attack Coverage — Design Spec (Spec 1 of the IR-triage expansion)
 
-> **Date:** 2026-07-03
+> **Date:** 2026-07-03 (re-activated after IR snapshot panels branch merged to main `88831a1`)
 > **Status:** Approved direction — pending user spec review
 > **Scope:** WMI event-subscription collector + EVTX channel expansion (PowerShell /
 > authentication / lateral movement) + matching Sigma rules + one cross-event heuristic.
 > **Depends on:** heuristic gate redesign (merged to main `068983e`, 2026-07-02) —
 > reuses the persist dispositive-signal gate and the Observation channel.
+> **Orthogonal to:** IR snapshot panels (merged to main `88831a1`, 2026-07-03) — that
+> branch is presentation-only (report.html panels from already-collected data); this
+> spec is detection/collection (new WMI collector + EVTX channels + one heuristic).
+> No overlap, no ordering dependency between the two.
 > **SRS refs:** §4 (collectors), §10 (heuristics), FR9 (persistence), FR12, golden rules 1/6/8.
 
 ---
