@@ -1641,4 +1641,77 @@ author: test-integration
             "finding must carry DRL 1.1 rule_author"
         );
     }
+
+    /// Integration: proves the whole BYOVD pipeline end-to-end — a --driver-list file
+    /// is read + parsed exactly as the live CLI path does, then ByovdHeuristic (wired
+    /// through run_live like any other analyzer) matches a real amcache_driver record
+    /// against it and emits a High finding. This substitutes for a real-machine e2e
+    /// scan on a host without SeBackupPrivilege (amcache_driver requires it), which
+    /// this dev environment lacks — same collector-injection pattern as
+    /// `sigma_analyzer_findings_appear_in_live_outcome` above.
+    #[test]
+    fn byovd_driver_list_override_pipeline_end_to_end() {
+        use cairn_core::manifest::Privileges;
+        use cairn_core::orchestrator::run_live;
+        use cairn_core::record::{ExecutionRecord, Record};
+        use cairn_core::traits::{CollectCtx, Collector};
+
+        const KNOWN_SHA1: &str = "4a68c2d7a4c471e062a32c83a36eedb45a619683"; // RTCore64.sys, bundled list
+
+        // Simulates writing --driver-list to a temp file and reading it back exactly
+        // as the CLI's Cmd::Run(args) branch does: std::fs::read_to_string then
+        // cairn_heur::byovd::parse_driver_hashes.
+        let dir = std::env::temp_dir();
+        let list_path = dir.join(format!("cairn-byovd-test-{}.txt", std::process::id()));
+        std::fs::write(&list_path, format!("{KNOWN_SHA1}  # RTCore64.sys test override\n"))
+            .expect("write temp driver list");
+        let text = std::fs::read_to_string(&list_path).expect("read temp driver list");
+        let hashes = cairn_heur::byovd::parse_driver_hashes(&text);
+        std::fs::remove_file(&list_path).ok();
+        assert!(hashes.contains(KNOWN_SHA1), "override file must parse back the known hash");
+
+        struct DriverCollector(ExecutionRecord);
+        impl Collector for DriverCollector {
+            fn name(&self) -> &str {
+                "fake_amcache_driver"
+            }
+            fn collect(&self, _ctx: &CollectCtx<'_>) -> cairn_core::Result<Vec<Record>> {
+                Ok(vec![Record::Execution(self.0.clone())])
+            }
+        }
+
+        let driver_rec = ExecutionRecord {
+            source: "amcache_driver".into(),
+            path: r"C:\Windows\System32\drivers\rtcore64.sys".into(),
+            first_run: None,
+            last_run: None,
+            run_count: None,
+            sha1: Some(KNOWN_SHA1.to_string()),
+            user_sid: None,
+            execution_confirmed: Some(true),
+        };
+
+        let cfg = cairn_core::Config::default();
+        let privs = Privileges {
+            admin: true,
+            se_backup: false,
+            se_debug: false,
+        };
+        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(DriverCollector(driver_rec))];
+        let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> =
+            vec![Box::new(cairn_heur::ByovdHeuristic::new(hashes))];
+
+        let outcome = run_live(&cfg, privs, "TEST".into(), &collectors, &analyzers);
+
+        assert_eq!(outcome.records.len(), 1, "driver record must be collected");
+        assert_eq!(outcome.findings.len(), 1, "byovd match must produce exactly one finding");
+        assert_eq!(outcome.findings[0].artifact, "byovd");
+        assert_eq!(outcome.findings[0].severity, cairn_core::finding::Severity::High);
+        assert!(outcome.findings[0].mitre.contains(&"T1068".to_string()));
+        assert!(
+            outcome.findings[0].title.contains("rtcore64.sys"),
+            "title: {}",
+            outcome.findings[0].title
+        );
+    }
 }
