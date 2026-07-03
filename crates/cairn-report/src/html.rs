@@ -126,6 +126,58 @@ fn netconn_panel(records: &[cairn_core::Record]) -> String {
     )
 }
 
+/// Running-processes panel: unsigned first, then signature-unknown.
+fn process_panel(records: &[cairn_core::Record]) -> String {
+    use cairn_core::record::Record;
+    let mut procs: Vec<&cairn_core::record::ProcessRecord> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Process(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+    if procs.is_empty() {
+        return String::new();
+    }
+    let unsigned_count = procs.iter().filter(|p| p.signed == Some(false)).count();
+    // rank: unsigned(0) < unknown(1) < signed(2)
+    fn sig_rank(s: Option<bool>) -> u8 {
+        match s {
+            Some(false) => 0,
+            None => 1,
+            Some(true) => 2,
+        }
+    }
+    procs.sort_by(|a, b| sig_rank(a.signed).cmp(&sig_rank(b.signed)).then_with(|| a.pid.cmp(&b.pid)));
+    let rows: String = procs
+        .iter()
+        .map(|p| {
+            let sig = match p.signed {
+                Some(true) => "已簽章",
+                Some(false) => "未簽章",
+                None => "未知",
+            };
+            let cmd = p.cmdline.chars().take(120).collect::<String>();
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td style=\"font-size:0.8em;color:#6b7280\">{}</td></tr>",
+                p.pid,
+                p.ppid,
+                esc(&p.image),
+                esc(sig),
+                esc(p.integrity.as_deref().unwrap_or("-")),
+                esc(&cmd),
+            )
+        })
+        .collect();
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">執行中程序 ({} 個，其中 {} 個未簽章)</h2></summary>\
+         <table><tr><th>PID</th><th>PPID</th><th>映像路徑</th><th>簽章</th><th>完整性</th><th>命令列</th></tr>{}</table></details>",
+        procs.len(),
+        unsigned_count,
+        rows
+    )
+}
+
 /// Generate a self-contained HTML report from findings, observations and manifest.
 pub fn html_report(
     findings: &[Finding],
@@ -134,6 +186,7 @@ pub fn html_report(
     manifest: &Manifest,
 ) -> String {
     let netconn_html = netconn_panel(records);
+    let process_html = process_panel(records);
     let critical = count_sev(findings, Severity::Critical);
     let high = count_sev(findings, Severity::High);
     let medium = count_sev(findings, Severity::Medium);
@@ -331,6 +384,8 @@ tr:hover td{{background:#f9fafb}}
 
 {netconn_html}
 
+{process_html}
+
 {obs_html}
 
 <div class="footer">
@@ -505,5 +560,39 @@ mod tests {
     fn netconn_panel_absent_when_no_conns() {
         let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(!html.contains("對外連線"));
+    }
+
+    fn proc(pid: u32, image: &str, signed: Option<bool>) -> cairn_core::Record {
+        cairn_core::Record::Process(cairn_core::record::ProcessRecord {
+            pid,
+            ppid: 4,
+            image: image.into(),
+            cmdline: format!("{image} --run"),
+            signed,
+            signer: None,
+            binary_sha256: None,
+            integrity: Some("medium".into()),
+            user: None,
+            start_time: None,
+        })
+    }
+
+    #[test]
+    fn process_panel_lists_unsigned_first() {
+        let recs = vec![
+            proc(100, r"C:\Windows\System32\svchost.exe", Some(true)),
+            proc(200, r"C:\Users\a\AppData\Roaming\x.exe", Some(false)),
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("執行中程序 (2 個，其中 1 個未簽章)"));
+        let unsigned_pos = html.find("x.exe").unwrap();
+        let signed_pos = html.find("svchost.exe").unwrap();
+        assert!(unsigned_pos < signed_pos, "unsigned proc must sort first");
+    }
+
+    #[test]
+    fn process_panel_absent_when_no_processes() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        assert!(!html.contains("執行中程序"));
     }
 }
