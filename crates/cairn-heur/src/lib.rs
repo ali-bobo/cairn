@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod byovd;
 pub mod netconn;
 pub mod parentchild;
 pub mod persist;
@@ -14,6 +15,7 @@ pub mod trust;
 
 // Public API: the analyzers wired into the CLI live run (and reusable elsewhere).
 pub use account::AccountHeuristic;
+pub use byovd::ByovdHeuristic;
 pub use netconn::NetConnHeuristic;
 pub use parentchild::ParentChildHeuristic;
 pub use persist::PersistHeuristic;
