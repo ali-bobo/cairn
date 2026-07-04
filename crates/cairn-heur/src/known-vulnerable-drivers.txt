@@ -6,7 +6,7 @@
 # Maintained: 2026-07-04. Update via --driver-list or by editing + recompiling.
 
 # --- RTCore64.sys (MSI Afterburner) — CVE-2019-16098, arbitrary R/W, EDR-killer favorite ---
-4a68c2d7a4c471e062a32c83a36eedb45a619683  # RTCore64.sys
+f6f11ad2cd2b0cf95ed42324876bee1d83e01775  # RTCore64.sys
 af50109b112995f8c82be8ef3a88be404510cdde  # RTCore64.sys
 4fe873544c34243826489997a5ff14ed39dd090d  # RTCore64.sys
 8800a33a37c640922ce6a2996cd822ed4603b8bb  # RTCore64.sys
