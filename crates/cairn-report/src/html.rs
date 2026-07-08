@@ -452,6 +452,43 @@ pub fn html_report(
         )
     };
 
+    let filter_script_html = if sorted.is_empty() {
+        String::new()
+    } else {
+        r#"<script>
+(function() {
+  var checkboxes = document.querySelectorAll('.sev-filter');
+  var artifactSel = document.getElementById('artifact-filter');
+  var keywordInput = document.getElementById('keyword-filter');
+  var rows = document.querySelectorAll('#findings-tbody tr[data-severity]');
+  var countEl = document.getElementById('filter-count');
+  if (!rows.length) { return; }
+
+  function applyFilter() {
+    var activeSevs = Array.prototype.filter.call(checkboxes, function(cb) { return cb.checked; })
+                          .map(function(cb) { return cb.value; });
+    var artifact = artifactSel.value;
+    var keyword = keywordInput.value.toLowerCase();
+    var visible = 0;
+    rows.forEach(function(row) {
+      var sevOk = activeSevs.indexOf(row.dataset.severity) !== -1;
+      var artOk = !artifact || row.dataset.artifact === artifact;
+      var kwOk = !keyword || row.textContent.toLowerCase().indexOf(keyword) !== -1;
+      var show = sevOk && artOk && kwOk;
+      row.style.display = show ? '' : 'none';
+      if (show) { visible++; }
+    });
+    countEl.textContent = '顯示 ' + visible + ' / ' + rows.length + ' 筆';
+  }
+  checkboxes.forEach(function(cb) { cb.addEventListener('change', applyFilter); });
+  artifactSel.addEventListener('change', applyFilter);
+  keywordInput.addEventListener('input', applyFilter);
+  applyFilter();
+})();
+</script>"#
+            .to_string()
+    };
+
     // Build findings rows
     let rows = if sorted.is_empty() {
         "<tr><td colspan=\"6\" style=\"text-align:center;color:#6b7280;padding:2rem\">本次掃描無 finding</td></tr>".to_string()
@@ -637,6 +674,8 @@ tr:hover td{{background:#f9fafb}}
   <p style="margin-top:.25rem">cairn v{tool_ver} &nbsp;·&nbsp; 報告產生時間：{generated}</p>
 </div>
 
+{filter_script_html}
+
 </div>
 </body>
 </html>"#,
@@ -773,6 +812,28 @@ mod tests {
             !html.contains("<div class=\"filter-bar\">"),
             "filter bar div must not render when there are no findings"
         );
+    }
+
+    #[test]
+    fn filter_script_present_when_findings_exist() {
+        let mut f = Finding::new(Severity::High, "Test High", FindingSource::Sigma);
+        f.host = "TEST-PC".into();
+        f.artifact = "evtx:Security".into();
+        let html = html_report(&[f], &[], &[], &minimal_manifest());
+        assert!(
+            html.contains("addEventListener"),
+            "filter script must be present: {html}"
+        );
+    }
+
+    #[test]
+    fn filter_script_has_no_eval_or_innerhtml() {
+        let mut f = Finding::new(Severity::High, "Test High", FindingSource::Sigma);
+        f.host = "TEST-PC".into();
+        f.artifact = "evtx:Security".into();
+        let html = html_report(&[f], &[], &[], &minimal_manifest());
+        assert!(!html.contains("eval("), "must not use eval()");
+        assert!(!html.contains("innerHTML ="), "must not assign innerHTML");
     }
 
     /// Findings render their evidence list (collapsible "佐證來源"), and observations
