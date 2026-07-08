@@ -14,7 +14,12 @@ pub fn parse_driver_hashes(text: &str) -> HashSet<String> {
     let mut set = HashSet::new();
     for line in text.lines() {
         // Strip an inline comment: keep everything before the first '#'.
-        let body = line.split('#').next().unwrap_or("").trim().to_ascii_lowercase();
+        let body = line
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
         if body.is_empty() {
             continue;
         }
@@ -60,7 +65,9 @@ impl Analyzer for ByovdHeuristic {
             }
             // Only compare when the collector produced a real SHA1 (None = malformed
             // DriverId, honestly skipped per NFR12 — never a false match).
-            let Some(sha1) = e.sha1.as_deref() else { continue };
+            let Some(sha1) = e.sha1.as_deref() else {
+                continue;
+            };
             if !self.hashes.contains(sha1) {
                 continue;
             }
@@ -137,7 +144,10 @@ this line has spaces in the middle 00112233
         // The shipped list must contain at least one valid SHA1 (else the whole
         // feature is a no-op). Guards against an accidentally-empty/all-malformed file.
         let set = parse_driver_hashes(BUNDLED_DRIVER_LIST);
-        assert!(!set.is_empty(), "bundled driver list must have >=1 valid SHA1");
+        assert!(
+            !set.is_empty(),
+            "bundled driver list must have >=1 valid SHA1"
+        );
     }
 }
 
@@ -168,7 +178,11 @@ mod analyze_tests {
     #[test]
     fn known_driver_hash_is_high_with_mitre_and_evidence() {
         let heur = heur_with(&[KNOWN]);
-        let recs = vec![driver_exec("amcache_driver", r"C:\Windows\System32\drivers\rtcore64.sys", Some(KNOWN))];
+        let recs = vec![driver_exec(
+            "amcache_driver",
+            r"C:\Windows\System32\drivers\rtcore64.sys",
+            Some(KNOWN),
+        )];
         let findings = heur.analyze(&recs).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
@@ -183,7 +197,11 @@ mod analyze_tests {
     #[test]
     fn unknown_hash_yields_nothing() {
         let heur = heur_with(&[KNOWN]);
-        let recs = vec![driver_exec("amcache_driver", r"C:\x\clean.sys", Some("0000000000000000000000000000000000000000"))];
+        let recs = vec![driver_exec(
+            "amcache_driver",
+            r"C:\x\clean.sys",
+            Some("0000000000000000000000000000000000000000"),
+        )];
         assert!(heur.analyze(&recs).unwrap().is_empty());
     }
 

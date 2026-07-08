@@ -142,7 +142,10 @@ impl Collector for EvtxLiveCollector {
     }
 
     fn sources(&self) -> Vec<SourceEntry> {
-        self.sources.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.sources
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 }
 
@@ -175,7 +178,10 @@ mod tests {
 
     #[test]
     fn filename_to_channel_security() {
-        assert_eq!(filename_to_channel("Security.evtx"), Some("Security".to_string()));
+        assert_eq!(
+            filename_to_channel("Security.evtx"),
+            Some("Security".to_string())
+        );
     }
 
     #[test]
@@ -194,7 +200,9 @@ mod tests {
     #[test]
     fn since_filter_drops_old_event() {
         let since = chrono::Utc.with_ymd_and_hms(2026, 6, 27, 0, 0, 0).unwrap();
-        let old_ts = chrono::Utc.with_ymd_and_hms(2026, 6, 26, 23, 59, 59).unwrap();
+        let old_ts = chrono::Utc
+            .with_ymd_and_hms(2026, 6, 26, 23, 59, 59)
+            .unwrap();
         assert!(!event_is_recent(old_ts, since));
     }
 

@@ -772,28 +772,29 @@ fn main() -> anyhow::Result<()> {
 
             // Load Sigma engine if --rules was given. Built before collector construction so
             // we can pass referenced_channels() to EvtxLiveCollector.
-            let sigma_analyzer: Option<cairn_heur::SigmaAnalyzer> =
-                if let Some(ref rules_dir) = cfg.rules_dir {
-                    let mut engine = Engine::default();
-                    match engine.load(rules_dir, cfg.rules_plain) {
-                        Ok(n) => {
-                            tracing::info!(
-                                rules = n,
-                                dir = %rules_dir.display(),
-                                plain = cfg.rules_plain,
-                                "loaded sigma rules"
-                            );
-                            Some(cairn_heur::SigmaAnalyzer::new(engine))
-                        }
-                        Err(e) => {
-                            tracing::warn!(error = %e, dir = %rules_dir.display(), "rule load failed; skipping Sigma");
-                            None
-                        }
+            let sigma_analyzer: Option<cairn_heur::SigmaAnalyzer> = if let Some(ref rules_dir) =
+                cfg.rules_dir
+            {
+                let mut engine = Engine::default();
+                match engine.load(rules_dir, cfg.rules_plain) {
+                    Ok(n) => {
+                        tracing::info!(
+                            rules = n,
+                            dir = %rules_dir.display(),
+                            plain = cfg.rules_plain,
+                            "loaded sigma rules"
+                        );
+                        Some(cairn_heur::SigmaAnalyzer::new(engine))
                     }
-                } else {
-                    tracing::info!("no --rules; skipping Sigma and live EVTX");
-                    None
-                };
+                    Err(e) => {
+                        tracing::warn!(error = %e, dir = %rules_dir.display(), "rule load failed; skipping Sigma");
+                        None
+                    }
+                }
+            } else {
+                tracing::info!("no --rules; skipping Sigma and live EVTX");
+                None
+            };
 
             // S2-L: construct only the selected collectors, matching the real
             // Collector::name() strings; order follows AVAILABLE (deterministic).
@@ -805,7 +806,9 @@ fn main() -> anyhow::Result<()> {
                 collectors.push(Box::new(cairn_collectors::net::NetCollector));
             }
             if selection.selected.iter().any(|m| m == "logon_session") {
-                collectors.push(Box::new(cairn_collectors::logon_session::LogonSessionCollector));
+                collectors.push(Box::new(
+                    cairn_collectors::logon_session::LogonSessionCollector,
+                ));
             }
             if selection.selected.iter().any(|m| m == "persist") {
                 collectors.push(Box::new(
@@ -863,10 +866,14 @@ fn main() -> anyhow::Result<()> {
                     Err(e) => {
                         tracing::warn!(error = %e, path = %p.display(),
                             "driver-list read failed; using bundled list");
-                        cairn_heur::byovd::parse_driver_hashes(cairn_heur::byovd::BUNDLED_DRIVER_LIST)
+                        cairn_heur::byovd::parse_driver_hashes(
+                            cairn_heur::byovd::BUNDLED_DRIVER_LIST,
+                        )
                     }
                 },
-                None => cairn_heur::byovd::parse_driver_hashes(cairn_heur::byovd::BUNDLED_DRIVER_LIST),
+                None => {
+                    cairn_heur::byovd::parse_driver_hashes(cairn_heur::byovd::BUNDLED_DRIVER_LIST)
+                }
             };
             let mut analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
@@ -894,7 +901,8 @@ fn main() -> anyhow::Result<()> {
                 o.host = outcome.hostname.clone();
             }
             outcome.observations.sort_by(|a, b| {
-                (a.category.as_str(), a.title.as_str()).cmp(&(b.category.as_str(), b.title.as_str()))
+                (a.category.as_str(), a.title.as_str())
+                    .cmp(&(b.category.as_str(), b.title.as_str()))
             });
             // FR14: hash the binaries behind findings (streaming, size-capped) and fill
             // binary_sha256 so each suspicious record carries an IOC hash. In-memory only —
@@ -1269,7 +1277,9 @@ mod tests {
             Box::new(cairn_heur::PersistHeuristic),
             Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
             Box::new(cairn_heur::AccountHeuristic),
-            Box::new(cairn_heur::ByovdHeuristic::new(std::collections::HashSet::new())),
+            Box::new(cairn_heur::ByovdHeuristic::new(
+                std::collections::HashSet::new(),
+            )),
         ];
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_timestomp"),
@@ -1663,12 +1673,18 @@ author: test-integration
         // cairn_heur::byovd::parse_driver_hashes.
         let dir = std::env::temp_dir();
         let list_path = dir.join(format!("cairn-byovd-test-{}.txt", std::process::id()));
-        std::fs::write(&list_path, format!("{KNOWN_SHA1}  # RTCore64.sys test override\n"))
-            .expect("write temp driver list");
+        std::fs::write(
+            &list_path,
+            format!("{KNOWN_SHA1}  # RTCore64.sys test override\n"),
+        )
+        .expect("write temp driver list");
         let text = std::fs::read_to_string(&list_path).expect("read temp driver list");
         let hashes = cairn_heur::byovd::parse_driver_hashes(&text);
         std::fs::remove_file(&list_path).ok();
-        assert!(hashes.contains(KNOWN_SHA1), "override file must parse back the known hash");
+        assert!(
+            hashes.contains(KNOWN_SHA1),
+            "override file must parse back the known hash"
+        );
 
         struct DriverCollector(ExecutionRecord);
         impl Collector for DriverCollector {
@@ -1704,9 +1720,16 @@ author: test-integration
         let outcome = run_live(&cfg, privs, "TEST".into(), &collectors, &analyzers);
 
         assert_eq!(outcome.records.len(), 1, "driver record must be collected");
-        assert_eq!(outcome.findings.len(), 1, "byovd match must produce exactly one finding");
+        assert_eq!(
+            outcome.findings.len(),
+            1,
+            "byovd match must produce exactly one finding"
+        );
         assert_eq!(outcome.findings[0].artifact, "byovd");
-        assert_eq!(outcome.findings[0].severity, cairn_core::finding::Severity::High);
+        assert_eq!(
+            outcome.findings[0].severity,
+            cairn_core::finding::Severity::High
+        );
         assert!(outcome.findings[0].mitre.contains(&"T1068".to_string()));
         assert!(
             outcome.findings[0].title.contains("rtcore64.sys"),

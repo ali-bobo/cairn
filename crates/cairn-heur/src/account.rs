@@ -176,7 +176,10 @@ impl Analyzer for AccountHeuristic {
                     ae.event_id,
                     ae.target,
                     ae.subject,
-                    ae.group.as_deref().map(|g| format!(" group={g}")).unwrap_or_default()
+                    ae.group
+                        .as_deref()
+                        .map(|g| format!(" group={g}"))
+                        .unwrap_or_default()
                 ),
             }];
 
@@ -193,12 +196,7 @@ mod tests {
     use cairn_core::record::Record;
     use serde_json::{Map, Value};
 
-    fn make_event(
-        eid: u32,
-        channel: &str,
-        ts: DateTime<Utc>,
-        data: Map<String, Value>,
-    ) -> Record {
+    fn make_event(eid: u32, channel: &str, ts: DateTime<Utc>, data: Map<String, Value>) -> Record {
         Record::Event(EventRecord {
             ts,
             channel: channel.to_string(),
@@ -366,7 +364,12 @@ mod tests {
 
     #[test]
     fn account_finding_carries_evtx_evidence() {
-        let records = vec![make_event(4720, "Security", recent(), account_data("u", "admin"))];
+        let records = vec![make_event(
+            4720,
+            "Security",
+            recent(),
+            account_data("u", "admin"),
+        )];
         let f = &AccountHeuristic.analyze(&records).unwrap()[0];
         assert_eq!(f.evidence.len(), 1);
         assert_eq!(f.evidence[0].artifact, "evtx:Security");

@@ -129,7 +129,9 @@ mod win {
                     None
                 } else {
                     // SAFETY: just checked non-null; the API null-terminates the string.
-                    unsafe { e.pWinStationName.to_string() }.ok().filter(|s| !s.is_empty())
+                    unsafe { e.pWinStationName.to_string() }
+                        .ok()
+                        .filter(|s| !s.is_empty())
                 };
                 Some(WtsSession {
                     session_id: e.SessionId,

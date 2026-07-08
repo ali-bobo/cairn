@@ -129,8 +129,8 @@ pub struct ExecutionRecord {
 /// A live logon session (LSA/WTS enumeration). "Who is using the host right now."
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogonSessionRecord {
-    pub user: String,           // domain\username
-    pub logon_type: String,     // Interactive|RemoteInteractive|Network|Service|...
+    pub user: String,       // domain\username
+    pub logon_type: String, // Interactive|RemoteInteractive|Network|Service|...
     pub logon_time: Option<DateTime<Utc>>,
     pub source: Option<String>, // source host/IP for network/RDP sessions
     pub session_id: Option<u32>,

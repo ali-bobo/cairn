@@ -195,7 +195,10 @@ impl Analyzer for ParentChildHeuristic {
             f.details = if p.cmdline.is_empty() {
                 format!("{} (pid={}, parent={})", p_name, p.pid, p.ppid)
             } else {
-                format!("{} (pid={}, parent={}, cmd={})", p_name, p.pid, p.ppid, p.cmdline)
+                format!(
+                    "{} (pid={}, parent={}, cmd={})",
+                    p_name, p.pid, p.ppid, p.cmdline
+                )
             };
             f.ts = p.start_time.unwrap_or_else(chrono::Utc::now);
             f.entity = Entity {
@@ -453,22 +456,38 @@ mod tests {
     #[test]
     fn process_details_format() {
         // Use Office-spawns-PowerShell to guarantee a finding above the noise floor.
-        let parent = rec(proc(100, 4, r"C:\Program Files\Microsoft Office\winword.exe", ""));
+        let parent = rec(proc(
+            100,
+            4,
+            r"C:\Program Files\Microsoft Office\winword.exe",
+            "",
+        ));
         let child = rec(proc(
             200,
             100,
             r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
             "powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA",
         ));
-        let findings = ParentChildHeuristic.analyze(&[parent, child]).expect("analyze");
+        let findings = ParentChildHeuristic
+            .analyze(&[parent, child])
+            .expect("analyze");
         assert!(!findings.is_empty(), "should produce at least one finding");
         let details = &findings[0].details;
         // Must contain the process name (last segment of image path).
-        assert!(details.contains("powershell.exe"), "process name missing: {details}");
+        assert!(
+            details.contains("powershell.exe"),
+            "process name missing: {details}"
+        );
         // Must contain the PID.
-        assert!(details.contains("200") || details.contains("pid="), "pid missing: {details}");
+        assert!(
+            details.contains("200") || details.contains("pid="),
+            "pid missing: {details}"
+        );
         // Must NOT use raw debug "image=" or "ppid=" key-value format.
-        assert!(!details.contains("image="), "must not use debug key=value format: {details}");
+        assert!(
+            !details.contains("image="),
+            "must not use debug key=value format: {details}"
+        );
     }
 
     /// When cmdline is empty, details omit the cmd= field. Uses the S3 masquerade
@@ -485,10 +504,19 @@ mod tests {
             "", // empty cmdline
         ));
         let findings = ParentChildHeuristic.analyze(&[p]).expect("analyze");
-        assert!(!findings.is_empty(), "masquerade signal should produce a finding");
+        assert!(
+            !findings.is_empty(),
+            "masquerade signal should produce a finding"
+        );
         let details = &findings[0].details;
-        assert!(!details.contains("cmd="), "empty cmdline must not produce cmd= field: {details}");
-        assert!(details.contains("svchost.exe"), "binary name missing: {details}");
+        assert!(
+            !details.contains("cmd="),
+            "empty cmdline must not produce cmd= field: {details}"
+        );
+        assert!(
+            details.contains("svchost.exe"),
+            "binary name missing: {details}"
+        );
     }
 
     /// The analyzer emits one Heuristic finding (with reason + entity) for a malicious
@@ -523,14 +551,13 @@ mod tests {
     /// the bare 60 because the path amplifier stacks on top).
     #[test]
     fn masquerade_svchost_in_appdata_fires_high_alone() {
-        let p = rec(proc(
-            500,
-            0,
-            r"C:\Users\a\AppData\Roaming\svchost.exe",
-            "",
-        ));
+        let p = rec(proc(500, 0, r"C:\Users\a\AppData\Roaming\svchost.exe", ""));
         let findings = ParentChildHeuristic.analyze(&[p]).expect("analyze");
-        assert_eq!(findings.len(), 1, "masquerade should produce exactly one finding");
+        assert_eq!(
+            findings.len(),
+            1,
+            "masquerade should produce exactly one finding"
+        );
         let f = &findings[0];
         assert_eq!(f.severity, cairn_core::Severity::Critical);
         assert!(f.mitre.contains(&"T1036.005".to_string()));
@@ -542,6 +569,9 @@ mod tests {
     fn real_svchost_in_system32_does_not_fire() {
         let p = rec(proc(501, 0, r"C:\Windows\System32\svchost.exe", ""));
         let findings = ParentChildHeuristic.analyze(&[p]).expect("analyze");
-        assert!(findings.is_empty(), "legitimate svchost.exe must not be flagged");
+        assert!(
+            findings.is_empty(),
+            "legitimate svchost.exe must not be flagged"
+        );
     }
 }

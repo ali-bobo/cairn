@@ -4,15 +4,15 @@ use std::path::Path;
 
 #[derive(Debug, PartialEq)]
 pub enum Verdict {
-    Clean,   // 無 critical / high
-    Alert,   // 有 critical 或 high
+    Clean, // 無 critical / high
+    Alert, // 有 critical 或 high
 }
 
 #[derive(Debug)]
 pub struct ScanSummary {
     pub hostname: String,
-    pub started_utc: String,       // 已格式化字串 "2026-06-27 14:30 UTC"
-    pub time_window_desc: String,  // 由 runner 傳入，如 "最近 24 小時"
+    pub started_utc: String,      // 已格式化字串 "2026-06-27 14:30 UTC"
+    pub time_window_desc: String, // 由 runner 傳入，如 "最近 24 小時"
     pub admin: bool,
     pub verdict: Verdict,
     pub counts: std::collections::BTreeMap<String, u64>, // "critical"->N ...
@@ -110,7 +110,8 @@ mod tests {
     }
 
     fn minimal_manifest(critical: u64, high: u64, medium: u64) -> String {
-        format!(r#"{{
+        format!(
+            r#"{{
   "tool": {{"name":"cairn","version":"0.1.0","build_sha":"abc","sigma_ruleset_ver":"98781da+abcd"}},
   "run": {{"started_utc":"2026-06-27T14:30:00Z","finished_utc":"2026-06-27T14:31:00Z","cmdline":"","operator":"","case_id":"","profile":"standard","selected_modules":[]}},
   "host": {{"hostname":"TEST-PC","os_build":"","timezone":"UTC","wall_clock_utc_skew":"unknown"}},
@@ -119,7 +120,9 @@ mod tests {
   "counts": {{"records":100,"findings_by_sev":{{"critical":{},"high":{},"medium":{},"low":0,"info":0}}}},
   "integrity_note":"",
   "governance": {{"effective_threads":4,"low_priority_applied":false,"truncations":[]}}
-}}"#, critical, high, medium)
+}}"#,
+            critical, high, medium
+        )
     }
 
     #[test]

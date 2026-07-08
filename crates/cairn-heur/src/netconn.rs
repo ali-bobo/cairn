@@ -504,7 +504,10 @@ mod tests {
         let findings = NetConnHeuristic
             .analyze(&[bad_conn, proc_rec])
             .expect("analyze");
-        assert!(!findings.is_empty(), "other PID must still produce findings");
+        assert!(
+            !findings.is_empty(),
+            "other PID must still produce findings"
+        );
     }
 
     // --- R6: human-readable details field ---
@@ -536,10 +539,19 @@ mod tests {
         let findings = NetConnHeuristic.analyze(&[bad, proc_rec]).expect("analyze");
         assert!(!findings.is_empty(), "should produce at least one finding");
         let details = &findings[0].details;
-        assert!(details.contains("beacon.exe"), "process name missing: {details}");
+        assert!(
+            details.contains("beacon.exe"),
+            "process name missing: {details}"
+        );
         assert!(details.contains("1234"), "pid missing: {details}");
-        assert!(details.contains("104.18.0.1"), "remote addr missing: {details}");
-        assert!(!details.contains("pid=Some("), "must not use debug format: {details}");
+        assert!(
+            details.contains("104.18.0.1"),
+            "remote addr missing: {details}"
+        );
+        assert!(
+            !details.contains("pid=Some("),
+            "must not use debug format: {details}"
+        );
     }
 
     /// With no owning process record, connection-only signals (public-IP 25 + rare-port
@@ -613,9 +625,7 @@ mod tests {
             Some(1),
         ));
         let proc = Record::Process(owner(r"C:\Windows\System32\svc.exe", Some(false)));
-        let findings = NetConnHeuristic
-            .analyze(&[bad, proc])
-            .expect("analyze");
+        let findings = NetConnHeuristic.analyze(&[bad, proc]).expect("analyze");
         assert_eq!(findings.len(), 1, "combo (65) must clear the gate floor");
         assert_eq!(findings[0].severity, cairn_core::Severity::High);
     }
