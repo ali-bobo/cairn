@@ -30,6 +30,13 @@ fn is_public_ipv4_hint(addr: &str) -> bool {
     }
 }
 
+/// Extract the final path segment (file name) from a path string, handling both
+/// backslash (Windows-native) and forward-slash (rare but honest to handle) separators.
+/// A path with no separator is returned as-is (already a bare file name).
+fn basename(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
 fn sev_label(s: Severity) -> &'static str {
     match s {
         Severity::Critical => "Critical",
@@ -360,6 +367,43 @@ fn logon_panel(records: &[cairn_core::Record]) -> String {
     )
 }
 
+/// "Same binary across multiple findings" aggregation: counts, per distinct basename
+/// derived from `Finding.evidence[].path`, how many *different findings* mention it
+/// (not how many evidence items — a single finding with 3 evidence items pointing at
+/// the same file counts once). Only basenames appearing in >= 2 findings are shown;
+/// empty result renders nothing (same "no data, no panel" convention as the other
+/// inventory panels in this file).
+fn evidence_source_summary_panel(findings: &[&Finding]) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for f in findings {
+        let mut seen_in_this_finding: BTreeSet<String> = BTreeSet::new();
+        for ev in &f.evidence {
+            if let Some(path) = &ev.path {
+                seen_in_this_finding.insert(basename(path).to_string());
+            }
+        }
+        for base in seen_in_this_finding {
+            *counts.entry(base).or_insert(0) += 1;
+        }
+    }
+    let mut repeated: Vec<(&String, &usize)> = counts.iter().filter(|(_, &c)| c >= 2).collect();
+    if repeated.is_empty() {
+        return String::new();
+    }
+    repeated.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let rows: String = repeated
+        .iter()
+        .map(|(base, count)| format!("<tr><td>{}</td><td>{}</td></tr>", esc(base), count))
+        .collect();
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">相同來源多次出現 ({} 個檔名)</h2></summary>\
+         <table><tr><th>檔名</th><th>出現於幾筆 finding</th></tr>{}</table></details>",
+        repeated.len(),
+        rows
+    )
+}
+
 /// Generate a self-contained HTML report from findings, observations and manifest.
 pub fn html_report(
     findings: &[Finding],
@@ -405,6 +449,8 @@ pub fn html_report(
     // Sort findings: critical first
     let mut sorted: Vec<&Finding> = findings.iter().collect();
     sorted.sort_by_key(|f| sev_order(f.severity));
+
+    let evidence_summary_html = evidence_source_summary_panel(&sorted);
 
     // CSS for the filter bar is only emitted when the filter bar itself renders,
     // so `html.contains("filter-bar")` is a reliable presence check (see
@@ -657,6 +703,8 @@ tr:hover td{{background:#f9fafb}}
 </div>
 </div>
 
+{evidence_summary_html}
+
 {netconn_html}
 
 {process_html}
@@ -727,6 +775,90 @@ mod tests {
             integrity_note: "All hashes SHA-256.".into(),
             governance: GovernanceReport::default(),
         }
+    }
+
+    #[test]
+    fn basename_extracts_from_backslash_path() {
+        assert_eq!(basename(r"C:\Windows\System32\evil.exe"), "evil.exe");
+    }
+
+    #[test]
+    fn basename_extracts_from_forward_slash_path() {
+        assert_eq!(basename("C:/Users/a/evil.exe"), "evil.exe");
+    }
+
+    #[test]
+    fn basename_returns_input_when_no_separator() {
+        assert_eq!(basename("EVIL.EXE"), "EVIL.EXE");
+    }
+
+    #[test]
+    fn evidence_summary_lists_basenames_appearing_in_two_or_more_findings() {
+        use cairn_core::finding::EvidenceItem;
+        let mut f1 = Finding::new(Severity::High, "A", FindingSource::Sigma);
+        f1.host = "TEST-PC".into();
+        f1.artifact = "evtx:Security".into();
+        f1.evidence.push(EvidenceItem {
+            artifact: "prefetch".into(),
+            path: Some("EVIL.EXE".into()),
+            ts: None,
+            detail: "run_count=3".into(),
+        });
+        let mut f2 = Finding::new(Severity::Medium, "B", FindingSource::Heuristic);
+        f2.host = "TEST-PC".into();
+        f2.artifact = "persist:run_key".into();
+        f2.evidence.push(EvidenceItem {
+            artifact: "shimcache".into(),
+            path: Some(r"C:\Users\a\EVIL.EXE".into()),
+            ts: None,
+            detail: "seen in shimcache".into(),
+        });
+        let html = html_report(&[f1, f2], &[], &[], &minimal_manifest());
+        assert!(
+            html.contains("EVIL.EXE"),
+            "aggregation panel must list the repeated basename: {html}"
+        );
+        assert!(html.contains("相同來源多次出現") || html.contains("同一執行檔"));
+    }
+
+    #[test]
+    fn evidence_summary_excludes_basenames_appearing_only_once() {
+        use cairn_core::finding::EvidenceItem;
+        let mut f = Finding::new(Severity::High, "A", FindingSource::Sigma);
+        f.host = "TEST-PC".into();
+        f.artifact = "evtx:Security".into();
+        f.evidence.push(EvidenceItem {
+            artifact: "prefetch".into(),
+            path: Some("ONLYONE.EXE".into()),
+            ts: None,
+            detail: "run_count=1".into(),
+        });
+        let html = html_report(&[f], &[], &[], &minimal_manifest());
+        assert!(
+            !html.contains("相同來源多次出現") && !html.contains("同一執行檔"),
+            "panel must not render when nothing repeats: {html}"
+        );
+    }
+
+    #[test]
+    fn evidence_summary_counts_once_per_finding_not_per_evidence_item() {
+        use cairn_core::finding::EvidenceItem;
+        let mut f1 = Finding::new(Severity::High, "A", FindingSource::Sigma);
+        f1.host = "TEST-PC".into();
+        f1.artifact = "evtx:Security".into();
+        for src in ["prefetch", "shimcache", "amcache"] {
+            f1.evidence.push(EvidenceItem {
+                artifact: src.into(),
+                path: Some("SAME.EXE".into()),
+                ts: None,
+                detail: "seen".into(),
+            });
+        }
+        let html = html_report(&[f1], &[], &[], &minimal_manifest());
+        assert!(
+            !html.contains("相同來源多次出現") && !html.contains("同一執行檔"),
+            "must not count multiple evidence items within one finding as repetition: {html}"
+        );
     }
 
     #[test]
