@@ -137,14 +137,16 @@ pub(crate) fn parse_task_xml(xml: &str) -> Vec<ParsedExecAction> {
     let mut capture: Option<&'static str> = None; // "uri" | "command" | "arguments"
 
     // Accumulate the raw (still-escaped) text of the element currently being captured.
-    // quick-xml 0.40.1 surfaces XML entities (`&amp;`) as separate Event::GeneralRef events
-    // that split the surrounding text, so we collect fragments and unescape once at the
-    // element's end rather than per Text event (which would drop everything but the last).
+    // quick-xml (since 0.38, still true in 0.41) surfaces XML entities (`&amp;`) as separate
+    // Event::GeneralRef events that split the surrounding text, so we collect fragments and
+    // unescape once at the element's end rather than per Text event (which would drop
+    // everything but the last).
     let mut buf = String::new();
 
     // Decode the accumulated (escaped) buffer: run the standalone
     // `quick_xml::escape::unescape` for XML entity decoding (&amp; -> &). BytesText has no
-    // `unescape()` in 0.40.1, so this is done explicitly on the assembled string.
+    // `unescape()` method (removed in 0.38, still absent in 0.41), so this is done explicitly
+    // on the assembled string.
     let finish = |raw: &str| -> String {
         let decoded = match quick_xml::escape::unescape(raw) {
             Ok(c) => c.into_owned(),
