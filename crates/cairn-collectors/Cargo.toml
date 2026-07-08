@@ -14,7 +14,7 @@ evtx.workspace = true
 chrono.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-quick-xml = { version = "0.40.1", default-features = false }
+quick-xml = { version = "0.41.0", default-features = false }
 sha2.workspace = true
 compcol = { workspace = true }
 srum-core   = { version = "0.1.0", default-features = false }
