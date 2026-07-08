@@ -139,7 +139,7 @@ fn netconn_panel(records: &[cairn_core::Record]) -> String {
         })
         .collect();
     format!(
-        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">對外連線 ({} 條，其中 {} 條連往公網)</h2></summary>\
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">網路連線 ({} 條，其中 {} 條連往公網)</h2></summary>\
          <table><tr><th>協定</th><th>本地</th><th>遠端</th><th>狀態</th><th>PID</th></tr>{}</table></details>",
         conns.len(),
         public_count,
@@ -348,19 +348,20 @@ fn logon_panel(records: &[cairn_core::Record]) -> String {
         .iter()
         .map(|s| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 esc(&s.user),
                 esc(&s.logon_type),
                 s.session_id
                     .map(|i| i.to_string())
                     .unwrap_or_else(|| "-".into()),
                 esc(s.source.as_deref().unwrap_or("-")),
+                if s.state_active { "是" } else { "否" },
             )
         })
         .collect();
     format!(
         "<details class=\"inventory\"><summary><h2 style=\"display:inline\">登入 session ({} 個，其中 {} 個遠端)</h2></summary>\
-         <table><tr><th>使用者</th><th>類型</th><th>Session ID</th><th>來源</th></tr>{}</table></details>",
+         <table><tr><th>使用者</th><th>類型</th><th>Session ID</th><th>來源</th><th>狀態</th></tr>{}</table></details>",
         sessions.len(),
         remote_count,
         rows
@@ -1040,7 +1041,7 @@ mod tests {
         ];
         let html = html_report(&[], &[], &recs, &minimal_manifest());
         assert!(
-            html.contains("對外連線 (2 條，其中 1 條連往公網)"),
+            html.contains("網路連線 (2 條，其中 1 條連往公網)"),
             "html: missing panel"
         );
         assert!(html.contains("8.8.8.8:443"));
@@ -1053,7 +1054,7 @@ mod tests {
     #[test]
     fn netconn_panel_absent_when_no_conns() {
         let html = html_report(&[], &[], &[], &minimal_manifest());
-        assert!(!html.contains("對外連線"));
+        assert!(!html.contains("網路連線"));
     }
 
     fn proc(pid: u32, image: &str, signed: Option<bool>) -> cairn_core::Record {
@@ -1220,5 +1221,48 @@ mod tests {
     fn logon_panel_absent_when_no_sessions() {
         let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(!html.contains("登入 session"));
+    }
+
+    #[test]
+    fn logon_panel_shows_state_active_column() {
+        let recs = vec![
+            cairn_core::Record::LogonSession(cairn_core::record::LogonSessionRecord {
+                user: r"PC\alice".into(),
+                logon_type: "Interactive".into(),
+                logon_time: None,
+                source: None,
+                session_id: Some(1),
+                state_active: true,
+            }),
+            cairn_core::Record::LogonSession(cairn_core::record::LogonSessionRecord {
+                user: r"PC\bob".into(),
+                logon_type: "Interactive".into(),
+                logon_time: None,
+                source: None,
+                session_id: Some(2),
+                state_active: false,
+            }),
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(
+            html.contains("<th>狀態</th>"),
+            "missing state column header: {html}"
+        );
+        assert!(html.contains("是"), "active session must show 是");
+        assert!(html.contains("否"), "inactive session must show 否");
+    }
+
+    #[test]
+    fn netconn_panel_title_is_network_connections_not_external() {
+        let recs = vec![netconn(
+            "tcp",
+            Some("8.8.8.8"),
+            Some(443),
+            "ESTABLISHED",
+            Some(100),
+        )];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("網路連線"), "title must be renamed: {html}");
+        assert!(!html.contains("對外連線"), "old title must be gone: {html}");
     }
 }
