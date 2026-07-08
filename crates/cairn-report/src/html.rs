@@ -92,7 +92,7 @@ fn short_ts(ts: &str) -> &str {
     }
 }
 
-/// Outbound-connections panel: established + listening only; public-remote sorted first.
+/// Network-connections panel: established + listening; public-remote sorted first.
 fn netconn_panel(records: &[cairn_core::Record]) -> String {
     use cairn_core::record::Record;
     let mut conns: Vec<&cairn_core::record::NetConnRecord> = records
