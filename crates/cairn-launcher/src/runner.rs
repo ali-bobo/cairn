@@ -47,10 +47,7 @@ pub fn run_scan(cfg: &RunConfig<'_>) -> anyhow::Result<()> {
         .args(&args)
         .status()?;
     if !status.success() {
-        anyhow::bail!(
-            "cairn.exe 執行失敗（exit code: {:?}）",
-            status.code()
-        );
+        anyhow::bail!("cairn.exe 執行失敗（exit code: {:?}）", status.code());
     }
     Ok(())
 }
@@ -66,7 +63,12 @@ mod tests {
         output: &'a Path,
         since: &'a str,
     ) -> RunConfig<'a> {
-        RunConfig { cairn_exe: exe, rules_dir: rules, output_dir: output, since }
+        RunConfig {
+            cairn_exe: exe,
+            rules_dir: rules,
+            output_dir: output,
+            since,
+        }
     }
 
     #[test]

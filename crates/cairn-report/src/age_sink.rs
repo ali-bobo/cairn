@@ -61,7 +61,8 @@ impl OutputSink for AgeSink {
 
     fn write_observations(&mut self, observations: &[Observation]) -> Result<()> {
         let buf = crate::observations_jsonl(observations)?;
-        self.files.push(("observations.jsonl".into(), buf.into_bytes()));
+        self.files
+            .push(("observations.jsonl".into(), buf.into_bytes()));
         Ok(())
     }
 

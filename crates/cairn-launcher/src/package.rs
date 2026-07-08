@@ -45,9 +45,7 @@ pub fn zip_output(output_dir: &Path) -> anyhow::Result<PathBuf> {
 pub fn open_folder(path: &Path) {
     #[cfg(target_os = "windows")]
     {
-        let _ = std::process::Command::new("explorer.exe")
-            .arg(path)
-            .spawn();
+        let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -69,7 +67,10 @@ mod tests {
 
         let zip_path = zip_output(&output_dir).unwrap();
         assert!(zip_path.exists(), "zip file should exist");
-        assert!(zip_path.metadata().unwrap().len() > 0, "zip should not be empty");
+        assert!(
+            zip_path.metadata().unwrap().len() > 0,
+            "zip should not be empty"
+        );
         assert_eq!(zip_path.extension().unwrap(), "zip");
     }
 

@@ -153,8 +153,7 @@ impl SigmaMatcher for Engine {
         let refs: Vec<&str> = yamls.iter().map(String::as_str).collect();
         *self = Engine::from_rules(&refs)?;
         // Populate ruleset_ver from the PROVENANCE file for manifest integrity (ADR-0003).
-        self.ruleset_ver =
-            crate::ruleset::ruleset_version(rules_dir, plain).unwrap_or_default();
+        self.ruleset_ver = crate::ruleset::ruleset_version(rules_dir, plain).unwrap_or_default();
         Ok(self.rules.len())
     }
 

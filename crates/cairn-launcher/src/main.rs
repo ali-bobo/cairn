@@ -34,13 +34,21 @@ fn detect_env() -> anyhow::Result<Env> {
 
     let rules_dir = {
         let p = launcher_dir.join("rules").join("sigma");
-        if p.exists() { Some(p) } else { None }
+        if p.exists() {
+            Some(p)
+        } else {
+            None
+        }
     };
 
     let output_base = launcher_dir.join("output");
     std::fs::create_dir_all(&output_base)?;
 
-    Ok(Env { cairn_exe, rules_dir, output_base })
+    Ok(Env {
+        cairn_exe,
+        rules_dir,
+        output_base,
+    })
 }
 
 fn hostname() -> String {
@@ -71,7 +79,11 @@ fn run_scan_flow(env: &Env, hours: u64, desc: &str) -> anyhow::Result<()> {
     };
 
     println!("\n執行掃描中，請稍候...");
-    println!("（掃描範圍：{}，輸出目錄：{}）\n", desc, output_dir.display());
+    println!(
+        "（掃描範圍：{}，輸出目錄：{}）\n",
+        desc,
+        output_dir.display()
+    );
 
     runner::run_scan(&cfg)?;
 
@@ -93,7 +105,10 @@ fn run_scan_flow(env: &Env, hours: u64, desc: &str) -> anyhow::Result<()> {
             }
         }
         Err(e) => {
-            eprintln!("無法讀取掃描結果（{e}），報告目錄：{}", output_dir.display());
+            eprintln!(
+                "無法讀取掃描結果（{e}），報告目錄：{}",
+                output_dir.display()
+            );
             menu::wait_enter("\n按 Enter 繼續...");
         }
     }
@@ -111,9 +126,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     if env.rules_dir.is_none() {
-        eprintln!(
-            "⚠️  找不到規則目錄 rules\\sigma\\，Sigma 偵測將無法執行（僅啟發式偵測）\n"
-        );
+        eprintln!("⚠️  找不到規則目錄 rules\\sigma\\，Sigma 偵測將無法執行（僅啟發式偵測）\n");
     }
 
     let host = hostname();

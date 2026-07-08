@@ -13,7 +13,11 @@ pub fn read_choice() -> char {
     let stdin = io::stdin();
     let mut line = String::new();
     let _ = stdin.lock().read_line(&mut line);
-    line.trim().chars().next().map(|c| c.to_ascii_uppercase()).unwrap_or('\0')
+    line.trim()
+        .chars()
+        .next()
+        .map(|c| c.to_ascii_uppercase())
+        .unwrap_or('\0')
 }
 
 /// 印主選單（標題 + 環境資訊 + 選項）
@@ -68,7 +72,11 @@ pub fn print_summary(s: &crate::summary::ScanSummary) {
     println!("║  掃描時間：{:<30}║", s.started_utc);
     println!(
         "║  管理員權限：{:<28}║",
-        if s.admin { "是" } else { "否（部分功能受限）" }
+        if s.admin {
+            "是"
+        } else {
+            "否（部分功能受限）"
+        }
     );
     if !s.sigma_ruleset_ver.is_empty() {
         println!("║  規則版本：{:<30}║", truncate(&s.sigma_ruleset_ver, 28));

@@ -143,6 +143,9 @@ author: test
         let ev = make_event(r"C:\Windows\System32\notepad.exe");
         let records = vec![Record::Event(ev)];
         let findings = analyzer.analyze(&records).unwrap();
-        assert!(findings.is_empty(), "notepad.exe should not trigger cmd rule");
+        assert!(
+            findings.is_empty(),
+            "notepad.exe should not trigger cmd rule"
+        );
     }
 }

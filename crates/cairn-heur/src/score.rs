@@ -134,10 +134,7 @@ fn normalise_service_cmd(cmd: &str) -> String {
     if lower.len() > 11 {
         let (head, rest) = lower.split_at(11);
         let chars: Vec<char> = head.chars().collect();
-        if chars[0].is_ascii_alphabetic()
-            && chars[1] == ':'
-            && &head[2..] == r"\windows\"
-        {
+        if chars[0].is_ascii_alphabetic() && chars[1] == ':' && &head[2..] == r"\windows\" {
             return format!(r"<win>\{rest}");
         }
     }
@@ -337,9 +334,7 @@ mod tests {
 
     #[test]
     fn inbox_backslash_systemroot_suppressed() {
-        assert!(is_inbox_service_command(
-            r"\SystemRoot\system32\lsass.exe"
-        ));
+        assert!(is_inbox_service_command(r"\SystemRoot\system32\lsass.exe"));
     }
 
     #[test]

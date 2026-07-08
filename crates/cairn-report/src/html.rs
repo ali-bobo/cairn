@@ -23,7 +23,9 @@ fn esc(s: &str) -> String {
 fn is_public_ipv4_hint(addr: &str) -> bool {
     use std::net::Ipv4Addr;
     match addr.parse::<Ipv4Addr>() {
-        Ok(ip) => !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified(),
+        Ok(ip) => {
+            !ip.is_private() && !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified()
+        }
         Err(_) => false,
     }
 }
@@ -148,7 +150,11 @@ fn process_panel(records: &[cairn_core::Record]) -> String {
             Some(true) => 2,
         }
     }
-    procs.sort_by(|a, b| sig_rank(a.signed).cmp(&sig_rank(b.signed)).then_with(|| a.pid.cmp(&b.pid)));
+    procs.sort_by(|a, b| {
+        sig_rank(a.signed)
+            .cmp(&sig_rank(b.signed))
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
     let rows: String = procs
         .iter()
         .map(|p| {
@@ -204,13 +210,16 @@ fn execution_panel(records: &[cairn_core::Record]) -> String {
                 e.path.clone()
             };
             let fmt_ts = |t: &Option<chrono::DateTime<chrono::Utc>>| {
-                t.map(|t| t.format("%Y-%m-%d %H:%MZ").to_string()).unwrap_or_else(|| "-".into())
+                t.map(|t| t.format("%Y-%m-%d %H:%MZ").to_string())
+                    .unwrap_or_else(|| "-".into())
             };
             format!(
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 esc(&e.source),
                 esc(&path),
-                e.run_count.map(|c| c.to_string()).unwrap_or_else(|| "-".into()),
+                e.run_count
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".into()),
                 esc(&fmt_ts(&e.first_run)),
                 esc(&fmt_ts(&e.last_run)),
             )
@@ -323,7 +332,9 @@ fn logon_panel(records: &[cairn_core::Record]) -> String {
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 esc(&s.user),
                 esc(&s.logon_type),
-                s.session_id.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
+                s.session_id
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "-".into()),
                 esc(s.source.as_deref().unwrap_or("-")),
             )
         })
@@ -365,7 +376,11 @@ pub fn html_report(
 
     let hostname = esc(&manifest.host.hostname);
     let started = esc(&manifest.run.started_utc.to_rfc3339());
-    let admin = if manifest.privileges.admin { "是" } else { "否" };
+    let admin = if manifest.privileges.admin {
+        "是"
+    } else {
+        "否"
+    };
     let rules_ver = if manifest.tool.sigma_ruleset_ver.is_empty() {
         "未載入".to_string()
     } else {
@@ -407,8 +422,7 @@ pub fn html_report(
                                 "<li><b>{}</b> {} {}<br>{}</li>",
                                 esc(&e.artifact),
                                 e.path.as_deref().map(esc).unwrap_or_default(),
-                                e.ts
-                                    .map(|t| t.format("%Y-%m-%d %H:%MZ").to_string())
+                                e.ts.map(|t| t.format("%Y-%m-%d %H:%MZ").to_string())
                                     .unwrap_or_default(),
                                 esc(&e.detail),
                             )
@@ -641,7 +655,10 @@ mod tests {
         let mut m = minimal_manifest();
         m.host.hostname = "<script>alert(1)</script>".into();
         let html = html_report(&[], &[], &[], &m);
-        assert!(!html.contains("<script>"), "raw script tag should be escaped");
+        assert!(
+            !html.contains("<script>"),
+            "raw script tag should be escaped"
+        );
         assert!(html.contains("&lt;script&gt;"));
     }
 
@@ -676,7 +693,10 @@ mod tests {
 
         let html = html_report(&[f], &[o], &[], &minimal_manifest());
 
-        assert!(html.contains("主機盤點"), "missing host-inventory heading: {html}");
+        assert!(
+            html.contains("主機盤點"),
+            "missing host-inventory heading: {html}"
+        );
         assert!(
             html.contains("佐證來源 (1)"),
             "missing evidence summary: {html}"
@@ -709,7 +729,13 @@ mod tests {
     fn netconn_panel_lists_and_counts_public() {
         let recs = vec![
             netconn("tcp", Some("8.8.8.8"), Some(443), "ESTABLISHED", Some(100)),
-            netconn("tcp", Some("192.168.1.5"), Some(445), "ESTABLISHED", Some(200)),
+            netconn(
+                "tcp",
+                Some("192.168.1.5"),
+                Some(445),
+                "ESTABLISHED",
+                Some(200),
+            ),
             netconn("tcp", None, None, "TIME_WAIT", None), // filtered out
         ];
         let html = html_report(&[], &[], &recs, &minimal_manifest());
@@ -764,8 +790,13 @@ mod tests {
         assert!(!html.contains("執行中程序"));
     }
 
-    fn exec(source: &str, path: &str, last: Option<(i32, u32, u32, u32, u32)>) -> cairn_core::Record {
-        let last_run = last.map(|(y, mo, d, h, mi)| Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap());
+    fn exec(
+        source: &str,
+        path: &str,
+        last: Option<(i32, u32, u32, u32, u32)>,
+    ) -> cairn_core::Record {
+        let last_run =
+            last.map(|(y, mo, d, h, mi)| Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).unwrap());
         cairn_core::Record::Execution(cairn_core::record::ExecutionRecord {
             source: source.into(),
             path: path.into(),
@@ -823,14 +854,21 @@ mod tests {
     #[test]
     fn file_activity_panel_motw_and_usn_filtered() {
         let recs = vec![
-            usn("File_Create", r"C:\Users\a\Downloads\dropper.exe", (2026, 6, 1)),
+            usn(
+                "File_Create",
+                r"C:\Users\a\Downloads\dropper.exe",
+                (2026, 6, 1),
+            ),
             usn("Basic_Info_Change", r"C:\noise.txt", (2026, 6, 2)), // filtered (not create/rename)
             motw_file(r"C:\Users\a\Downloads\dropper.exe", "ZoneId=3"),
         ];
         let html = html_report(&[], &[], &recs, &minimal_manifest());
         assert!(html.contains("可疑檔案活動 (1 個 MOTW 檔案 / 1 筆近期檔案事件)"));
         assert!(html.contains("ZoneId=3"));
-        assert!(!html.contains("noise.txt"), "non-create/rename USN filtered");
+        assert!(
+            !html.contains("noise.txt"),
+            "non-create/rename USN filtered"
+        );
         // MOTW row before USN row
         let motw_pos = html.find("ZoneId=3").unwrap();
         let usn_pos = html.rfind("File_Create").unwrap();

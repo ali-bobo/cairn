@@ -783,9 +783,11 @@ fn resolve_relative_binary_paths_with(
     exists: impl Fn(&str) -> bool,
 ) {
     for r in records.iter_mut() {
-        let Some(p) = r.binary_path.as_deref() else { continue };
-        let is_absolute = p.get(1..).is_some_and(|rest| rest.starts_with(":\\"))
-            || p.starts_with("\\\\");
+        let Some(p) = r.binary_path.as_deref() else {
+            continue;
+        };
+        let is_absolute =
+            p.get(1..).is_some_and(|rest| rest.starts_with(":\\")) || p.starts_with("\\\\");
         if is_absolute || p.contains('\\') || p.is_empty() {
             continue; // absolute, UNC, or already dir-qualified relative — leave alone
         }
@@ -1563,7 +1565,10 @@ mod tests {
         resolve_relative_binary_paths_with(&mut recs, r"C:\Windows", |p| {
             p == r"C:\Windows\explorer.exe" // not in System32, found at root
         });
-        assert_eq!(recs[0].binary_path.as_deref(), Some(r"C:\Windows\explorer.exe"));
+        assert_eq!(
+            recs[0].binary_path.as_deref(),
+            Some(r"C:\Windows\explorer.exe")
+        );
 
         let mut recs2 = vec![rec_with_path(Some("userinit.exe"))];
         resolve_relative_binary_paths_with(&mut recs2, r"C:\Windows", |p| {
@@ -1584,7 +1589,10 @@ mod tests {
             rec_with_path(None),
         ];
         resolve_relative_binary_paths_with(&mut recs, r"C:\Windows", |_| false);
-        assert_eq!(recs[0].binary_path.as_deref(), Some(r"C:\Windows\explorer.exe"));
+        assert_eq!(
+            recs[0].binary_path.as_deref(),
+            Some(r"C:\Windows\explorer.exe")
+        );
         assert_eq!(recs[1].binary_path.as_deref(), Some(r"\\srv\share\x.exe"));
         assert_eq!(recs[2].binary_path.as_deref(), Some("ghost.exe")); // stays; verifier -> None
         assert_eq!(recs[3].binary_path, None);

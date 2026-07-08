@@ -139,9 +139,7 @@ fn netconn_client_text(host: &str, f: &Finding) -> String {
             format!(
                 "{}:{}",
                 c.raddr.as_deref().unwrap_or("-"),
-                c.rport
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "-".into())
+                c.rport.map(|p| p.to_string()).unwrap_or_else(|| "-".into())
             )
         })
         .unwrap_or_else(|| "未知目標".to_owned());
