@@ -30,6 +30,13 @@ fn is_public_ipv4_hint(addr: &str) -> bool {
     }
 }
 
+/// Extract the final path segment (file name) from a path string, handling both
+/// backslash (Windows-native) and forward-slash (rare but honest to handle) separators.
+/// A path with no separator is returned as-is (already a bare file name).
+fn basename(path: &str) -> &str {
+    path.rsplit(['\\', '/']).next().unwrap_or(path)
+}
+
 fn sev_label(s: Severity) -> &'static str {
     match s {
         Severity::Critical => "Critical",
@@ -37,6 +44,18 @@ fn sev_label(s: Severity) -> &'static str {
         Severity::Medium => "Medium",
         Severity::Low => "Low",
         Severity::Info => "Info",
+    }
+}
+
+/// Lowercase severity string for use as an HTML data-attribute value (client-side
+/// filter matches against this, not the display label from `sev_label`).
+fn sev_key(s: Severity) -> &'static str {
+    match s {
+        Severity::Critical => "critical",
+        Severity::High => "high",
+        Severity::Medium => "medium",
+        Severity::Low => "low",
+        Severity::Info => "info",
     }
 }
 
@@ -73,7 +92,7 @@ fn short_ts(ts: &str) -> &str {
     }
 }
 
-/// Outbound-connections panel: established + listening only; public-remote sorted first.
+/// Network-connections panel: established + listening; public-remote sorted first.
 fn netconn_panel(records: &[cairn_core::Record]) -> String {
     use cairn_core::record::Record;
     let mut conns: Vec<&cairn_core::record::NetConnRecord> = records
@@ -120,7 +139,7 @@ fn netconn_panel(records: &[cairn_core::Record]) -> String {
         })
         .collect();
     format!(
-        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">對外連線 ({} 條，其中 {} 條連往公網)</h2></summary>\
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">網路連線 ({} 條，其中 {} 條連往公網)</h2></summary>\
          <table><tr><th>協定</th><th>本地</th><th>遠端</th><th>狀態</th><th>PID</th></tr>{}</table></details>",
         conns.len(),
         public_count,
@@ -329,21 +348,59 @@ fn logon_panel(records: &[cairn_core::Record]) -> String {
         .iter()
         .map(|s| {
             format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
                 esc(&s.user),
                 esc(&s.logon_type),
                 s.session_id
                     .map(|i| i.to_string())
                     .unwrap_or_else(|| "-".into()),
                 esc(s.source.as_deref().unwrap_or("-")),
+                if s.state_active { "是" } else { "否" },
             )
         })
         .collect();
     format!(
         "<details class=\"inventory\"><summary><h2 style=\"display:inline\">登入 session ({} 個，其中 {} 個遠端)</h2></summary>\
-         <table><tr><th>使用者</th><th>類型</th><th>Session ID</th><th>來源</th></tr>{}</table></details>",
+         <table><tr><th>使用者</th><th>類型</th><th>Session ID</th><th>來源</th><th>狀態</th></tr>{}</table></details>",
         sessions.len(),
         remote_count,
+        rows
+    )
+}
+
+/// "Same binary across multiple findings" aggregation: counts, per distinct basename
+/// derived from `Finding.evidence[].path`, how many *different findings* mention it
+/// (not how many evidence items — a single finding with 3 evidence items pointing at
+/// the same file counts once). Only basenames appearing in >= 2 findings are shown;
+/// empty result renders nothing (same "no data, no panel" convention as the other
+/// inventory panels in this file).
+fn evidence_source_summary_panel(findings: &[&Finding]) -> String {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for f in findings {
+        let mut seen_in_this_finding: BTreeSet<String> = BTreeSet::new();
+        for ev in &f.evidence {
+            if let Some(path) = &ev.path {
+                seen_in_this_finding.insert(basename(path).to_string());
+            }
+        }
+        for base in seen_in_this_finding {
+            *counts.entry(base).or_insert(0) += 1;
+        }
+    }
+    let mut repeated: Vec<(&String, &usize)> = counts.iter().filter(|(_, &c)| c >= 2).collect();
+    if repeated.is_empty() {
+        return String::new();
+    }
+    repeated.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    let rows: String = repeated
+        .iter()
+        .map(|(base, count)| format!("<tr><td>{}</td><td>{}</td></tr>", esc(base), count))
+        .collect();
+    format!(
+        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">相同來源多次出現 ({} 個檔名)</h2></summary>\
+         <table><tr><th>檔名</th><th>出現於幾筆 finding</th></tr>{}</table></details>",
+        repeated.len(),
         rows
     )
 }
@@ -394,6 +451,91 @@ pub fn html_report(
     let mut sorted: Vec<&Finding> = findings.iter().collect();
     sorted.sort_by_key(|f| sev_order(f.severity));
 
+    let evidence_summary_html = evidence_source_summary_panel(&sorted);
+
+    // CSS for the filter bar is only emitted when the filter bar itself renders,
+    // so `html.contains("filter-bar")` is a reliable presence check (see
+    // filter_bar_absent_when_no_findings).
+    let filter_css = if sorted.is_empty() {
+        String::new()
+    } else {
+        r"
+.filter-bar{display:flex;gap:1rem;flex-wrap:wrap;align-items:center;
+            margin-bottom:.75rem;font-size:.85rem}
+.filter-group{display:flex;gap:.75rem;flex-wrap:wrap}
+.filter-group label{display:flex;align-items:center;gap:.25rem;cursor:pointer}
+#artifact-filter,#keyword-filter{padding:.35rem .5rem;border:1px solid #d1d5db;
+                                   border-radius:4px;font-size:.85rem}
+#keyword-filter{flex:1;min-width:150px}
+#filter-count{color:#6b7280;font-size:.8rem;white-space:nowrap}"
+            .to_string()
+    };
+
+    let filter_bar_html = if sorted.is_empty() {
+        String::new()
+    } else {
+        use std::collections::BTreeSet;
+        let artifacts: BTreeSet<&str> = sorted.iter().map(|f| f.artifact.as_str()).collect();
+        let artifact_options: String = artifacts
+            .iter()
+            .map(|a| {
+                let a_esc = esc(a);
+                format!("<option value=\"{a_esc}\">{a_esc}</option>")
+            })
+            .collect();
+        format!(
+            r#"<div class="filter-bar">
+  <div class="filter-group">
+    <label><input type="checkbox" class="sev-filter" value="critical" checked> Critical</label>
+    <label><input type="checkbox" class="sev-filter" value="high" checked> High</label>
+    <label><input type="checkbox" class="sev-filter" value="medium" checked> Medium</label>
+    <label><input type="checkbox" class="sev-filter" value="low" checked> Low</label>
+    <label><input type="checkbox" class="sev-filter" value="info" checked> Info</label>
+  </div>
+  <select id="artifact-filter"><option value="">全部來源</option>{artifact_options}</select>
+  <input type="text" id="keyword-filter" placeholder="搜尋標題或說明...">
+  <span id="filter-count"></span>
+</div>"#
+        )
+    };
+
+    let filter_script_html = if sorted.is_empty() {
+        String::new()
+    } else {
+        r#"<script>
+(function() {
+  var checkboxes = document.querySelectorAll('.sev-filter');
+  var artifactSel = document.getElementById('artifact-filter');
+  var keywordInput = document.getElementById('keyword-filter');
+  var rows = document.querySelectorAll('#findings-tbody tr[data-severity]');
+  var countEl = document.getElementById('filter-count');
+  if (!rows.length) { return; }
+
+  function applyFilter() {
+    var activeSevs = Array.prototype.filter.call(checkboxes, function(cb) { return cb.checked; })
+                          .map(function(cb) { return cb.value; });
+    var artifact = artifactSel.value;
+    var keyword = keywordInput.value.toLowerCase();
+    var visible = 0;
+    rows.forEach(function(row) {
+      var sevOk = activeSevs.indexOf(row.dataset.severity) !== -1;
+      var artOk = !artifact || row.dataset.artifact === artifact;
+      var kwOk = !keyword || row.textContent.toLowerCase().indexOf(keyword) !== -1;
+      var show = sevOk && artOk && kwOk;
+      row.style.display = show ? '' : 'none';
+      if (show) { visible++; }
+    });
+    countEl.textContent = '顯示 ' + visible + ' / ' + rows.length + ' 筆';
+  }
+  checkboxes.forEach(function(cb) { cb.addEventListener('change', applyFilter); });
+  artifactSel.addEventListener('change', applyFilter);
+  keywordInput.addEventListener('input', applyFilter);
+  applyFilter();
+})();
+</script>"#
+            .to_string()
+    };
+
     // Build findings rows
     let rows = if sorted.is_empty() {
         "<tr><td colspan=\"6\" style=\"text-align:center;color:#6b7280;padding:2rem\">本次掃描無 finding</td></tr>".to_string()
@@ -434,8 +576,10 @@ pub fn html_report(
                         items
                     )
                 };
+                let data_sev = sev_key(f.severity);
+                let data_art = esc(&f.artifact);
                 format!(
-                    "<tr>\
+                    "<tr data-severity=\"{data_sev}\" data-artifact=\"{data_art}\">\
                   <td style=\"white-space:nowrap;color:#6b7280;font-size:0.85em\">{ts}</td>\
                   <td><span style=\"background:{color};color:#fff;padding:2px 8px;\
                       border-radius:4px;font-size:0.8em;white-space:nowrap\">{sev}</span></td>\
@@ -511,6 +655,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
        padding:1rem;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.1)}}
 .stat-num{{font-size:2rem;font-weight:700}}
 .stat-label{{font-size:.75rem;color:#6b7280;margin-top:.25rem}}
+{filter_css}
 table{{width:100%;border-collapse:collapse;font-size:.9rem}}
 th{{text-align:left;padding:.6rem .75rem;background:#f9fafb;
     color:#6b7280;font-size:.75rem;font-weight:600;
@@ -545,18 +690,21 @@ tr:hover td{{background:#f9fafb}}
 
 <div class="card" style="margin-top:1.25rem">
 <div class="card-title">Findings（共 {total} 筆）</div>
+{filter_bar_html}
 <div style="overflow-x:auto">
 <table>
 <thead><tr>
   <th>時間</th><th>嚴重度</th><th>標題</th>
   <th>MITRE</th><th>來源</th><th>說明</th>
 </tr></thead>
-<tbody>
+<tbody id="findings-tbody">
 {rows}
 </tbody>
 </table>
 </div>
 </div>
+
+{evidence_summary_html}
 
 {netconn_html}
 
@@ -574,6 +722,8 @@ tr:hover td{{background:#f9fafb}}
   <p>{int_note}</p>
   <p style="margin-top:.25rem">cairn v{tool_ver} &nbsp;·&nbsp; 報告產生時間：{generated}</p>
 </div>
+
+{filter_script_html}
 
 </div>
 </body>
@@ -629,6 +779,90 @@ mod tests {
     }
 
     #[test]
+    fn basename_extracts_from_backslash_path() {
+        assert_eq!(basename(r"C:\Windows\System32\evil.exe"), "evil.exe");
+    }
+
+    #[test]
+    fn basename_extracts_from_forward_slash_path() {
+        assert_eq!(basename("C:/Users/a/evil.exe"), "evil.exe");
+    }
+
+    #[test]
+    fn basename_returns_input_when_no_separator() {
+        assert_eq!(basename("EVIL.EXE"), "EVIL.EXE");
+    }
+
+    #[test]
+    fn evidence_summary_lists_basenames_appearing_in_two_or_more_findings() {
+        use cairn_core::finding::EvidenceItem;
+        let mut f1 = Finding::new(Severity::High, "A", FindingSource::Sigma);
+        f1.host = "TEST-PC".into();
+        f1.artifact = "evtx:Security".into();
+        f1.evidence.push(EvidenceItem {
+            artifact: "prefetch".into(),
+            path: Some("EVIL.EXE".into()),
+            ts: None,
+            detail: "run_count=3".into(),
+        });
+        let mut f2 = Finding::new(Severity::Medium, "B", FindingSource::Heuristic);
+        f2.host = "TEST-PC".into();
+        f2.artifact = "persist:run_key".into();
+        f2.evidence.push(EvidenceItem {
+            artifact: "shimcache".into(),
+            path: Some(r"C:\Users\a\EVIL.EXE".into()),
+            ts: None,
+            detail: "seen in shimcache".into(),
+        });
+        let html = html_report(&[f1, f2], &[], &[], &minimal_manifest());
+        assert!(
+            html.contains("EVIL.EXE"),
+            "aggregation panel must list the repeated basename: {html}"
+        );
+        assert!(html.contains("相同來源多次出現") || html.contains("同一執行檔"));
+    }
+
+    #[test]
+    fn evidence_summary_excludes_basenames_appearing_only_once() {
+        use cairn_core::finding::EvidenceItem;
+        let mut f = Finding::new(Severity::High, "A", FindingSource::Sigma);
+        f.host = "TEST-PC".into();
+        f.artifact = "evtx:Security".into();
+        f.evidence.push(EvidenceItem {
+            artifact: "prefetch".into(),
+            path: Some("ONLYONE.EXE".into()),
+            ts: None,
+            detail: "run_count=1".into(),
+        });
+        let html = html_report(&[f], &[], &[], &minimal_manifest());
+        assert!(
+            !html.contains("相同來源多次出現") && !html.contains("同一執行檔"),
+            "panel must not render when nothing repeats: {html}"
+        );
+    }
+
+    #[test]
+    fn evidence_summary_counts_once_per_finding_not_per_evidence_item() {
+        use cairn_core::finding::EvidenceItem;
+        let mut f1 = Finding::new(Severity::High, "A", FindingSource::Sigma);
+        f1.host = "TEST-PC".into();
+        f1.artifact = "evtx:Security".into();
+        for src in ["prefetch", "shimcache", "amcache"] {
+            f1.evidence.push(EvidenceItem {
+                artifact: src.into(),
+                path: Some("SAME.EXE".into()),
+                ts: None,
+                detail: "seen".into(),
+            });
+        }
+        let html = html_report(&[f1], &[], &[], &minimal_manifest());
+        assert!(
+            !html.contains("相同來源多次出現") && !html.contains("同一執行檔"),
+            "must not count multiple evidence items within one finding as repetition: {html}"
+        );
+    }
+
+    #[test]
     fn html_report_contains_hostname() {
         let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(html.contains("TEST-PC"), "should contain hostname");
@@ -666,6 +900,73 @@ mod tests {
     fn html_report_no_findings_shows_empty_message() {
         let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(html.contains("本次掃描無 finding"));
+    }
+
+    #[test]
+    fn finding_rows_carry_severity_and_artifact_data_attributes() {
+        let mut f = Finding::new(Severity::High, "Test High", FindingSource::Sigma);
+        f.host = "TEST-PC".into();
+        f.artifact = "evtx:Security".into();
+        let html = html_report(&[f], &[], &[], &minimal_manifest());
+        assert!(
+            html.contains("data-severity=\"high\""),
+            "missing data-severity attribute: {html}"
+        );
+        assert!(
+            html.contains("data-artifact=\"evtx:Security\""),
+            "missing data-artifact attribute: {html}"
+        );
+    }
+
+    #[test]
+    fn artifact_dropdown_lists_deduplicated_sorted_values() {
+        let mut f1 = Finding::new(Severity::High, "A", FindingSource::Sigma);
+        f1.host = "TEST-PC".into();
+        f1.artifact = "evtx:Security".into();
+        let mut f2 = Finding::new(Severity::Medium, "B", FindingSource::Heuristic);
+        f2.host = "TEST-PC".into();
+        f2.artifact = "persist:run_key".into();
+        let mut f3 = Finding::new(Severity::Low, "C", FindingSource::Sigma);
+        f3.host = "TEST-PC".into();
+        f3.artifact = "evtx:Security".into();
+        let html = html_report(&[f1, f2, f3], &[], &[], &minimal_manifest());
+        assert!(html.contains("<option value=\"evtx:Security\">evtx:Security</option>"));
+        assert!(html.contains("<option value=\"persist:run_key\">persist:run_key</option>"));
+        let opt_count = html.matches("<option value=\"evtx:Security\">").count();
+        assert_eq!(opt_count, 1, "artifact option must be deduplicated");
+    }
+
+    #[test]
+    fn filter_bar_absent_when_no_findings() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        // The `.filter-bar` CSS rule is always present in the static <style> block;
+        // what must not render is the actual filter bar markup (the div itself).
+        assert!(
+            !html.contains("<div class=\"filter-bar\">"),
+            "filter bar div must not render when there are no findings"
+        );
+    }
+
+    #[test]
+    fn filter_script_present_when_findings_exist() {
+        let mut f = Finding::new(Severity::High, "Test High", FindingSource::Sigma);
+        f.host = "TEST-PC".into();
+        f.artifact = "evtx:Security".into();
+        let html = html_report(&[f], &[], &[], &minimal_manifest());
+        assert!(
+            html.contains("addEventListener"),
+            "filter script must be present: {html}"
+        );
+    }
+
+    #[test]
+    fn filter_script_has_no_eval_or_innerhtml() {
+        let mut f = Finding::new(Severity::High, "Test High", FindingSource::Sigma);
+        f.host = "TEST-PC".into();
+        f.artifact = "evtx:Security".into();
+        let html = html_report(&[f], &[], &[], &minimal_manifest());
+        assert!(!html.contains("eval("), "must not use eval()");
+        assert!(!html.contains("innerHTML ="), "must not assign innerHTML");
     }
 
     /// Findings render their evidence list (collapsible "佐證來源"), and observations
@@ -740,7 +1041,7 @@ mod tests {
         ];
         let html = html_report(&[], &[], &recs, &minimal_manifest());
         assert!(
-            html.contains("對外連線 (2 條，其中 1 條連往公網)"),
+            html.contains("網路連線 (2 條，其中 1 條連往公網)"),
             "html: missing panel"
         );
         assert!(html.contains("8.8.8.8:443"));
@@ -753,7 +1054,7 @@ mod tests {
     #[test]
     fn netconn_panel_absent_when_no_conns() {
         let html = html_report(&[], &[], &[], &minimal_manifest());
-        assert!(!html.contains("對外連線"));
+        assert!(!html.contains("網路連線"));
     }
 
     fn proc(pid: u32, image: &str, signed: Option<bool>) -> cairn_core::Record {
@@ -899,6 +1200,7 @@ mod tests {
             logon_time: None,
             source: source.map(String::from),
             session_id: Some(sid),
+            state_active: false,
         })
     }
 
@@ -919,5 +1221,48 @@ mod tests {
     fn logon_panel_absent_when_no_sessions() {
         let html = html_report(&[], &[], &[], &minimal_manifest());
         assert!(!html.contains("登入 session"));
+    }
+
+    #[test]
+    fn logon_panel_shows_state_active_column() {
+        let recs = vec![
+            cairn_core::Record::LogonSession(cairn_core::record::LogonSessionRecord {
+                user: r"PC\alice".into(),
+                logon_type: "Interactive".into(),
+                logon_time: None,
+                source: None,
+                session_id: Some(1),
+                state_active: true,
+            }),
+            cairn_core::Record::LogonSession(cairn_core::record::LogonSessionRecord {
+                user: r"PC\bob".into(),
+                logon_type: "Interactive".into(),
+                logon_time: None,
+                source: None,
+                session_id: Some(2),
+                state_active: false,
+            }),
+        ];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(
+            html.contains("<th>狀態</th>"),
+            "missing state column header: {html}"
+        );
+        assert!(html.contains("是"), "active session must show 是");
+        assert!(html.contains("否"), "inactive session must show 否");
+    }
+
+    #[test]
+    fn netconn_panel_title_is_network_connections_not_external() {
+        let recs = vec![netconn(
+            "tcp",
+            Some("8.8.8.8"),
+            Some(443),
+            "ESTABLISHED",
+            Some(100),
+        )];
+        let html = html_report(&[], &[], &recs, &minimal_manifest());
+        assert!(html.contains("網路連線"), "title must be renamed: {html}");
+        assert!(!html.contains("對外連線"), "old title must be gone: {html}");
     }
 }

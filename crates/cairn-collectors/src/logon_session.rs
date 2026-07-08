@@ -30,6 +30,7 @@ impl Collector for LogonSessionCollector {
                     logon_time: None, // WTS has no reliable logon timestamp; honest None
                     source: s.client_address,
                     session_id: Some(s.session_id),
+                    state_active: s.state_active,
                 })
             })
             .collect())
@@ -68,5 +69,22 @@ mod tests {
     #[test]
     fn collector_name_is_logon_session() {
         assert_eq!(LogonSessionCollector.name(), "logon_session");
+    }
+
+    #[test]
+    fn maps_state_active_from_wts_session() {
+        use cairn_core::record::{LogonSessionRecord, Record};
+        let rec = Record::LogonSession(LogonSessionRecord {
+            user: "test".into(),
+            logon_type: "Interactive".into(),
+            logon_time: None,
+            source: None,
+            session_id: Some(1),
+            state_active: true,
+        });
+        match rec {
+            Record::LogonSession(s) => assert!(s.state_active),
+            _ => panic!("expected LogonSession"),
+        }
     }
 }
