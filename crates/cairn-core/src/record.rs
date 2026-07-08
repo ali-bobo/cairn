@@ -134,6 +134,12 @@ pub struct LogonSessionRecord {
     pub logon_time: Option<DateTime<Utc>>,
     pub source: Option<String>, // source host/IP for network/RDP sessions
     pub session_id: Option<u32>,
+    /// Whether the collector observed this session as currently active (HTML
+    /// report filtering, additive schema field). `#[serde(default)]` keeps old
+    /// JSONL (pre-field replay) deserializable: missing key -> `false`, i.e.
+    /// "unknown" is conservatively treated as "not active" rather than assumed true.
+    #[serde(default)]
+    pub state_active: bool,
 }
 
 #[cfg(test)]
@@ -316,10 +322,39 @@ mod tests {
             logon_time: None,
             source: Some("10.0.0.5".into()),
             session_id: Some(2),
+            state_active: true,
         });
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"kind\":\"logon_session\""));
         let back: Record = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn logon_session_state_active_defaults_false_on_old_json_and_roundtrips() {
+        // Older JSONL (pre-state_active field) must deserialize with state_active = false.
+        let old = r#"{"kind":"logon_session","user":"DOMAIN\\alice","logon_type":"Interactive","logon_time":null,"source":null,"session_id":1}"#;
+        let parsed: Record = serde_json::from_str(old).unwrap();
+        match parsed {
+            Record::LogonSession(rec) => assert_eq!(rec.state_active, false),
+            other => panic!("expected LogonSession, got {other:?}"),
+        }
+
+        // New record with state_active: true round-trips through serialize/deserialize.
+        let rec = Record::LogonSession(LogonSessionRecord {
+            user: r"DOMAIN\bob".into(),
+            logon_type: "Interactive".into(),
+            logon_time: None,
+            source: None,
+            session_id: Some(3),
+            state_active: true,
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""state_active":true"#));
+        let back: Record = serde_json::from_str(&json).unwrap();
+        match back {
+            Record::LogonSession(back_rec) => assert_eq!(back_rec.state_active, true),
+            other => panic!("expected LogonSession, got {other:?}"),
+        }
     }
 }
