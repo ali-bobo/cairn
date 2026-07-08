@@ -336,7 +336,7 @@ mod tests {
         let old = r#"{"kind":"logon_session","user":"DOMAIN\\alice","logon_type":"Interactive","logon_time":null,"source":null,"session_id":1}"#;
         let parsed: Record = serde_json::from_str(old).unwrap();
         match parsed {
-            Record::LogonSession(rec) => assert_eq!(rec.state_active, false),
+            Record::LogonSession(rec) => assert!(!rec.state_active),
             other => panic!("expected LogonSession, got {other:?}"),
         }
 
@@ -353,7 +353,7 @@ mod tests {
         assert!(json.contains(r#""state_active":true"#));
         let back: Record = serde_json::from_str(&json).unwrap();
         match back {
-            Record::LogonSession(back_rec) => assert_eq!(back_rec.state_active, true),
+            Record::LogonSession(back_rec) => assert!(back_rec.state_active),
             other => panic!("expected LogonSession, got {other:?}"),
         }
     }
