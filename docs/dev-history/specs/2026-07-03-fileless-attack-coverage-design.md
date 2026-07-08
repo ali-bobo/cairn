@@ -2,6 +2,20 @@
 
 > **Date:** 2026-07-03 (re-activated after IR snapshot panels branch merged to main `88831a1`)
 > **Status:** Approved direction — pending user spec review
+>
+> **⚠️ 2026-07-08 現況查證附註（重啟本 spec 前必讀，優先於下方原文）**：
+> 1. **塊 B 的「現況」描述已過時**：LogsourceMap（`cairn-sigma/src/lib.rs:216-260`）
+>    **已映射** PowerShell Operational / Security / System 等頻道（整頻道粒度）；
+>    `ruleset.toml` 實際 43 條規則且**已含** Security 規則（帳戶/服務/NTLM/DCSync）
+>    → Security 頻道**已在收集**。§1.2 的「49 條規則」與 §1.3 的「沒有規則引用認證
+>    頻道故不會被收集」皆不再成立。塊 B 已併入 REMAINING-WORK 段 2（Sigma 擴充）。
+> 2. **§6.3 的塊 B↔塊 C 相依性顧慮實質解除**（Security 頻道已被引用）。
+> 3. **§4.4「復用 S9 gate 故零新 heuristic」有已記錄的設計缺陷**（BYOVD brainstorm
+>    時發現）：S9 只認「被呼叫的直譯器」，`ActiveScriptEventConsumer` 內嵌 ScriptText
+>    無被呼叫執行檔，會被漏進 Observation——塊 A 重啟時需重設計為 Observation-first
+>    （WMI 訂閱一律先進 observations，佐證升級才成 Finding），不能照 §4.4 原文實作。
+> 4. 塊 A/C 的其餘設計（WMI 收集三類物件、爆破分組邏輯、graceful degrade）仍有效。
+> 重啟入口見 `docs/REMAINING-WORK.md` 段 4。
 > **Scope:** WMI event-subscription collector + EVTX channel expansion (PowerShell /
 > authentication / lateral movement) + matching Sigma rules + one cross-event heuristic.
 > **Depends on:** heuristic gate redesign (merged to main `068983e`, 2026-07-02) —

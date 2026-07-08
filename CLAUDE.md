@@ -1,8 +1,16 @@
 # CLAUDE.md — Cairn project guide for Claude Code
 
+> **Status: S1–S4 complete; post-S4 hardening merged (gate redesign, IR panels,
+> BYOVD, dependency-audit fix). Current backlog: `docs/REMAINING-WORK.md`.**
+
 This file is the operating contract for Claude Code working in this repo. Read it
-fully before writing code. Authoritative spec: `cairn-SRS.md`. Build order:
-`docs/stage1-plan.md`. Decision context: `cairn-decision-summary.md`.
+fully before writing code. Authoritative spec: `cairn-SRS.md`.
+Backlog + per-segment known risks: `docs/REMAINING-WORK.md`.
+Decision context: `cairn-decision-summary.md`.
+
+Before diving into any individual spec/plan under `docs/dev-history/`, check
+`docs/dev-history/INDEX.md` first — it records merge status per topic so you
+don't have to open a spec just to find out it's already shipped.
 
 ## What this is
 A single signed Rust binary: agentless, **user-space only**, on-host Windows
@@ -30,33 +38,35 @@ split)+Velociraptor offline-collector(packaging), fused in one process.
    manifest, continue. Never abort the whole run for one collector.
 
 ## Workspace map
-- `crates/cairn-core`  — typed contracts: Record, Finding, Manifest, traits, Config, orchestrator. Depend-on-only crate; no host or external-forensic deps.
-- `crates/cairn-collectors` — artifact->Record collectors (evtx; S2+ proc/net pure logic). `#![forbid(unsafe_code)]`.
-- `crates/cairn-collectors-win` — Windows unsafe FFI ONLY (proc/net/host/privilege; later raw-NTFS). The single `#![allow(unsafe_code)]` crate; `cfg(windows)`, empty shell elsewhere (S2-A).
-- `crates/cairn-sigma` — SigmaMatcher trait + chosen engine + LogsourceMap (de-abstraction).
-- `crates/cairn-report`— timeline(csv)/findings(jsonl)/manifest, sha256, output sinks.
-- `crates/cairn-cli`   — `cairn` binary, clap CLI (SRS §6).
+- `crates/cairn-core`  — typed contracts: Record, Finding (+ EvidenceItem), Manifest, traits, Config, orchestrator. Depend-on-only crate; no host or external-forensic deps.
+- `crates/cairn-collectors` — artifact->Record collectors (evtx live; proc/net/persist pure logic; offline raw-NTFS/hive/prefetch/srum parsers). `#![forbid(unsafe_code)]`.
+- `crates/cairn-collectors-win` — Windows unsafe FFI ONLY (proc/net/host/privilege/logon; raw `\\.\C:` VolumeReader). The single `#![allow(unsafe_code)]` crate; `cfg(windows)`, empty shell elsewhere.
+- `crates/cairn-sigma` — SigmaMatcher trait + sigma-rust engine + LogsourceMap + XOR rule codec.
+- `crates/cairn-heur`  — heuristic analyzers (parentchild/persist gate/netconn/account/timestomp/byovd) + trust.rs path-trust knowledge + known-vulnerable-drivers list.
+- `crates/cairn-report`— timeline(csv)/findings(jsonl)/observations(jsonl)/manifest/report.html, sha256, output sinks (Dir/Zip/Age/DryRun), bodyfile, client_text (zh-TW).
+- `crates/cairn-updater` — `cairn update-rules`: SSRF-gated SigmaHQ fetch + DRL 1.1 + XOR encode + PROVENANCE. `#![forbid(unsafe_code)]`.
+- `crates/cairn-cli`   — `cairn` binary, clap CLI (SRS §6). Subcommands: run / evtx / update-rules / verify.
 - `crates/cairn-launcher` — interactive CLI launcher for end users; double-click entry point that wraps cairn.exe.
-- `rules/`             — bundled Sigma (DRL 1.1) + config maps. May be XOR-encoded on disk (avoid AV FP on .yml; encode RULES, never the tool).
-- `docs/`              — stage1-plan, threat-model, SOC-runbook, sigma benchmark plan.
+- `rules/`             — bundled Sigma (DRL 1.1) + config maps. XOR-encoded on disk (avoid AV FP on .yml; encode RULES, never the tool). Subset list: `rules/ruleset.toml`.
+- `docs/`              — REMAINING-WORK (backlog), threat-model, SOC-runbook, dev-history (INDEX.md first).
 - `tests/`             — EVTX-ATTACK-SAMPLES fixtures + Sigma match-parity tests.
 
 ## Build / test commands
 ```
-cargo check --workspace          # FIRST: skeleton not yet compiled; expect to fix dep versions
+cargo check --workspace
 cargo build --workspace
-cargo test  --workspace
-cargo clippy --workspace -- -D warnings
-cargo fmt
+cargo test  --workspace                                  # elevated e2e are #[ignore]
+cargo clippy --workspace --all-targets -- -D warnings    # --all-targets: must match CI
+cargo fmt --check                                        # must pass — CI gates on it
 ```
-The dependency versions in Cargo.toml are 2025-plausible starting points, NOT
-verified. Resolve them in task T0 before anything else.
+Set `CARGO_TARGET_DIR` outside OneDrive first (see Local dev environment notes).
 
 ## How to proceed (do NOT free-build)
-Work task-by-task through `docs/stage1-plan.md`. After EACH task: `cargo check`,
-then `cargo test` for that task's acceptance check. Do not start a later task
-until the current one's acceptance gate passes. Stage 1 (EVTX+Sigma+timeline+
-manifest) must stand alone as a useful, shippable tool before any S2 work.
+S1–S4 and post-S4 hardening are complete. For any new work: pick the segment from
+`docs/REMAINING-WORK.md`, then brainstorm → writing-plans → subagent-driven-development
+→ finishing-a-development-branch. Merge via GitHub PR only (CI green first) — never
+local `git merge` pushed straight to main. Each task needs its `cargo check` +
+scoped `cargo test` gate before moving on.
 
 ## Coding conventions
 - `#![forbid(unsafe_code)]` everywhere EXCEPT collector modules that must do raw
@@ -78,6 +88,40 @@ is THIS file. Use the available engineering workflow skills where they fit:
 - debug : EVTX/Sigma match mismatches.
 Do not invent new skills; do not add SKILL.md files (that format is for claude.ai
 /Cowork, not Claude Code).
+
+## Test scope discipline (avoid 4x redundant full-workspace runs)
+Full `cargo test --workspace` + `cargo clippy --workspace --all-targets` is expensive
+and gets re-run redundantly across a single dev loop (subagent → controller →
+finishing-a-branch → post-merge). Split responsibility:
+- **Task-implementer subagents**: run `cargo test -p <crate>` scoped to the crate(s)
+  they touched. Do not run full workspace unless the task itself changes a trait
+  signature, schema, or public API surface consumed by other crates.
+- **Controller (this session)**: only run full-workspace check/test/clippy when
+  crossing a cross-crate boundary (trait shape in cairn-core, schema in
+  cairn-report, main.rs wiring, or multi-crate integration). Otherwise trust the
+  scoped subagent runs.
+- **finishing-a-development-branch**: this is the one authoritative full-workspace
+  gate for the whole branch before merge.
+- **Post-merge**: do not re-run the full suite again; the pre-merge gate already
+  covered HEAD.
+
+## SeBackupPrivilege constraint (real-machine e2e limitation)
+A normal Administrator token does NOT include `SeBackupPrivilege` by default (it
+must be explicitly enabled, which most interactive admin sessions don't do). The
+7 collectors that depend on raw-NTFS / raw-hive reads for real-machine e2e
+verification — amcache, mft, usn, shimcache, bam, userassist, srum — will
+silently produce zero records under a normal admin session, not because of a
+bug but because of this privilege gap. When validating this class of feature:
+- Do not treat an empty real-machine e2e run as a regression signal by itself —
+  first check whether the run actually had the privilege.
+- Prefer synthetic integration tests that exercise the pipeline without needing
+  the real privilege, following the existing pattern of tests like
+  `byovd_driver_list_override_pipeline_end_to_end` and
+  `sigma_analyzer_findings_appear_in_live_outcome` (fake collector data fed
+  through the real `run_live` + analyzer + report path).
+- Real-machine e2e with the privilege genuinely enabled remains the final
+  acceptance bar for these 7 collectors, but is not the day-to-day dev loop
+  verification method.
 
 ## Legitimacy work (must exist before first real client use, any stage)
 Authenticode-sign + timestamp releases; ship README intent statement (done);

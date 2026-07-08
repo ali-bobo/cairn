@@ -1,7 +1,19 @@
 # Temporal Window Correlator — Design Spec
 
 > **Date:** 2026-07-04
-> **Status:** Approved direction — pending user spec review
+> **Status:** Approved direction — spec reviewed 2026-07-08, ready for writing-plans
+>
+> **2026-07-08 前提複查（對照 main 程式碼逐項驗證）**：
+> - `ProcessRecord.start_time` 仍恆為 `None`（`proc.rs:146` 硬編，全庫無
+>   `GetProcessTimes` 呼叫）→ Task 0 前提成立。
+> - `NetConnRecord` 有 `pid: Option<u32>`、無任何時間戳欄位（`record.rs:57-65`）
+>   → §1.2/§4.4 前提成立。
+> - persist gate 僅對 winlogon/ifeo/startup 三個 mechanism 特判，其餘透明
+>   （`persist.rs:105/126/154`）→ §4.1 整合點前提成立。
+> - `Finding.evidence: Vec<EvidenceItem>`（artifact/path/ts/detail）存在且
+>   report.html 已有 `<details>` 明細展示（`html.rs:414-433`）→ §4.3/§4.4 的
+>   evidence 附加機制與呈現路徑都是現成的。
+> 結論：spec 內容零修改，直接進 writing-plans（Task 0 先行 + §3.3 效能實測 gate）。
 > **Scope:** (1) Real `ProcessRecord.start_time` collection; (2) a heuristic that
 > attaches time-window-adjacent USN/NetConn evidence to already-gated suspicious
 > processes. **This is NOT a causal chain engine** — see §2 for why, and §1 for the
