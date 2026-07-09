@@ -59,6 +59,45 @@ pub fn run_scan(cfg: &RunConfig<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 離線 EVTX 分析所需的參數。`cairn evtx` 子指令沒有 `--output` 旗標
+/// （見 cairn-cli::main::Cmd::Evtx 定義）——輸出目錄固定是
+/// `cairn_core::config::Config::default()` 的 `./out`（相對子程序工作目錄），
+/// 所以這裡的 `output_dir` 是拿來設 `Command::current_dir`，不是命令列參數。
+pub struct EvtxConfig<'a> {
+    pub cairn_exe: &'a Path,
+    pub files: &'a [PathBuf],
+    pub rules_dir: Option<&'a Path>,
+    pub output_dir: &'a Path,
+}
+
+/// 建立 `cairn evtx` 的參數列表（不含 output——見上方結構註解）。
+pub fn build_evtx_args(cfg: &EvtxConfig<'_>) -> Vec<String> {
+    let mut args = vec!["evtx".to_string()];
+    for f in cfg.files {
+        args.push(f.display().to_string());
+    }
+    if let Some(rules) = cfg.rules_dir {
+        args.push("--rules".to_string());
+        args.push(rules.display().to_string());
+    }
+    args
+}
+
+/// 執行 `cairn evtx`，把子程序工作目錄設成 `cfg.output_dir`，讓
+/// `cairn.exe` 預設輸出的 `./out` 落在 `cfg.output_dir` 裡（golden rule 4：
+/// 輸出離 target，不寫進來源目錄）。呼叫前 `cfg.output_dir` 必須已存在。
+pub fn run_evtx(cfg: &EvtxConfig<'_>) -> anyhow::Result<PathBuf> {
+    let args = build_evtx_args(cfg);
+    let status = std::process::Command::new(cfg.cairn_exe)
+        .args(&args)
+        .current_dir(cfg.output_dir)
+        .status()?;
+    if !status.success() {
+        anyhow::bail!("cairn.exe evtx 執行失敗（exit code: {:?}）", status.code());
+    }
+    Ok(cfg.output_dir.join("out"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -153,5 +192,56 @@ mod tests {
         // 格式應為 YYYYMMDD_HHMMSS（15 字元）
         assert_eq!(name.len(), 15, "format should be YYYYMMDD_HHMMSS: {name}");
         assert_eq!(&name[8..9], "_");
+    }
+
+    #[test]
+    fn build_evtx_args_with_rules() {
+        let exe = PathBuf::from(r"C:\tools\cairn.exe");
+        let rules = PathBuf::from(r"C:\tools\rules\sigma");
+        let files = vec![PathBuf::from(r"C:\logs\Security.evtx")];
+        let cfg = EvtxConfig {
+            cairn_exe: &exe,
+            files: &files,
+            rules_dir: Some(&rules),
+            output_dir: &PathBuf::from(r"C:\tools\output\20260709_120000"),
+        };
+        let args = build_evtx_args(&cfg);
+        assert_eq!(args[0], "evtx");
+        assert!(args.contains(&files[0].display().to_string()));
+        assert!(args.contains(&"--rules".to_string()));
+        assert!(args.contains(&rules.display().to_string()));
+    }
+
+    #[test]
+    fn build_evtx_args_without_rules_has_no_rules_flag() {
+        let exe = PathBuf::from(r"C:\tools\cairn.exe");
+        let files = vec![PathBuf::from(r"C:\logs\System.evtx")];
+        let cfg = EvtxConfig {
+            cairn_exe: &exe,
+            files: &files,
+            rules_dir: None,
+            output_dir: &PathBuf::from(r"C:\tools\output\20260709_120000"),
+        };
+        let args = build_evtx_args(&cfg);
+        assert!(!args.contains(&"--rules".to_string()));
+        assert!(args.contains(&files[0].display().to_string()));
+    }
+
+    #[test]
+    fn build_evtx_args_multiple_files() {
+        let exe = PathBuf::from(r"C:\tools\cairn.exe");
+        let files = vec![
+            PathBuf::from(r"C:\logs\Security.evtx"),
+            PathBuf::from(r"C:\logs\System.evtx"),
+        ];
+        let cfg = EvtxConfig {
+            cairn_exe: &exe,
+            files: &files,
+            rules_dir: None,
+            output_dir: &PathBuf::from(r"C:\tools\output\20260709_120000"),
+        };
+        let args = build_evtx_args(&cfg);
+        assert!(args.contains(&files[0].display().to_string()));
+        assert!(args.contains(&files[1].display().to_string()));
     }
 }
