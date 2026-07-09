@@ -66,7 +66,7 @@ fn since_from_hours(hours: u64) -> String {
     dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-fn run_scan_flow(env: &Env, hours: u64, desc: &str) -> anyhow::Result<()> {
+fn run_scan_flow(env: &Env, hours: u64, desc: &str, profile: Option<&str>) -> anyhow::Result<()> {
     let output_dir = runner::timestamped_output_dir(&env.output_base);
     std::fs::create_dir_all(&output_dir)?;
 
@@ -76,6 +76,7 @@ fn run_scan_flow(env: &Env, hours: u64, desc: &str) -> anyhow::Result<()> {
         rules_dir: env.rules_dir.as_deref(),
         output_dir: &output_dir,
         since: &since,
+        profile,
     };
 
     println!("\n執行掃描中，請稍候...");
@@ -139,14 +140,14 @@ fn main() -> anyhow::Result<()> {
 
         match menu::read_choice() {
             '1' => {
-                if let Err(e) = run_scan_flow(&env, 24, "最近 24 小時") {
+                if let Err(e) = run_scan_flow(&env, 24, "最近 24 小時", None) {
                     eprintln!("\n掃描發生錯誤：{e}");
                     menu::wait_enter("按 Enter 繼續...");
                 }
             }
             '2' => {
                 let (hours, desc) = menu::print_time_menu();
-                if let Err(e) = run_scan_flow(&env, hours, desc) {
+                if let Err(e) = run_scan_flow(&env, hours, desc, None) {
                     eprintln!("\n掃描發生錯誤：{e}");
                     menu::wait_enter("按 Enter 繼續...");
                 }

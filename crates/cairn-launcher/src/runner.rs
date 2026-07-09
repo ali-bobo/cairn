@@ -12,6 +12,9 @@ pub struct RunConfig<'a> {
     pub output_dir: &'a Path,
     /// --since 的 UTC datetime（RFC3339 格式，如 "2026-06-27T14:30:00Z"）
     pub since: &'a str,
+    /// --profile 的值（"minimal"/"standard"/"verbose"）。None 時不帶旗標，
+    /// cairn.exe 自身預設 "standard"（見 cairn-cli RunArgs::profile default_value）。
+    pub profile: Option<&'a str>,
 }
 
 /// 根據 `RunConfig` 建立 cairn.exe 的完整參數列表。
@@ -29,6 +32,10 @@ pub fn build_args(cfg: &RunConfig<'_>) -> Vec<String> {
     if let Some(rules) = cfg.rules_dir {
         args.push("--rules".to_string());
         args.push(rules.display().to_string());
+    }
+    if let Some(profile) = cfg.profile {
+        args.push("--profile".to_string());
+        args.push(profile.to_string());
     }
     args
 }
@@ -68,7 +75,39 @@ mod tests {
             rules_dir: rules,
             output_dir: output,
             since,
+            profile: None,
         }
+    }
+
+    #[test]
+    fn build_args_with_profile_includes_profile_flag() {
+        let exe = PathBuf::from(r"C:\tools\cairn.exe");
+        let output = PathBuf::from(r"C:\tools\output\20260627_143022");
+        let cfg = RunConfig {
+            cairn_exe: &exe,
+            rules_dir: None,
+            output_dir: &output,
+            since: "2026-06-27T14:30:00Z",
+            profile: Some("verbose"),
+        };
+        let args = build_args(&cfg);
+        assert!(args.contains(&"--profile".to_string()));
+        assert!(args.contains(&"verbose".to_string()));
+    }
+
+    #[test]
+    fn build_args_without_profile_has_no_profile_flag() {
+        let exe = PathBuf::from(r"C:\tools\cairn.exe");
+        let output = PathBuf::from(r"C:\tools\output\20260627_143022");
+        let cfg = RunConfig {
+            cairn_exe: &exe,
+            rules_dir: None,
+            output_dir: &output,
+            since: "2026-06-27T14:30:00Z",
+            profile: None,
+        };
+        let args = build_args(&cfg);
+        assert!(!args.contains(&"--profile".to_string()));
     }
 
     #[test]
