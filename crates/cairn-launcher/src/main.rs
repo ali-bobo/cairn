@@ -136,7 +136,8 @@ fn expand_evtx_input(input: &Path) -> Vec<PathBuf> {
                     .map(|e| e.path())
                     .filter(|p| {
                         p.is_file()
-                            && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("evtx"))
+                            && p.extension()
+                                .is_some_and(|e| e.eq_ignore_ascii_case("evtx"))
                     })
                     .collect()
             })
@@ -181,7 +182,10 @@ fn run_evtx_flow(env: &Env) -> anyhow::Result<()> {
 
     match summary::load_summary(&report_dir, "離線 EVTX 分析") {
         Ok(s) => menu::print_summary(&s),
-        Err(e) => eprintln!("無法讀取分析結果（{e}），報告目錄：{}", report_dir.display()),
+        Err(e) => eprintln!(
+            "無法讀取分析結果（{e}），報告目錄：{}",
+            report_dir.display()
+        ),
     }
     menu::wait_enter("\n按 Enter 繼續...");
     Ok(())
@@ -223,32 +227,28 @@ fn main() -> anyhow::Result<()> {
                     menu::wait_enter("按 Enter 繼續...");
                 }
             }
-            '3' => {
-                loop {
-                    menu::clear_screen();
-                    menu::print_engineer_menu();
-                    match menu::read_choice() {
-                        '1' => {
-                            let (profile_value, profile_desc) = menu::print_profile_menu();
-                            let desc = format!("最近 24 小時（{profile_desc} profile）");
-                            if let Err(e) =
-                                run_scan_flow(&env, 24, &desc, Some(profile_value))
-                            {
-                                eprintln!("\n掃描發生錯誤：{e}");
-                                menu::wait_enter("按 Enter 繼續...");
-                            }
+            '3' => loop {
+                menu::clear_screen();
+                menu::print_engineer_menu();
+                match menu::read_choice() {
+                    '1' => {
+                        let (profile_value, profile_desc) = menu::print_profile_menu();
+                        let desc = format!("最近 24 小時（{profile_desc} profile）");
+                        if let Err(e) = run_scan_flow(&env, 24, &desc, Some(profile_value)) {
+                            eprintln!("\n掃描發生錯誤：{e}");
+                            menu::wait_enter("按 Enter 繼續...");
                         }
-                        '2' => {
-                            if let Err(e) = run_evtx_flow(&env) {
-                                eprintln!("\nEVTX 分析發生錯誤：{e}");
-                                menu::wait_enter("按 Enter 繼續...");
-                            }
-                        }
-                        'B' => break,
-                        _ => {}
                     }
+                    '2' => {
+                        if let Err(e) = run_evtx_flow(&env) {
+                            eprintln!("\nEVTX 分析發生錯誤：{e}");
+                            menu::wait_enter("按 Enter 繼續...");
+                        }
+                    }
+                    'B' => break,
+                    _ => {}
                 }
-            }
+            },
             'Q' => {
                 println!("\n離開 Cairn 鑑識工具。");
                 break;

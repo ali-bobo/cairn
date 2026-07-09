@@ -240,10 +240,7 @@ mod engineer_menu_tests {
 
     #[test]
     fn plain_path_unchanged() {
-        assert_eq!(
-            clean_path_input("C:\\logs"),
-            Some("C:\\logs".to_string())
-        );
+        assert_eq!(clean_path_input("C:\\logs"), Some("C:\\logs".to_string()));
     }
 
     #[test]
