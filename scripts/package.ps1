@@ -34,11 +34,12 @@ Copy-Item "LICENSE"        "$OutDir\LICENSE"
 Copy-Item "NOTICE"         "$OutDir\NOTICE"
 
 Write-Host "Generating CHECKSUMS.txt..." -ForegroundColor Cyan
+$OutDirFull = (Resolve-Path $OutDir).Path
 $checksumLines = Get-ChildItem $OutDir -Recurse -File |
     Where-Object { $_.Name -ne "CHECKSUMS.txt" } |
     ForEach-Object {
         $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
-        $relPath = $_.FullName.Substring($OutDir.Length + 1) -replace '\\', '/'
+        $relPath = $_.FullName.Substring($OutDirFull.Length + 1) -replace '\\', '/'
         "$hash  $relPath"
     }
 $checksumLines | Set-Content "$OutDir\CHECKSUMS.txt" -Encoding utf8
