@@ -45,3 +45,5 @@
 | 2026-07-03 | fileless-attack-coverage（僅有 spec，無 plan） | 待辦（FUTURE） | WMI 訂閱 + EVTX 認證/PowerShell/橫向移動 + 登入暴力破解偵測；設計完成但尚未進入實作階段 | — |
 | 2026-07-04 | byovd-driver-detection | 已合併 | amcache_driver SHA1 比對已知漏洞驅動清單 | 60691fd |
 | 2026-07-04 | temporal-window-correlator（僅有 spec，無 plan） | spec 待審 | 誠實時間窗證據關聯（非因果鏈）；最新項目，剛完成 brainstorm，尚未進入 subagent-driven 執行 | — |
+| 2026-07-08 | html-report-filtering | 已合併 | 報告篩選（嚴重度/文物/關鍵字）+ 同源 binary 聚合面板 + state_active 補接線 + netconn 改名 | 74aefba |
+| 2026-07-09 | usability-governance（段 8） | spec 已定稿待實作 | launcher 工程師模式補實 + 打包健全化 + 手冊更新含概念章 + Apache→MIT + 混合健全性審計 | — |
