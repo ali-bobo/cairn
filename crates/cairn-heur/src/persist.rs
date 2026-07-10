@@ -205,46 +205,120 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     hits
 }
 
-/// Lowercased basename with a trailing ".exe" stripped — the cross-artifact join key.
-/// (Moved from the retired CorrelationAnalyzer.)
-fn normalized_basename(path: &str) -> String {
-    let base = path
-        .trim()
-        .trim_matches('"')
-        .rsplit(['\\', '/'])
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    base.strip_suffix(".exe").map(String::from).unwrap_or(base)
+/// 跨文物比對鍵：有完整路徑（含目錄分隔符）就用正規化後的完整路徑比對；
+/// 只有檔名（來源本身缺路徑資訊，如多數 prefetch 條目、srum 的 "id:<n>" 回退）
+/// 就降級成純檔名比對。降級佐證的信心度低於完整路徑相符，呼叫端在組
+/// finding reason 時必須標註「降級佐證」（見 gate_details 呼叫處）。
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum JoinKey {
+    /// 正規化（trim + 去引號 + 小寫）後的完整路徑，含目錄。
+    Path(String),
+    /// 僅檔名（去 `.exe` 尾綴），來源缺路徑資訊。
+    Name(String),
 }
 
-/// Index execution + process records by normalized basename for corroboration lookups.
+impl JoinKey {
+    /// 兩個 JoinKey 是否應視為同一佐證目標：Path 對 Path 要求完全相同；
+    /// 任一方是 Name（降級）就退回比對雙方的 basename。
+    fn degraded_key(&self) -> String {
+        match self {
+            JoinKey::Path(p) => basename_from_normalized(p),
+            JoinKey::Name(n) => n.clone(),
+        }
+    }
+}
+
+/// 從一個原始路徑/檔名字串建立 JoinKey：trim + 去引號 + 小寫，再判斷是否含
+/// 目錄分隔符（`\` 或 `/`）。不含分隔符（如純檔名、或 srum 的 "id:42" 回退）
+/// 一律視為 Name（降級）鍵。
+fn join_key(raw: &str) -> JoinKey {
+    let normalized = raw.trim().trim_matches('"').to_ascii_lowercase();
+    if normalized.contains('\\') || normalized.contains('/') {
+        JoinKey::Path(normalized)
+    } else {
+        JoinKey::Name(strip_exe_suffix(&normalized))
+    }
+}
+
+/// 從一個已正規化（小寫、trim 過）的完整路徑取出檔名（去 `.exe` 尾綴）。
+fn basename_from_normalized(path: &str) -> String {
+    let base = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    strip_exe_suffix(base)
+}
+
+/// 去掉 `.exe` 尾綴（若有）。
+fn strip_exe_suffix(s: &str) -> String {
+    s.strip_suffix(".exe")
+        .map(String::from)
+        .unwrap_or_else(|| s.to_string())
+}
+
+/// Index execution + process records for corroboration lookups. 用兩層索引：
+/// exact（JoinKey 完全相等，Path 對 Path 或 Name 對 Name 且字串相同）優先；
+/// 找不到 exact 命中時，用 degraded_key()（純 basename）再查一次，並標記
+/// 該次命中為「降級佐證」。
 struct CrossIndex<'a> {
-    exec: HashMap<String, Vec<&'a ExecutionRecord>>,
-    proc: HashMap<String, Vec<&'a ProcessRecord>>,
+    exec_exact: HashMap<JoinKey, Vec<&'a ExecutionRecord>>,
+    exec_degraded: HashMap<String, Vec<&'a ExecutionRecord>>,
+    proc_exact: HashMap<JoinKey, Vec<&'a ProcessRecord>>,
+    proc_degraded: HashMap<String, Vec<&'a ProcessRecord>>,
+}
+
+impl<'a> CrossIndex<'a> {
+    /// 查找 exec 佐證：先試 exact key；沒有的話退回 degraded（僅檔名）比對，
+    /// 回傳 (命中清單, 是否為降級命中)。
+    fn lookup_exec(&self, key: &JoinKey) -> (Vec<&'a ExecutionRecord>, bool) {
+        if let Some(hits) = self.exec_exact.get(key) {
+            if !hits.is_empty() {
+                return (hits.clone(), false);
+            }
+        }
+        let degraded = self.exec_degraded.get(&key.degraded_key());
+        (degraded.cloned().unwrap_or_default(), true)
+    }
+
+    /// 同 lookup_exec，查 process 側。
+    fn lookup_proc(&self, key: &JoinKey) -> (Vec<&'a ProcessRecord>, bool) {
+        if let Some(hits) = self.proc_exact.get(key) {
+            if !hits.is_empty() {
+                return (hits.clone(), false);
+            }
+        }
+        let degraded = self.proc_degraded.get(&key.degraded_key());
+        (degraded.cloned().unwrap_or_default(), true)
+    }
 }
 
 fn build_cross_index(records: &[Record]) -> CrossIndex<'_> {
-    let mut exec: HashMap<String, Vec<&ExecutionRecord>> = HashMap::new();
-    let mut proc: HashMap<String, Vec<&ProcessRecord>> = HashMap::new();
+    let mut exec_exact: HashMap<JoinKey, Vec<&ExecutionRecord>> = HashMap::new();
+    let mut exec_degraded: HashMap<String, Vec<&ExecutionRecord>> = HashMap::new();
+    let mut proc_exact: HashMap<JoinKey, Vec<&ProcessRecord>> = HashMap::new();
+    let mut proc_degraded: HashMap<String, Vec<&ProcessRecord>> = HashMap::new();
     for r in records {
         match r {
             Record::Execution(e) => {
-                let k = normalized_basename(&e.path);
-                if !k.is_empty() {
-                    exec.entry(k).or_default().push(e);
+                let k = join_key(&e.path);
+                if !k.degraded_key().is_empty() {
+                    exec_degraded.entry(k.degraded_key()).or_default().push(e);
+                    exec_exact.entry(k).or_default().push(e);
                 }
             }
             Record::Process(p) => {
-                let k = normalized_basename(&p.image);
-                if !k.is_empty() {
-                    proc.entry(k).or_default().push(p);
+                let k = join_key(&p.image);
+                if !k.degraded_key().is_empty() {
+                    proc_degraded.entry(k.degraded_key()).or_default().push(p);
+                    proc_exact.entry(k).or_default().push(p);
                 }
             }
             _ => {}
         }
     }
-    CrossIndex { exec, proc }
+    CrossIndex {
+        exec_exact,
+        exec_degraded,
+        proc_exact,
+        proc_degraded,
+    }
 }
 
 /// Return the bare file name from a command/path string (strips surrounding quotes too).
@@ -383,23 +457,25 @@ impl Analyzer for PersistHeuristic {
                 reasons.push(format!("{} independent signals — escalated", hits.len()));
             }
 
-            let key = normalized_basename(
+            let key = join_key(
                 p.binary_path
                     .as_deref()
                     .or(p.command.as_deref())
                     .unwrap_or(""),
             );
             let mut evidence = vec![persistence_evidence(p)];
-            let exec_hits = idx.exec.get(&key).map(Vec::as_slice).unwrap_or(&[]);
-            let proc_hits = idx.proc.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+            let (exec_hits, exec_degraded) = idx.lookup_exec(&key);
+            let (proc_hits, proc_degraded) = idx.lookup_proc(&key);
             if !exec_hits.is_empty() || !proc_hits.is_empty() {
                 sev = escalate(sev);
                 let mut corr = Vec::new();
+                let mut any_degraded = false;
                 if !exec_hits.is_empty() {
                     corr.push(format!("executed ({} artifact records)", exec_hits.len()));
-                    evidence.extend(execution_evidence(exec_hits));
+                    evidence.extend(execution_evidence(&exec_hits));
+                    any_degraded |= exec_degraded;
                 }
-                for pr in proc_hits {
+                for pr in &proc_hits {
                     corr.push(format!("currently running (pid={})", pr.pid));
                     evidence.push(EvidenceItem {
                         artifact: "process".into(),
@@ -408,7 +484,16 @@ impl Analyzer for PersistHeuristic {
                         detail: format!("running pid={} image={}", pr.pid, pr.image),
                     });
                 }
-                reasons.push(format!("corroborated: {} — escalated", corr.join("; ")));
+                any_degraded |= !proc_hits.is_empty() && proc_degraded;
+                let suffix = if any_degraded {
+                    "（降級佐證：僅檔名相符，來源缺完整路徑）"
+                } else {
+                    ""
+                };
+                reasons.push(format!(
+                    "corroborated: {} — escalated{suffix}",
+                    corr.join("; ")
+                ));
             }
 
             let top = hits
@@ -991,5 +1076,42 @@ mod tests {
         assert!(PersistHeuristic.analyze(&records).unwrap().is_empty());
         let obs = PersistHeuristic.observe(&records).unwrap();
         assert_eq!(obs[0].category, "winlogon_default");
+    }
+
+    #[test]
+    fn join_key_full_path_requires_path_match_not_just_basename() {
+        // Two ProcessRecords with the same basename but different directories must
+        // NOT be treated as the same join key when both sides have full paths.
+        let a = join_key(r"C:\Windows\System32\evil.exe");
+        let b = join_key(r"C:\Users\x\AppData\Local\Temp\evil.exe");
+        assert_ne!(a, b, "same basename, different full paths must not collide");
+    }
+
+    #[test]
+    fn join_key_full_path_matches_identical_path_case_insensitive() {
+        let a = join_key(r"C:\Windows\System32\evil.exe");
+        let b = join_key(r"c:\windows\system32\EVIL.EXE");
+        assert_eq!(a, b, "identical path differing only by case must match");
+    }
+
+    #[test]
+    fn join_key_name_only_source_degrades_to_basename_match() {
+        // prefetch-style source: bare filename, no directory component.
+        let prefetch_side = join_key("NOTEPAD.EXE");
+        let live_side = join_key(r"C:\Windows\System32\notepad.exe");
+        // Degraded match: both reduce to the same basename-level key.
+        assert_eq!(
+            prefetch_side.degraded_key(),
+            live_side.degraded_key(),
+            "basename-only source must still corroborate via degraded match"
+        );
+    }
+
+    #[test]
+    fn join_key_srum_id_fallback_is_name_only() {
+        // srum's resolve_app_name falls back to "id:<n>" when unmapped — must be
+        // treated as a Name key (no directory component), not misparsed as a path.
+        let k = join_key("id:42");
+        assert!(matches!(k, JoinKey::Name(_)), "id: fallback must be a Name key");
     }
 }
