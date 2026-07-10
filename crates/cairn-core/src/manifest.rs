@@ -34,9 +34,12 @@ pub struct RunInfo {
     pub operator: String,
     pub case_id: String,
     /// The active run profile (minimal|standard|verbose) — transparency (FR6).
+    /// Additive (S2-L); `#[serde(default)]` keeps pre-S2-L manifests parseable.
+    #[serde(default)]
     pub profile: String,
     /// The collector modules actually selected for this run (S2-L). Empty is honest:
-    /// e.g. `--only nonexistent` ran no collectors.
+    /// e.g. `--only nonexistent` ran no collectors. Additive; defaults on old JSON.
+    #[serde(default)]
     pub selected_modules: Vec<String>,
 }
 
@@ -248,5 +251,32 @@ mod tests {
         let back: Manifest = serde_json::from_value(v).unwrap();
         assert_eq!(back.governance.effective_threads, 0);
         assert!(back.governance.truncations.is_empty());
+    }
+
+    #[test]
+    fn run_info_missing_profile_and_modules_defaults_on_old_json() {
+        // Pre-S2-L manifest JSON lacks `profile`/`selected_modules` (added in S2-L).
+        let json = r#"{
+            "started_utc":"2026-06-10T12:00:00Z",
+            "finished_utc":null,
+            "cmdline":"cairn evtx Security.evtx",
+            "operator":"",
+            "case_id":""
+        }"#;
+        let ri: RunInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(ri.profile, "");
+        assert!(ri.selected_modules.is_empty());
+    }
+
+    #[test]
+    fn manifest_missing_run_profile_field_deserializes() {
+        // Full pre-S2-L manifest: `run.profile`/`run.selected_modules` absent entirely.
+        let m = sample_manifest();
+        let mut v: serde_json::Value = serde_json::to_value(&m).unwrap();
+        v["run"].as_object_mut().unwrap().remove("profile");
+        v["run"].as_object_mut().unwrap().remove("selected_modules");
+        let back: Manifest = serde_json::from_value(v).unwrap();
+        assert_eq!(back.run.profile, "");
+        assert!(back.run.selected_modules.is_empty());
     }
 }
