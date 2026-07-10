@@ -29,6 +29,20 @@ Copy-Item "$TargetDir\cairn.exe"          "$OutDir\cairn.exe"
 Copy-Item "$TargetDir\cairn-launcher.exe" "$OutDir\cairn-launcher.exe"
 
 Copy-Item -Recurse "rules" "$OutDir\rules"
+Copy-Item "USER-MANUAL.md" "$OutDir\USER-MANUAL.md"
+Copy-Item "LICENSE"        "$OutDir\LICENSE"
+Copy-Item "NOTICE"         "$OutDir\NOTICE"
+
+Write-Host "Generating CHECKSUMS.txt..." -ForegroundColor Cyan
+$OutDirFull = (Resolve-Path $OutDir).Path
+$checksumLines = Get-ChildItem $OutDir -Recurse -File |
+    Where-Object { $_.Name -ne "CHECKSUMS.txt" } |
+    ForEach-Object {
+        $hash = (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower()
+        $relPath = $_.FullName.Substring($OutDirFull.Length + 1) -replace '\\', '/'
+        "$hash  $relPath"
+    }
+$checksumLines | Set-Content "$OutDir\CHECKSUMS.txt" -Encoding utf8
 
 Write-Host ""
 Write-Host "Done! Package ready at: $OutDir" -ForegroundColor Green

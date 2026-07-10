@@ -66,7 +66,7 @@ fn since_from_hours(hours: u64) -> String {
     dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-fn run_scan_flow(env: &Env, hours: u64, desc: &str) -> anyhow::Result<()> {
+fn run_scan_flow(env: &Env, hours: u64, desc: &str, profile: Option<&str>) -> anyhow::Result<()> {
     let output_dir = runner::timestamped_output_dir(&env.output_base);
     std::fs::create_dir_all(&output_dir)?;
 
@@ -76,6 +76,7 @@ fn run_scan_flow(env: &Env, hours: u64, desc: &str) -> anyhow::Result<()> {
         rules_dir: env.rules_dir.as_deref(),
         output_dir: &output_dir,
         since: &since,
+        profile,
     };
 
     println!("\n執行掃描中，請稍候...");
@@ -115,6 +116,81 @@ fn run_scan_flow(env: &Env, hours: u64, desc: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// 展開輸入路徑成 .evtx 檔案清單：檔案直接回傳單一項；目錄則列舉其下（非遞迴）
+/// 所有 .evtx 副檔名檔案。不存在或無 .evtx 檔的目錄回傳空清單。
+fn expand_evtx_input(input: &Path) -> Vec<PathBuf> {
+    if input.is_file() {
+        if input
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("evtx"))
+        {
+            vec![input.to_path_buf()]
+        } else {
+            vec![]
+        }
+    } else if input.is_dir() {
+        std::fs::read_dir(input)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.is_file()
+                            && p.extension()
+                                .is_some_and(|e| e.eq_ignore_ascii_case("evtx"))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![]
+    }
+}
+
+fn run_evtx_flow(env: &Env) -> anyhow::Result<()> {
+    let Some(raw) = menu::read_path_input("請輸入 .evtx 檔案或目錄路徑：") else {
+        println!("\n未輸入路徑，取消。");
+        menu::wait_enter("按 Enter 繼續...");
+        return Ok(());
+    };
+    let input_path = PathBuf::from(&raw);
+    if !input_path.exists() {
+        eprintln!("\n路徑不存在：{raw}");
+        menu::wait_enter("按 Enter 繼續...");
+        return Ok(());
+    }
+    let files = expand_evtx_input(&input_path);
+    if files.is_empty() {
+        eprintln!("\n找不到任何 .evtx 檔案：{raw}");
+        menu::wait_enter("按 Enter 繼續...");
+        return Ok(());
+    }
+
+    let output_dir = runner::timestamped_output_dir(&env.output_base);
+    std::fs::create_dir_all(&output_dir)?;
+
+    println!("\n分析 {} 個 EVTX 檔案中，請稍候...", files.len());
+    println!("（輸出目錄：{}）\n", output_dir.display());
+
+    let cfg = runner::EvtxConfig {
+        cairn_exe: &env.cairn_exe,
+        files: &files,
+        rules_dir: env.rules_dir.as_deref(),
+        output_dir: &output_dir,
+    };
+    let report_dir = runner::run_evtx(&cfg)?;
+
+    match summary::load_summary(&report_dir, "離線 EVTX 分析") {
+        Ok(s) => menu::print_summary(&s),
+        Err(e) => eprintln!(
+            "無法讀取分析結果（{e}），報告目錄：{}",
+            report_dir.display()
+        ),
+    }
+    menu::wait_enter("\n按 Enter 繼續...");
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let env = match detect_env() {
         Ok(e) => e,
@@ -139,23 +215,40 @@ fn main() -> anyhow::Result<()> {
 
         match menu::read_choice() {
             '1' => {
-                if let Err(e) = run_scan_flow(&env, 24, "最近 24 小時") {
+                if let Err(e) = run_scan_flow(&env, 24, "最近 24 小時", None) {
                     eprintln!("\n掃描發生錯誤：{e}");
                     menu::wait_enter("按 Enter 繼續...");
                 }
             }
             '2' => {
                 let (hours, desc) = menu::print_time_menu();
-                if let Err(e) = run_scan_flow(&env, hours, desc) {
+                if let Err(e) = run_scan_flow(&env, hours, desc, None) {
                     eprintln!("\n掃描發生錯誤：{e}");
                     menu::wait_enter("按 Enter 繼續...");
                 }
             }
-            '3' => {
+            '3' => loop {
                 menu::clear_screen();
-                println!("\n工程師模式開發中，敬請期待。\n");
-                menu::wait_enter("按 Enter 回到主選單...");
-            }
+                menu::print_engineer_menu();
+                match menu::read_choice() {
+                    '1' => {
+                        let (profile_value, profile_desc) = menu::print_profile_menu();
+                        let desc = format!("最近 24 小時（{profile_desc} profile）");
+                        if let Err(e) = run_scan_flow(&env, 24, &desc, Some(profile_value)) {
+                            eprintln!("\n掃描發生錯誤：{e}");
+                            menu::wait_enter("按 Enter 繼續...");
+                        }
+                    }
+                    '2' => {
+                        if let Err(e) = run_evtx_flow(&env) {
+                            eprintln!("\nEVTX 分析發生錯誤：{e}");
+                            menu::wait_enter("按 Enter 繼續...");
+                        }
+                    }
+                    'B' => break,
+                    _ => {}
+                }
+            },
             'Q' => {
                 println!("\n離開 Cairn 鑑識工具。");
                 break;

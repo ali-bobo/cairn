@@ -1,7 +1,7 @@
 Cairn
 Copyright 2026 Cairn project (ali-bobo)
 
-This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+This product is licensed under the MIT License (see LICENSE).
 
 Cairn bundles a small subset of Sigma detection rules from the SigmaHQ project
 (https://github.com/SigmaHQ/sigma), pinned by commit and stored XOR-encoded under

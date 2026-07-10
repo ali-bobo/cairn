@@ -50,7 +50,7 @@ fn embed_windows_version_resource(build_sha: &str) {
             "Cairn — authorized Windows live-forensics triage (DFIR)",
         )
         .set("CompanyName", "Cairn project")
-        .set("LegalCopyright", "Apache-2.0 licensed; open source")
+        .set("LegalCopyright", "MIT licensed; open source")
         .set("OriginalFilename", "cairn.exe")
         .set("InternalName", "cairn")
         .set("ProductVersion", &format!("{version} ({build_sha})"))

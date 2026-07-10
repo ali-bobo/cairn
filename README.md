@@ -106,5 +106,5 @@ use `--rules-plain`. The bundled set is small (3 example rules); expand it by ed
 
 ## License
 
-Code: Apache-2.0. Bundled Sigma rules: Detection Rule License (DRL) 1.1 —
+Code: MIT. Bundled Sigma rules: Detection Rule License (DRL) 1.1 —
 rule authors are credited in every detection output row as the license requires.

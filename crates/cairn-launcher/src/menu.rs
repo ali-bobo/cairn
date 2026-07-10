@@ -125,6 +125,75 @@ pub fn wait_enter(msg: &str) {
     let _ = read_choice();
 }
 
+/// 清理使用者貼上的路徑輸入：去前後空白、去頭尾成對的雙引號（使用者從檔案總管
+/// 複製路徑常帶引號）。空輸入（或去除後為空）回傳 None。純函式，可測試。
+pub fn clean_path_input(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let unquoted = trimmed
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .trim();
+    if unquoted.is_empty() {
+        None
+    } else {
+        Some(unquoted.to_string())
+    }
+}
+
+/// 提示使用者輸入路徑，回傳清理過的字串；空輸入回傳 None。
+pub fn read_path_input(prompt: &str) -> Option<String> {
+    print!("{prompt}");
+    let _ = io::stdout().flush();
+    let stdin = io::stdin();
+    let mut line = String::new();
+    let _ = stdin.lock().read_line(&mut line);
+    clean_path_input(&line)
+}
+
+/// 數字選項 → cairn --profile 的字串值。對應 `cairn_core::Profile` 三個變體
+/// （Minimal/Standard/Verbose，見 crates/cairn-core/src/config.rs:17-21）。
+/// 未知選項一律回退 "standard"（與 cairn-cli RunArgs::profile 的預設值一致，
+/// 不是自造的行為）。
+pub fn profile_choice_to_value(choice: char) -> &'static str {
+    match choice {
+        '1' => "minimal",
+        '3' => "verbose",
+        _ => "standard",
+    }
+}
+
+/// 印工程師模式子選單，回傳使用者選擇的字元。
+pub fn print_engineer_menu() {
+    println!("\n╔══════════════════════════════════════════╗");
+    println!("║  工程師模式                              ║");
+    println!("╠══════════════════════════════════════════╣");
+    println!("║  [1] 選擇 Profile 掃描                   ║");
+    println!("║  [2] 離線 EVTX 分析                      ║");
+    println!("║  [B] 返回主選單                          ║");
+    println!("╚══════════════════════════════════════════╝");
+    print!("請選擇：");
+    let _ = io::stdout().flush();
+}
+
+/// 印 profile 選單，回傳 (cairn --profile 值, 描述字串)。
+pub fn print_profile_menu() -> (&'static str, &'static str) {
+    println!("\n選擇掃描 Profile：");
+    println!("  [1] Minimal（最小模組集，速度優先）");
+    println!("  [2] Standard（標準模組集，預設）");
+    println!("  [3] Verbose（完整模組集，含耗時的 raw-NTFS 收集）");
+    print!("請選擇（預設 2）：");
+    let _ = io::stdout().flush();
+    let choice = read_choice();
+    let value = profile_choice_to_value(choice);
+    let desc = match value {
+        "minimal" => "Minimal",
+        "verbose" => "Verbose",
+        _ => "Standard",
+    };
+    (value, desc)
+}
+
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -140,5 +209,44 @@ fn truncate_rules_ver(ver: &str) -> String {
         format!("{short_pin}+{short_agg}")
     } else {
         truncate(ver, 20)
+    }
+}
+
+#[cfg(test)]
+mod engineer_menu_tests {
+    use super::clean_path_input;
+    use super::profile_choice_to_value;
+
+    #[test]
+    fn maps_known_choices() {
+        assert_eq!(profile_choice_to_value('1'), "minimal");
+        assert_eq!(profile_choice_to_value('2'), "standard");
+        assert_eq!(profile_choice_to_value('3'), "verbose");
+    }
+
+    #[test]
+    fn unknown_choice_defaults_to_standard() {
+        assert_eq!(profile_choice_to_value('9'), "standard");
+        assert_eq!(profile_choice_to_value('\0'), "standard");
+    }
+
+    #[test]
+    fn strips_surrounding_quotes_and_whitespace() {
+        assert_eq!(
+            clean_path_input("  \"C:\\logs\\Security.evtx\"  "),
+            Some("C:\\logs\\Security.evtx".to_string())
+        );
+    }
+
+    #[test]
+    fn plain_path_unchanged() {
+        assert_eq!(clean_path_input("C:\\logs"), Some("C:\\logs".to_string()));
+    }
+
+    #[test]
+    fn empty_input_is_none() {
+        assert_eq!(clean_path_input(""), None);
+        assert_eq!(clean_path_input("   "), None);
+        assert_eq!(clean_path_input("\"\""), None);
     }
 }
