@@ -46,4 +46,6 @@
 | 2026-07-04 | byovd-driver-detection | 已合併 | amcache_driver SHA1 比對已知漏洞驅動清單 | 60691fd |
 | 2026-07-04 | temporal-window-correlator（僅有 spec，無 plan） | spec 待審 | 誠實時間窗證據關聯（非因果鏈）；最新項目，剛完成 brainstorm，尚未進入 subagent-driven 執行 | — |
 | 2026-07-08 | html-report-filtering | 已合併 | 報告篩選（嚴重度/文物/關鍵字）+ 同源 binary 聚合面板 + state_active 補接線 + netconn 改名 | 74aefba |
-| 2026-07-09 | usability-governance（段 8） | spec 已定稿待實作 | launcher 工程師模式補實 + 打包健全化 + 手冊更新含概念章 + Apache→MIT + 混合健全性審計 | — |
+| 2026-07-09 | usability-governance（段 8） | 已合併 | launcher 工程師模式補實 + 打包健全化 + 手冊更新含概念章 + Apache→MIT + 混合健全性審計（含 build.rs PE 授權修正 F-11） | 30ecb8f |
+| 2026-07-10 | resilience-audit（段 8 附錄） | 已合併（審計報告） | 12 findings；F-1（live proc 不採集 cmdline/integrity→parentchild 訊號靜默）列為段 9 主題；F-8 進度回饋缺失 | 30ecb8f |
+| 2026-07-10 | proc-cmdline-integrity（段 9） | 規劃中 | F-1+F-8：live proc collector 補採集 cmdline（PEB/NtQueryInformationProcess）+ integrity（OpenProcessToken）+ 掃描進度回饋；動 unsafe WinAPI（cairn-collectors-win） | — |
