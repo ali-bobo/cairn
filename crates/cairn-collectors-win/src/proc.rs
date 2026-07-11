@@ -39,8 +39,12 @@ mod win {
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+        OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
@@ -104,6 +108,93 @@ mod win {
         None
     }
 
+    /// RAII guard for a token HANDLE.
+    /// INVARIANT: holds a valid token handle from OpenProcessToken; closed once on drop.
+    struct TokenHandle(HANDLE);
+    impl Drop for TokenHandle {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is the valid token handle; closed exactly once.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Best-effort token integrity RID for a pid. Returns None on any failure
+    /// (privilege / pid 0 / exited process) — never panics. Read-only: TOKEN_QUERY
+    /// cannot modify the target.
+    fn read_integrity(pid: u32) -> Option<u32> {
+        // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
+        // QUERY_LIMITED_INFORMATION is sufficient to open a token for TOKEN_QUERY.
+        let proc_handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let proc_guard = ProcHandle(proc_handle);
+
+        let mut token = HANDLE::default();
+        // SAFETY: proc_guard.0 valid; token is an out-param written only on success.
+        unsafe { OpenProcessToken(proc_guard.0, TOKEN_QUERY, &mut token) }.ok()?;
+        let token_guard = TokenHandle(token);
+
+        // Two-stage size probe: first call with a null buffer to learn the required
+        // size, which GetTokenInformation always reports via the out-param even
+        // though the probe call itself returns an error.
+        let mut len: u32 = 0;
+        // SAFETY: null buffer + 0 size is the documented probe form; return value
+        // intentionally ignored (probe always "fails" with the required size in `len`).
+        unsafe {
+            let _ = GetTokenInformation(token_guard.0, TokenIntegrityLevel, None, 0, &mut len);
+        }
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: buf sized to the probed `len`; token_guard.0 valid; out len re-passed.
+        unsafe {
+            GetTokenInformation(
+                token_guard.0,
+                TokenIntegrityLevel,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                len,
+                &mut len,
+            )
+        }
+        .ok()?;
+
+        // Defensive: TOKEN_MANDATORY_LABEL must fit in the returned buffer before we
+        // read it out. Normal Windows semantics guarantee len >= size_of::<TOKEN_MANDATORY_LABEL>()
+        // (the SID data follows the struct in the same allocation), but this is the one
+        // unsafe-code crate — never trust an OS buffer size to imply a specific layout.
+        if (len as usize) < std::mem::size_of::<TOKEN_MANDATORY_LABEL>() {
+            return None;
+        }
+
+        // SAFETY: buf is exactly `len` bytes as filled by the API above, and the check
+        // just above guarantees len >= size_of::<TOKEN_MANDATORY_LABEL>(); read via
+        // read_unaligned because a Vec<u8> only guarantees 1-byte alignment while
+        // TOKEN_MANDATORY_LABEL requires pointer alignment.
+        let label: TOKEN_MANDATORY_LABEL =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL) };
+
+        // SAFETY: label.Label.Sid is a valid PSID pointing into `buf`, which is still
+        // in scope for the remainder of this unsafe block; GetSidSubAuthorityCount/
+        // GetSidSubAuthority are read-only queries against that SID.
+        unsafe {
+            let count_ptr = GetSidSubAuthorityCount(label.Label.Sid);
+            if count_ptr.is_null() {
+                return None;
+            }
+            let count = *count_ptr;
+            if count == 0 {
+                return None;
+            }
+            let rid_ptr = GetSidSubAuthority(label.Label.Sid, (count - 1) as u32);
+            if rid_ptr.is_null() {
+                return None;
+            }
+            Some(*rid_ptr)
+        }
+    }
+
     pub fn enumerate() -> Result<Vec<RawProc>> {
         // SAFETY: TH32CS_SNAPPROCESS with pid 0 snapshots all processes; returns an owned
         // handle wrapped immediately in the guard.
@@ -140,7 +231,7 @@ mod win {
                 ppid: entry.th32ParentProcessID,
                 image,
                 cmdline: None,
-                integrity_raw: None,
+                integrity_raw: read_integrity(entry.th32ProcessID),
                 signed: None,
                 user: None,
                 start_time: None,
@@ -183,6 +274,19 @@ mod tests {
             mine.image.contains(":\\"),
             "expected absolute path, got {:?}",
             mine.image
+        );
+    }
+
+    /// Our own process's token integrity level should resolve to a known non-empty
+    /// RID (typically "medium" for a non-elevated session, "high" if elevated).
+    #[test]
+    fn current_process_integrity_resolves() {
+        let me = std::process::id();
+        let procs = enumerate().expect("enumerate");
+        let mine = procs.iter().find(|p| p.pid == me).expect("self in list");
+        assert!(
+            mine.integrity_raw.is_some(),
+            "expected an integrity RID for our own process"
         );
     }
 }
