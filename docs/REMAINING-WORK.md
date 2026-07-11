@@ -37,6 +37,14 @@
   程序的正常 graceful degrade）。Task 3/4 執行中一度發生平行 subagent 對同一 branch
   做 git 操作互相干擾，經使用者授權後用 `git reset --soft` 重建成兩個乾淨 commit 排除；
   教訓見文末「流程缺陷教訓」。
+- **段 10（Analyzer 依賴宣告基礎設施）✅ 完成並已 merge**（2026-07-11，PR #33，
+  main `56341b0`）：`Analyzer` trait 新增 `depends_on()`（宣告執行順序依賴）+
+  `analyze()` 簽名加 `prior_findings: &[Finding]`（讀取已跑完的 analyzer 的
+  Finding）；`orchestrator` 新增穩定拓撲排序（Kahn's algorithm，注入順序
+  tie-break，循環依賴 panic）。純基礎設施，七個既有 analyzer（parentchild/
+  persist/netconn/account/timestomp/byovd/sigma）只做簽名遷移，零行為變化。
+  為段 11（netconn 佐證 persist，解決 443 埠偽裝 C2 完全漏偵測）鋪路，本段
+  本身不含任何具體偵測邏輯。
 
 ### 流程缺陷教訓（2026-07-08 段 0 執行時發現，全段適用）
 - **main 曾紅著沒人管**：gate-redesign/ir-panels/byovd 三次合併都是本機 `git merge`
