@@ -27,8 +27,8 @@
   實質解除）——重啟時範圍可縮，見段 4 與 spec 檔頭附註。
 - 舊版待辦 A（Finding.evidence）與待辦 C（correlation 時間標注）已在 gate-redesign 一併
   完成，**關閉**。
-- **段 9（live proc 資料補齊 + 進度回饋 + manifest 相容 + 關聯佐證修正）✅ 完成待 merge**
-  （2026-07-11，`feature/segment9-proc-data-progress`）：live proc collector 補採集
+- **段 9（live proc 資料補齊 + 進度回饋 + manifest 相容 + 關聯佐證修正）✅ 完成並已 merge**
+  （2026-07-11，PR #32，main `9c9ec98`）：live proc collector 補採集
   cmdline（PEB 讀取）/integrity（token）/start_time（GetProcessTimes），解決段 8 F-1
   （parentchild 半數訊號 live 掃描永不觸發的根因）；orchestrator per-collector 進度回饋
   解決 F-8；`manifest.rs::RunInfo` 補 `#[serde(default)]`；`persist.rs` 跨文物 join key
