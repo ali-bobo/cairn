@@ -1,6 +1,7 @@
 //! heur_persist (spec §4.2): dispositive-signal gate over persistence records. A record
 //! that clears the gate (>=1 rare/dispositive signal) becomes a Finding; everything else
 //! is inventory surfaced via `observe()` as an Observation (spec §6).
+use crate::score::{join_key, JoinKey};
 use crate::trust::{
     is_masquerade, is_system_or_program_files, is_user_writable_path, winlogon_value_is_default,
 };
@@ -14,6 +15,11 @@ use std::collections::HashMap;
 
 /// Days within which a LastWrite counts as "recent" (a freshly-planted persistence entry).
 const RECENT_DAYS: i64 = 7;
+
+/// Marker appended to every persist Finding's reason, letting other analyzers
+/// (netconn, segment 11) identify persist-originated findings in prior_findings
+/// without a dedicated source-analyzer field on Finding.
+pub const PERSIST_SOURCE_MARKER: &str = "source: heur_persist";
 
 /// One dispositive-signal hit (spec §4.2). `label` feeds the Finding title;
 /// `reason` feeds Finding.reason (golden rule 6).
@@ -203,54 +209,6 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     }
 
     hits
-}
-
-/// 跨文物比對鍵：有完整路徑（含目錄分隔符）就用正規化後的完整路徑比對；
-/// 只有檔名（來源本身缺路徑資訊，如多數 prefetch 條目、srum 的 "id:<n>" 回退）
-/// 就降級成純檔名比對。降級佐證的信心度低於完整路徑相符，呼叫端在組
-/// finding reason 時必須標註「降級佐證」（見 gate_details 呼叫處）。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum JoinKey {
-    /// 正規化（trim + 去引號 + 小寫）後的完整路徑，含目錄。
-    Path(String),
-    /// 僅檔名（去 `.exe` 尾綴），來源缺路徑資訊。
-    Name(String),
-}
-
-impl JoinKey {
-    /// 兩個 JoinKey 是否應視為同一佐證目標：Path 對 Path 要求完全相同；
-    /// 任一方是 Name（降級）就退回比對雙方的 basename。
-    fn degraded_key(&self) -> String {
-        match self {
-            JoinKey::Path(p) => basename_from_normalized(p),
-            JoinKey::Name(n) => n.clone(),
-        }
-    }
-}
-
-/// 從一個原始路徑/檔名字串建立 JoinKey：trim + 去引號 + 小寫，再判斷是否含
-/// 目錄分隔符（`\` 或 `/`）。不含分隔符（如純檔名、或 srum 的 "id:42" 回退）
-/// 一律視為 Name（降級）鍵。
-fn join_key(raw: &str) -> JoinKey {
-    let normalized = raw.trim().trim_matches('"').to_ascii_lowercase();
-    if normalized.contains('\\') || normalized.contains('/') {
-        JoinKey::Path(normalized)
-    } else {
-        JoinKey::Name(strip_exe_suffix(&normalized))
-    }
-}
-
-/// 從一個已正規化（小寫、trim 過）的完整路徑取出檔名（去 `.exe` 尾綴）。
-fn basename_from_normalized(path: &str) -> String {
-    let base = path.rsplit(['\\', '/']).next().unwrap_or(path);
-    strip_exe_suffix(base)
-}
-
-/// 去掉 `.exe` 尾綴（若有）。
-fn strip_exe_suffix(s: &str) -> String {
-    s.strip_suffix(".exe")
-        .map(String::from)
-        .unwrap_or_else(|| s.to_string())
 }
 
 /// Index execution + process records for corroboration lookups. 用兩層索引：
@@ -527,6 +485,9 @@ impl Analyzer for PersistHeuristic {
                 format!("{}: {short}", top.label),
                 FindingSource::Heuristic,
             );
+            // Cross-analyzer marker (segment 11): lets netconn identify persist-originated
+            // findings in prior_findings without a dedicated source-analyzer field.
+            reasons.push(PERSIST_SOURCE_MARKER.to_string());
             f.reason = Some(reasons.join("; "));
             f.mitre = {
                 let mut m: Vec<String> = hits.iter().map(|h| h.mitre.to_string()).collect();
@@ -668,6 +629,30 @@ mod tests {
         assert_eq!(f.artifact, "persistence");
         assert!(f.entity.registry.is_some(), "ifeo is registry-backed");
         assert!(f.mitre.contains(&"T1546.012".to_string()));
+    }
+
+    /// Every persist Finding's reason carries a "source: heur_persist" marker so
+    /// other analyzers (netconn, segment 11) can identify persist-originated
+    /// findings in prior_findings without a dedicated source-analyzer field on
+    /// Finding.
+    #[test]
+    fn finding_reason_carries_source_marker_for_cross_analyzer_lookup() {
+        let now = Utc::now();
+        let bad = Record::Persistence(rec(
+            "ifeo",
+            Some(r"C:\Users\a\AppData\Local\Temp\dbg.exe"),
+            Some(now),
+        ));
+        let findings = PersistHeuristic.analyze(&[bad], &[]).expect("analyze");
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains(PERSIST_SOURCE_MARKER)),
+            "reason must carry the source marker: {:?}",
+            findings[0].reason
+        );
     }
 
     /// A startup (file) mechanism populates entity.file, not entity.registry.
@@ -1094,46 +1079,6 @@ mod tests {
         assert!(PersistHeuristic.analyze(&records, &[]).unwrap().is_empty());
         let obs = PersistHeuristic.observe(&records).unwrap();
         assert_eq!(obs[0].category, "winlogon_default");
-    }
-
-    #[test]
-    fn join_key_full_path_requires_path_match_not_just_basename() {
-        // Two ProcessRecords with the same basename but different directories must
-        // NOT be treated as the same join key when both sides have full paths.
-        let a = join_key(r"C:\Windows\System32\evil.exe");
-        let b = join_key(r"C:\Users\x\AppData\Local\Temp\evil.exe");
-        assert_ne!(a, b, "same basename, different full paths must not collide");
-    }
-
-    #[test]
-    fn join_key_full_path_matches_identical_path_case_insensitive() {
-        let a = join_key(r"C:\Windows\System32\evil.exe");
-        let b = join_key(r"c:\windows\system32\EVIL.EXE");
-        assert_eq!(a, b, "identical path differing only by case must match");
-    }
-
-    #[test]
-    fn join_key_name_only_source_degrades_to_basename_match() {
-        // prefetch-style source: bare filename, no directory component.
-        let prefetch_side = join_key("NOTEPAD.EXE");
-        let live_side = join_key(r"C:\Windows\System32\notepad.exe");
-        // Degraded match: both reduce to the same basename-level key.
-        assert_eq!(
-            prefetch_side.degraded_key(),
-            live_side.degraded_key(),
-            "basename-only source must still corroborate via degraded match"
-        );
-    }
-
-    #[test]
-    fn join_key_srum_id_fallback_is_name_only() {
-        // srum's resolve_app_name falls back to "id:<n>" when unmapped — must be
-        // treated as a Name key (no directory component), not misparsed as a path.
-        let k = join_key("id:42");
-        assert!(
-            matches!(k, JoinKey::Name(_)),
-            "id: fallback must be a Name key"
-        );
     }
 
     #[test]

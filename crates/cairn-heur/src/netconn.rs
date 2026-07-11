@@ -1,6 +1,8 @@
 //! heur_netconn (FR11, SRS §10): bare public-IP remote, rare remote port, owning-proc
 //! in temp, unsigned owner, suspicious high-port listener. Pure scoring + Analyzer impl.
-use crate::score::{is_public_ipv4, is_rare_port, is_suspicious_path, severity_for, Score};
+use crate::score::{
+    is_public_ipv4, is_rare_port, is_suspicious_path, join_key, severity_for, Score,
+};
 use cairn_core::finding::{EntityNetConn, EntityProcess};
 use cairn_core::record::{NetConnRecord, ProcessRecord, Record};
 use cairn_core::traits::Analyzer;
@@ -38,21 +40,39 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
     }
     if let Some(o) = owner {
         let mut owner_path_suspicious = false;
-        if is_suspicious_path(&o.image) {
+        // 獨立訊號（段 11）：owner 未簽章 + 可疑路徑的組合，不需要連線本身先觸發
+        // 任何訊號。與下方「可疑路徑」「unsigned 放大器」互斥——這三者若都命中會
+        // 對同一個底層事實（owner 身分可疑）重複計分，所以用 if/else 讓「未簽章+
+        // 可疑路徑」這個組合只走這條單一 50 分路徑，不與下方兩條疊加。真實世界
+        // C2 最常見的偽裝手法正是用常見埠（443/80）混在正常流量裡——不能因為埠
+        // 是常見埠就假設這是正常流量。MITRE T1036 (Masquerading)，比照
+        // parentchild.rs 對同性質訊號的標籤。
+        if is_suspicious_path(&o.image) && o.signed == Some(false) {
+            s.add(
+                50,
+                format!(
+                    "owning process is unsigned and runs from a suspicious path: {}",
+                    o.image
+                ),
+                &["T1036"],
+            );
+            owner_path_suspicious = true;
+        } else if is_suspicious_path(&o.image) {
             s.add(
                 30,
                 format!("owning process runs from a suspicious path: {}", o.image),
                 &[],
             );
             owner_path_suspicious = true;
-        }
-        // Unsigned owner is an amplifier: fire only if another signal (public-IP/rare-port
-        // earlier, or the owner suspicious-path above) already fired. catalog-signed OS
-        // binaries report unsigned via WTD_CHOICE_FILE, so an unconditional signal would
-        // flood every signed-by-catalog service. Never penalize None/Some(true).
-        let another_signal_fired = !s.reasons.is_empty();
-        if o.signed == Some(false) && another_signal_fired {
-            s.add(20, "owning process is unsigned", &[]);
+        } else if o.signed == Some(false) {
+            // Unsigned owner is an amplifier: fire only if another signal (public-IP/
+            // rare-port earlier) already fired. catalog-signed OS binaries report
+            // unsigned via WTD_CHOICE_FILE, so an unconditional signal would flood
+            // every signed-by-catalog service. Never penalize None/Some(true).
+            let another_signal_fired = !s.reasons.is_empty();
+            if another_signal_fired {
+                s.add(20, "owning process is unsigned", &[]);
+            }
         }
         // Unsigned high-port listener: keep listen + port>1024 + unsigned, but ALSO require
         // the suspicious-path signal so a catalog-signed service on an ephemeral port (every
@@ -80,7 +100,11 @@ impl Analyzer for NetConnHeuristic {
         "heur_netconn"
     }
 
-    fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
+    fn depends_on(&self) -> &[&str] {
+        &["heur_persist"]
+    }
+
+    fn analyze(&self, records: &[Record], prior_findings: &[Finding]) -> Result<Vec<Finding>> {
         // Index processes by pid for owner lookup. As in parentchild: on pid reuse the
         // last Process record wins; a live-state snapshot almost never reuses pids, so
         // this only affects owner attribution accuracy, never correctness/panics.
@@ -100,7 +124,40 @@ impl Analyzer for NetConnHeuristic {
                 continue; // never flag own network connections
             }
             let owner = c.pid.and_then(|pid| by_pid.get(&pid).copied());
-            let score = score_conn(c, owner);
+            let mut score = score_conn(c, owner);
+
+            // 跨 analyzer 佐證（段 11）：owner 若同時是 heur_persist 判定為落地
+            // 持久化的程式，這是強烈的獨立佐證（不同資料來源、不同 analyzer
+            // 各自判斷出同一個結論）。+30，與 persist.rs 內部同級跨文物佐證
+            // 權重一致（那邊是直接 escalate() 一個 severity 級，這裡是分數制，
+            // +30 大致對應 High(50..=69) 到 Critical(70..) 這個常見躍遷）。
+            if let Some(o) = owner {
+                let owner_key = join_key(&o.image);
+                let owner_degraded = owner_key.degraded_key();
+                let corroborated = prior_findings.iter().any(|f| {
+                    f.reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains(crate::persist::PERSIST_SOURCE_MARKER))
+                        && f.evidence
+                            .iter()
+                            .filter_map(|e| e.path.as_deref())
+                            .any(|p| {
+                                let ev_key = join_key(p);
+                                ev_key == owner_key || ev_key.degraded_key() == owner_degraded
+                            })
+                });
+                if corroborated {
+                    score.add(
+                        30,
+                        format!(
+                            "owning process {} also has a persistence finding (source: heur_persist)",
+                            o.image
+                        ),
+                        &["T1547"],
+                    );
+                }
+            }
+
             if score.weight < NETCONN_GATE_FLOOR {
                 continue;
             }
@@ -178,6 +235,11 @@ mod tests {
             pid,
         }
     }
+    #[test]
+    fn depends_on_returns_heur_persist() {
+        assert_eq!(NetConnHeuristic.depends_on(), &["heur_persist"]);
+    }
+
     fn owner(image: &str, signed: Option<bool>) -> ProcessRecord {
         ProcessRecord {
             pid: 1,
@@ -231,6 +293,61 @@ mod tests {
             s.weight < 15,
             "normal https should be below floor, got {}",
             s.weight
+        );
+    }
+
+    /// An unsigned process running from a suspicious path (Temp), connecting to a
+    /// public IP on port 443 (common port — the real-world C2 disguise this segment
+    /// fixes), must now score independently of port rarity: suspicious-path(30) +
+    /// unsigned(20) as a single combined signal = 50, clearing the gate floor.
+    #[test]
+    fn unsigned_suspicious_path_owner_scores_independently_of_port_443() {
+        let c = conn(
+            "tcp",
+            51000,
+            Some("104.18.0.1"),
+            Some(443), // common port — must NOT suppress this signal
+            Some("established"),
+            Some(1),
+        );
+        let o = owner(r"C:\Users\a\AppData\Local\Temp\evil.exe", Some(false));
+        let s = score_conn(&c, Some(&o));
+        assert!(
+            s.weight >= NETCONN_GATE_FLOOR,
+            "weight {} must clear the gate floor even on a common port",
+            s.weight
+        );
+        assert!(s
+            .reasons
+            .iter()
+            .any(|r| r.contains("unsigned") && r.contains("suspicious path")));
+
+        let findings = NetConnHeuristic
+            .analyze(&[Record::NetConn(c), Record::Process(o)], &[])
+            .expect("analyze");
+        assert!(
+            !findings.is_empty(),
+            "a 443-port C2 disguise with an unsigned+suspicious-path owner must be flagged"
+        );
+    }
+
+    /// A signed, normal-path owner connecting on port 443 must still stay quiet —
+    /// this proves the new independent signal doesn't fire on legitimate browsing.
+    #[test]
+    fn signed_normal_path_owner_on_443_still_scores_zero() {
+        let c = conn(
+            "tcp",
+            51000,
+            Some("104.18.0.1"),
+            Some(443),
+            Some("established"),
+            Some(2),
+        );
+        let o = owner(r"C:\Program Files\browser\b.exe", Some(true));
+        let s = score_conn(&c, Some(&o));
+        assert_eq!(
+            s.weight, 0,
+            "signed, normal-path owner on a common port must score zero"
         );
     }
 
@@ -415,7 +532,12 @@ mod tests {
         let c = conn("tcp", 4444, None, None, Some("listen"), Some(1));
         let o = owner(r"C:\Users\a\AppData\Local\Temp\svc.exe", Some(false));
         let s = score_conn(&c, Some(&o));
-        // suspicious path 30 + unsigned 20 + listener 25 = 75
+        // owner is unsigned + suspicious path, so the mutually-exclusive owner-identity
+        // block (score_conn) takes the single combined path: unsigned+suspicious-path
+        // signal (50) — NOT suspicious-path(30) and unsigned(20) added separately, since
+        // those would double-count the same underlying fact. owner_path_suspicious is
+        // still set true by that branch, so the listener signal (25) still fires on top:
+        // 50 + 25 = 75.
         assert_eq!(s.weight, 75);
         assert!(s
             .reasons
@@ -652,6 +774,87 @@ mod tests {
         assert!(
             findings.is_empty(),
             "weight 45 must not clear the gate floor (50)"
+        );
+    }
+
+    /// A connection whose owner also appears in a prior_findings entry sourced from
+    /// heur_persist (same image path) gets a +30 corroboration bonus, which can push
+    /// a below-floor connection over the gate.
+    #[test]
+    fn netconn_corroborated_by_persist_finding_clears_gate() {
+        // Connection alone: public+rare (25+20=45) — below the 50 gate floor.
+        let c = conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        );
+        let o = owner(r"C:\Users\a\AppData\Local\Temp\evil.exe", None);
+        let proc_rec = Record::Process(o);
+
+        // A prior_findings entry from heur_persist, whose evidence includes the SAME
+        // image path as the netconn owner.
+        let mut persist_finding = Finding::new(
+            cairn_core::Severity::High,
+            "Persistence: evil.exe",
+            FindingSource::Heuristic,
+        );
+        persist_finding.reason = Some(format!(
+            "some persist reason; {}",
+            crate::persist::PERSIST_SOURCE_MARKER
+        ));
+        persist_finding.evidence = vec![cairn_core::finding::EvidenceItem {
+            artifact: "run_key".into(),
+            path: Some(r"C:\Users\a\AppData\Local\Temp\evil.exe".into()),
+            ts: None,
+            detail: "".into(),
+        }];
+
+        let findings = NetConnHeuristic
+            .analyze(&[Record::NetConn(c), proc_rec], &[persist_finding])
+            .expect("analyze");
+        assert_eq!(
+            findings.len(),
+            1,
+            "45 (connection-only) + 30 (corroboration) = 75 must clear the gate floor"
+        );
+        assert!(
+            findings[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("heur_persist")),
+            "reason must mention the corroborating source: {:?}",
+            findings[0].reason
+        );
+    }
+
+    /// Without a matching prior_findings entry, the connection's score is unaffected
+    /// (regression: corroboration logic must not fire spuriously). Uses a
+    /// non-suspicious-path owner (unlike the sibling test above) so the score stays
+    /// at connection-only signals (45): a suspicious-path owner (e.g. Temp) would
+    /// independently add 30 via score_conn's own owner-identity signal and clear the
+    /// gate on its own, which would defeat the purpose of this regression test.
+    #[test]
+    fn netconn_without_persist_corroboration_unaffected() {
+        let c = conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        );
+        let o = owner(r"C:\Windows\System32\svc.exe", None);
+        let proc_rec = Record::Process(o);
+
+        let findings = NetConnHeuristic
+            .analyze(&[Record::NetConn(c), proc_rec], &[])
+            .expect("analyze");
+        assert!(
+            findings.is_empty(),
+            "45 (connection-only, no corroboration) must stay below the gate floor"
         );
     }
 }
