@@ -34,14 +34,19 @@ pub fn enumerate() -> Result<Vec<RawProc>> {
 mod win {
     use super::RawProc;
     use cairn_core::{CairnError, Result};
+    use windows::Win32::Foundation::FILETIME;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    };
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
     };
     use windows::Win32::System::Threading::{
-        OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     /// RAII guard for a snapshot HANDLE.
@@ -104,6 +109,264 @@ mod win {
         None
     }
 
+    /// RAII guard for a token HANDLE.
+    /// INVARIANT: holds a valid token handle from OpenProcessToken; closed once on drop.
+    struct TokenHandle(HANDLE);
+    impl Drop for TokenHandle {
+        fn drop(&mut self) {
+            // SAFETY: self.0 is the valid token handle; closed exactly once.
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+
+    /// Best-effort token integrity RID for a pid. Returns None on any failure
+    /// (privilege / pid 0 / exited process) — never panics. Read-only: TOKEN_QUERY
+    /// cannot modify the target.
+    fn read_integrity(pid: u32) -> Option<u32> {
+        // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
+        // QUERY_LIMITED_INFORMATION is sufficient to open a token for TOKEN_QUERY.
+        let proc_handle =
+            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let proc_guard = ProcHandle(proc_handle);
+
+        let mut token = HANDLE::default();
+        // SAFETY: proc_guard.0 valid; token is an out-param written only on success.
+        unsafe { OpenProcessToken(proc_guard.0, TOKEN_QUERY, &mut token) }.ok()?;
+        let token_guard = TokenHandle(token);
+
+        // Two-stage size probe: first call with a null buffer to learn the required
+        // size, which GetTokenInformation always reports via the out-param even
+        // though the probe call itself returns an error.
+        let mut len: u32 = 0;
+        // SAFETY: null buffer + 0 size is the documented probe form; return value
+        // intentionally ignored (probe always "fails" with the required size in `len`).
+        unsafe {
+            let _ = GetTokenInformation(token_guard.0, TokenIntegrityLevel, None, 0, &mut len);
+        }
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: buf sized to the probed `len`; token_guard.0 valid; out len re-passed.
+        unsafe {
+            GetTokenInformation(
+                token_guard.0,
+                TokenIntegrityLevel,
+                Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
+                len,
+                &mut len,
+            )
+        }
+        .ok()?;
+
+        // Defensive: TOKEN_MANDATORY_LABEL must fit in the returned buffer before we
+        // read it out. Normal Windows semantics guarantee len >= size_of::<TOKEN_MANDATORY_LABEL>()
+        // (the SID data follows the struct in the same allocation), but this is the one
+        // unsafe-code crate — never trust an OS buffer size to imply a specific layout.
+        if (len as usize) < std::mem::size_of::<TOKEN_MANDATORY_LABEL>() {
+            return None;
+        }
+
+        // SAFETY: buf is exactly `len` bytes as filled by the API above, and the check
+        // just above guarantees len >= size_of::<TOKEN_MANDATORY_LABEL>(); read via
+        // read_unaligned because a Vec<u8> only guarantees 1-byte alignment while
+        // TOKEN_MANDATORY_LABEL requires pointer alignment.
+        let label: TOKEN_MANDATORY_LABEL =
+            unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const TOKEN_MANDATORY_LABEL) };
+
+        // SAFETY: label.Label.Sid is a valid PSID pointing into `buf`, which is still
+        // in scope for the remainder of this unsafe block; GetSidSubAuthorityCount/
+        // GetSidSubAuthority are read-only queries against that SID.
+        unsafe {
+            let count_ptr = GetSidSubAuthorityCount(label.Label.Sid);
+            if count_ptr.is_null() {
+                return None;
+            }
+            let count = *count_ptr;
+            if count == 0 {
+                return None;
+            }
+            let rid_ptr = GetSidSubAuthority(label.Label.Sid, (count - 1) as u32);
+            if rid_ptr.is_null() {
+                return None;
+            }
+            Some(*rid_ptr)
+        }
+    }
+
+    /// Best-effort process creation time via GetProcessTimes. None on any failure
+    /// (privilege / exited process) or on an all-zero FILETIME (no real timestamp).
+    /// Never panics. Read-only: QUERY_LIMITED_INFORMATION cannot modify the target.
+    fn read_start_time(pid: u32) -> Option<super::DateTime<super::Utc>> {
+        // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let guard = ProcHandle(handle);
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: guard.0 valid; all four out-params are valid mutable FILETIME refs
+        // owned by this stack frame for the duration of the call.
+        unsafe { GetProcessTimes(guard.0, &mut creation, &mut exit, &mut kernel, &mut user) }
+            .ok()?;
+
+        let ticks = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+        cairn_core::filetime_to_utc(ticks)
+    }
+
+    use windows::Wdk::System::Threading::{
+        NtQueryInformationProcess, ProcessBasicInformation, ProcessWow64Information,
+    };
+    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows::Win32::System::Threading::{PROCESS_BASIC_INFORMATION, PROCESS_VM_READ};
+
+    /// Upper bound on a UNICODE_STRING.Length we will trust before allocating a
+    /// read buffer — the value lives in the target's (potentially adversarial)
+    /// memory, so it must be capped before use (mirrors volume.rs::MAX_READ).
+    const MAX_CMDLINE_BYTES: usize = 32 * 1024;
+
+    /// True if `pid` is a WOW64 (32-bit-on-64-bit) process. On query failure,
+    /// conservatively returns `true` (abstain) rather than risk misreading a
+    /// 32-bit PEB layout as a 64-bit one.
+    fn is_wow64(handle: HANDLE) -> bool {
+        let mut wow64_peb: usize = 0;
+        // SAFETY: handle valid; wow64_peb is a valid out-param; ProcessWow64Information
+        // on a 64-bit build returns the WOW64 PEB address (non-zero) or 0 if native.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                handle,
+                ProcessWow64Information,
+                &mut wow64_peb as *mut usize as *mut core::ffi::c_void,
+                std::mem::size_of::<usize>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if status.is_err() {
+            return true; // abstain-safe default
+        }
+        wow64_peb != 0
+    }
+
+    /// Read an entire `T` from `pid`'s address space at `addr` via a single
+    /// ReadProcessMemory call. Returns None on any failure or short read — never
+    /// interprets a partial/uninitialized `T`.
+    fn read_remote_struct<T: Default>(handle: HANDLE, addr: *const core::ffi::c_void) -> Option<T> {
+        let mut out = T::default();
+        let mut bytes_read: usize = 0;
+        let size = std::mem::size_of::<T>();
+        // SAFETY: handle valid; `out` is a local T with `size` bytes reserved;
+        // bytes_read out-param checked below for a partial-read short-circuit.
+        unsafe {
+            ReadProcessMemory(
+                handle,
+                addr,
+                &mut out as *mut T as *mut core::ffi::c_void,
+                size,
+                Some(&mut bytes_read as *mut usize),
+            )
+        }
+        .ok()?;
+        if bytes_read != size {
+            return None;
+        }
+        Some(out)
+    }
+
+    /// Best-effort full command line for `pid`, via PEB -> RTL_USER_PROCESS_PARAMETERS
+    /// -> CommandLine (three chained ReadProcessMemory calls into the target's address
+    /// space). None on ANY failure at ANY step (target exited mid-read, WOW64 mismatch,
+    /// oversized/corrupt UNICODE_STRING.Length, partial read) — never guesses from a
+    /// partial result. Read-only: PROCESS_VM_READ cannot modify the target (rule 1).
+    fn read_cmdline(pid: u32) -> Option<String> {
+        // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
+        let handle = unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                false,
+                pid,
+            )
+        }
+        .ok()?;
+        let guard = ProcHandle(handle);
+
+        if is_wow64(guard.0) {
+            return None; // native-width only; abstain on bitness mismatch (NFR12)
+        }
+
+        let pbi: PROCESS_BASIC_INFORMATION = {
+            let mut pbi = PROCESS_BASIC_INFORMATION::default();
+            // SAFETY: guard.0 valid; pbi is a valid out-param sized correctly.
+            let status = unsafe {
+                NtQueryInformationProcess(
+                    guard.0,
+                    ProcessBasicInformation,
+                    &mut pbi as *mut PROCESS_BASIC_INFORMATION as *mut core::ffi::c_void,
+                    std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if status.is_err() {
+                return None;
+            }
+            pbi
+        };
+        if pbi.PebBaseAddress.is_null() {
+            return None;
+        }
+
+        // Step 1: read the entire PEB struct (not a hand-computed offset) so
+        // ProcessParameters is accessed via the crate's own field layout.
+        let peb: windows::Win32::System::Threading::PEB =
+            read_remote_struct(guard.0, pbi.PebBaseAddress as *const core::ffi::c_void)?;
+        let params_ptr = peb.ProcessParameters;
+        if params_ptr.is_null() {
+            return None;
+        }
+
+        // Step 2: read the entire RTL_USER_PROCESS_PARAMETERS struct, then take
+        // its CommandLine field (a UNICODE_STRING: Length in bytes + a remote pointer).
+        let params: windows::Win32::System::Threading::RTL_USER_PROCESS_PARAMETERS =
+            read_remote_struct(guard.0, params_ptr as *const core::ffi::c_void)?;
+        let cmdline_us = params.CommandLine;
+
+        if cmdline_us.Length as usize > MAX_CMDLINE_BYTES {
+            return None; // adversarial/corrupt Length; abstain rather than OOM (NFR9)
+        }
+        if cmdline_us.Length == 0 || cmdline_us.Buffer.is_null() {
+            return None;
+        }
+
+        // Step 3: read the actual UTF-16LE command-line bytes.
+        let byte_len = cmdline_us.Length as usize;
+        let mut buf = vec![0u16; byte_len.div_ceil(2)];
+        let mut bytes_read: usize = 0;
+        // SAFETY: guard.0 valid; buf sized to hold byte_len bytes; bytes_read
+        // out-param checked below for a partial-read short-circuit.
+        unsafe {
+            ReadProcessMemory(
+                guard.0,
+                cmdline_us.Buffer.0 as *const core::ffi::c_void,
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                byte_len,
+                Some(&mut bytes_read as *mut usize),
+            )
+        }
+        .ok()?;
+        if bytes_read != byte_len {
+            return None; // partial read: treat as failure, never truncate-and-guess
+        }
+
+        let s = String::from_utf16_lossy(&buf);
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
+    }
+
     pub fn enumerate() -> Result<Vec<RawProc>> {
         // SAFETY: TH32CS_SNAPPROCESS with pid 0 snapshots all processes; returns an owned
         // handle wrapped immediately in the guard.
@@ -139,11 +402,11 @@ mod win {
                 pid: entry.th32ProcessID,
                 ppid: entry.th32ParentProcessID,
                 image,
-                cmdline: None,
-                integrity_raw: None,
+                cmdline: read_cmdline(entry.th32ProcessID),
+                integrity_raw: read_integrity(entry.th32ProcessID),
                 signed: None,
                 user: None,
-                start_time: None,
+                start_time: read_start_time(entry.th32ProcessID),
             });
             // SAFETY: snap.0 valid; entry reused per the Toolhelp iteration contract.
             if unsafe { Process32NextW(snap.0, &mut entry) }.is_err() {
@@ -183,6 +446,47 @@ mod tests {
             mine.image.contains(":\\"),
             "expected absolute path, got {:?}",
             mine.image
+        );
+    }
+
+    /// Our own process's token integrity level should resolve to a known non-empty
+    /// RID (typically "medium" for a non-elevated session, "high" if elevated).
+    #[test]
+    fn current_process_integrity_resolves() {
+        let me = std::process::id();
+        let procs = enumerate().expect("enumerate");
+        let mine = procs.iter().find(|p| p.pid == me).expect("self in list");
+        assert!(
+            mine.integrity_raw.is_some(),
+            "expected an integrity RID for our own process"
+        );
+    }
+
+    /// Our own process's start_time should resolve to a real, past timestamp.
+    #[test]
+    fn current_process_start_time_resolves() {
+        let me = std::process::id();
+        let procs = enumerate().expect("enumerate");
+        let mine = procs.iter().find(|p| p.pid == me).expect("self in list");
+        let st = mine
+            .start_time
+            .expect("expected a start_time for our own process");
+        assert!(
+            st <= chrono::Utc::now(),
+            "start_time must not be in the future"
+        );
+    }
+
+    /// Our own process's cmdline should be readable (we are not WOW64, not
+    /// protected, and PROCESS_VM_READ against our own process always succeeds).
+    #[test]
+    fn current_process_cmdline_resolves() {
+        let me = std::process::id();
+        let procs = enumerate().expect("enumerate");
+        let mine = procs.iter().find(|p| p.pid == me).expect("self in list");
+        assert!(
+            mine.cmdline.is_some(),
+            "expected a cmdline for our own process"
         );
     }
 }

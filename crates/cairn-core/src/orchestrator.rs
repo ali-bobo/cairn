@@ -38,14 +38,27 @@ pub fn run_live(
     let mut records = Vec::new();
     let mut sources = Vec::new();
     for c in collectors {
+        let started = std::time::Instant::now();
+        tracing::info!(collector = c.name(), "collector started");
         match c.collect(&ctx) {
             Ok(mut recs) => {
+                tracing::info!(
+                    collector = c.name(),
+                    records = recs.len(),
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "collector finished"
+                );
                 records.append(&mut recs);
                 sources.extend(c.sources());
             }
             Err(e) => {
                 // Graceful degrade: record the failure as a source entry, keep going.
-                tracing::warn!(collector = c.name(), error = %e, "collector failed; skipping");
+                tracing::warn!(
+                    collector = c.name(),
+                    error = %e,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "collector failed; skipping"
+                );
                 sources.push(SourceEntry {
                     artifact: c.name().to_string(),
                     path: format!("live:{}", c.name()),

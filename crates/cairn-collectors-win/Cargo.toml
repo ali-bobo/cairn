@@ -27,4 +27,7 @@ features = [
   "Win32_System_RemoteDesktop", # WTS session enumeration (logon.rs, "who is using this host")
   "Win32_System_IO",    # provides DeviceIoControl (sector-size IOCTL), paired with Win32_System_Ioctl (IOCTL constants)
   "Win32_System_Ioctl",
+  "Win32_System_Kernel",
+  "Win32_System_Diagnostics_Debug",
+  "Wdk_System_Threading",
 ]
