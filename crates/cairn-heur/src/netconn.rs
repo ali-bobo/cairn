@@ -38,21 +38,39 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
     }
     if let Some(o) = owner {
         let mut owner_path_suspicious = false;
-        if is_suspicious_path(&o.image) {
+        // 獨立訊號（段 11）：owner 未簽章 + 可疑路徑的組合，不需要連線本身先觸發
+        // 任何訊號。與下方「可疑路徑」「unsigned 放大器」互斥——這三者若都命中會
+        // 對同一個底層事實（owner 身分可疑）重複計分，所以用 if/else 讓「未簽章+
+        // 可疑路徑」這個組合只走這條單一 50 分路徑，不與下方兩條疊加。真實世界
+        // C2 最常見的偽裝手法正是用常見埠（443/80）混在正常流量裡——不能因為埠
+        // 是常見埠就假設這是正常流量。MITRE T1036 (Masquerading)，比照
+        // parentchild.rs 對同性質訊號的標籤。
+        if is_suspicious_path(&o.image) && o.signed == Some(false) {
+            s.add(
+                50,
+                format!(
+                    "owning process is unsigned and runs from a suspicious path: {}",
+                    o.image
+                ),
+                &["T1036"],
+            );
+            owner_path_suspicious = true;
+        } else if is_suspicious_path(&o.image) {
             s.add(
                 30,
                 format!("owning process runs from a suspicious path: {}", o.image),
                 &[],
             );
             owner_path_suspicious = true;
-        }
-        // Unsigned owner is an amplifier: fire only if another signal (public-IP/rare-port
-        // earlier, or the owner suspicious-path above) already fired. catalog-signed OS
-        // binaries report unsigned via WTD_CHOICE_FILE, so an unconditional signal would
-        // flood every signed-by-catalog service. Never penalize None/Some(true).
-        let another_signal_fired = !s.reasons.is_empty();
-        if o.signed == Some(false) && another_signal_fired {
-            s.add(20, "owning process is unsigned", &[]);
+        } else if o.signed == Some(false) {
+            // Unsigned owner is an amplifier: fire only if another signal (public-IP/
+            // rare-port earlier) already fired. catalog-signed OS binaries report
+            // unsigned via WTD_CHOICE_FILE, so an unconditional signal would flood
+            // every signed-by-catalog service. Never penalize None/Some(true).
+            let another_signal_fired = !s.reasons.is_empty();
+            if another_signal_fired {
+                s.add(20, "owning process is unsigned", &[]);
+            }
         }
         // Unsigned high-port listener: keep listen + port>1024 + unsigned, but ALSO require
         // the suspicious-path signal so a catalog-signed service on an ephemeral port (every
@@ -231,6 +249,61 @@ mod tests {
             s.weight < 15,
             "normal https should be below floor, got {}",
             s.weight
+        );
+    }
+
+    /// An unsigned process running from a suspicious path (Temp), connecting to a
+    /// public IP on port 443 (common port — the real-world C2 disguise this segment
+    /// fixes), must now score independently of port rarity: suspicious-path(30) +
+    /// unsigned(20) as a single combined signal = 50, clearing the gate floor.
+    #[test]
+    fn unsigned_suspicious_path_owner_scores_independently_of_port_443() {
+        let c = conn(
+            "tcp",
+            51000,
+            Some("104.18.0.1"),
+            Some(443), // common port — must NOT suppress this signal
+            Some("established"),
+            Some(1),
+        );
+        let o = owner(r"C:\Users\a\AppData\Local\Temp\evil.exe", Some(false));
+        let s = score_conn(&c, Some(&o));
+        assert!(
+            s.weight >= NETCONN_GATE_FLOOR,
+            "weight {} must clear the gate floor even on a common port",
+            s.weight
+        );
+        assert!(s
+            .reasons
+            .iter()
+            .any(|r| r.contains("unsigned") && r.contains("suspicious path")));
+
+        let findings = NetConnHeuristic
+            .analyze(&[Record::NetConn(c), Record::Process(o)], &[])
+            .expect("analyze");
+        assert!(
+            !findings.is_empty(),
+            "a 443-port C2 disguise with an unsigned+suspicious-path owner must be flagged"
+        );
+    }
+
+    /// A signed, normal-path owner connecting on port 443 must still stay quiet —
+    /// this proves the new independent signal doesn't fire on legitimate browsing.
+    #[test]
+    fn signed_normal_path_owner_on_443_still_scores_zero() {
+        let c = conn(
+            "tcp",
+            51000,
+            Some("104.18.0.1"),
+            Some(443),
+            Some("established"),
+            Some(2),
+        );
+        let o = owner(r"C:\Program Files\browser\b.exe", Some(true));
+        let s = score_conn(&c, Some(&o));
+        assert_eq!(
+            s.weight, 0,
+            "signed, normal-path owner on a common port must score zero"
         );
     }
 
@@ -415,7 +488,12 @@ mod tests {
         let c = conn("tcp", 4444, None, None, Some("listen"), Some(1));
         let o = owner(r"C:\Users\a\AppData\Local\Temp\svc.exe", Some(false));
         let s = score_conn(&c, Some(&o));
-        // suspicious path 30 + unsigned 20 + listener 25 = 75
+        // owner is unsigned + suspicious path, so the mutually-exclusive owner-identity
+        // block (score_conn) takes the single combined path: unsigned+suspicious-path
+        // signal (50) — NOT suspicious-path(30) and unsigned(20) added separately, since
+        // those would double-count the same underlying fact. owner_path_suspicious is
+        // still set true by that branch, so the listener signal (25) still fires on top:
+        // 50 + 25 = 75.
         assert_eq!(s.weight, 75);
         assert!(s
             .reasons
