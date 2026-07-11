@@ -55,7 +55,7 @@ impl Analyzer for ByovdHeuristic {
         "heur_byovd"
     }
 
-    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+    fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
         let now = Utc::now();
         let mut findings = Vec::new();
         for r in records {
@@ -183,7 +183,7 @@ mod analyze_tests {
             r"C:\Windows\System32\drivers\rtcore64.sys",
             Some(KNOWN),
         )];
-        let findings = heur.analyze(&recs).unwrap();
+        let findings = heur.analyze(&recs, &[]).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
         assert_eq!(findings[0].artifact, "byovd");
@@ -202,14 +202,14 @@ mod analyze_tests {
             r"C:\x\clean.sys",
             Some("0000000000000000000000000000000000000000"),
         )];
-        assert!(heur.analyze(&recs).unwrap().is_empty());
+        assert!(heur.analyze(&recs, &[]).unwrap().is_empty());
     }
 
     #[test]
     fn none_sha1_is_skipped_not_matched() {
         let heur = heur_with(&[KNOWN]);
         let recs = vec![driver_exec("amcache_driver", r"C:\x\d.sys", None)];
-        assert!(heur.analyze(&recs).unwrap().is_empty());
+        assert!(heur.analyze(&recs, &[]).unwrap().is_empty());
     }
 
     #[test]
@@ -217,13 +217,13 @@ mod analyze_tests {
         // Same hash, but from a non-driver execution source -> not our concern.
         let heur = heur_with(&[KNOWN]);
         let recs = vec![driver_exec("prefetch", r"C:\x\app.exe", Some(KNOWN))];
-        assert!(heur.analyze(&recs).unwrap().is_empty());
+        assert!(heur.analyze(&recs, &[]).unwrap().is_empty());
     }
 
     #[test]
     fn empty_list_never_matches() {
         let heur = heur_with(&[]);
         let recs = vec![driver_exec("amcache_driver", r"C:\x\d.sys", Some(KNOWN))];
-        assert!(heur.analyze(&recs).unwrap().is_empty());
+        assert!(heur.analyze(&recs, &[]).unwrap().is_empty());
     }
 }
