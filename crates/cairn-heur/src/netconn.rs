@@ -1,6 +1,6 @@
 //! heur_netconn (FR11, SRS §10): bare public-IP remote, rare remote port, owning-proc
 //! in temp, unsigned owner, suspicious high-port listener. Pure scoring + Analyzer impl.
-use crate::score::{is_public_ipv4, is_rare_port, is_suspicious_path, severity_for, Score};
+use crate::score::{is_public_ipv4, is_rare_port, is_suspicious_path, join_key, severity_for, Score};
 use cairn_core::finding::{EntityNetConn, EntityProcess};
 use cairn_core::record::{NetConnRecord, ProcessRecord, Record};
 use cairn_core::traits::Analyzer;
@@ -98,7 +98,11 @@ impl Analyzer for NetConnHeuristic {
         "heur_netconn"
     }
 
-    fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
+    fn depends_on(&self) -> &[&str] {
+        &["heur_persist"]
+    }
+
+    fn analyze(&self, records: &[Record], prior_findings: &[Finding]) -> Result<Vec<Finding>> {
         // Index processes by pid for owner lookup. As in parentchild: on pid reuse the
         // last Process record wins; a live-state snapshot almost never reuses pids, so
         // this only affects owner attribution accuracy, never correctness/panics.
@@ -118,7 +122,37 @@ impl Analyzer for NetConnHeuristic {
                 continue; // never flag own network connections
             }
             let owner = c.pid.and_then(|pid| by_pid.get(&pid).copied());
-            let score = score_conn(c, owner);
+            let mut score = score_conn(c, owner);
+
+            // 跨 analyzer 佐證（段 11）：owner 若同時是 heur_persist 判定為落地
+            // 持久化的程式，這是強烈的獨立佐證（不同資料來源、不同 analyzer
+            // 各自判斷出同一個結論）。+30，與 persist.rs 內部同級跨文物佐證
+            // 權重一致（那邊是直接 escalate() 一個 severity 級，這裡是分數制，
+            // +30 大致對應 High(50..=69) 到 Critical(70..) 這個常見躍遷）。
+            if let Some(o) = owner {
+                let owner_key = join_key(&o.image);
+                let owner_degraded = owner_key.degraded_key();
+                let corroborated = prior_findings.iter().any(|f| {
+                    f.reason
+                        .as_deref()
+                        .is_some_and(|r| r.contains(crate::persist::PERSIST_SOURCE_MARKER))
+                        && f.evidence.iter().filter_map(|e| e.path.as_deref()).any(|p| {
+                            let ev_key = join_key(p);
+                            ev_key == owner_key || ev_key.degraded_key() == owner_degraded
+                        })
+                });
+                if corroborated {
+                    score.add(
+                        30,
+                        format!(
+                            "owning process {} also has a persistence finding (source: heur_persist)",
+                            o.image
+                        ),
+                        &["T1547"],
+                    );
+                }
+            }
+
             if score.weight < NETCONN_GATE_FLOOR {
                 continue;
             }
@@ -196,6 +230,11 @@ mod tests {
             pid,
         }
     }
+    #[test]
+    fn depends_on_returns_heur_persist() {
+        assert_eq!(NetConnHeuristic.depends_on(), &["heur_persist"]);
+    }
+
     fn owner(image: &str, signed: Option<bool>) -> ProcessRecord {
         ProcessRecord {
             pid: 1,
@@ -730,6 +769,87 @@ mod tests {
         assert!(
             findings.is_empty(),
             "weight 45 must not clear the gate floor (50)"
+        );
+    }
+
+    /// A connection whose owner also appears in a prior_findings entry sourced from
+    /// heur_persist (same image path) gets a +30 corroboration bonus, which can push
+    /// a below-floor connection over the gate.
+    #[test]
+    fn netconn_corroborated_by_persist_finding_clears_gate() {
+        // Connection alone: public+rare (25+20=45) — below the 50 gate floor.
+        let c = conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        );
+        let o = owner(r"C:\Users\a\AppData\Local\Temp\evil.exe", None);
+        let proc_rec = Record::Process(o);
+
+        // A prior_findings entry from heur_persist, whose evidence includes the SAME
+        // image path as the netconn owner.
+        let mut persist_finding = Finding::new(
+            cairn_core::Severity::High,
+            "Persistence: evil.exe",
+            FindingSource::Heuristic,
+        );
+        persist_finding.reason = Some(format!(
+            "some persist reason; {}",
+            crate::persist::PERSIST_SOURCE_MARKER
+        ));
+        persist_finding.evidence = vec![cairn_core::finding::EvidenceItem {
+            artifact: "run_key".into(),
+            path: Some(r"C:\Users\a\AppData\Local\Temp\evil.exe".into()),
+            ts: None,
+            detail: "".into(),
+        }];
+
+        let findings = NetConnHeuristic
+            .analyze(&[Record::NetConn(c), proc_rec], &[persist_finding])
+            .expect("analyze");
+        assert_eq!(
+            findings.len(),
+            1,
+            "45 (connection-only) + 30 (corroboration) = 75 must clear the gate floor"
+        );
+        assert!(
+            findings[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("heur_persist")),
+            "reason must mention the corroborating source: {:?}",
+            findings[0].reason
+        );
+    }
+
+    /// Without a matching prior_findings entry, the connection's score is unaffected
+    /// (regression: corroboration logic must not fire spuriously). Uses a
+    /// non-suspicious-path owner (unlike the sibling test above) so the score stays
+    /// at connection-only signals (45): a suspicious-path owner (e.g. Temp) would
+    /// independently add 30 via score_conn's own owner-identity signal and clear the
+    /// gate on its own, which would defeat the purpose of this regression test.
+    #[test]
+    fn netconn_without_persist_corroboration_unaffected() {
+        let c = conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        );
+        let o = owner(r"C:\Windows\System32\svc.exe", None);
+        let proc_rec = Record::Process(o);
+
+        let findings = NetConnHeuristic
+            .analyze(&[Record::NetConn(c), proc_rec], &[])
+            .expect("analyze");
+        assert!(
+            findings.is_empty(),
+            "45 (connection-only, no corroboration) must stay below the gate floor"
         );
     }
 }
