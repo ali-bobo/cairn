@@ -34,18 +34,19 @@ pub fn enumerate() -> Result<Vec<RawProc>> {
 mod win {
     use super::RawProc;
     use cairn_core::{CairnError, Result};
+    use windows::Win32::Foundation::FILETIME;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-        TH32CS_SNAPPROCESS,
-    };
     use windows::Win32::Security::{
         GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
         TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
     };
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
     use windows::Win32::System::Threading::{
-        OpenProcess, OpenProcessToken, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
-        PROCESS_QUERY_LIMITED_INFORMATION,
+        GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     /// RAII guard for a snapshot HANDLE.
@@ -195,6 +196,27 @@ mod win {
         }
     }
 
+    /// Best-effort process creation time via GetProcessTimes. None on any failure
+    /// (privilege / exited process) or on an all-zero FILETIME (no real timestamp).
+    /// Never panics. Read-only: QUERY_LIMITED_INFORMATION cannot modify the target.
+    fn read_start_time(pid: u32) -> Option<super::DateTime<super::Utc>> {
+        // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+        let guard = ProcHandle(handle);
+
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        // SAFETY: guard.0 valid; all four out-params are valid mutable FILETIME refs
+        // owned by this stack frame for the duration of the call.
+        unsafe { GetProcessTimes(guard.0, &mut creation, &mut exit, &mut kernel, &mut user) }
+            .ok()?;
+
+        let ticks = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
+        cairn_core::filetime_to_utc(ticks)
+    }
+
     pub fn enumerate() -> Result<Vec<RawProc>> {
         // SAFETY: TH32CS_SNAPPROCESS with pid 0 snapshots all processes; returns an owned
         // handle wrapped immediately in the guard.
@@ -234,7 +256,7 @@ mod win {
                 integrity_raw: read_integrity(entry.th32ProcessID),
                 signed: None,
                 user: None,
-                start_time: None,
+                start_time: read_start_time(entry.th32ProcessID),
             });
             // SAFETY: snap.0 valid; entry reused per the Toolhelp iteration contract.
             if unsafe { Process32NextW(snap.0, &mut entry) }.is_err() {
@@ -287,6 +309,21 @@ mod tests {
         assert!(
             mine.integrity_raw.is_some(),
             "expected an integrity RID for our own process"
+        );
+    }
+
+    /// Our own process's start_time should resolve to a real, past timestamp.
+    #[test]
+    fn current_process_start_time_resolves() {
+        let me = std::process::id();
+        let procs = enumerate().expect("enumerate");
+        let mine = procs.iter().find(|p| p.pid == me).expect("self in list");
+        let st = mine
+            .start_time
+            .expect("expected a start_time for our own process");
+        assert!(
+            st <= chrono::Utc::now(),
+            "start_time must not be in the future"
         );
     }
 }
