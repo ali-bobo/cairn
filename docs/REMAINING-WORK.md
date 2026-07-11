@@ -45,6 +45,20 @@
   persist/netconn/account/timestomp/byovd/sigma）只做簽名遷移，零行為變化。
   為段 11（netconn 佐證 persist，解決 443 埠偽裝 C2 完全漏偵測）鋪路，本段
   本身不含任何具體偵測邏輯。
+- **段 11（C2 偵測強化：netconn 獨立訊號 + 跨 analyzer 佐證）✅ 完成並已 merge**
+  （2026-07-11，PR #34，main `51497ec`）：`heur_netconn` 新增不依賴埠稀有度
+  的獨立訊號（owner 未簽章+可疑路徑，權重 50，MITRE T1036）——**修復 443/80
+  常見埠偽裝 C2 完全漏偵測的核心缺口**（真實世界最常見的 C2 偽裝手法）；
+  `NetConnHeuristic` 宣告 `depends_on(["heur_persist"])`，用段 10 的
+  `prior_findings` 讀取 persist 判定結果做跨 analyzer 佐證（owner 落地持久化
+  時 +30）；`JoinKey`/`join_key` 搬至共用 `score.rs`；`persist.rs` 新增
+  `PERSIST_SOURCE_MARKER` 常數供 netconn 識別來源（Finding 無 source-analyzer
+  欄位的技術妥協，已記錄）。**Task 3 code quality 審查抓到並修正一個真實
+  severity 計算缺陷**：新訊號的觸發條件是既有兩個放大器條件的子集，第一版
+  實作導致三者同時命中同一底層事實，最簡案例真實分數是 100（非設計的 50，
+  會誤判 Critical 而非 High）；改成 if/else if 互斥結構修復，經 controller
+  親自逐案手算五種輸入組合驗證。同時修正 MITRE 標籤誤用（T1071→T1036）。
+  真機驗證：乾淨系統下 0 個 netconn finding（無誤報，符合預期）。
 
 ### 流程缺陷教訓（2026-07-08 段 0 執行時發現，全段適用）
 - **main 曾紅著沒人管**：gate-redesign/ir-panels/byovd 三次合併都是本機 `git merge`
