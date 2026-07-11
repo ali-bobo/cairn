@@ -218,3 +218,31 @@ path = "windows/builtin/security/win_security_ad_replication_non_machine_account
 
 [[rules]]
 path = "windows/builtin/security/win_security_account_backdoor_dcsync_rights.yml"
+
+# ============================================================
+# PowerShell 4104 script block (malicious script content)
+# ============================================================
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_malicious_keywords.yml"
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_amsi_bypass_pattern_nov22.yml"
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_disable_psreadline_command_history.yml"
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_create_local_user.yml"
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_potential_invoke_mimikatz.yml"
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_clear_powershell_history.yml"
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_hktl_rubeus.yml"
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_download_com_cradles.yml"
