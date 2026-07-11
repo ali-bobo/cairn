@@ -44,11 +44,22 @@ pub trait Collector: Send + Sync {
 /// Heuristic analyzers MUST populate `Finding.reason` (explainability).
 pub trait Analyzer: Send + Sync {
     fn name(&self) -> &str;
-    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>>;
+    /// `prior_findings` is the accumulated Finding output of every analyzer that has
+    /// already run this cycle, in `depends_on()`-resolved order (not just the ones this
+    /// analyzer depends on — see `depends_on()` doc for why). Analyzers that don't read
+    /// this parameter simply ignore it.
+    fn analyze(&self, records: &[Record], prior_findings: &[Finding]) -> Result<Vec<Finding>>;
     /// Inventory items that did NOT clear the dispositive-signal gate (spec §6).
     /// Default empty: only analyzers that own an inventory (persist) override.
     fn observe(&self, _records: &[Record]) -> Result<Vec<Observation>> {
         Ok(vec![])
+    }
+    /// Names (matching other analyzers' `name()`) that must finish running before this
+    /// one starts. Default: no dependencies. A name with no matching analyzer in the
+    /// current run is silently ignored (not an error — allows declaring a dependency on
+    /// an analyzer that may not always be present).
+    fn depends_on(&self) -> &[&str] {
+        &[]
     }
 }
 
