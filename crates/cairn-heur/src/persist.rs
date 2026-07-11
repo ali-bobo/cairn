@@ -16,6 +16,11 @@ use std::collections::HashMap;
 /// Days within which a LastWrite counts as "recent" (a freshly-planted persistence entry).
 const RECENT_DAYS: i64 = 7;
 
+/// Marker appended to every persist Finding's reason, letting other analyzers
+/// (netconn, segment 11) identify persist-originated findings in prior_findings
+/// without a dedicated source-analyzer field on Finding.
+pub const PERSIST_SOURCE_MARKER: &str = "source: heur_persist";
+
 /// One dispositive-signal hit (spec §4.2). `label` feeds the Finding title;
 /// `reason` feeds Finding.reason (golden rule 6).
 pub(crate) struct GateHit {
@@ -480,6 +485,9 @@ impl Analyzer for PersistHeuristic {
                 format!("{}: {short}", top.label),
                 FindingSource::Heuristic,
             );
+            // Cross-analyzer marker (segment 11): lets netconn identify persist-originated
+            // findings in prior_findings without a dedicated source-analyzer field.
+            reasons.push(PERSIST_SOURCE_MARKER.to_string());
             f.reason = Some(reasons.join("; "));
             f.mitre = {
                 let mut m: Vec<String> = hits.iter().map(|h| h.mitre.to_string()).collect();
@@ -621,6 +629,30 @@ mod tests {
         assert_eq!(f.artifact, "persistence");
         assert!(f.entity.registry.is_some(), "ifeo is registry-backed");
         assert!(f.mitre.contains(&"T1546.012".to_string()));
+    }
+
+    /// Every persist Finding's reason carries a "source: heur_persist" marker so
+    /// other analyzers (netconn, segment 11) can identify persist-originated
+    /// findings in prior_findings without a dedicated source-analyzer field on
+    /// Finding.
+    #[test]
+    fn finding_reason_carries_source_marker_for_cross_analyzer_lookup() {
+        let now = Utc::now();
+        let bad = Record::Persistence(rec(
+            "ifeo",
+            Some(r"C:\Users\a\AppData\Local\Temp\dbg.exe"),
+            Some(now),
+        ));
+        let findings = PersistHeuristic.analyze(&[bad], &[]).expect("analyze");
+        assert_eq!(findings.len(), 1);
+        assert!(
+            findings[0]
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains(PERSIST_SOURCE_MARKER)),
+            "reason must carry the source marker: {:?}",
+            findings[0].reason
+        );
     }
 
     /// A startup (file) mechanism populates entity.file, not entity.registry.
