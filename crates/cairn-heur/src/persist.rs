@@ -1128,7 +1128,10 @@ mod tests {
         // srum's resolve_app_name falls back to "id:<n>" when unmapped — must be
         // treated as a Name key (no directory component), not misparsed as a path.
         let k = join_key("id:42");
-        assert!(matches!(k, JoinKey::Name(_)), "id: fallback must be a Name key");
+        assert!(
+            matches!(k, JoinKey::Name(_)),
+            "id: fallback must be a Name key"
+        );
     }
 
     #[test]
@@ -1165,20 +1168,34 @@ mod tests {
         let idx = build_cross_index(&records);
 
         let (hits, degraded) = idx.lookup_exec(&join_key(r"C:\Windows\System32\evil.exe"));
-        assert_eq!(hits.len(), 1, "must match only the exact path, not the temp twin");
+        assert_eq!(
+            hits.len(),
+            1,
+            "must match only the exact path, not the temp twin"
+        );
         assert_eq!(hits[0].path, sys32.path);
-        assert!(!degraded, "exact path match must not be flagged as degraded");
+        assert!(
+            !degraded,
+            "exact path match must not be flagged as degraded"
+        );
 
         let (hits, degraded) =
             idx.lookup_exec(&join_key(r"C:\Users\alice\AppData\Local\Temp\evil.exe"));
-        assert_eq!(hits.len(), 1, "must match only the exact path, not the system32 twin");
+        assert_eq!(
+            hits.len(),
+            1,
+            "must match only the exact path, not the system32 twin"
+        );
         assert_eq!(hits[0].path, temp.path);
         assert!(!degraded);
 
         // A path with no exact match at all must return empty, not fall back to
         // basename-guessing against either full-path record above.
         let (hits, degraded) = idx.lookup_exec(&join_key(r"D:\Other\evil.exe"));
-        assert!(hits.is_empty(), "unmatched full path must not degrade to basename guess");
+        assert!(
+            hits.is_empty(),
+            "unmatched full path must not degrade to basename guess"
+        );
         assert!(!degraded);
     }
 }
