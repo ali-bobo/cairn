@@ -389,7 +389,10 @@ mod tests {
         let out2 = run_live(&cfg, privs(), "WS01".into(), &collectors, &build());
         let titles1: Vec<&str> = out1.findings.iter().map(|f| f.title.as_str()).collect();
         let titles2: Vec<&str> = out2.findings.iter().map(|f| f.title.as_str()).collect();
-        assert_eq!(titles1, titles2, "same input must produce the same order every time");
+        assert_eq!(
+            titles1, titles2,
+            "same input must produce the same order every time"
+        );
     }
 
     /// A circular dependency (a depends on b, b depends on a) must panic at run_live,
@@ -415,7 +418,11 @@ mod tests {
         let analyzers: Vec<Box<dyn Analyzer>> =
             vec![FakeAnalyzer::with_deps("solo", &["nonexistent"])];
         let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
-        assert_eq!(out.findings.len(), 1, "run must proceed despite the dangling dependency");
+        assert_eq!(
+            out.findings.len(),
+            1,
+            "run must proceed despite the dangling dependency"
+        );
     }
 
     /// Analyzer findings land in RunOutcome.findings.
