@@ -161,7 +161,7 @@ impl Analyzer for ParentChildHeuristic {
         "heur_parentchild"
     }
 
-    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+    fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
         // Index processes by pid for parent lookup. Known limitation: if a snapshot
         // contains two processes with the same pid (OS pid reuse), the last one wins;
         // a live triage snapshot almost never reuses pids, so this only affects parent
@@ -425,7 +425,7 @@ mod tests {
             r"C:\Users\x\AppData\Local\cairn-target\release\cairn.exe",
             "",
         ));
-        let findings = ParentChildHeuristic.analyze(&[own]).expect("analyze");
+        let findings = ParentChildHeuristic.analyze(&[own], &[]).expect("analyze");
         assert!(findings.is_empty(), "own PID must never produce a finding");
     }
 
@@ -443,7 +443,9 @@ mod tests {
             r"C:\Users\x\AppData\Local\cairn-target\release\cairn.exe",
             "",
         ));
-        let findings = ParentChildHeuristic.analyze(&[other]).expect("analyze");
+        let findings = ParentChildHeuristic
+            .analyze(&[other], &[])
+            .expect("analyze");
         assert!(
             findings.is_empty(),
             "suspicious path alone must not produce a finding"
@@ -469,7 +471,7 @@ mod tests {
             "powershell.exe -enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA",
         ));
         let findings = ParentChildHeuristic
-            .analyze(&[parent, child])
+            .analyze(&[parent, child], &[])
             .expect("analyze");
         assert!(!findings.is_empty(), "should produce at least one finding");
         let details = &findings[0].details;
@@ -503,7 +505,7 @@ mod tests {
             r"C:\Users\a\AppData\Roaming\svchost.exe",
             "", // empty cmdline
         ));
-        let findings = ParentChildHeuristic.analyze(&[p]).expect("analyze");
+        let findings = ParentChildHeuristic.analyze(&[p], &[]).expect("analyze");
         assert!(
             !findings.is_empty(),
             "masquerade signal should produce a finding"
@@ -534,7 +536,7 @@ mod tests {
         benign.signed = Some(true);
         let recs = vec![rec(parent), rec(child), rec(benign)];
 
-        let findings = ParentChildHeuristic.analyze(&recs).expect("analyze");
+        let findings = ParentChildHeuristic.analyze(&recs, &[]).expect("analyze");
         assert_eq!(findings.len(), 1, "only the malicious child should fire");
         let f = &findings[0];
         assert!(matches!(f.source, cairn_core::FindingSource::Heuristic));
@@ -552,7 +554,7 @@ mod tests {
     #[test]
     fn masquerade_svchost_in_appdata_fires_high_alone() {
         let p = rec(proc(500, 0, r"C:\Users\a\AppData\Roaming\svchost.exe", ""));
-        let findings = ParentChildHeuristic.analyze(&[p]).expect("analyze");
+        let findings = ParentChildHeuristic.analyze(&[p], &[]).expect("analyze");
         assert_eq!(
             findings.len(),
             1,
@@ -568,7 +570,7 @@ mod tests {
     #[test]
     fn real_svchost_in_system32_does_not_fire() {
         let p = rec(proc(501, 0, r"C:\Windows\System32\svchost.exe", ""));
-        let findings = ParentChildHeuristic.analyze(&[p]).expect("analyze");
+        let findings = ParentChildHeuristic.analyze(&[p], &[]).expect("analyze");
         assert!(
             findings.is_empty(),
             "legitimate svchost.exe must not be flagged"

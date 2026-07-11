@@ -105,7 +105,7 @@ impl Analyzer for TimestompHeuristic {
         "heur_timestomp"
     }
 
-    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+    fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
         let mut out = Vec::new();
         for r in records {
             let Record::FileMeta(m) = r else { continue };
@@ -357,7 +357,7 @@ mod tests {
         ));
 
         let h = TimestompHeuristic::new(Duration::hours(24));
-        let findings = h.analyze(&[stomped, clean]).expect("analyze");
+        let findings = h.analyze(&[stomped, clean], &[]).expect("analyze");
 
         assert_eq!(findings.len(), 1, "only the stomped file fires");
         let f = &findings[0];
@@ -386,7 +386,7 @@ mod tests {
         let records = vec![stomped];
 
         let h = TimestompHeuristic::new(Duration::hours(24));
-        let f = &h.analyze(&records).unwrap()[0];
+        let f = &h.analyze(&records, &[]).unwrap()[0];
         assert_eq!(f.evidence[0].artifact, "mft");
         assert!(f.evidence[0].path.is_some());
     }
@@ -396,7 +396,7 @@ mod tests {
         use cairn_core::traits::Analyzer;
         // an empty stream yields zero findings (no crash).
         let h = TimestompHeuristic::new(Duration::hours(24));
-        assert!(h.analyze(&[]).unwrap().is_empty());
+        assert!(h.analyze(&[], &[]).unwrap().is_empty());
     }
 
     #[test]
@@ -413,6 +413,6 @@ mod tests {
             pid: None,
         });
         let h = TimestompHeuristic::new(Duration::hours(24));
-        assert!(h.analyze(&[nc]).unwrap().is_empty());
+        assert!(h.analyze(&[nc], &[]).unwrap().is_empty());
     }
 }

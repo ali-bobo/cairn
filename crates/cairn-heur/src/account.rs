@@ -92,7 +92,7 @@ impl Analyzer for AccountHeuristic {
         "heur_account"
     }
 
-    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+    fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
         let now = Utc::now();
         let mut findings = Vec::new();
 
@@ -239,7 +239,7 @@ mod tests {
             recent(),
             account_data("evil_user", "SYSTEM"),
         )];
-        let findings = AccountHeuristic.analyze(&records).unwrap();
+        let findings = AccountHeuristic.analyze(&records, &[]).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
         assert!(findings[0].mitre.contains(&"T1136.001".to_string()));
@@ -254,7 +254,7 @@ mod tests {
             old(),
             account_data("old_user", "admin"),
         )];
-        let findings = AccountHeuristic.analyze(&records).unwrap();
+        let findings = AccountHeuristic.analyze(&records, &[]).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::Medium);
     }
@@ -267,7 +267,7 @@ mod tests {
             recent(),
             account_data("victim", "attacker"),
         )];
-        let findings = AccountHeuristic.analyze(&records).unwrap();
+        let findings = AccountHeuristic.analyze(&records, &[]).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
         assert!(findings[0].mitre.contains(&"T1531".to_string()));
@@ -281,7 +281,7 @@ mod tests {
             recent(),
             group_data(r"DESKTOP\evil", "Administrators", "admin"),
         )];
-        let findings = AccountHeuristic.analyze(&records).unwrap();
+        let findings = AccountHeuristic.analyze(&records, &[]).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
         assert!(findings[0].mitre.contains(&"T1098.001".to_string()));
@@ -300,7 +300,7 @@ mod tests {
             recent(),
             group_data(r"DOMAIN\evil", "Domain Admins", "DA"),
         )];
-        let findings = AccountHeuristic.analyze(&records).unwrap();
+        let findings = AccountHeuristic.analyze(&records, &[]).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
         assert!(findings[0].mitre.contains(&"T1098.001".to_string()));
@@ -314,7 +314,7 @@ mod tests {
             recent(),
             account_data("user", "admin"),
         )];
-        assert!(AccountHeuristic.analyze(&records).unwrap().is_empty());
+        assert!(AccountHeuristic.analyze(&records, &[]).unwrap().is_empty());
     }
 
     #[test]
@@ -325,7 +325,7 @@ mod tests {
             recent(),
             account_data("user", "admin"),
         )];
-        assert!(AccountHeuristic.analyze(&records).unwrap().is_empty());
+        assert!(AccountHeuristic.analyze(&records, &[]).unwrap().is_empty());
     }
 
     #[test]
@@ -343,7 +343,7 @@ mod tests {
             user: None,
             start_time: None,
         })];
-        assert!(AccountHeuristic.analyze(&records).unwrap().is_empty());
+        assert!(AccountHeuristic.analyze(&records, &[]).unwrap().is_empty());
     }
 
     #[test]
@@ -354,7 +354,7 @@ mod tests {
             recent(),
             account_data("user", "admin"),
         )];
-        let findings = AccountHeuristic.analyze(&records).unwrap();
+        let findings = AccountHeuristic.analyze(&records, &[]).unwrap();
         let reason = findings[0].reason.as_deref().unwrap_or("");
         assert!(
             reason.contains("90") || reason.contains("近期"),
@@ -370,7 +370,7 @@ mod tests {
             recent(),
             account_data("u", "admin"),
         )];
-        let f = &AccountHeuristic.analyze(&records).unwrap()[0];
+        let f = &AccountHeuristic.analyze(&records, &[]).unwrap()[0];
         assert_eq!(f.evidence.len(), 1);
         assert_eq!(f.evidence[0].artifact, "evtx:Security");
         assert!(f.evidence[0].detail.contains("EID 4720"));
@@ -384,7 +384,7 @@ mod tests {
             recent(),
             account_data("user", "admin"),
         )];
-        let findings = AccountHeuristic.analyze(&records).unwrap();
+        let findings = AccountHeuristic.analyze(&records, &[]).unwrap();
         assert_eq!(findings[0].artifact, "account");
     }
 }

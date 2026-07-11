@@ -80,7 +80,7 @@ impl Analyzer for NetConnHeuristic {
         "heur_netconn"
     }
 
-    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+    fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
         // Index processes by pid for owner lookup. As in parentchild: on pid reuse the
         // last Process record wins; a live-state snapshot almost never reuses pids, so
         // this only affects owner attribution accuracy, never correctness/panics.
@@ -308,7 +308,7 @@ mod tests {
         assert!(!s.reasons.iter().any(|r| r.contains("public IP")));
 
         let findings = NetConnHeuristic
-            .analyze(&[Record::NetConn(c)])
+            .analyze(&[Record::NetConn(c)], &[])
             .expect("analyze");
         assert!(
             findings.is_empty(),
@@ -439,7 +439,7 @@ mod tests {
             Some("established"),
             Some(own_pid),
         ));
-        let findings = NetConnHeuristic.analyze(&[bad_conn]).expect("analyze");
+        let findings = NetConnHeuristic.analyze(&[bad_conn], &[]).expect("analyze");
         assert!(
             findings.is_empty(),
             "own PID connections must never produce findings"
@@ -469,7 +469,9 @@ mod tests {
             user: None,
             start_time: None,
         });
-        let findings = NetConnHeuristic.analyze(&[bad, proc_rec]).expect("analyze");
+        let findings = NetConnHeuristic
+            .analyze(&[bad, proc_rec], &[])
+            .expect("analyze");
         assert!(!findings.is_empty(), "must produce a finding");
         let f = &findings[0];
         assert!(
@@ -502,7 +504,7 @@ mod tests {
         o.pid = other_pid;
         let proc_rec = Record::Process(o);
         let findings = NetConnHeuristic
-            .analyze(&[bad_conn, proc_rec])
+            .analyze(&[bad_conn, proc_rec], &[])
             .expect("analyze");
         assert!(
             !findings.is_empty(),
@@ -536,7 +538,9 @@ mod tests {
             user: None,
             start_time: None,
         });
-        let findings = NetConnHeuristic.analyze(&[bad, proc_rec]).expect("analyze");
+        let findings = NetConnHeuristic
+            .analyze(&[bad, proc_rec], &[])
+            .expect("analyze");
         assert!(!findings.is_empty(), "should produce at least one finding");
         let details = &findings[0].details;
         assert!(
@@ -570,7 +574,7 @@ mod tests {
             Some("established"),
             Some(9999),
         ));
-        let findings = NetConnHeuristic.analyze(&[bad]).expect("analyze");
+        let findings = NetConnHeuristic.analyze(&[bad], &[]).expect("analyze");
         assert!(
             findings.is_empty(),
             "connection-only signals (45) must not clear the gate floor (50)"
@@ -604,7 +608,7 @@ mod tests {
         // owner pid must match the bad conn's pid (1); the owner() helper sets pid=1
         let recs = vec![bad, good, proc];
 
-        let findings = NetConnHeuristic.analyze(&recs).expect("analyze");
+        let findings = NetConnHeuristic.analyze(&recs, &[]).expect("analyze");
         assert_eq!(findings.len(), 1);
         let f = &findings[0];
         assert!(matches!(f.source, cairn_core::FindingSource::Heuristic));
@@ -625,7 +629,9 @@ mod tests {
             Some(1),
         ));
         let proc = Record::Process(owner(r"C:\Windows\System32\svc.exe", Some(false)));
-        let findings = NetConnHeuristic.analyze(&[bad, proc]).expect("analyze");
+        let findings = NetConnHeuristic
+            .analyze(&[bad, proc], &[])
+            .expect("analyze");
         assert_eq!(findings.len(), 1, "combo (65) must clear the gate floor");
         assert_eq!(findings[0].severity, cairn_core::Severity::High);
     }
@@ -642,7 +648,7 @@ mod tests {
             Some("established"),
             None,
         ));
-        let findings = NetConnHeuristic.analyze(&[bad]).expect("analyze");
+        let findings = NetConnHeuristic.analyze(&[bad], &[]).expect("analyze");
         assert!(
             findings.is_empty(),
             "weight 45 must not clear the gate floor (50)"

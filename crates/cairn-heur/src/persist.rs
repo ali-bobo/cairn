@@ -440,7 +440,7 @@ impl Analyzer for PersistHeuristic {
         "heur_persist"
     }
 
-    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+    fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
         // NOTE: `observe()` below independently samples its own `now`. The orchestrator
         // calls analyze() then observe() as two separate trait-method calls, so these two
         // timestamps can differ by however long analysis takes. S4's 7-day recency gate
@@ -658,7 +658,9 @@ mod tests {
             Some(r"C:\Program Files\V\a.exe"),
             Some(now - Duration::days(400)),
         ));
-        let findings = PersistHeuristic.analyze(&[bad, quiet]).expect("analyze");
+        let findings = PersistHeuristic
+            .analyze(&[bad, quiet], &[])
+            .expect("analyze");
         assert_eq!(findings.len(), 1);
         let f = &findings[0];
         assert!(matches!(f.source, cairn_core::FindingSource::Heuristic));
@@ -687,7 +689,7 @@ mod tests {
             last_write: Some(now),
         };
         let findings = PersistHeuristic
-            .analyze(&[Record::Persistence(r)])
+            .analyze(&[Record::Persistence(r)], &[])
             .expect("analyze");
         assert_eq!(findings.len(), 1);
         let f = &findings[0];
@@ -1006,7 +1008,7 @@ mod tests {
                 Some(now),
             )),
         ];
-        let findings = PersistHeuristic.analyze(&records).unwrap();
+        let findings = PersistHeuristic.analyze(&records, &[]).unwrap();
         assert_eq!(findings.len(), 1, "only the S2 hit is a finding");
         assert_eq!(findings[0].severity, Severity::High);
         let obs = PersistHeuristic.observe(&records).unwrap();
@@ -1038,7 +1040,7 @@ mod tests {
                 execution_confirmed: Some(true),
             }),
         ];
-        let findings = PersistHeuristic.analyze(&records).unwrap();
+        let findings = PersistHeuristic.analyze(&records, &[]).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(
             findings[0].severity,
@@ -1068,7 +1070,7 @@ mod tests {
             Some(false),
             Some(now),
         ))];
-        let f = &PersistHeuristic.analyze(&records).unwrap()[0];
+        let f = &PersistHeuristic.analyze(&records, &[]).unwrap()[0];
         assert!(
             f.details
                 .starts_with(r"C:\Users\a\AppData\Roaming\evil.exe |"),
@@ -1089,7 +1091,7 @@ mod tests {
             Some(true),
             Some(now),
         ))];
-        assert!(PersistHeuristic.analyze(&records).unwrap().is_empty());
+        assert!(PersistHeuristic.analyze(&records, &[]).unwrap().is_empty());
         let obs = PersistHeuristic.observe(&records).unwrap();
         assert_eq!(obs[0].category, "winlogon_default");
     }

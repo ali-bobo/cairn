@@ -34,7 +34,7 @@ impl Analyzer for SigmaAnalyzer {
         "sigma"
     }
 
-    fn analyze(&self, records: &[Record]) -> Result<Vec<Finding>> {
+    fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
         let mut findings = Vec::new();
         for record in records {
             if let Record::Event(ev) = record {
@@ -113,7 +113,7 @@ author: test
         let engine = Engine::from_rules(&[RULE_CMD]).unwrap();
         let analyzer = SigmaAnalyzer::new(engine);
         let records = vec![make_proc_record()];
-        let findings = analyzer.analyze(&records).unwrap();
+        let findings = analyzer.analyze(&records, &[]).unwrap();
         assert!(findings.is_empty());
     }
 
@@ -121,7 +121,7 @@ author: test
     fn sigma_analyzer_empty_records_returns_empty() {
         let engine = Engine::from_rules(&[RULE_CMD]).unwrap();
         let analyzer = SigmaAnalyzer::new(engine);
-        let findings = analyzer.analyze(&[]).unwrap();
+        let findings = analyzer.analyze(&[], &[]).unwrap();
         assert!(findings.is_empty());
     }
 
@@ -131,7 +131,7 @@ author: test
         let analyzer = SigmaAnalyzer::new(engine);
         let ev = make_event(r"C:\Windows\System32\cmd.exe");
         let records = vec![Record::Event(ev)];
-        let findings = analyzer.analyze(&records).unwrap();
+        let findings = analyzer.analyze(&records, &[]).unwrap();
         assert!(!findings.is_empty(), "cmd.exe should trigger the rule");
         assert_eq!(findings[0].rule_author.as_deref(), Some("test"));
     }
@@ -142,7 +142,7 @@ author: test
         let analyzer = SigmaAnalyzer::new(engine);
         let ev = make_event(r"C:\Windows\System32\notepad.exe");
         let records = vec![Record::Event(ev)];
-        let findings = analyzer.analyze(&records).unwrap();
+        let findings = analyzer.analyze(&records, &[]).unwrap();
         assert!(
             findings.is_empty(),
             "notepad.exe should not trigger cmd rule"

@@ -19,6 +19,66 @@ pub struct RunOutcome {
     pub hostname: String,
 }
 
+/// Stable topological sort of `analyzers` by `depends_on()`. Returns the execution
+/// order as indices into `analyzers`. Ties (no dependency relationship) are broken by
+/// original array position (Kahn's algorithm with an index-ordered ready queue), so the
+/// same input always produces the same order (Determinism, CLAUDE.md). A name in
+/// `depends_on()` with no matching `name()` among `analyzers` is silently ignored — it
+/// simply contributes no edge. Panics if a cycle exists (a static configuration error,
+/// not a runtime condition — see spec's rationale for panic over Result here).
+fn topo_sort(analyzers: &[Box<dyn Analyzer>]) -> Vec<usize> {
+    let n = analyzers.len();
+    let name_to_idx: std::collections::HashMap<&str, usize> = analyzers
+        .iter()
+        .enumerate()
+        .map(|(i, a)| (a.name(), i))
+        .collect();
+
+    // in_degree[i] = number of unresolved dependencies analyzers[i] has.
+    // dependents[i] = indices of analyzers that depend on analyzers[i].
+    let mut in_degree = vec![0usize; n];
+    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for (i, a) in analyzers.iter().enumerate() {
+        for dep_name in a.depends_on() {
+            if let Some(&dep_idx) = name_to_idx.get(dep_name) {
+                dependents[dep_idx].push(i);
+                in_degree[i] += 1;
+            }
+            // Unknown dependency name: silently ignored (no edge added).
+        }
+    }
+
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = analyzers
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| in_degree[*i] == 0)
+        .map(|(i, _)| std::cmp::Reverse(i))
+        .collect();
+
+    let mut order = Vec::with_capacity(n);
+    while let Some(std::cmp::Reverse(i)) = ready.pop() {
+        order.push(i);
+        for &dep in &dependents[i] {
+            in_degree[dep] -= 1;
+            if in_degree[dep] == 0 {
+                ready.push(std::cmp::Reverse(dep));
+            }
+        }
+    }
+
+    if order.len() != n {
+        let stuck: Vec<&str> = (0..n)
+            .filter(|i| in_degree[*i] > 0)
+            .map(|i| analyzers[i].name())
+            .collect();
+        panic!(
+            "circular dependency among analyzers: {} still have unresolved depends_on() after topological sort",
+            stuck.join(", ")
+        );
+    }
+    order
+}
+
 /// Run the given collectors against the host, then fan-in analyzers over the accumulated
 /// records. `privileges`/`hostname` are provided by the caller (real probe in the bin;
 /// fakes in tests) so this stays pure + testable.
@@ -70,11 +130,14 @@ pub fn run_live(
             }
         }
     }
-    // Analyzer fan-in (SRS §3): each analyzer reads the accumulated records and emits
-    // findings. A failing analyzer is logged + skipped (graceful degrade), never aborts.
+    // Analyzer fan-in (SRS §3): each analyzer reads the accumulated records + prior
+    // analyzers' findings (dependency-ordered) and emits findings. A failing analyzer is
+    // logged + skipped (graceful degrade), never aborts.
+    let order = topo_sort(analyzers);
     let mut findings = Vec::new();
-    for a in analyzers {
-        match a.analyze(&records) {
+    for &idx in &order {
+        let a = &analyzers[idx];
+        match a.analyze(&records, &findings) {
             Ok(mut fs) => findings.append(&mut fs),
             Err(e) => {
                 tracing::warn!(analyzer = a.name(), error = %e, "analyzer failed; skipping");
@@ -223,25 +286,44 @@ mod tests {
     use crate::finding::{Finding, FindingSource, Severity};
     use crate::traits::Analyzer;
 
-    /// A fake analyzer returning a canned result (or an error).
+    /// A fake analyzer returning a canned result (or an error). `deps` declares
+    /// `depends_on()`; `record_prior_count` is set true to make this analyzer's
+    /// single returned Finding's title encode how many prior_findings it saw
+    /// (`"saw:<N>"`), so tests can assert on it without a new Finding field.
     struct FakeAnalyzer {
         name: &'static str,
+        deps: Vec<&'static str>,
         result: std::sync::Mutex<Option<Result<Vec<Finding>, CairnError>>>,
+        record_prior_count: bool,
     }
     impl FakeAnalyzer {
         fn ok(name: &'static str, findings: Vec<Finding>) -> Box<dyn Analyzer> {
             Box::new(FakeAnalyzer {
                 name,
+                deps: vec![],
                 result: std::sync::Mutex::new(Some(Ok(findings))),
+                record_prior_count: false,
             })
         }
         fn err(name: &'static str) -> Box<dyn Analyzer> {
             Box::new(FakeAnalyzer {
                 name,
+                deps: vec![],
                 result: std::sync::Mutex::new(Some(Err(CairnError::Analyzer {
                     analyzer: name.into(),
                     reason: "boom".into(),
                 }))),
+                record_prior_count: false,
+            })
+        }
+        /// Declares dependencies on the given analyzer names; its Finding's title
+        /// will be `"saw:<N>"` where N is `prior_findings.len()` at call time.
+        fn with_deps(name: &'static str, deps: &[&'static str]) -> Box<dyn Analyzer> {
+            Box::new(FakeAnalyzer {
+                name,
+                deps: deps.to_vec(),
+                result: std::sync::Mutex::new(Some(Ok(vec![]))), // overwritten in analyze()
+                record_prior_count: true,
             })
         }
     }
@@ -249,13 +331,98 @@ mod tests {
         fn name(&self) -> &str {
             self.name
         }
-        fn analyze(&self, _records: &[Record]) -> crate::Result<Vec<Finding>> {
+        fn analyze(
+            &self,
+            _records: &[Record],
+            prior_findings: &[Finding],
+        ) -> crate::Result<Vec<Finding>> {
+            if self.record_prior_count {
+                return Ok(vec![Finding::new(
+                    Severity::Info,
+                    format!("saw:{}", prior_findings.len()),
+                    FindingSource::Heuristic,
+                )]);
+            }
             self.result.lock().unwrap().take().unwrap()
+        }
+        fn depends_on(&self) -> &[&str] {
+            &self.deps
         }
     }
 
     fn a_finding() -> Finding {
         Finding::new(Severity::High, "t", FindingSource::Heuristic)
+    }
+
+    /// B depends on A: B's prior_findings must include A's Finding (A ran first).
+    #[test]
+    fn dependency_is_honored_prior_findings_visible() {
+        let cfg = Config::default();
+        let collectors: Vec<Box<dyn Collector>> = vec![];
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![
+            FakeAnalyzer::with_deps("b", &["a"]), // declared first, but must run AFTER a
+            FakeAnalyzer::ok("a", vec![a_finding()]),
+        ];
+        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
+        // a's finding (title "t") + b's finding (title "saw:1", since it saw a's 1 finding)
+        assert_eq!(out.findings.len(), 2);
+        assert!(
+            out.findings.iter().any(|f| f.title == "saw:1"),
+            "b must have seen a's 1 finding by the time it ran; findings: {:?}",
+            out.findings.iter().map(|f| &f.title).collect::<Vec<_>>()
+        );
+    }
+
+    /// No dependency relationships: execution order matches injection order (stable),
+    /// reproducibly across repeated calls on the same input.
+    #[test]
+    fn no_deps_execution_order_is_stable_and_matches_injection_order() {
+        let cfg = Config::default();
+        let collectors: Vec<Box<dyn Collector>> = vec![];
+        let build = || -> Vec<Box<dyn Analyzer>> {
+            vec![
+                FakeAnalyzer::ok("first", vec![a_finding()]),
+                FakeAnalyzer::ok("second", vec![a_finding()]),
+            ]
+        };
+        let out1 = run_live(&cfg, privs(), "WS01".into(), &collectors, &build());
+        let out2 = run_live(&cfg, privs(), "WS01".into(), &collectors, &build());
+        let titles1: Vec<&str> = out1.findings.iter().map(|f| f.title.as_str()).collect();
+        let titles2: Vec<&str> = out2.findings.iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(
+            titles1, titles2,
+            "same input must produce the same order every time"
+        );
+    }
+
+    /// A circular dependency (a depends on b, b depends on a) must panic at run_live,
+    /// with a message naming both analyzers.
+    #[test]
+    #[should_panic(expected = "circular")]
+    fn circular_dependency_panics() {
+        let cfg = Config::default();
+        let collectors: Vec<Box<dyn Collector>> = vec![];
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![
+            FakeAnalyzer::with_deps("a", &["b"]),
+            FakeAnalyzer::with_deps("b", &["a"]),
+        ];
+        run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
+    }
+
+    /// Declaring a dependency on an analyzer name that isn't present in the current run
+    /// is NOT an error — it's silently ignored, and the run proceeds normally.
+    #[test]
+    fn dependency_on_absent_analyzer_name_is_ignored_not_an_error() {
+        let cfg = Config::default();
+        let collectors: Vec<Box<dyn Collector>> = vec![];
+        let analyzers: Vec<Box<dyn Analyzer>> =
+            vec![FakeAnalyzer::with_deps("solo", &["nonexistent"])];
+        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
+        assert_eq!(
+            out.findings.len(),
+            1,
+            "run must proceed despite the dangling dependency"
+        );
     }
 
     /// Analyzer findings land in RunOutcome.findings.
