@@ -1,6 +1,8 @@
 //! heur_netconn (FR11, SRS §10): bare public-IP remote, rare remote port, owning-proc
 //! in temp, unsigned owner, suspicious high-port listener. Pure scoring + Analyzer impl.
-use crate::score::{is_public_ipv4, is_rare_port, is_suspicious_path, join_key, severity_for, Score};
+use crate::score::{
+    is_public_ipv4, is_rare_port, is_suspicious_path, join_key, severity_for, Score,
+};
 use cairn_core::finding::{EntityNetConn, EntityProcess};
 use cairn_core::record::{NetConnRecord, ProcessRecord, Record};
 use cairn_core::traits::Analyzer;
@@ -136,10 +138,13 @@ impl Analyzer for NetConnHeuristic {
                     f.reason
                         .as_deref()
                         .is_some_and(|r| r.contains(crate::persist::PERSIST_SOURCE_MARKER))
-                        && f.evidence.iter().filter_map(|e| e.path.as_deref()).any(|p| {
-                            let ev_key = join_key(p);
-                            ev_key == owner_key || ev_key.degraded_key() == owner_degraded
-                        })
+                        && f.evidence
+                            .iter()
+                            .filter_map(|e| e.path.as_deref())
+                            .any(|p| {
+                                let ev_key = join_key(p);
+                                ev_key == owner_key || ev_key.degraded_key() == owner_degraded
+                            })
                 });
                 if corroborated {
                     score.add(
