@@ -40,3 +40,17 @@ the engagement, not an evasion measure. Fill the bracketed fields per engagement
 Cairn WILL generate telemetry (file reads, raw volume handle, process/registry
 enumeration). This is expected and correct. Coordinate so the SOC distinguishes
 Cairn's authorized activity from real threat activity during the window.
+
+## 6. Sigma 規則資料前提
+
+部分 Sigma 規則依賴非預設的 Windows 稽核設定才能有事件可比對，缺少這些設定時
+規則不會誤判也不會漏報——單純是沒有資料可比對（graceful degrade，非工具缺陷）：
+
+- **PowerShell Script Block Logging**（`EnableScriptBlockLogging=1`）：PowerShell
+  4104 相關規則的前提。預設稽核設定下，4104 事件僅記錄「可疑」腳本片段，非完整
+  逐字稿——這是 Windows 稽核設計本身的限制，非 Cairn 的缺陷。
+- **Process Creation 稽核 + 命令列記錄**（`ProcessCreationIncludeCmdLine_Enabled=1`）：
+  process_creation 分類規則（EID 4688）的前提。
+- **對應 Windows 安全稽核原則**：`service: security`/`service: system` 類規則
+  （認證/登入事件、服務安裝事件等）需要主機已啟用對應的稽核子類別。
+- 詳細規則對照見 `docs/sigma-rule-catalog.md`。

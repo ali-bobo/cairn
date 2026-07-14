@@ -400,6 +400,27 @@ mod tests {
         assert!(hits.iter().any(|e| e.channel == "Security"));
     }
 
+    /// `category: ps_script` (the logsource used by segment-2's PowerShell 4104 rules)
+    /// has no dedicated LogsourceMap seed — only `service: powershell` is mapped. This
+    /// is expected: LogsourceMap only decides which channels to watch, it does not
+    /// participate in rule matching. `Engine::match_event` compares the synthetic
+    /// EventRecord's channel/event_id/data directly against each rule's `detection`
+    /// block (see parity.rs's `ps_script_*_fires` tests, which pass without any
+    /// `ps_script` LogsourceMap entry). This test documents the gap rather than
+    /// papering over it with a seed that isn't exercised by the matching path.
+    #[test]
+    fn ps_script_category_has_no_dedicated_logsource_seed() {
+        let map = LogsourceMap::windows_builtin();
+        let hits = map.resolve(Some("ps_script"), None, None);
+        assert!(
+            hits.is_empty(),
+            "ps_script has no dedicated seed today; if this starts returning \
+             entries, update this test's assertion rather than deleting it — \
+             the point is to make the current gap visible, not silently pass \
+             either way"
+        );
+    }
+
     /// The built-in map covers at least the top ~20 Windows logsources (T5 acceptance).
     #[test]
     fn builtin_covers_top_windows_logsources() {
