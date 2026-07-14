@@ -4,4 +4,4 @@
 # the manifest's sigma_ruleset_ver = "<commit-sha>+<aggregate-sha256>".
 pin = 98781da19cf60c48ce6e7f2d3ad11c9ba389191a
 source = https://github.com/SigmaHQ/sigma
-fetched_at = 2026-07-14T15:10:30.678254200+00:00
+fetched_at = 2026-07-14T15:24:00.174811+00:00

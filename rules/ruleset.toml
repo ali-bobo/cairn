@@ -268,3 +268,19 @@ path = "windows/builtin/security/win_security_hidden_user_creation.yml"
 
 [[rules]]
 path = "windows/builtin/security/win_security_lsass_access_non_system_account.yml"
+
+# ============================================================
+# Service installation (System.evtx, EventID 7045)
+# ============================================================
+
+[[rules]]
+path = "windows/builtin/system/service_control_manager/win_system_service_install_hacktools.yml"
+
+[[rules]]
+path = "windows/builtin/system/service_control_manager/win_system_service_install_susp.yml"
+
+[[rules]]
+path = "windows/builtin/system/service_control_manager/win_system_service_install_uncommon.yml"
+
+[[rules]]
+path = "windows/builtin/system/service_control_manager/win_system_krbrelayup_service_installation.yml"

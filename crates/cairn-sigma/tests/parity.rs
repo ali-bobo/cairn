@@ -74,6 +74,25 @@ fn security_event(event_id: u32, fields: serde_json::Value) -> EventRecord {
     }
 }
 
+/// A System-channel (service: system) EventRecord with the given EventID and fields.
+/// `EventID` is also injected into `data` since Sigma rules under `service: system`
+/// match `EventID` as a regular event field, not via `EventRecord::event_id`.
+fn system_event(event_id: u32, fields: serde_json::Value) -> EventRecord {
+    let serde_json::Value::Object(mut map) = fields else {
+        panic!("fields must be a JSON object");
+    };
+    map.insert("EventID".into(), serde_json::json!(event_id));
+    EventRecord {
+        ts: Utc::now(),
+        channel: "System".into(),
+        event_id,
+        provider: "Service Control Manager".into(),
+        computer: "WS01".into(),
+        record_id: 1,
+        data: map,
+    }
+}
+
 /// Load the bundled encoded rules once.
 fn load_bundled() -> Engine {
     let mut engine = Engine::default();
@@ -478,5 +497,125 @@ fn benign_logon_event_fires_nothing() {
     assert!(
         hits.is_empty(),
         "benign interactive logon should not fire, got {hits:?}"
+    );
+}
+
+// ============================================================
+// Service installation (service: system, EventID 7045)
+// ============================================================
+
+/// HackTool Service Registration or Execution (d26ce60c): condition is
+/// "selection_eid and 1 of selection_service_*". EventID 7045 (or 7036) from the
+/// Service Control Manager provider, plus a ServiceName containing a known
+/// credential-dumping tool name (gsecdump), fires.
+#[test]
+fn hacktool_service_install_fires() {
+    let engine = load_bundled();
+    let ev = system_event(
+        7045,
+        json!({
+            "Provider_Name": "Service Control Manager",
+            "ServiceName": "gsecdump-svc"
+        }),
+    );
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("d26ce60c-2151-403c-9a42-49420d87b5e4"))
+        .expect("HackTool Service Registration rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// Suspicious Service Installation (1d61f71d): EventID 7045 from the Service Control
+/// Manager provider with an ImagePath containing a PowerShell obfuscation flag
+/// (' -w hidden ') fires.
+#[test]
+fn suspicious_service_install_fires() {
+    let engine = load_bundled();
+    let ev = system_event(
+        7045,
+        json!({
+            "Provider_Name": "Service Control Manager",
+            "ImagePath": r"C:\Windows\System32\cmd.exe /c powershell.exe -w hidden -enc BASE64PAYLOAD"
+        }),
+    );
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("1d61f71d-59d2-479e-9562-4ff5f4ead16b"))
+        .expect("Suspicious Service Installation rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// Uncommon Service Installation Image Path (26481afe): condition is "selection and
+/// ( suspicious_paths or all of suspicious_encoded_* ) and not 1 of filter_*". EventID
+/// 7045 with an ImagePath referencing a named pipe (\\.\pipe) satisfies the
+/// suspicious_paths branch.
+#[test]
+fn uncommon_service_install_path_fires() {
+    let engine = load_bundled();
+    let ev = system_event(
+        7045,
+        json!({
+            "Provider_Name": "Service Control Manager",
+            "ImagePath": r"\\.\pipe\evil_pipe_service"
+        }),
+    );
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("26481afe-db26-4228-b264-25a29fe6efc7"))
+        .expect("Uncommon Service Installation Image Path rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// KrbRelayUp Service Installation (e97d9903): EventID 7045 with ServiceName exactly
+/// 'KrbSCM' fires.
+#[test]
+fn krbrelayup_service_install_fires() {
+    let engine = load_bundled();
+    let ev = system_event(
+        7045,
+        json!({
+            "ServiceName": "KrbSCM"
+        }),
+    );
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("e97d9903-53b2-41fc-8cb9-889ed4093e80"))
+        .expect("KrbRelayUp Service Installation rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// A benign service installation (legitimate app updater, plain Program Files path,
+/// ordinary ServiceName) fires none of the new service-installation rules.
+#[test]
+fn benign_service_install_fires_nothing() {
+    let engine = load_bundled();
+    let ev = system_event(
+        7045,
+        json!({
+            "Provider_Name": "Service Control Manager",
+            "ServiceName": "MyAppUpdater",
+            "ImagePath": r"C:\Program Files\MyApp\updater.exe"
+        }),
+    );
+    let hits = engine.match_event(&ev).unwrap();
+    assert!(
+        hits.is_empty(),
+        "benign service install should not fire, got {hits:?}"
     );
 }
