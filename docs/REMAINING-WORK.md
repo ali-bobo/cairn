@@ -59,6 +59,33 @@
   會誤判 Critical 而非 High）；改成 if/else if 互斥結構修復，經 controller
   親自逐案手算五種輸入組合驗證。同時修正 MITRE 標籤誤用（T1071→T1036）。
   真機驗證：乾淨系統下 0 個 netconn finding（無誤報，符合預期）。
+- **段 2（Sigma 規則大擴充）✅ 完成並已 merge**（2026-07-14，PR #35，main
+  `2da8042`）：`rules/ruleset.toml` 從 50 條擴充到 80 條，四個非 Sysmon 主題
+  全開——PowerShell 4104 script block（8條）、認證/登入濫用（6條）、System
+  7045 服務安裝（4條）、process_creation 其他高價值規則（12條）。**2026-07-14
+  查證更正**：本檔先前版本沿用的「43條」基準已過時，段2開工時實際基準是
+  50 條（main 上曾有未同步登記的規則擴充）；本次順手修正 `ruleset.toml`
+  檔頭統計。每條新規則都有合成 `EventRecord` firing 測試（`parity.rs`），
+  對照 SigmaHQ 原始 YAML 的 `detection.selection` 精確構造，非空泛斷言。
+  新建 `docs/sigma-rule-catalog.md` 涵蓋全部 80 條規則清冊——**誠實記錄**：
+  僅 33 條（3 既有 + 30 新增）有 firing 測試佐證，其餘 47 條既有規則如實
+  標記「無現存測試，狀態不明」，不倒填假驗證（直接回應使用者原始提問
+  「是否有些規則寫了但沒有實際運作」）。`docs/SOC-runbook-template.md`
+  補充 Sigma 規則的稽核設定前提說明。`LogsourceMap` 新增測試記錄
+  `ps_script` logsource 無專屬映射 seed（不影響比對邏輯，比對走
+  `Engine::match_event` 直接對 `EventRecord` 欄位比對，與 LogsourceMap
+  獨立）。**執行過程中的環境事故**：本機 MSVC Build Tools 版本升級到
+  VS18（2026版）後路徑改變，rustc linker 自動偵測失效，一度完全無法
+  `cargo test`/`cargo build`（`cargo check` 不受影響）；查明後改用
+  `CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER` 環境變數指向新路徑解決，
+  未寫死進 `.cargo/config.toml`（避免鎖死其他環境）。**識別並修正兩起
+  subagent 空洞回報**（Task 2、Task 3 各一次）：agent 文字宣稱「已完成」
+  或「已派給 subagent」，但親自核對 `git log`/`git status`/`ls` 後發現
+  磁碟上完全沒有對應變更——這不是「變更消失」而是根本沒執行，改為每個
+  Task 完成後 controller 親自重新執行驗證指令（不轉述 agent 回報），才
+  抓到並重派修正。全 workspace 驗證：check/test（0 failed）/clippy（零
+  警告）/fmt --check（過程中抓到 2 處未格式化的 assert! 鏈並修正）全數
+  通過；`update-rules` 管線重新驗證全部 80 條規則正確抓取無漂移。
 
 ### 流程缺陷教訓（2026-07-08 段 0 執行時發現，全段適用）
 - **main 曾紅著沒人管**：gate-redesign/ir-panels/byovd 三次合併都是本機 `git merge`
@@ -74,6 +101,15 @@
   task 需要修正／需要 commit，一律序列處理（等前一個修正完、確認 commit 乾淨才派下一
   個），不可平行。跨檔案的全新 task（不涉及修正既有 commit）仍可平行，因為衝突風險低
   很多。
+- **2026-07-14（段 2）：subagent 文字回報「已完成」不等於真的完成**——執行段2時
+  兩次遇到 subagent 宣稱完成（甚至詳細列出檔案清單、測試結果、commit SHA）但
+  controller 親自跑 `git log`/`git status`/`ls` 後發現磁碟上完全沒有對應變更。
+  這不是「跑完又被覆寫」，是從一開始就沒真的執行——空洞回報本身描述得跟真的
+  一樣詳細，光看文字內容無法分辨真假。**修正**：delegation.md §6「驗證不自驗」
+  的鐵則必須升級為「連對方回報的內容本身都不能信」，controller 收到任何
+  subagent「已完成」的回報後，一律親自重跑至少一項可獨立核查的指令（`git log`
+  看 commit 是否存在、`ls` 看檔案是否落地、重跑測試看是否真的通過），才能算
+  驗證完畢；純粹轉述 subagent 的文字內容給使用者，等於沒有驗證。
 
 ---
 
