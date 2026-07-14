@@ -3,8 +3,13 @@
 # All paths are relative to the SigmaHQ `rules/` directory.
 # All listed rules MUST carry an `author:` field (DRL 1.1).
 # Verified: paths confirmed to exist at pin + author field present.
-# Updated: 2026-06-28 — expanded from 18 to 44 rules.
-# Scope: no-Sysmon environments (Security.evtx + PowerShell + process_creation via EID 4688).
+# Updated: 2026-07-11 — expanded from 50 to 80 rules (segment 2: PowerShell 4104
+# script block, authentication/logon abuse, System 7045 service installs, and
+# additional process_creation coverage — see docs/dev-history/specs/
+# 2026-07-11-sigma-ruleset-expansion-design.md).
+# Scope: no-Sysmon environments (Security.evtx + System.evtx + PowerShell
+# Operational/classic + process_creation via EID 4688). Sysmon rules deliberately
+# excluded — see design doc for rationale.
 # Prerequisites for full process_creation coverage:
 #   1. Audit Process Creation + command line: GPO or reg key ProcessCreationIncludeCmdLine_Enabled=1
 #   2. PowerShell Script Block Logging: reg key EnableScriptBlockLogging=1
