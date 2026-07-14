@@ -172,7 +172,8 @@ fn powershell_malicious_keywords_fires() {
         hits.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
     );
     assert!(
-        hits.iter().all(|h| h.rule_author.as_deref().is_some_and(|a| !a.is_empty())),
+        hits.iter()
+            .all(|h| h.rule_author.as_deref().is_some_and(|a| !a.is_empty())),
         "DRL 1.1: author must be present on every fired rule"
     );
 }
@@ -243,7 +244,8 @@ fn powershell_invoke_mimikatz_keyword_fires() {
         hits.iter().map(|f| &f.rule_id).collect::<Vec<_>>()
     );
     assert!(
-        hits.iter().all(|h| h.rule_author.as_deref().is_some_and(|a| !a.is_empty())),
+        hits.iter()
+            .all(|h| h.rule_author.as_deref().is_some_and(|a| !a.is_empty())),
         "DRL 1.1: author must be present on every fired rule"
     );
 }
