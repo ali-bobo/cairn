@@ -246,3 +246,25 @@ path = "windows/powershell/powershell_script/posh_ps_hktl_rubeus.yml"
 
 [[rules]]
 path = "windows/powershell/powershell_script/posh_ps_download_com_cradles.yml"
+
+# ============================================================
+# Authentication / logon abuse (Security.evtx)
+# ============================================================
+
+[[rules]]
+path = "windows/builtin/security/win_security_kerberoasting_activity.yml"
+
+[[rules]]
+path = "windows/builtin/security/win_security_kerberos_asrep_roasting.yml"
+
+[[rules]]
+path = "windows/builtin/security/win_security_admin_share_access.yml"
+
+[[rules]]
+path = "windows/builtin/security/win_security_impacket_secretdump.yml"
+
+[[rules]]
+path = "windows/builtin/security/win_security_hidden_user_creation.yml"
+
+[[rules]]
+path = "windows/builtin/security/win_security_lsass_access_non_system_account.yml"
