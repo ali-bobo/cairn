@@ -20,8 +20,14 @@ any contribution that crosses the line.
    (public key embedded only; private key never on the host).
 4. Transparency: the tool logs its own actions; it is open-source and signed.
 
-## FORBIDDEN capabilities (auto-reject)
-These overlap with malware/offensive tooling and are out of scope by design:
+## FORBIDDEN capabilities (auto-reject by default)
+These overlap with malware/offensive tooling and are out of scope by design.
+**Exception (2026-07-15, user-approved)**: any item below may be overridden only
+by the user's explicit, per-conversation approval of that *specific* technique —
+see CLAUDE.md GOLDEN RULES §1. No blanket or standing exception exists; a prior
+approval does not extend to a new conversation or a different technique, and
+each use must be logged (commit message or this file's lesson log) naming what
+was approved and why.
 - process injection / hollowing / APC / thread hijack;
 - direct or indirect syscalls to bypass user-mode hooks; unhooking;
 - AMSI or ETW patching/bypass;
@@ -67,3 +73,8 @@ NOT a security control) → ADR-0002.
 Legitimacy is reputation-based: Authenticode signing, stable naming, version
 resources, published hashes, open source, and SOC pre-allow-listing make the tool
 trusted. A tool that tries to evade EDR looks exactly like the threat it hunts.
+This remains the project's default posture even with the narrow, user-approved
+exception clause above — the exception exists for a deliberate, logged, one-off
+decision by the user, not as a routine way to quiet AV noise. Signing and
+hash-based allow-listing (docs/verifying-a-release.md, docs/SOC-runbook-template.md)
+are the intended default remedy for false positives.

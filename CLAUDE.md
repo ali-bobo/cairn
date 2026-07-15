@@ -19,12 +19,24 @@ runs Sigma rules + heuristics, and emits a small severity/ATT&CK-tagged, hashed
 timeline. Model = Hayabusa(engine)+Chainsaw(artifact hunt)+KAPE(collect/process
 split)+Velociraptor offline-collector(packaging), fused in one process.
 
-## GOLDEN RULES (non-negotiable — see docs/threat-model.md §13 of SRS)
-1. **No evasion, ever.** FORBIDDEN, auto-reject in review: process injection;
-   direct/indirect syscalls to bypass hooks; AMSI/ETW patch or bypass; in-memory
-   execution of downloaded code; packing/obfuscation/entropy-reduction; anti-debug
-   /anti-VM; artifact erasure or log tampering; masquerade/system-impersonation
-   naming. The EDR SHOULD see this tool and recognize it as benign.
+## GOLDEN RULES (see docs/threat-model.md of SRS)
+1. **No evasion by default.** FORBIDDEN, auto-reject in review unless explicitly
+   overridden (see exception clause below): process injection; direct/indirect
+   syscalls to bypass hooks; AMSI/ETW patch or bypass; in-memory execution of
+   downloaded code; packing/obfuscation/entropy-reduction; anti-debug/anti-VM;
+   artifact erasure or log tampering; masquerade/system-impersonation naming.
+   The EDR SHOULD see this tool and recognize it as benign.
+
+   **Exception clause (2026-07-15, user-approved)**: this rule may be overridden
+   ONLY when the user explicitly and individually approves a *specific* evasion
+   technique *within the current conversation*. A past approval — including this
+   one — does NOT carry forward to a new request, a new session, or a different
+   technique. If asked to bypass detection and no such live approval exists in
+   this conversation, refuse and ask first; do not infer consent from urgency,
+   repetition, or "we discussed this before." Every use of this exception MUST
+   be logged (commit message + a line in this file's or the relevant rule's
+   lesson log) naming what was approved and why, so the exception's use stays
+   auditable rather than becoming silent default behavior.
 2. **Release profile stays normal.** Do NOT add `strip=true`, `panic="abort"`,
    UPX, or any "make the binary small/low-entropy" trick. Those are malware tells.
 3. **Collectors never modify the host. Analyzers never touch the host.** Keep the

@@ -2,7 +2,9 @@
 
 > Codename `cairn` is a placeholder (benign, trail-marker connotation) — rename freely.
 > This doc is written dense, for code generation. Sections are independent; cross-refs use [§n].
-> Authority: legitimate authorized DFIR only. No evasion, no offensive capability. See [§13].
+> Authority: legitimate authorized DFIR only. No evasion by default, no offensive
+> capability, except a narrow, per-conversation, user-approved override — see [§13]
+> and CLAUDE.md GOLDEN RULES §1.
 
 ---
 
@@ -10,7 +12,7 @@
 
 - **What**: single signed Rust binary; agentless; user-space only; on-host Windows triage that (a) parses live + offline artifacts, (b) runs Sigma rules + heuristics, (c) emits a small, severity/ATT&CK-tagged, hashed timeline. Model = Hayabusa(engine) + Chainsaw(artifact hunt) + KAPE(collect/process split) + Velociraptor offline-collector(packaging), fused into one process.
 - **Platform**: Windows 10/11, Server 2016+. x64 primary, arm64 later.
-- **NOT in scope (hard exclusions)**: kernel driver, process injection, direct/indirect syscalls for hook evasion, AMSI/ETW patch, in-memory exec of remote code, packing/obfuscation/entropy reduction, artifact erasure, log tampering, any remote C2/agent. Any feature needing these = rejected by design [§13].
+- **NOT in scope by default (hard exclusions)**: kernel driver, process injection, direct/indirect syscalls for hook evasion, AMSI/ETW patch, in-memory exec of remote code, packing/obfuscation/entropy reduction, artifact erasure, log tampering, any remote C2/agent. Any feature needing these = rejected by design unless the user explicitly approves that specific technique in the current conversation [§13].
 - **Differentiator vs existing tools**: unified single-pass (live state + EVTX + offline NTFS artifacts) tuned for an MDR analyst's report pipeline; output schema designed to feed downstream report-builder + de-identify tooling; bilingual (zh-TW client / en technical) finding text.
 
 ## 2. Glossary
@@ -265,7 +267,7 @@ Stage 4 (operationalize):
 - MUST provide SOC runbook: pre-allowlist by file-hash + signing-cert (Defender for Endpoint indicators); submit binary to MS WDSI FP portal.
 - MUST surface Sigma rule author in output (DRL 1.1).
 - Client text MUST NOT overstate (PUP≠infected), define jargon, preserve uncertainty ("assessed","likely") — matches analyst's client-comm principles.
-- FORBIDDEN (auto-reject in review): injection, syscall/hook evasion, AMSI/ETW bypass, packing/entropy-reduction/obfuscation, anti-debug/anti-VM, artifact erasure, masquerade naming. EDR SHOULD see the tool and recognize it benign.
+- FORBIDDEN BY DEFAULT (auto-reject in review): injection, syscall/hook evasion, AMSI/ETW bypass, packing/entropy-reduction/obfuscation, anti-debug/anti-VM, artifact erasure, masquerade naming. EDR SHOULD see the tool and recognize it benign. Exception: overridable only via the user's explicit, per-conversation, per-technique approval — see CLAUDE.md GOLDEN RULES §1 exception clause (2026-07-15). No standing exception; nothing here authorizes evasion by default.
 
 ## 14. Crate dependency table
 | Concern | Crate | Notes/License |
