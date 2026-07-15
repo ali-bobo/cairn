@@ -11,6 +11,7 @@ pub mod parentchild;
 pub mod persist;
 pub mod score;
 pub mod sigma;
+pub mod temporal;
 pub mod timestomp;
 pub mod trust;
 
@@ -22,4 +23,5 @@ pub use netconn::NetConnHeuristic;
 pub use parentchild::ParentChildHeuristic;
 pub use persist::PersistHeuristic;
 pub use sigma::SigmaAnalyzer;
+pub use temporal::TemporalWindowCorrelator;
 pub use timestomp::TimestompHeuristic;
