@@ -117,6 +117,20 @@ pub struct Config {
     /// Below this, sub-day SI/FN drift from legit ops (unzip/copy/install) is ignored.
     /// Fixed default; no CLI flag — banding (Medium/High/Critical) carries severity.
     pub timestomp_threshold_hours: i64,
+    /// Time window (minutes) for grouping repeated failed logons (EID 4625) from the
+    /// same (TargetUserName, IpAddress) pair before flagging bruteforce (segment 4-C).
+    /// Fixed default; no CLI flag.
+    pub logon_bruteforce_window_minutes: i64,
+    /// Failure count within `logon_bruteforce_window_minutes` that triggers a
+    /// bruteforce Finding for a single (TargetUserName, IpAddress) group.
+    pub logon_bruteforce_threshold: u32,
+    /// Time window (minutes) for grouping distinct-account logon attempts from the
+    /// same source (IpAddress or WorkstationName) before flagging password spraying.
+    /// Fixed default; no CLI flag.
+    pub password_spraying_window_minutes: i64,
+    /// Distinct TargetUserName count within `password_spraying_window_minutes` from
+    /// the same source that triggers a spraying Finding.
+    pub password_spraying_threshold: u32,
     /// Reconstruct full file paths from $MFT parent references (path map, S2-O).
     /// false → fall back to S2-N bare-filename behaviour (path_complete = None),
     /// the first optional enhancement to drop under a future minimal profile.
@@ -142,6 +156,10 @@ impl Default for Config {
             max_mft_records: 1_000_000,
             max_usn_records: 1_000_000,
             timestomp_threshold_hours: 24,
+            logon_bruteforce_window_minutes: 5,
+            logon_bruteforce_threshold: 5,
+            password_spraying_window_minutes: 1,
+            password_spraying_threshold: 10,
             resolve_mft_paths: true,
             governance: Governance::default(),
         }

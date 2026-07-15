@@ -884,6 +884,12 @@ fn main() -> anyhow::Result<()> {
                     chrono::Duration::hours(cfg.timestomp_threshold_hours),
                 )),
                 Box::new(cairn_heur::AccountHeuristic),
+                Box::new(cairn_heur::LogonBruteforceHeuristic::new(
+                    chrono::Duration::minutes(cfg.logon_bruteforce_window_minutes),
+                    cfg.logon_bruteforce_threshold,
+                    chrono::Duration::minutes(cfg.password_spraying_window_minutes),
+                    cfg.password_spraying_threshold,
+                )),
                 Box::new(cairn_heur::ByovdHeuristic::new(driver_hashes)),
             ];
             if let Some(sa) = sigma_analyzer {
@@ -1277,6 +1283,12 @@ mod tests {
             Box::new(cairn_heur::PersistHeuristic),
             Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
             Box::new(cairn_heur::AccountHeuristic),
+            Box::new(cairn_heur::LogonBruteforceHeuristic::new(
+                chrono::Duration::minutes(5),
+                5,
+                chrono::Duration::minutes(1),
+                10,
+            )),
             Box::new(cairn_heur::ByovdHeuristic::new(
                 std::collections::HashSet::new(),
             )),
@@ -1292,6 +1304,12 @@ mod tests {
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_byovd"),
             "heur_byovd must be in analyzer set"
+        );
+        assert!(
+            analyzers
+                .iter()
+                .any(|a| a.name() == "heur_logon_bruteforce"),
+            "logon bruteforce heuristic must be registered"
         );
     }
 
@@ -1650,6 +1668,85 @@ author: test-integration
             Some("test-integration"),
             "finding must carry DRL 1.1 rule_author"
         );
+    }
+
+    /// Integration: LogonBruteforceHeuristic wired into run_live detects a bruteforce
+    /// pattern end-to-end (fake collector -> run_live -> RunOutcome.findings).
+    #[test]
+    fn logon_bruteforce_heuristic_fires_in_live_outcome() {
+        use cairn_core::manifest::Privileges;
+        use cairn_core::orchestrator::run_live;
+        use cairn_core::record::{EventRecord, Record};
+        use cairn_core::traits::{CollectCtx, Collector};
+        use chrono::Utc;
+
+        struct FixedEventsCollector(Vec<EventRecord>);
+        impl Collector for FixedEventsCollector {
+            fn name(&self) -> &str {
+                "fake_security_events"
+            }
+            fn collect(&self, _ctx: &CollectCtx<'_>) -> cairn_core::Result<Vec<Record>> {
+                Ok(self.0.iter().cloned().map(Record::Event).collect())
+            }
+        }
+
+        let base = Utc::now();
+        let events: Vec<EventRecord> = (0..5)
+            .map(|i| {
+                let mut data = serde_json::Map::new();
+                data.insert(
+                    "TargetUserName".to_string(),
+                    serde_json::Value::String("integration_user".to_string()),
+                );
+                data.insert(
+                    "IpAddress".to_string(),
+                    serde_json::Value::String("192.0.2.10".to_string()),
+                );
+                EventRecord {
+                    ts: base + chrono::Duration::seconds(i * 20),
+                    channel: "Security".to_string(),
+                    event_id: 4625,
+                    provider: "Microsoft-Windows-Security-Auditing".to_string(),
+                    computer: "TEST".to_string(),
+                    record_id: 100 + i as u64,
+                    data,
+                }
+            })
+            .collect();
+
+        let cfg = cairn_core::Config::default();
+        let privs = Privileges {
+            admin: false,
+            se_backup: false,
+            se_debug: false,
+        };
+        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedEventsCollector(events))];
+        let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> =
+            vec![Box::new(cairn_heur::LogonBruteforceHeuristic::new(
+                chrono::Duration::minutes(cfg.logon_bruteforce_window_minutes),
+                cfg.logon_bruteforce_threshold,
+                chrono::Duration::minutes(cfg.password_spraying_window_minutes),
+                cfg.password_spraying_threshold,
+            ))];
+
+        let outcome = run_live(&cfg, privs, "TEST".into(), &collectors, &analyzers);
+
+        assert_eq!(
+            outcome.records.len(),
+            5,
+            "all 5 fake events must be collected"
+        );
+        assert!(
+            !outcome.findings.is_empty(),
+            "bruteforce finding must be present in RunOutcome"
+        );
+        let finding = &outcome.findings[0];
+        assert_eq!(finding.severity, cairn_core::finding::Severity::Medium);
+        assert!(
+            finding.reason.is_some(),
+            "golden rule 6: reason must be set"
+        );
+        assert_eq!(finding.mitre, vec!["T1110.001".to_string()]);
     }
 
     /// Integration: proves the whole BYOVD pipeline end-to-end — a --driver-list file
