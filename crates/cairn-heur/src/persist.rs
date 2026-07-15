@@ -1,11 +1,11 @@
 //! heur_persist (spec §4.2): dispositive-signal gate over persistence records. A record
 //! that clears the gate (>=1 rare/dispositive signal) becomes a Finding; everything else
 //! is inventory surfaced via `observe()` as an Observation (spec §6).
-use crate::score::{join_key, JoinKey};
+use crate::score::{escalate, join_key, JoinKey};
 use crate::trust::{
     is_masquerade, is_system_or_program_files, is_user_writable_path, winlogon_value_is_default,
 };
-use cairn_core::finding::{EntityFile, EntityRegistry, EvidenceItem};
+use cairn_core::finding::{EntityFile, EntityProcess, EntityRegistry, EvidenceItem};
 use cairn_core::observation::Observation;
 use cairn_core::record::{ExecutionRecord, PersistenceRecord, ProcessRecord, Record};
 use cairn_core::traits::Analyzer;
@@ -28,16 +28,6 @@ pub(crate) struct GateHit {
     pub label: &'static str,
     pub reason: String,
     pub mitre: &'static str,
-}
-
-/// Bump one severity band (multi-signal / execution-corroboration escalation).
-fn escalate(sev: Severity) -> Severity {
-    match sev {
-        Severity::Info => Severity::Low,
-        Severity::Low => Severity::Medium,
-        Severity::Medium => Severity::High,
-        Severity::High | Severity::Critical => Severity::Critical,
-    }
 }
 
 /// S9 (spec §4.2): persistence command invoking a script interpreter.
@@ -498,6 +488,16 @@ impl Analyzer for PersistHeuristic {
             f.details = gate_details(p);
             f.ts = p.last_write.unwrap_or(now);
             f.entity = persistence_entity(p);
+            if let Some(pr) = proc_hits.first() {
+                f.entity.process = Some(EntityProcess {
+                    pid: pr.pid,
+                    ppid: pr.ppid,
+                    image: pr.image.clone(),
+                    cmdline: pr.cmdline.clone(),
+                    signed: pr.signed,
+                    integrity: pr.integrity.clone(),
+                });
+            }
             f.evidence = evidence;
             out.push(f);
         }
@@ -653,6 +653,48 @@ mod tests {
             "reason must carry the source marker: {:?}",
             findings[0].reason
         );
+    }
+
+    /// An S9 execution-corroboration hit (a live ProcessRecord whose image matches the
+    /// persistence record's binary_path via join_key) must populate entity.process with
+    /// the matched process's fields — not just escalate severity silently.
+    #[test]
+    fn s9_execution_hit_populates_entity_process() {
+        let now = Utc::now();
+        let bad = Record::Persistence(rec(
+            "ifeo",
+            Some(r"C:\Users\victim\AppData\Local\Temp\evil.exe"),
+            Some(now),
+        ));
+        let running = Record::Process(ProcessRecord {
+            pid: 4242,
+            ppid: 1,
+            image: r"C:\Users\victim\AppData\Local\Temp\evil.exe".to_string(),
+            cmdline: r"evil.exe -x".to_string(),
+            signed: Some(false),
+            signer: None,
+            binary_sha256: None,
+            integrity: Some("Medium".to_string()),
+            user: None,
+            start_time: None,
+        });
+        let findings = PersistHeuristic
+            .analyze(&[bad, running], &[])
+            .expect("analyze");
+        assert_eq!(findings.len(), 1);
+        let entity_process = findings[0]
+            .entity
+            .process
+            .as_ref()
+            .expect("S9 execution hit must populate entity.process");
+        assert_eq!(entity_process.pid, 4242);
+        assert_eq!(
+            entity_process.image,
+            r"C:\Users\victim\AppData\Local\Temp\evil.exe"
+        );
+        assert_eq!(entity_process.cmdline, r"evil.exe -x");
+        assert_eq!(entity_process.signed, Some(false));
+        assert_eq!(entity_process.integrity, Some("Medium".to_string()));
     }
 
     /// A startup (file) mechanism populates entity.file, not entity.registry.
@@ -956,14 +998,6 @@ mod tests {
             Some(now - Duration::days(2)),
         );
         assert!(evaluate_gate(&svc_recent, now).is_empty());
-    }
-
-    #[test]
-    fn escalate_caps_at_critical() {
-        assert_eq!(escalate(Severity::Low), Severity::Medium);
-        assert_eq!(escalate(Severity::Medium), Severity::High);
-        assert_eq!(escalate(Severity::High), Severity::Critical);
-        assert_eq!(escalate(Severity::Critical), Severity::Critical);
     }
 
     // ── analyze/observe split + cross-artifact corroboration ────────────────

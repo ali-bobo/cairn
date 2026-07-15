@@ -248,6 +248,17 @@ pub fn severity_for(weight: u32) -> Option<Severity> {
     }
 }
 
+/// Bump one severity band (multi-signal / execution-corroboration escalation).
+/// Caps at Critical.
+pub fn escalate(sev: Severity) -> Severity {
+    match sev {
+        Severity::Info => Severity::Low,
+        Severity::Low => Severity::Medium,
+        Severity::Medium => Severity::High,
+        Severity::High | Severity::Critical => Severity::Critical,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,5 +492,13 @@ mod tests {
     #[test]
     fn empty_command_not_suppressed() {
         assert!(!is_inbox_service_command(""));
+    }
+
+    #[test]
+    fn escalate_caps_at_critical() {
+        assert_eq!(escalate(Severity::Low), Severity::Medium);
+        assert_eq!(escalate(Severity::Medium), Severity::High);
+        assert_eq!(escalate(Severity::High), Severity::Critical);
+        assert_eq!(escalate(Severity::Critical), Severity::Critical);
     }
 }
