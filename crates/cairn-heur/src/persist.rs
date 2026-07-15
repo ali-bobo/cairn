@@ -1,7 +1,7 @@
 //! heur_persist (spec §4.2): dispositive-signal gate over persistence records. A record
 //! that clears the gate (>=1 rare/dispositive signal) becomes a Finding; everything else
 //! is inventory surfaced via `observe()` as an Observation (spec §6).
-use crate::score::{join_key, JoinKey};
+use crate::score::{escalate, join_key, JoinKey};
 use crate::trust::{
     is_masquerade, is_system_or_program_files, is_user_writable_path, winlogon_value_is_default,
 };
@@ -28,16 +28,6 @@ pub(crate) struct GateHit {
     pub label: &'static str,
     pub reason: String,
     pub mitre: &'static str,
-}
-
-/// Bump one severity band (multi-signal / execution-corroboration escalation).
-fn escalate(sev: Severity) -> Severity {
-    match sev {
-        Severity::Info => Severity::Low,
-        Severity::Low => Severity::Medium,
-        Severity::Medium => Severity::High,
-        Severity::High | Severity::Critical => Severity::Critical,
-    }
 }
 
 /// S9 (spec §4.2): persistence command invoking a script interpreter.
@@ -1008,14 +998,6 @@ mod tests {
             Some(now - Duration::days(2)),
         );
         assert!(evaluate_gate(&svc_recent, now).is_empty());
-    }
-
-    #[test]
-    fn escalate_caps_at_critical() {
-        assert_eq!(escalate(Severity::Low), Severity::Medium);
-        assert_eq!(escalate(Severity::Medium), Severity::High);
-        assert_eq!(escalate(Severity::High), Severity::Critical);
-        assert_eq!(escalate(Severity::Critical), Severity::Critical);
     }
 
     // ── analyze/observe split + cross-artifact corroboration ────────────────
