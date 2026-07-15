@@ -28,11 +28,11 @@ fn by_pid(records: &[Record]) -> HashMap<u32, &ProcessRecord> {
 /// USN events whose ts falls within [start_time, start_time + window].
 /// Linear scan — UsnEventRecord has no pid field (Windows USN journal design
 /// limitation), so no index can narrow this further than the time bound itself.
-fn usn_events_in_window<'a>(
-    records: &'a [Record],
+fn usn_events_in_window(
+    records: &[Record],
     start_time: DateTime<Utc>,
     window: Duration,
-) -> Vec<&'a cairn_core::record::UsnEventRecord> {
+) -> Vec<&cairn_core::record::UsnEventRecord> {
     let window_end = start_time + window;
     records
         .iter()
@@ -45,10 +45,7 @@ fn usn_events_in_window<'a>(
 
 /// NetConn records owned by the given pid (existence, not temporal — NetConnRecord
 /// has no timestamp field, see spec §1 API limitation).
-fn netconns_for_pid<'a>(
-    records: &'a [Record],
-    pid: u32,
-) -> Vec<&'a cairn_core::record::NetConnRecord> {
+fn netconns_for_pid(records: &[Record], pid: u32) -> Vec<&cairn_core::record::NetConnRecord> {
     records
         .iter()
         .filter_map(|r| match r {
@@ -179,7 +176,11 @@ mod tests {
     }
 
     fn prior_finding_with_process(pid: u32, image: &str) -> Finding {
-        let mut f = Finding::new(Severity::Medium, "test persist finding", FindingSource::Heuristic);
+        let mut f = Finding::new(
+            Severity::Medium,
+            "test persist finding",
+            FindingSource::Heuristic,
+        );
         f.entity = Entity {
             process: Some(EntityProcess {
                 pid,
@@ -221,7 +222,11 @@ mod tests {
         let prior = vec![prior_finding_with_process(100, r"C:\evil.exe")];
         let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].severity, Severity::High, "Medium -> High via escalate()");
+        assert_eq!(
+            findings[0].severity,
+            Severity::High,
+            "Medium -> High via escalate()"
+        );
         assert!(findings[0].evidence[0].detail.contains("非確認因果"));
     }
 
@@ -234,7 +239,10 @@ mod tests {
         ];
         let prior = vec![prior_finding_with_process(100, r"C:\evil.exe")];
         let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
-        assert!(findings.is_empty(), "event 10 minutes after start (window=5min) must not attach");
+        assert!(
+            findings.is_empty(),
+            "event 10 minutes after start (window=5min) must not attach"
+        );
     }
 
     #[test]
@@ -244,11 +252,18 @@ mod tests {
         let start = Utc::now();
         let records = vec![
             process_with_start_time(100, r"C:\Users\a\dropper.exe", Some(start)),
-            usn_event(start + Duration::seconds(30), r"C:\Windows\Temp\payload.dll"),
+            usn_event(
+                start + Duration::seconds(30),
+                r"C:\Windows\Temp\payload.dll",
+            ),
         ];
         let prior = vec![prior_finding_with_process(100, r"C:\Users\a\dropper.exe")];
         let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
-        assert_eq!(findings.len(), 1, "cross-directory USN event must still attach");
+        assert_eq!(
+            findings.len(),
+            1,
+            "cross-directory USN event must still attach"
+        );
     }
 
     #[test]
@@ -259,7 +274,10 @@ mod tests {
         ];
         let prior = vec![prior_finding_with_process(100, r"C:\evil.exe")];
         let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
-        assert!(findings.is_empty(), "start_time=None must skip, not panic or guess");
+        assert!(
+            findings.is_empty(),
+            "start_time=None must skip, not panic or guess"
+        );
     }
 
     #[test]
@@ -271,10 +289,17 @@ mod tests {
         ];
         // No entity.process on this prior finding (e.g. persist Finding that's
         // file/registry-backed with no S9 execution hit).
-        let mut pf = Finding::new(Severity::Medium, "no process entity", FindingSource::Heuristic);
+        let mut pf = Finding::new(
+            Severity::Medium,
+            "no process entity",
+            FindingSource::Heuristic,
+        );
         pf.entity = Entity::default();
         let findings = TemporalWindowCorrelator.analyze(&records, &[pf]).unwrap();
-        assert!(findings.is_empty(), "Finding without entity.process must be skipped");
+        assert!(
+            findings.is_empty(),
+            "Finding without entity.process must be skipped"
+        );
     }
 
     #[test]
@@ -346,7 +371,10 @@ mod tests {
         ];
         let prior = vec![prior_finding_with_process(100, r"C:\evil.exe")];
         let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
-        assert!(findings.is_empty(), "netconn owned by a different pid must not attach");
+        assert!(
+            findings.is_empty(),
+            "netconn owned by a different pid must not attach"
+        );
     }
 
     #[test]
