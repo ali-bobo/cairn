@@ -884,6 +884,12 @@ fn main() -> anyhow::Result<()> {
                     chrono::Duration::hours(cfg.timestomp_threshold_hours),
                 )),
                 Box::new(cairn_heur::AccountHeuristic),
+                Box::new(cairn_heur::LogonBruteforceHeuristic::new(
+                    chrono::Duration::minutes(cfg.logon_bruteforce_window_minutes),
+                    cfg.logon_bruteforce_threshold,
+                    chrono::Duration::minutes(cfg.password_spraying_window_minutes),
+                    cfg.password_spraying_threshold,
+                )),
                 Box::new(cairn_heur::ByovdHeuristic::new(driver_hashes)),
             ];
             if let Some(sa) = sigma_analyzer {
@@ -1277,6 +1283,12 @@ mod tests {
             Box::new(cairn_heur::PersistHeuristic),
             Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
             Box::new(cairn_heur::AccountHeuristic),
+            Box::new(cairn_heur::LogonBruteforceHeuristic::new(
+                chrono::Duration::minutes(5),
+                5,
+                chrono::Duration::minutes(1),
+                10,
+            )),
             Box::new(cairn_heur::ByovdHeuristic::new(
                 std::collections::HashSet::new(),
             )),
@@ -1292,6 +1304,10 @@ mod tests {
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_byovd"),
             "heur_byovd must be in analyzer set"
+        );
+        assert!(
+            analyzers.iter().any(|a| a.name() == "heur_logon_bruteforce"),
+            "logon bruteforce heuristic must be registered"
         );
     }
 
