@@ -274,3 +274,284 @@ impl Analyzer for LogonBruteforceHeuristic {
         Ok(findings)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Map, Value};
+
+    fn make_logon_event(eid: u32, ts: DateTime<Utc>, target_user: &str, ip: &str) -> Record {
+        let mut data = Map::new();
+        data.insert(
+            "TargetUserName".to_string(),
+            Value::String(target_user.to_string()),
+        );
+        data.insert("IpAddress".to_string(), Value::String(ip.to_string()));
+        Record::Event(EventRecord {
+            ts,
+            channel: "Security".to_string(),
+            event_id: eid,
+            provider: "Microsoft-Windows-Security-Auditing".to_string(),
+            computer: "TEST-PC".to_string(),
+            record_id: 1,
+            data,
+        })
+    }
+
+    fn heuristic() -> LogonBruteforceHeuristic {
+        LogonBruteforceHeuristic::new(Duration::minutes(5), 5, Duration::minutes(1), 10)
+    }
+
+    #[test]
+    fn five_failures_same_account_same_source_within_window_fires_medium() {
+        let base = Utc::now();
+        let records: Vec<Record> = (0..5)
+            .map(|i| make_logon_event(4625, base + Duration::seconds(i * 30), "alice", "10.0.0.5"))
+            .collect();
+        let h = heuristic();
+        let findings = h.analyze(&records, &[]).unwrap();
+        assert_eq!(
+            findings.len(),
+            1,
+            "expected exactly one bruteforce finding, got {findings:?}"
+        );
+        assert_eq!(findings[0].severity, Severity::Medium);
+        assert!(findings[0].title.contains("alice"));
+    }
+
+    #[test]
+    fn four_failures_below_threshold_fires_nothing() {
+        let base = Utc::now();
+        let records: Vec<Record> = (0..4)
+            .map(|i| make_logon_event(4625, base + Duration::seconds(i * 30), "bob", "10.0.0.9"))
+            .collect();
+        let h = heuristic();
+        let findings = h.analyze(&records, &[]).unwrap();
+        assert!(
+            findings.is_empty(),
+            "expected no findings below threshold, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn five_failures_then_success_fires_high() {
+        let base = Utc::now();
+        let mut records: Vec<Record> = (0..5)
+            .map(|i| make_logon_event(4625, base + Duration::seconds(i * 30), "carol", "10.0.0.7"))
+            .collect();
+        records.push(make_logon_event(
+            4624,
+            base + Duration::seconds(200),
+            "carol",
+            "10.0.0.7",
+        ));
+        let h = heuristic();
+        let findings = h.analyze(&records, &[]).unwrap();
+        let bruteforce_finding = findings
+            .iter()
+            .find(|f| f.title.contains("carol"))
+            .expect("bruteforce finding for carol must exist");
+        assert_eq!(bruteforce_finding.severity, Severity::High);
+    }
+
+    #[test]
+    fn failures_outside_window_do_not_accumulate() {
+        let base = Utc::now();
+        let records: Vec<Record> = (0..5)
+            .map(|i| make_logon_event(4625, base + Duration::minutes(i * 10), "dave", "10.0.0.1"))
+            .collect();
+        let h = heuristic();
+        let findings = h.analyze(&records, &[]).unwrap();
+        assert!(
+            findings.is_empty(),
+            "failures spread 10 minutes apart (window=5min) should not accumulate, got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ten_distinct_accounts_same_source_within_window_fires_spraying_medium() {
+        let base = Utc::now();
+        let records: Vec<Record> = (0..10)
+            .map(|i| {
+                make_logon_event(
+                    4625,
+                    base + Duration::seconds(i * 3),
+                    &format!("user{i}"),
+                    "10.0.0.99",
+                )
+            })
+            .collect();
+        let h = heuristic();
+        let findings = h.analyze(&records, &[]).unwrap();
+        let spraying_finding = findings
+            .iter()
+            .find(|f| f.title.contains("Spraying"))
+            .expect("spraying finding must exist");
+        assert_eq!(spraying_finding.severity, Severity::Medium);
+    }
+
+    #[test]
+    fn nine_distinct_accounts_below_spraying_threshold_fires_nothing() {
+        let base = Utc::now();
+        let records: Vec<Record> = (0..9)
+            .map(|i| {
+                make_logon_event(
+                    4625,
+                    base + Duration::seconds(i * 3),
+                    &format!("user{i}"),
+                    "10.0.0.88",
+                )
+            })
+            .collect();
+        let h = heuristic();
+        let findings = h.analyze(&records, &[]).unwrap();
+        assert!(
+            findings.iter().all(|f| !f.title.contains("Spraying")),
+            "9 distinct accounts should not trigger spraying (threshold=10), got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn spraying_with_one_success_fires_high() {
+        let base = Utc::now();
+        let mut records: Vec<Record> = (0..9)
+            .map(|i| {
+                make_logon_event(
+                    4625,
+                    base + Duration::seconds(i * 3),
+                    &format!("spray_user{i}"),
+                    "10.0.0.77",
+                )
+            })
+            .collect();
+        records.push(make_logon_event(
+            4624,
+            base + Duration::seconds(30),
+            "spray_user9",
+            "10.0.0.77",
+        ));
+        let h = heuristic();
+        let findings = h.analyze(&records, &[]).unwrap();
+        let spraying_finding = findings
+            .iter()
+            .find(|f| f.title.contains("Spraying"))
+            .expect("spraying finding must exist (9 failures + 1 success = 10 distinct)");
+        assert_eq!(spraying_finding.severity, Severity::High);
+    }
+
+    #[test]
+    fn missing_ip_falls_back_to_workstation_name() {
+        let base = Utc::now();
+        let records: Vec<Record> = (0..5)
+            .map(|i| {
+                let mut data = Map::new();
+                data.insert(
+                    "TargetUserName".to_string(),
+                    Value::String("erin".to_string()),
+                );
+                data.insert(
+                    "WorkstationName".to_string(),
+                    Value::String("WORKSTATION1".to_string()),
+                );
+                Record::Event(EventRecord {
+                    ts: base + Duration::seconds(i * 30),
+                    channel: "Security".to_string(),
+                    event_id: 4625,
+                    provider: "Microsoft-Windows-Security-Auditing".to_string(),
+                    computer: "TEST-PC".to_string(),
+                    record_id: 1,
+                    data,
+                })
+            })
+            .collect();
+        let h = heuristic();
+        let findings = h.analyze(&records, &[]).unwrap();
+        assert_eq!(
+            findings.len(),
+            1,
+            "fallback to WorkstationName must still group and fire"
+        );
+        assert!(findings[0].details.contains("WORKSTATION1"));
+    }
+
+    #[test]
+    fn missing_both_ip_and_workstation_never_fires() {
+        let base = Utc::now();
+        let records: Vec<Record> = (0..10)
+            .map(|i| {
+                let mut data = Map::new();
+                data.insert(
+                    "TargetUserName".to_string(),
+                    Value::String("frank".to_string()),
+                );
+                Record::Event(EventRecord {
+                    ts: base + Duration::seconds(i * 30),
+                    channel: "Security".to_string(),
+                    event_id: 4625,
+                    provider: "Microsoft-Windows-Security-Auditing".to_string(),
+                    computer: "TEST-PC".to_string(),
+                    record_id: 1,
+                    data,
+                })
+            })
+            .collect();
+        let h = heuristic();
+        let findings = h.analyze(&records, &[]).unwrap();
+        assert!(
+            findings.is_empty(),
+            "source='-' groups must be skipped entirely (no grouping possible), got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn non_security_channel_ignored() {
+        let base = Utc::now();
+        let mut data = Map::new();
+        data.insert(
+            "TargetUserName".to_string(),
+            Value::String("grace".to_string()),
+        );
+        data.insert(
+            "IpAddress".to_string(),
+            Value::String("10.0.0.50".to_string()),
+        );
+        let records: Vec<Record> = (0..5)
+            .map(|i| {
+                Record::Event(EventRecord {
+                    ts: base + Duration::seconds(i * 30),
+                    channel: "System".to_string(),
+                    event_id: 4625,
+                    provider: "test".to_string(),
+                    computer: "TEST-PC".to_string(),
+                    record_id: 1,
+                    data: data.clone(),
+                })
+            })
+            .collect();
+        let h = heuristic();
+        let findings = h.analyze(&records, &[]).unwrap();
+        assert!(
+            findings.is_empty(),
+            "non-Security channel events must be ignored"
+        );
+    }
+
+    #[test]
+    fn finding_carries_reason_and_evidence() {
+        let base = Utc::now();
+        let records: Vec<Record> = (0..5)
+            .map(|i| make_logon_event(4625, base + Duration::seconds(i * 30), "henry", "10.0.0.20"))
+            .collect();
+        let h = heuristic();
+        let findings = h.analyze(&records, &[]).unwrap();
+        assert!(
+            findings[0].reason.is_some(),
+            "golden rule 6: reason must be set"
+        );
+        assert_eq!(
+            findings[0].evidence.len(),
+            5,
+            "each failure should be captured as evidence"
+        );
+    }
+}
