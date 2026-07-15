@@ -156,3 +156,205 @@ impl Analyzer for TemporalWindowCorrelator {
         Ok(out)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cairn_core::finding::{Entity, EntityProcess, Severity};
+    use cairn_core::record::{NetConnRecord, ProcessRecord, UsnEventRecord};
+
+    fn process_with_start_time(pid: u32, image: &str, start_time: Option<DateTime<Utc>>) -> Record {
+        Record::Process(ProcessRecord {
+            pid,
+            ppid: 1,
+            image: image.to_string(),
+            cmdline: String::new(),
+            signed: None,
+            signer: None,
+            binary_sha256: None,
+            integrity: None,
+            user: None,
+            start_time,
+        })
+    }
+
+    fn prior_finding_with_process(pid: u32, image: &str) -> Finding {
+        let mut f = Finding::new(Severity::Medium, "test persist finding", FindingSource::Heuristic);
+        f.entity = Entity {
+            process: Some(EntityProcess {
+                pid,
+                ppid: 1,
+                image: image.to_string(),
+                cmdline: String::new(),
+                signed: None,
+                integrity: None,
+            }),
+            ..Entity::default()
+        };
+        f
+    }
+
+    fn usn_event(ts: DateTime<Utc>, path: &str) -> Record {
+        Record::UsnEvent(UsnEventRecord {
+            ts,
+            path: path.to_string(),
+            reason: "create".to_string(),
+            mft_ref: 1,
+        })
+    }
+
+    #[test]
+    fn depends_on_returns_persist_and_parentchild() {
+        assert_eq!(
+            TemporalWindowCorrelator.depends_on(),
+            &["heur_persist", "heur_parentchild"]
+        );
+    }
+
+    #[test]
+    fn usn_event_within_window_attaches_as_evidence_and_escalates() {
+        let start = Utc::now();
+        let records = vec![
+            process_with_start_time(100, r"C:\evil.exe", Some(start)),
+            usn_event(start + Duration::minutes(2), r"C:\Temp\dropped.exe"),
+        ];
+        let prior = vec![prior_finding_with_process(100, r"C:\evil.exe")];
+        let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::High, "Medium -> High via escalate()");
+        assert!(findings[0].evidence[0].detail.contains("非確認因果"));
+    }
+
+    #[test]
+    fn usn_event_outside_window_not_attached() {
+        let start = Utc::now();
+        let records = vec![
+            process_with_start_time(100, r"C:\evil.exe", Some(start)),
+            usn_event(start + Duration::minutes(10), r"C:\Temp\dropped.exe"),
+        ];
+        let prior = vec![prior_finding_with_process(100, r"C:\evil.exe")];
+        let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
+        assert!(findings.is_empty(), "event 10 minutes after start (window=5min) must not attach");
+    }
+
+    #[test]
+    fn usn_event_in_different_directory_still_attaches() {
+        // §4.3 regression: USN correlation is NOT path-restricted (attackers
+        // commonly write payloads to a different directory than the dropper).
+        let start = Utc::now();
+        let records = vec![
+            process_with_start_time(100, r"C:\Users\a\dropper.exe", Some(start)),
+            usn_event(start + Duration::seconds(30), r"C:\Windows\Temp\payload.dll"),
+        ];
+        let prior = vec![prior_finding_with_process(100, r"C:\Users\a\dropper.exe")];
+        let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
+        assert_eq!(findings.len(), 1, "cross-directory USN event must still attach");
+    }
+
+    #[test]
+    fn missing_start_time_skips_temporal_expansion() {
+        let records = vec![
+            process_with_start_time(100, r"C:\evil.exe", None),
+            usn_event(Utc::now(), r"C:\Temp\dropped.exe"),
+        ];
+        let prior = vec![prior_finding_with_process(100, r"C:\evil.exe")];
+        let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
+        assert!(findings.is_empty(), "start_time=None must skip, not panic or guess");
+    }
+
+    #[test]
+    fn missing_entity_process_on_prior_finding_skips() {
+        let start = Utc::now();
+        let records = vec![
+            process_with_start_time(100, r"C:\evil.exe", Some(start)),
+            usn_event(start + Duration::seconds(30), r"C:\Temp\dropped.exe"),
+        ];
+        // No entity.process on this prior finding (e.g. persist Finding that's
+        // file/registry-backed with no S9 execution hit).
+        let mut pf = Finding::new(Severity::Medium, "no process entity", FindingSource::Heuristic);
+        pf.entity = Entity::default();
+        let findings = TemporalWindowCorrelator.analyze(&records, &[pf]).unwrap();
+        assert!(findings.is_empty(), "Finding without entity.process must be skipped");
+    }
+
+    #[test]
+    fn over_200_usn_events_are_capped_with_summary_note() {
+        let start = Utc::now();
+        let mut records = vec![process_with_start_time(100, r"C:\evil.exe", Some(start))];
+        for i in 0..250 {
+            records.push(usn_event(
+                start + Duration::seconds(i),
+                &format!(r"C:\Temp\file{i}.tmp"),
+            ));
+        }
+        let prior = vec![prior_finding_with_process(100, r"C:\evil.exe")];
+        let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
+        assert_eq!(findings.len(), 1);
+        let usn_evidence_count = findings[0]
+            .evidence
+            .iter()
+            .filter(|e| e.artifact == "usn_temporal")
+            .count();
+        assert_eq!(usn_evidence_count, 200, "must cap at USN_EVIDENCE_CAP");
+        assert!(
+            findings[0]
+                .evidence
+                .iter()
+                .any(|e| e.artifact == "usn_temporal_summary" && e.detail.contains("250")),
+            "must note the original total count when truncated"
+        );
+    }
+
+    #[test]
+    fn same_pid_netconn_attaches_as_existence_evidence() {
+        let start = Utc::now();
+        let records = vec![
+            process_with_start_time(100, r"C:\evil.exe", Some(start)),
+            Record::NetConn(NetConnRecord {
+                proto: "tcp".to_string(),
+                laddr: "10.0.0.5".to_string(),
+                lport: 51000,
+                raddr: Some("203.0.113.5".to_string()),
+                rport: Some(4444),
+                state: Some("established".to_string()),
+                pid: Some(100),
+            }),
+        ];
+        let prior = vec![prior_finding_with_process(100, r"C:\evil.exe")];
+        let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
+        assert_eq!(findings.len(), 1);
+        assert!(findings[0]
+            .evidence
+            .iter()
+            .any(|e| e.artifact == "netconn_temporal" && e.detail.contains("存在性")));
+    }
+
+    #[test]
+    fn different_pid_netconn_not_attached() {
+        let start = Utc::now();
+        let records = vec![
+            process_with_start_time(100, r"C:\evil.exe", Some(start)),
+            Record::NetConn(NetConnRecord {
+                proto: "tcp".to_string(),
+                laddr: "10.0.0.5".to_string(),
+                lport: 51000,
+                raddr: Some("203.0.113.5".to_string()),
+                rport: Some(4444),
+                state: Some("established".to_string()),
+                pid: Some(999),
+            }),
+        ];
+        let prior = vec![prior_finding_with_process(100, r"C:\evil.exe")];
+        let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
+        assert!(findings.is_empty(), "netconn owned by a different pid must not attach");
+    }
+
+    #[test]
+    fn no_usn_and_no_netconn_produces_no_finding() {
+        let start = Utc::now();
+        let records = vec![process_with_start_time(100, r"C:\evil.exe", Some(start))];
+        let prior = vec![prior_finding_with_process(100, r"C:\evil.exe")];
+        let findings = TemporalWindowCorrelator.analyze(&records, &prior).unwrap();
+        assert!(findings.is_empty());
+    }
+}
