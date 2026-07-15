@@ -1755,6 +1755,97 @@ author: test-integration
         assert_eq!(finding.mitre, vec!["T1110.001".to_string()]);
     }
 
+    /// Integration: TemporalWindowCorrelator, wired after PersistHeuristic in
+    /// run_live's analyzer chain, attaches USN evidence to a persist Finding that
+    /// has entity.process populated (S9 execution hit) and escalates its severity.
+    #[test]
+    fn temporal_window_correlator_fires_in_live_outcome() {
+        use cairn_core::manifest::Privileges;
+        use cairn_core::orchestrator::run_live;
+        use cairn_core::record::{PersistenceRecord, ProcessRecord, Record, UsnEventRecord};
+        use cairn_core::traits::{CollectCtx, Collector};
+        use chrono::Utc;
+
+        struct FixedRecordsCollector(Vec<Record>);
+        impl Collector for FixedRecordsCollector {
+            fn name(&self) -> &str {
+                "fake_temporal_records"
+            }
+            fn collect(&self, _ctx: &CollectCtx<'_>) -> cairn_core::Result<Vec<Record>> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let start = Utc::now();
+        let image_path = r"C:\Users\victim\AppData\Local\Temp\evil.exe";
+        let pr = ProcessRecord {
+            pid: 777,
+            ppid: 1,
+            image: image_path.to_string(),
+            cmdline: String::new(),
+            signed: Some(false),
+            signer: None,
+            binary_sha256: None,
+            integrity: None,
+            user: None,
+            start_time: Some(start),
+        };
+        // S9 execution-hit fixture: same construction pattern as persist.rs's
+        // `rec()` test helper (mechanism="ifeo", binary_path/command set to the
+        // same path as pr.image so PersistHeuristic's join_key matches this
+        // ProcessRecord and populates entity.process on the resulting Finding).
+        let persistence = PersistenceRecord {
+            mechanism: "ifeo".into(),
+            location: r"HKLM\...\Run".into(),
+            value: Some("Updater".into()),
+            command: Some(image_path.to_string()),
+            binary_path: Some(image_path.to_string()),
+            binary_sha256: None,
+            signed: None,
+            signer: None,
+            last_write: Some(start),
+        };
+        let usn = UsnEventRecord {
+            ts: start + chrono::Duration::minutes(1),
+            path: r"C:\Temp\dropped_payload.dll".to_string(),
+            reason: "create".to_string(),
+            mft_ref: 1,
+        };
+
+        let cfg = cairn_core::Config::default();
+        let privs = Privileges {
+            admin: false,
+            se_backup: false,
+            se_debug: false,
+        };
+        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedRecordsCollector(vec![
+            Record::Process(pr),
+            Record::Persistence(persistence),
+            Record::UsnEvent(usn),
+        ]))];
+        let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
+            Box::new(cairn_heur::PersistHeuristic),
+            Box::new(cairn_heur::TemporalWindowCorrelator),
+        ];
+
+        let outcome = run_live(&cfg, privs, "TEST".into(), &collectors, &analyzers);
+
+        let temporal_finding = outcome
+            .findings
+            .iter()
+            .find(|f| f.artifact == "temporal_window");
+        assert!(
+            temporal_finding.is_some(),
+            "temporal window finding must be present when persist Finding has entity.process \
+             and a USN event falls within the window; got findings: {:?}",
+            outcome
+                .findings
+                .iter()
+                .map(|f| &f.title)
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Integration: proves the whole BYOVD pipeline end-to-end — a --driver-list file
     /// is read + parsed exactly as the live CLI path does, then ByovdHeuristic (wired
     /// through run_live like any other analyzer) matches a real amcache_driver record
