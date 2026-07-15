@@ -879,6 +879,7 @@ fn main() -> anyhow::Result<()> {
                 Box::new(cairn_heur::ParentChildHeuristic),
                 Box::new(cairn_heur::NetConnHeuristic),
                 Box::new(cairn_heur::PersistHeuristic),
+                Box::new(cairn_heur::TemporalWindowCorrelator),
                 // S2-N′: threshold from Config (fixed default 24h; no CLI flag).
                 Box::new(cairn_heur::TimestompHeuristic::new(
                     chrono::Duration::hours(cfg.timestomp_threshold_hours),
@@ -1281,6 +1282,7 @@ mod tests {
             Box::new(cairn_heur::ParentChildHeuristic),
             Box::new(cairn_heur::NetConnHeuristic),
             Box::new(cairn_heur::PersistHeuristic),
+            Box::new(cairn_heur::TemporalWindowCorrelator),
             Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
             Box::new(cairn_heur::AccountHeuristic),
             Box::new(cairn_heur::LogonBruteforceHeuristic::new(
@@ -1310,6 +1312,10 @@ mod tests {
                 .iter()
                 .any(|a| a.name() == "heur_logon_bruteforce"),
             "logon bruteforce heuristic must be registered"
+        );
+        assert!(
+            analyzers.iter().any(|a| a.name() == "heur_temporal"),
+            "temporal window correlator must be registered"
         );
     }
 
