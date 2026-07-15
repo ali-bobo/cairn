@@ -58,7 +58,9 @@ type BruteforceKey = (String, String);
 /// Spraying group key: source only. Groups distinct-account attempts from one origin.
 type SprayingKey = String;
 
-fn group_by_bruteforce_key(attempts: &[LogonAttempt]) -> HashMap<BruteforceKey, Vec<&LogonAttempt>> {
+fn group_by_bruteforce_key(
+    attempts: &[LogonAttempt],
+) -> HashMap<BruteforceKey, Vec<&LogonAttempt>> {
     let mut groups: HashMap<BruteforceKey, Vec<&LogonAttempt>> = HashMap::new();
     for a in attempts {
         groups
@@ -134,7 +136,11 @@ impl LogonBruteforceHeuristic {
             if max_failures < self.bruteforce_threshold {
                 continue;
             }
-            let severity = if has_success { Severity::High } else { Severity::Medium };
+            let severity = if has_success {
+                Severity::High
+            } else {
+                Severity::Medium
+            };
             let title = format!("登入爆破: {target_user} ← {source}");
             let details = format!(
                 "帳號 {target_user} 在 {} 分鐘內從來源 {source} 收到 {max_failures} 次失敗登入嘗試",
@@ -166,7 +172,11 @@ impl LogonBruteforceHeuristic {
                     ts: Some(a.ts),
                     detail: format!(
                         "{}: target={} source={}",
-                        if a.success { "4624 success" } else { "4625 failure" },
+                        if a.success {
+                            "4624 success"
+                        } else {
+                            "4625 failure"
+                        },
                         a.target_user,
                         a.source
                     ),
@@ -230,7 +240,11 @@ impl LogonBruteforceHeuristic {
                 )
             };
             let mut f = Finding::new(severity, title, FindingSource::Heuristic);
-            f.ts = evidence_at_max.iter().map(|a| a.ts).max().unwrap_or_else(Utc::now);
+            f.ts = evidence_at_max
+                .iter()
+                .map(|a| a.ts)
+                .max()
+                .unwrap_or_else(Utc::now);
             f.artifact = "logon_bruteforce".into();
             f.mitre = vec!["T1110.003".into()];
             f.details = details;
@@ -243,7 +257,11 @@ impl LogonBruteforceHeuristic {
                     ts: Some(a.ts),
                     detail: format!(
                         "{}: target={} source={}",
-                        if a.success { "4624 success" } else { "4625 failure" },
+                        if a.success {
+                            "4624 success"
+                        } else {
+                            "4625 failure"
+                        },
                         a.target_user,
                         a.source
                     ),

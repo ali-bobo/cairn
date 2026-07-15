@@ -1306,7 +1306,9 @@ mod tests {
             "heur_byovd must be in analyzer set"
         );
         assert!(
-            analyzers.iter().any(|a| a.name() == "heur_logon_bruteforce"),
+            analyzers
+                .iter()
+                .any(|a| a.name() == "heur_logon_bruteforce"),
             "logon bruteforce heuristic must be registered"
         );
     }
@@ -1729,14 +1731,21 @@ author: test-integration
 
         let outcome = run_live(&cfg, privs, "TEST".into(), &collectors, &analyzers);
 
-        assert_eq!(outcome.records.len(), 5, "all 5 fake events must be collected");
+        assert_eq!(
+            outcome.records.len(),
+            5,
+            "all 5 fake events must be collected"
+        );
         assert!(
             !outcome.findings.is_empty(),
             "bruteforce finding must be present in RunOutcome"
         );
         let finding = &outcome.findings[0];
         assert_eq!(finding.severity, cairn_core::finding::Severity::Medium);
-        assert!(finding.reason.is_some(), "golden rule 6: reason must be set");
+        assert!(
+            finding.reason.is_some(),
+            "golden rule 6: reason must be set"
+        );
         assert_eq!(finding.mitre, vec!["T1110.001".to_string()]);
     }
 
