@@ -9,27 +9,16 @@
 //! Guarantee: read-only. PROCESS_VM_READ carries no write capability; this module
 //! never calls WriteProcessMemory or any handle-modifying API. Failures abstain
 //! (return None) rather than guess (NFR12) — see cairn/CLAUDE.md golden rule 8.
+//! This module does not open or close process handles itself — see
+//! proc.rs::enumerate for the shared-handle lifecycle (AV false-positive
+//! mitigation: one OpenProcess call per process instead of four).
 
 use windows::Wdk::System::Threading::{
     NtQueryInformationProcess, ProcessBasicInformation, ProcessWow64Information,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_BASIC_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
-};
-
-/// RAII guard for a process HANDLE.
-/// INVARIANT: holds a valid handle from OpenProcess; closed exactly once on drop.
-struct ProcHandle(HANDLE);
-impl Drop for ProcHandle {
-    fn drop(&mut self) {
-        // SAFETY: self.0 is the valid process handle from OpenProcess; closed once.
-        unsafe {
-            let _ = CloseHandle(self.0);
-        }
-    }
-}
+use windows::Win32::System::Threading::PROCESS_BASIC_INFORMATION;
 
 /// Upper bound on a UNICODE_STRING.Length we will trust before allocating a
 /// read buffer — the value lives in the target's (potentially adversarial)
@@ -83,33 +72,27 @@ fn read_remote_struct<T: Default>(handle: HANDLE, addr: *const core::ffi::c_void
     Some(out)
 }
 
-/// Best-effort full command line for `pid`, via PEB -> RTL_USER_PROCESS_PARAMETERS
-/// -> CommandLine (three chained ReadProcessMemory calls into the target's address
-/// space). None on ANY failure at ANY step (target exited mid-read, WOW64 mismatch,
-/// oversized/corrupt UNICODE_STRING.Length, partial read) — never guesses from a
-/// partial result. Read-only: PROCESS_VM_READ cannot modify the target (rule 1).
-pub(crate) fn read_cmdline(pid: u32) -> Option<String> {
-    // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
-    let handle = unsafe {
-        OpenProcess(
-            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-            false,
-            pid,
-        )
-    }
-    .ok()?;
-    let guard = ProcHandle(handle);
-
-    if is_wow64(guard.0) {
+/// Best-effort full command line for an already-open process handle, via PEB ->
+/// RTL_USER_PROCESS_PARAMETERS -> CommandLine (three chained ReadProcessMemory calls
+/// into the target's address space). None on ANY failure at ANY step (target exited
+/// mid-read, WOW64 mismatch, oversized/corrupt UNICODE_STRING.Length, partial read)
+/// — never guesses from a partial result. Read-only: PROCESS_VM_READ cannot modify
+/// the target (rule 1).
+///
+/// Caller contract: `handle` MUST have been opened with at least
+/// PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ. This function does not open
+/// or close the handle — the caller (proc.rs::enumerate) owns its lifetime.
+pub(crate) fn read_cmdline(handle: HANDLE) -> Option<String> {
+    if is_wow64(handle) {
         return None; // native-width only; abstain on bitness mismatch (NFR12)
     }
 
     let pbi: PROCESS_BASIC_INFORMATION = {
         let mut pbi = PROCESS_BASIC_INFORMATION::default();
-        // SAFETY: guard.0 valid; pbi is a valid out-param sized correctly.
+        // SAFETY: handle valid (caller contract); pbi is a valid out-param sized correctly.
         let status = unsafe {
             NtQueryInformationProcess(
-                guard.0,
+                handle,
                 ProcessBasicInformation,
                 &mut pbi as *mut PROCESS_BASIC_INFORMATION as *mut core::ffi::c_void,
                 std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
@@ -125,19 +108,15 @@ pub(crate) fn read_cmdline(pid: u32) -> Option<String> {
         return None;
     }
 
-    // Step 1: read the entire PEB struct (not a hand-computed offset) so
-    // ProcessParameters is accessed via the crate's own field layout.
     let peb: windows::Win32::System::Threading::PEB =
-        read_remote_struct(guard.0, pbi.PebBaseAddress as *const core::ffi::c_void)?;
+        read_remote_struct(handle, pbi.PebBaseAddress as *const core::ffi::c_void)?;
     let params_ptr = peb.ProcessParameters;
     if params_ptr.is_null() {
         return None;
     }
 
-    // Step 2: read the entire RTL_USER_PROCESS_PARAMETERS struct, then take
-    // its CommandLine field (a UNICODE_STRING: Length in bytes + a remote pointer).
     let params: windows::Win32::System::Threading::RTL_USER_PROCESS_PARAMETERS =
-        read_remote_struct(guard.0, params_ptr as *const core::ffi::c_void)?;
+        read_remote_struct(handle, params_ptr as *const core::ffi::c_void)?;
     let cmdline_us = params.CommandLine;
 
     if cmdline_us.Length as usize > MAX_CMDLINE_BYTES {
@@ -147,15 +126,14 @@ pub(crate) fn read_cmdline(pid: u32) -> Option<String> {
         return None;
     }
 
-    // Step 3: read the actual UTF-16LE command-line bytes.
     let byte_len = cmdline_us.Length as usize;
     let mut buf = vec![0u16; byte_len.div_ceil(2)];
     let mut bytes_read: usize = 0;
-    // SAFETY: guard.0 valid; buf sized to hold byte_len bytes; bytes_read
-    // out-param checked below for a partial-read short-circuit.
+    // SAFETY: handle valid (caller contract); buf sized to hold byte_len bytes;
+    // bytes_read out-param checked below for a partial-read short-circuit.
     unsafe {
         ReadProcessMemory(
-            guard.0,
+            handle,
             cmdline_us.Buffer.0 as *const core::ffi::c_void,
             buf.as_mut_ptr() as *mut core::ffi::c_void,
             byte_len,
