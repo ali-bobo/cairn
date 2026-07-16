@@ -54,3 +54,27 @@ Cairn's authorized activity from real threat activity during the window.
 - **對應 Windows 安全稽核原則**：`service: security`/`service: system` 類規則
   （認證/登入事件、服務安裝事件等）需要主機已啟用對應的稽核子類別。
 - 詳細規則對照見 `docs/sigma-rule-catalog.md`。
+
+## 7. Cairn 對每個行程做的記憶體讀取（PEB cmdline 擷取）
+
+Cairn 掃描到的每個 Windows 行程，會嘗試一次 `OpenProcess`
+（`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`）+ `ReadProcessMemory`
+讀取該行程的 PEB（Process Environment Block），取得完整命令列。
+
+**為什麼需要**：IR 鑑識需要攻擊者實際下達的完整指令（例如完整的
+PowerShell `-EncodedCommand` 內容），只有行程名稱不足以判斷是否為惡意。這是
+`heur_parentchild`/`heur_persist` 等多個 heuristic 的主要訊號來源。
+
+**保證**：純唯讀。`PROCESS_VM_READ` 不含任何寫入能力，Cairn 不會呼叫
+`WriteProcessMemory` 或任何會修改目標行程的 API。程式碼位置：
+`crates/cairn-collectors-win/src/cmdline_reader.rs`（供 SOC/資安人員逕行稽核）。
+
+**對 AV/EDR 的影響**：`OpenProcess`+`ReadProcessMemory` 這組 API 組合是多數
+EDR/AV 靜態與行為 heuristic 高度關注的訊號（跨行程記憶體讀取是常見的
+credential-dumping/infostealer 手法）。這正是本工具最常觸發防禦軟體誤判的
+行為之一——SOC 應預期在授權掃描期間看到這個行為，並將其識別為 Cairn 的正常
+運作，而非入侵指標。
+
+**已知限制**：受保護行程（PPL、防毒/EDR 自身行程等）會拒絕 `PROCESS_VM_READ`，
+此時 Cairn 會 fallback 拿基本身分資訊（image path、integrity、start_time），
+`cmdline` 欄位留空——這是預期的優雅降級，不是錯誤。

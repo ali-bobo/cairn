@@ -46,7 +46,7 @@ mod win {
     };
     use windows::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
     };
 
     /// RAII guard for a snapshot HANDLE.
@@ -73,26 +73,23 @@ mod win {
         }
     }
 
-    /// Best-effort full image path for a pid via OpenProcess + QueryFullProcessImageNameW.
-    /// Returns None if the process cannot be opened (privilege / exited / pid 0 = System
-    /// Idle, which always fails OpenProcess — expected and handled) or the query fails.
+    /// Best-effort full image path for an already-open process handle, via
+    /// QueryFullProcessImageNameW. Returns None if the query fails.
     /// Never panics. Read-only: QUERY_LIMITED_INFORMATION cannot modify the target.
-    fn full_image_path(pid: u32) -> Option<String> {
-        // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately in the
-        // guard. bInheritHandle=false; QUERY_LIMITED_INFORMATION is read-only.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-        let guard = ProcHandle(handle);
-
+    ///
+    /// Caller contract: `handle` MUST have been opened with at least
+    /// PROCESS_QUERY_LIMITED_INFORMATION.
+    fn full_image_path(handle: HANDLE) -> Option<String> {
         // First attempt with MAX_PATH; grow once on insufficient buffer.
         for cap in [260usize, 32768usize] {
             let mut buf = vec![0u16; cap];
             let mut len = cap as u32;
-            // SAFETY: guard.0 is a valid handle; buf has `cap` u16 slots; len is in/out
-            // (capacity in, chars-written out). On success the API guarantees len <= cap
-            // (the path + NUL fit), so the `&buf[..len]` slice below is always in-bounds.
+            // SAFETY: handle valid (caller contract); buf has `cap` u16 slots; len is
+            // in/out (capacity in, chars-written out). On success the API guarantees
+            // len <= cap (the path + NUL fit), so the `&buf[..len]` slice is in-bounds.
             let r = unsafe {
                 QueryFullProcessImageNameW(
-                    guard.0,
+                    handle,
                     PROCESS_NAME_WIN32,
                     windows::core::PWSTR(buf.as_mut_ptr()),
                     &mut len,
@@ -121,19 +118,17 @@ mod win {
         }
     }
 
-    /// Best-effort token integrity RID for a pid. Returns None on any failure
-    /// (privilege / pid 0 / exited process) — never panics. Read-only: TOKEN_QUERY
-    /// cannot modify the target.
-    fn read_integrity(pid: u32) -> Option<u32> {
-        // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
-        // QUERY_LIMITED_INFORMATION is sufficient to open a token for TOKEN_QUERY.
-        let proc_handle =
-            unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-        let proc_guard = ProcHandle(proc_handle);
-
+    /// Best-effort token integrity RID for an already-open process handle. Returns
+    /// None on any failure — never panics. Read-only: TOKEN_QUERY cannot modify
+    /// the target.
+    ///
+    /// Caller contract: `handle` MUST have been opened with at least
+    /// PROCESS_QUERY_LIMITED_INFORMATION.
+    fn read_integrity(handle: HANDLE) -> Option<u32> {
         let mut token = HANDLE::default();
-        // SAFETY: proc_guard.0 valid; token is an out-param written only on success.
-        unsafe { OpenProcessToken(proc_guard.0, TOKEN_QUERY, &mut token) }.ok()?;
+        // SAFETY: handle valid (caller contract); token is an out-param written
+        // only on success.
+        unsafe { OpenProcessToken(handle, TOKEN_QUERY, &mut token) }.ok()?;
         let token_guard = TokenHandle(token);
 
         // Two-stage size probe: first call with a null buffer to learn the required
@@ -196,175 +191,24 @@ mod win {
         }
     }
 
-    /// Best-effort process creation time via GetProcessTimes. None on any failure
-    /// (privilege / exited process) or on an all-zero FILETIME (no real timestamp).
-    /// Never panics. Read-only: QUERY_LIMITED_INFORMATION cannot modify the target.
-    fn read_start_time(pid: u32) -> Option<super::DateTime<super::Utc>> {
-        // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
-        let guard = ProcHandle(handle);
-
+    /// Best-effort process creation time for an already-open process handle, via
+    /// GetProcessTimes. None on any failure or on an all-zero FILETIME (no real
+    /// timestamp). Never panics. Read-only.
+    ///
+    /// Caller contract: `handle` MUST have been opened with at least
+    /// PROCESS_QUERY_LIMITED_INFORMATION.
+    fn read_start_time(handle: HANDLE) -> Option<super::DateTime<super::Utc>> {
         let mut creation = FILETIME::default();
         let mut exit = FILETIME::default();
         let mut kernel = FILETIME::default();
         let mut user = FILETIME::default();
-        // SAFETY: guard.0 valid; all four out-params are valid mutable FILETIME refs
-        // owned by this stack frame for the duration of the call.
-        unsafe { GetProcessTimes(guard.0, &mut creation, &mut exit, &mut kernel, &mut user) }
+        // SAFETY: handle valid (caller contract); all four out-params are valid
+        // mutable FILETIME refs owned by this stack frame for the duration of the call.
+        unsafe { GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user) }
             .ok()?;
 
         let ticks = ((creation.dwHighDateTime as u64) << 32) | creation.dwLowDateTime as u64;
         cairn_core::filetime_to_utc(ticks)
-    }
-
-    use windows::Wdk::System::Threading::{
-        NtQueryInformationProcess, ProcessBasicInformation, ProcessWow64Information,
-    };
-    use windows::Win32::System::Diagnostics::Debug::ReadProcessMemory;
-    use windows::Win32::System::Threading::{PROCESS_BASIC_INFORMATION, PROCESS_VM_READ};
-
-    /// Upper bound on a UNICODE_STRING.Length we will trust before allocating a
-    /// read buffer — the value lives in the target's (potentially adversarial)
-    /// memory, so it must be capped before use (mirrors volume.rs::MAX_READ).
-    const MAX_CMDLINE_BYTES: usize = 32 * 1024;
-
-    /// True if `pid` is a WOW64 (32-bit-on-64-bit) process. On query failure,
-    /// conservatively returns `true` (abstain) rather than risk misreading a
-    /// 32-bit PEB layout as a 64-bit one.
-    fn is_wow64(handle: HANDLE) -> bool {
-        let mut wow64_peb: usize = 0;
-        // SAFETY: handle valid; wow64_peb is a valid out-param; ProcessWow64Information
-        // on a 64-bit build returns the WOW64 PEB address (non-zero) or 0 if native.
-        let status = unsafe {
-            NtQueryInformationProcess(
-                handle,
-                ProcessWow64Information,
-                &mut wow64_peb as *mut usize as *mut core::ffi::c_void,
-                std::mem::size_of::<usize>() as u32,
-                std::ptr::null_mut(),
-            )
-        };
-        if status.is_err() {
-            return true; // abstain-safe default
-        }
-        wow64_peb != 0
-    }
-
-    /// Read an entire `T` from `pid`'s address space at `addr` via a single
-    /// ReadProcessMemory call. Returns None on any failure or short read — never
-    /// interprets a partial/uninitialized `T`.
-    fn read_remote_struct<T: Default>(handle: HANDLE, addr: *const core::ffi::c_void) -> Option<T> {
-        let mut out = T::default();
-        let mut bytes_read: usize = 0;
-        let size = std::mem::size_of::<T>();
-        // SAFETY: handle valid; `out` is a local T with `size` bytes reserved;
-        // bytes_read out-param checked below for a partial-read short-circuit.
-        unsafe {
-            ReadProcessMemory(
-                handle,
-                addr,
-                &mut out as *mut T as *mut core::ffi::c_void,
-                size,
-                Some(&mut bytes_read as *mut usize),
-            )
-        }
-        .ok()?;
-        if bytes_read != size {
-            return None;
-        }
-        Some(out)
-    }
-
-    /// Best-effort full command line for `pid`, via PEB -> RTL_USER_PROCESS_PARAMETERS
-    /// -> CommandLine (three chained ReadProcessMemory calls into the target's address
-    /// space). None on ANY failure at ANY step (target exited mid-read, WOW64 mismatch,
-    /// oversized/corrupt UNICODE_STRING.Length, partial read) — never guesses from a
-    /// partial result. Read-only: PROCESS_VM_READ cannot modify the target (rule 1).
-    fn read_cmdline(pid: u32) -> Option<String> {
-        // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
-        let handle = unsafe {
-            OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-                false,
-                pid,
-            )
-        }
-        .ok()?;
-        let guard = ProcHandle(handle);
-
-        if is_wow64(guard.0) {
-            return None; // native-width only; abstain on bitness mismatch (NFR12)
-        }
-
-        let pbi: PROCESS_BASIC_INFORMATION = {
-            let mut pbi = PROCESS_BASIC_INFORMATION::default();
-            // SAFETY: guard.0 valid; pbi is a valid out-param sized correctly.
-            let status = unsafe {
-                NtQueryInformationProcess(
-                    guard.0,
-                    ProcessBasicInformation,
-                    &mut pbi as *mut PROCESS_BASIC_INFORMATION as *mut core::ffi::c_void,
-                    std::mem::size_of::<PROCESS_BASIC_INFORMATION>() as u32,
-                    std::ptr::null_mut(),
-                )
-            };
-            if status.is_err() {
-                return None;
-            }
-            pbi
-        };
-        if pbi.PebBaseAddress.is_null() {
-            return None;
-        }
-
-        // Step 1: read the entire PEB struct (not a hand-computed offset) so
-        // ProcessParameters is accessed via the crate's own field layout.
-        let peb: windows::Win32::System::Threading::PEB =
-            read_remote_struct(guard.0, pbi.PebBaseAddress as *const core::ffi::c_void)?;
-        let params_ptr = peb.ProcessParameters;
-        if params_ptr.is_null() {
-            return None;
-        }
-
-        // Step 2: read the entire RTL_USER_PROCESS_PARAMETERS struct, then take
-        // its CommandLine field (a UNICODE_STRING: Length in bytes + a remote pointer).
-        let params: windows::Win32::System::Threading::RTL_USER_PROCESS_PARAMETERS =
-            read_remote_struct(guard.0, params_ptr as *const core::ffi::c_void)?;
-        let cmdline_us = params.CommandLine;
-
-        if cmdline_us.Length as usize > MAX_CMDLINE_BYTES {
-            return None; // adversarial/corrupt Length; abstain rather than OOM (NFR9)
-        }
-        if cmdline_us.Length == 0 || cmdline_us.Buffer.is_null() {
-            return None;
-        }
-
-        // Step 3: read the actual UTF-16LE command-line bytes.
-        let byte_len = cmdline_us.Length as usize;
-        let mut buf = vec![0u16; byte_len.div_ceil(2)];
-        let mut bytes_read: usize = 0;
-        // SAFETY: guard.0 valid; buf sized to hold byte_len bytes; bytes_read
-        // out-param checked below for a partial-read short-circuit.
-        unsafe {
-            ReadProcessMemory(
-                guard.0,
-                cmdline_us.Buffer.0 as *const core::ffi::c_void,
-                buf.as_mut_ptr() as *mut core::ffi::c_void,
-                byte_len,
-                Some(&mut bytes_read as *mut usize),
-            )
-        }
-        .ok()?;
-        if bytes_read != byte_len {
-            return None; // partial read: treat as failure, never truncate-and-guess
-        }
-
-        let s = String::from_utf16_lossy(&buf);
-        if s.is_empty() {
-            None
-        } else {
-            Some(s)
-        }
     }
 
     pub fn enumerate() -> Result<Vec<RawProc>> {
@@ -395,18 +239,56 @@ mod win {
                 .position(|&c| c == 0)
                 .unwrap_or(entry.szExeFile.len());
             let file_name = String::from_utf16_lossy(&entry.szExeFile[..len]);
-            // Prefer the full image path (for signature verification downstream); fall back
-            // to the Toolhelp file name when the process can't be opened (privilege/exited).
-            let image = full_image_path(entry.th32ProcessID).unwrap_or(file_name);
+            let pid = entry.th32ProcessID;
+
+            // AV false-positive mitigation: open the process ONCE per pid instead of up
+            // to 4 times. Try the union of every query's access mask first; if that's
+            // denied (e.g. a protected process refusing PROCESS_VM_READ), fall back to
+            // the base mask so image/integrity/start_time still resolve — only cmdline
+            // is sacrificed. This preserves golden rule 8 (graceful degrade): a denied
+            // capability degrades that one field, never the whole pid.
+            // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
+            let full_handle = unsafe {
+                OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                    false,
+                    pid,
+                )
+            }
+            .ok();
+
+            let (image, cmdline, integrity_raw, start_time) = if let Some(h) = full_handle {
+                let guard = ProcHandle(h);
+                let image = full_image_path(guard.0).unwrap_or_else(|| file_name.clone());
+                let cmdline = crate::cmdline_reader::read_cmdline(guard.0);
+                let integrity_raw = read_integrity(guard.0);
+                let start_time = read_start_time(guard.0);
+                (image, cmdline, integrity_raw, start_time)
+            } else {
+                // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
+                let base_handle =
+                    unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok();
+                match base_handle {
+                    Some(h) => {
+                        let guard = ProcHandle(h);
+                        let image = full_image_path(guard.0).unwrap_or_else(|| file_name.clone());
+                        let integrity_raw = read_integrity(guard.0);
+                        let start_time = read_start_time(guard.0);
+                        (image, None, integrity_raw, start_time)
+                    }
+                    None => (file_name.clone(), None, None, None),
+                }
+            };
+
             out.push(RawProc {
-                pid: entry.th32ProcessID,
+                pid,
                 ppid: entry.th32ParentProcessID,
                 image,
-                cmdline: read_cmdline(entry.th32ProcessID),
-                integrity_raw: read_integrity(entry.th32ProcessID),
+                cmdline,
+                integrity_raw,
                 signed: None,
                 user: None,
-                start_time: read_start_time(entry.th32ProcessID),
+                start_time,
             });
             // SAFETY: snap.0 valid; entry reused per the Toolhelp iteration contract.
             if unsafe { Process32NextW(snap.0, &mut entry) }.is_err() {
@@ -487,6 +369,25 @@ mod tests {
         assert!(
             mine.cmdline.is_some(),
             "expected a cmdline for our own process"
+        );
+    }
+
+    /// Documents the two-stage fallback contract: this test can't force a real
+    /// PROCESS_VM_READ denial (would need a genuinely protected process), but it
+    /// confirms the union-mask path is what's actually exercised for an unprotected
+    /// process — the fallback branch remains logic-reviewed rather than
+    /// integration-tested against a real protected target. Tracked as a known gap.
+    #[test]
+    fn enumerate_uses_union_mask_path_for_unprotected_process() {
+        let me = std::process::id();
+        let procs = enumerate().expect("enumerate");
+        let mine = procs.iter().find(|p| p.pid == me).expect("self in list");
+        // If the union-mask OpenProcess had failed and fallen back to the base mask,
+        // cmdline would be None. Since our own process is never protected, cmdline
+        // resolving proves the primary (non-fallback) path executed.
+        assert!(
+            mine.cmdline.is_some(),
+            "expected the union-mask path (not fallback) for our own unprotected process"
         );
     }
 }
