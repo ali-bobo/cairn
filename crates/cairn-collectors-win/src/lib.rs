@@ -8,6 +8,7 @@
 //! See docs/superpowers/specs/2026-06-12-s2a-orchestrator-proc-net-design.md.
 #![allow(unsafe_code)] // EXPECTED: this is the isolated FFI boundary (NFR3, CLAUDE.md).
 
+mod cmdline_reader;
 pub mod host;
 pub mod logon;
 pub mod net;
