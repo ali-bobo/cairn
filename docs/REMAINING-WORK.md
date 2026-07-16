@@ -110,6 +110,17 @@
   subagent「已完成」的回報後，一律親自重跑至少一項可獨立核查的指令（`git log`
   看 commit 是否存在、`ls` 看檔案是否落地、重跑測試看是否真的通過），才能算
   驗證完畢；純粹轉述 subagent 的文字內容給使用者，等於沒有驗證。
+- **2026-07-16：搬移 Windows-only 程式碼到新檔案時，cfg 邊界不會自動跟著搬**——
+  `crates/cairn-collectors-win/src/proc.rs` 原本把所有 WinAPI 邏輯包在
+  `#[cfg(windows)] mod win { ... }` 內；把其中一段（`read_cmdline` 及其依賴）
+  搬到新檔案 `cmdline_reader.rs` 時，只在 `lib.rs` 加了 `mod cmdline_reader;`
+  卻忘了同時補 `#[cfg(windows)]`。本機開發環境是 Windows，這個 cfg 恆真，
+  完全看不出問題，直到 CI 的 Linux fmt/clippy/check/test job 才報錯（`cannot
+  find module or crate windows`）。**修正**：往後任何跨檔案搬移 Windows-only
+  （或任何平台限定）程式碼時，第一步先確認新檔案的模組宣告處是否需要重新
+  顯式套用同樣的 `#[cfg(...)]`——不能依賴「舊檔案的 cfg 邊界」自動延續到新
+  檔案，這兩者是獨立的宣告點。本機全綠不能取代 CI 的跨平台驗證，尤其是牽涉
+  `cfg(windows)`/`cfg(unix)` 這類條件編譯邊界的重構。
 
 ---
 
@@ -249,6 +260,41 @@ clippy 抓到 `needless_lifetimes`、fmt 抓到未格式化程式碼，皆為預
 `run_live` pipeline，串接驗證 Task0 的 entity.process 填值與 Task2 的
 反查消費協作）。全 workspace 驗證：667 個測試 0 failed、clippy 零警告、
 fmt --check 通過。
+
+### 段外 — AV 誤判緩解（合法工程優化，非規避）✅ 完成並已 merge（2026-07-16，PR #38，main `5e6cbff`）
+
+背景：使用者實測打包後的 `cairn.exe` 被 PC-cillin 本機 heuristic 攔截。診斷確認
+觸發因子是 `OpenProcess`+`ReadProcessMemory`（PEB 讀取 cmdline）這組跨行程記憶體
+讀取 API，以及 `proc.rs` 對同一 pid 分散呼叫四次 `OpenProcess`（`full_image_path`/
+`read_integrity`/`read_start_time`/`read_cmdline` 各自獨立開關 handle）。使用者
+明確要求「純靠程式邏輯調整，不是刻意潛伏」——本段全程遵守這個判準：**只改變
+AV 怎麼分類這個行為，不改變 AV 能不能觀察到這個行為**，明確不使用同日稍早在
+CLAUDE.md 加入的 GOLDEN RULE 1 例外條款（規避手法），因為這兩項調整本質是
+效能與治理優化。
+
+三項調整：(1) `enumerate()` 對每個 pid 改成兩階段開啟——先試聯集權限
+（`PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`）一次拿全部四項欄位；
+失敗則 fallback 只用基礎權限再開一次，拿三項欄位、cmdline 放棄——保留 golden
+rule 8 graceful degrade（部分欄位失敗，非全部欄位失敗）。正常情況下每個 pid
+從 4 次 `OpenProcess` 降到 1 次。(2) 把 PEB/cmdline 讀取邏輯獨立成
+`crates/cairn-collectors-win/src/cmdline_reader.rs`，開頭加誠實的用途/唯讀保證
+說明，便於資安人員稽核。(3) 補 `docs/SOC-runbook-template.md` 說明這組 API 的
+用途，呼應段9記憶提過的已知殘留風險 L3。
+
+**CI 抓到並修正一個真實的跨平台編譯缺陷**：`cmdline_reader.rs` 直接用
+`windows` crate 但沒有 `#[cfg(windows)]` 保護；`proc.rs` 原本把所有 Windows-only
+邏輯包在 `#[cfg(windows)] mod win { ... }` 內，但 Task 1 把 `read_cmdline`
+搬到新檔案時，沒有在 `lib.rs` 的 `mod cmdline_reader;` 宣告處重新套用同樣的
+cfg 邊界。本機開發環境是 Windows，這個 cfg 恆真，完全看不出問題；只有 CI 的
+Linux fmt/clippy/check/test job 才暴露（`cannot find module or crate windows`）。
+修法：`lib.rs` 補 `#[cfg(windows)]` 在模組宣告前。**教訓**：搬移 Windows-only
+程式碼到新檔案時，原本的 cfg 邊界不會自動跟著搬——要在新檔案的模組宣告處
+（`lib.rs`／`mod.rs`）重新顯式套用，不能依賴本機 Windows 環境「看起來沒事」。
+
+**明確告知使用者**：這次改動能否解除 PC-cillin 的實際攔截無法保證（AV
+heuristic 評分規則不透明，未簽章執行檔的信譽分數需要時間累積），本段目的是
+降低誤判機率、提高治理透明度，簽章（SignPath.io，repo 已 public 符合免費
+資格）才是更根本的解法，使用者選擇先做別的、簽章事宜暫緩。
 
 ### 段 4 — WMI 持久化（Observation-first 重設計）
 
