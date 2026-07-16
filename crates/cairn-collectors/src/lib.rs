@@ -21,3 +21,4 @@ pub mod shimcache;
 pub mod srum;
 pub mod userassist;
 pub mod usn;
+pub mod wmi_subscription;
