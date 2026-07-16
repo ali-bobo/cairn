@@ -18,3 +18,5 @@ pub mod privilege;
 pub mod proc;
 pub mod signature;
 pub mod volume;
+#[cfg(windows)]
+pub mod wmi;
