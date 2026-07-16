@@ -18,7 +18,6 @@ fn extract_binary_path(consumer_type: &str, command: &str) -> Option<String> {
     }
     // Best-effort: first whitespace-delimited token, stripped of quotes.
     command
-        .trim()
         .split_whitespace()
         .next()
         .map(|s| s.trim_matches('"').to_string())
