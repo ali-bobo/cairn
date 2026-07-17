@@ -283,9 +283,9 @@ fn parse_cap(s: &str) -> Option<u64> {
 /// The collector names that the run arm's construction `if` blocks would build for
 /// this selection, in canonical order. Pure mirror of those blocks, so the
 /// selection→collectors mapping is unit-testable without a live Windows host.
-/// MUST stay in sync with the eleven unconditional `if ... push(...)` blocks in `main` that
-/// construct proc/net/logon_session/persist/mft/usn/shimcache/amcache/prefetch/bam/userassist
-/// collectors (search: "S2-L: construct only").
+/// MUST stay in sync with the twelve unconditional `if ... push(...)` blocks in `main` that
+/// construct proc/net/logon_session/persist/mft/usn/shimcache/amcache/prefetch/bam/userassist/
+/// wmi_subscription collectors (search: "S2-L: construct only").
 /// NOTE: `evtx_live` and `srum` are NOT included — they are conditionally constructed
 /// (evtx_live requires sigma_analyzer, srum has its own stub path).
 #[cfg(test)]
@@ -302,6 +302,7 @@ fn built_collector_names(selected: &[String]) -> Vec<String> {
         "prefetch",
         "bam",
         "userassist",
+        "wmi_subscription",
     ]
     .iter()
     .filter(|n| selected.iter().any(|m| m == *n))
@@ -693,6 +694,7 @@ fn main() -> anyhow::Result<()> {
                 "bam",
                 "userassist",
                 "srum",
+                "wmi_subscription",
                 "evtx_live",
             ];
             let selection = cairn_core::select_modules(profile, only.as_deref(), AVAILABLE);
@@ -846,6 +848,11 @@ fn main() -> anyhow::Result<()> {
             }
             if selection.selected.iter().any(|m| m == "srum") {
                 collectors.push(Box::new(cairn_collectors::srum::SrumCollector::default()));
+            }
+            if selection.selected.iter().any(|m| m == "wmi_subscription") {
+                collectors.push(Box::new(
+                    cairn_collectors::wmi_subscription::WmiSubscriptionCollector,
+                ));
             }
             if selection.selected.iter().any(|m| m == "evtx_live") {
                 if let Some(ref sa) = sigma_analyzer {
@@ -1133,6 +1140,7 @@ mod tests {
             "bam",
             "userassist",
             "srum",
+            "wmi_subscription",
             "evtx_live",
         ];
 
@@ -1159,7 +1167,8 @@ mod tests {
                 "amcache",
                 "prefetch",
                 "bam",
-                "userassist"
+                "userassist",
+                "wmi_subscription"
             ]
         );
 
