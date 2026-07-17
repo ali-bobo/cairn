@@ -32,10 +32,9 @@ impl Collector for WmiSubscriptionCollector {
     }
 
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
-        #[cfg(windows)]
+        // enumerate_subscriptions() is cross-platform on its own (empty vec on
+        // non-Windows) — no cfg needed at this call site.
         let raw = cairn_collectors_win::wmi::enumerate_subscriptions()?;
-        #[cfg(not(windows))]
-        let raw: Vec<cairn_collectors_win::wmi::RawWmiSubscription> = vec![];
 
         let records: Vec<PersistenceRecord> = raw
             .into_iter()
