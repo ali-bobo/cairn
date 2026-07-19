@@ -19,10 +19,7 @@ pub mod trust;
 // Public API: the analyzers wired into the CLI live run (and reusable elsewhere).
 pub use account::AccountHeuristic;
 pub use byovd::ByovdHeuristic;
-// NOTE: `pub use live_exec::LiveExecHeuristic;` intentionally NOT added yet — see
-// Task 2 report / self-review: the LiveExecHeuristic struct is Task 4's deliverable,
-// not Task 2's. Adding this re-export now breaks the crate build (E0432: unresolved
-// import). Add it in Task 4 alongside the struct definition.
+pub use live_exec::LiveExecHeuristic;
 pub use logon_bruteforce::LogonBruteforceHeuristic;
 pub use netconn::NetConnHeuristic;
 pub use parentchild::ParentChildHeuristic;

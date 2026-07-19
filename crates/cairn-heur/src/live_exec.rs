@@ -5,7 +5,7 @@
 //! returns &[].
 use crate::score::{build_cross_index, join_key, severity_for, Score};
 use cairn_core::finding::EntityProcess;
-use cairn_core::record::{ExecutionRecord, ProcessRecord, Record};
+use cairn_core::record::{ProcessRecord, Record};
 use cairn_core::traits::Analyzer;
 use cairn_core::{Entity, Finding, FindingSource, Result};
 use chrono::{Duration, Utc};
@@ -83,9 +83,91 @@ fn score_process(
     s
 }
 
+/// Analyzer: flags live processes with no execution-artifact history, or with a
+/// recently-first-seen unsigned one. Independent — depends_on() is empty.
+pub struct LiveExecHeuristic;
+
+impl Analyzer for LiveExecHeuristic {
+    fn name(&self) -> &str {
+        "heur_live_exec"
+    }
+
+    fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
+        let now = Utc::now();
+        let idx = build_cross_index(records);
+        let mut out = Vec::new();
+        for r in records {
+            let Record::Process(p) = r else { continue };
+            let score = score_process(p, &idx, now);
+            if score.weight == 0 {
+                continue;
+            }
+            let Some(severity) = severity_for(score.weight) else {
+                continue;
+            };
+
+            let key = join_key(&p.image);
+            let (hits, _degraded) = idx.lookup_exec(&key);
+            let short = p.image.rsplit(['\\', '/']).next().unwrap_or(&p.image);
+            let is_signal_a = hits.is_empty();
+
+            let mut f = Finding::new(
+                severity,
+                if is_signal_a {
+                    format!("正在執行但無執行文物紀錄: {short}")
+                } else {
+                    format!("正在執行的未簽章程式最近才首見: {short}")
+                },
+                FindingSource::Heuristic,
+            );
+            f.reason = Some(score.reasons.join("; "));
+            f.mitre = if is_signal_a {
+                // No ATT&CK technique cleanly maps to "no execution-artifact record
+                // exists" on its own — that absence could mean living-off-the-land
+                // execution never touched these artifact types, deliberate log/
+                // artifact clearing, or simply a coverage gap (prefetch disabled,
+                // retention rollover). Tagging a specific technique here would
+                // overclaim what signal A actually establishes. Leave mitre empty
+                // rather than guess; the honest `reason` text carries the nuance
+                // instead (golden rule 6).
+                vec![]
+            } else {
+                vec!["T1036".to_string()]
+            };
+            f.artifact = if is_signal_a {
+                "process".to_string()
+            } else {
+                // At least one source matched (signal B requires it) — use the
+                // source that supplied the winning (earliest) first_run.
+                let earliest = hits.iter().filter_map(|e| e.first_run).min();
+                hits.iter()
+                    .find(|e| e.first_run == earliest)
+                    .map(|e| e.source.clone())
+                    .unwrap_or_else(|| "process".to_string())
+            };
+            f.details = format!("pid={} image={}", p.pid, p.image);
+            f.entity = Entity {
+                process: Some(EntityProcess {
+                    pid: p.pid,
+                    ppid: p.ppid,
+                    image: p.image.clone(),
+                    cmdline: p.cmdline.clone(),
+                    signed: p.signed,
+                    integrity: p.integrity.clone(),
+                }),
+                ..Entity::default()
+            };
+            f.ts = p.start_time.unwrap_or(now);
+            out.push(f);
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cairn_core::record::ExecutionRecord;
 
     fn proc(image: &str, signed: Option<bool>) -> ProcessRecord {
         ProcessRecord {
@@ -278,5 +360,67 @@ mod tests {
         let s = score_process(&p, &idx, now);
         assert_eq!(s.weight, SIGNAL_B_WEIGHT);
         assert!(s.reasons[0].contains("registry LastWrite approximation"));
+    }
+
+    #[test]
+    fn depends_on_returns_empty() {
+        assert!(LiveExecHeuristic.depends_on().is_empty());
+    }
+
+    #[test]
+    fn analyzer_emits_finding_for_signal_a() {
+        let p = proc(r"C:\Users\a\AppData\Local\Temp\ghost.exe", None);
+        let findings = LiveExecHeuristic
+            .analyze(&[Record::Process(p)], &[])
+            .expect("analyze");
+        assert_eq!(findings.len(), 1);
+        let f = &findings[0];
+        assert!(matches!(f.source, FindingSource::Heuristic));
+        assert!(f.reason.is_some());
+        assert_eq!(f.artifact, "process");
+        assert!(f.entity.process.is_some());
+        assert_eq!(f.entity.process.as_ref().unwrap().pid, 100);
+    }
+
+    #[test]
+    fn analyzer_emits_finding_for_signal_b_with_matched_artifact() {
+        let now = Utc::now();
+        let p = proc(r"C:\Users\a\AppData\Local\Temp\new.exe", Some(false));
+        let records = vec![
+            Record::Process(p),
+            Record::Execution(exec_rec(
+                "prefetch",
+                "NEW.EXE",
+                Some(now - Duration::days(5)),
+            )),
+        ];
+        let findings = LiveExecHeuristic.analyze(&records, &[]).expect("analyze");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].artifact, "prefetch");
+    }
+
+    #[test]
+    fn analyzer_emits_nothing_for_a_quiet_signed_process_with_history() {
+        let now = Utc::now();
+        let p = proc(r"C:\Windows\System32\notepad.exe", Some(true));
+        let records = vec![
+            Record::Process(p),
+            Record::Execution(exec_rec(
+                "amcache",
+                r"C:\Windows\System32\notepad.exe",
+                Some(now - Duration::days(400)),
+            )),
+        ];
+        let findings = LiveExecHeuristic.analyze(&records, &[]).expect("analyze");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn severity_is_high_for_signal_a() {
+        let p = proc(r"C:\Users\a\AppData\Local\Temp\ghost.exe", None);
+        let findings = LiveExecHeuristic
+            .analyze(&[Record::Process(p)], &[])
+            .expect("analyze");
+        assert_eq!(findings[0].severity, cairn_core::Severity::High);
     }
 }
