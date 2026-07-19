@@ -311,14 +311,22 @@ impl<'a> CrossIndex<'a> {
 /// `records`.
 pub fn build_cross_index(records: &[cairn_core::record::Record]) -> CrossIndex<'_> {
     use cairn_core::record::Record;
-    let mut exec_exact: std::collections::HashMap<JoinKey, Vec<&cairn_core::record::ExecutionRecord>> =
-        std::collections::HashMap::new();
-    let mut exec_degraded: std::collections::HashMap<String, Vec<&cairn_core::record::ExecutionRecord>> =
-        std::collections::HashMap::new();
-    let mut proc_exact: std::collections::HashMap<JoinKey, Vec<&cairn_core::record::ProcessRecord>> =
-        std::collections::HashMap::new();
-    let mut proc_degraded: std::collections::HashMap<String, Vec<&cairn_core::record::ProcessRecord>> =
-        std::collections::HashMap::new();
+    let mut exec_exact: std::collections::HashMap<
+        JoinKey,
+        Vec<&cairn_core::record::ExecutionRecord>,
+    > = std::collections::HashMap::new();
+    let mut exec_degraded: std::collections::HashMap<
+        String,
+        Vec<&cairn_core::record::ExecutionRecord>,
+    > = std::collections::HashMap::new();
+    let mut proc_exact: std::collections::HashMap<
+        JoinKey,
+        Vec<&cairn_core::record::ProcessRecord>,
+    > = std::collections::HashMap::new();
+    let mut proc_degraded: std::collections::HashMap<
+        String,
+        Vec<&cairn_core::record::ProcessRecord>,
+    > = std::collections::HashMap::new();
     for r in records {
         match r {
             Record::Execution(e) => {
