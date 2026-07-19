@@ -259,6 +259,97 @@ pub fn escalate(sev: Severity) -> Severity {
     }
 }
 
+/// Index execution + process records for corroboration lookups. Two-layer index:
+/// exact (JoinKey equality — Path==Path or Name==Name with identical string) built
+/// for **all** records; degraded (basename-only) built **only** from records whose
+/// source itself lacks path information (`JoinKey::Name`, e.g. prefetch filenames,
+/// srum's `id:<n>` fallback) — records with a full path (`JoinKey::Path`) are never
+/// inserted into the degraded index. On lookup, exact is tried first regardless of
+/// the query's own key kind; degraded is only consulted on an exact miss. Because
+/// the degraded index only ever holds path-less records, two records that both carry
+/// full paths (but disagree on directory) can never collide there.
+pub struct CrossIndex<'a> {
+    exec_exact: std::collections::HashMap<JoinKey, Vec<&'a cairn_core::record::ExecutionRecord>>,
+    exec_degraded: std::collections::HashMap<String, Vec<&'a cairn_core::record::ExecutionRecord>>,
+    proc_exact: std::collections::HashMap<JoinKey, Vec<&'a cairn_core::record::ProcessRecord>>,
+    proc_degraded: std::collections::HashMap<String, Vec<&'a cairn_core::record::ProcessRecord>>,
+}
+
+impl<'a> CrossIndex<'a> {
+    /// Look up execution-artifact corroboration: exact key first, falling back to
+    /// the degraded (filename-only) index on a miss. Returns (hits, was_degraded).
+    pub fn lookup_exec(
+        &self,
+        key: &JoinKey,
+    ) -> (Vec<&'a cairn_core::record::ExecutionRecord>, bool) {
+        if let Some(hits) = self.exec_exact.get(key) {
+            if !hits.is_empty() {
+                return (hits.clone(), false);
+            }
+        }
+        match self.exec_degraded.get(&key.degraded_key()) {
+            Some(hits) if !hits.is_empty() => (hits.clone(), true),
+            _ => (Vec::new(), false),
+        }
+    }
+
+    /// Same as `lookup_exec`, on the process side.
+    pub fn lookup_proc(&self, key: &JoinKey) -> (Vec<&'a cairn_core::record::ProcessRecord>, bool) {
+        if let Some(hits) = self.proc_exact.get(key) {
+            if !hits.is_empty() {
+                return (hits.clone(), false);
+            }
+        }
+        match self.proc_degraded.get(&key.degraded_key()) {
+            Some(hits) if !hits.is_empty() => (hits.clone(), true),
+            _ => (Vec::new(), false),
+        }
+    }
+}
+
+/// Build a `CrossIndex` over every `Record::Execution`/`Record::Process` entry in
+/// `records`.
+pub fn build_cross_index(records: &[cairn_core::record::Record]) -> CrossIndex<'_> {
+    use cairn_core::record::Record;
+    let mut exec_exact: std::collections::HashMap<JoinKey, Vec<&cairn_core::record::ExecutionRecord>> =
+        std::collections::HashMap::new();
+    let mut exec_degraded: std::collections::HashMap<String, Vec<&cairn_core::record::ExecutionRecord>> =
+        std::collections::HashMap::new();
+    let mut proc_exact: std::collections::HashMap<JoinKey, Vec<&cairn_core::record::ProcessRecord>> =
+        std::collections::HashMap::new();
+    let mut proc_degraded: std::collections::HashMap<String, Vec<&cairn_core::record::ProcessRecord>> =
+        std::collections::HashMap::new();
+    for r in records {
+        match r {
+            Record::Execution(e) => {
+                let k = join_key(&e.path);
+                if !k.degraded_key().is_empty() {
+                    if let JoinKey::Name(n) = &k {
+                        exec_degraded.entry(n.clone()).or_default().push(e);
+                    }
+                    exec_exact.entry(k).or_default().push(e);
+                }
+            }
+            Record::Process(p) => {
+                let k = join_key(&p.image);
+                if !k.degraded_key().is_empty() {
+                    if let JoinKey::Name(n) = &k {
+                        proc_degraded.entry(n.clone()).or_default().push(p);
+                    }
+                    proc_exact.entry(k).or_default().push(p);
+                }
+            }
+            _ => {}
+        }
+    }
+    CrossIndex {
+        exec_exact,
+        exec_degraded,
+        proc_exact,
+        proc_degraded,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +591,71 @@ mod tests {
         assert_eq!(escalate(Severity::Medium), Severity::High);
         assert_eq!(escalate(Severity::High), Severity::Critical);
         assert_eq!(escalate(Severity::Critical), Severity::Critical);
+    }
+
+    #[test]
+    fn cross_index_full_paths_with_same_basename_never_collide_via_degraded() {
+        use cairn_core::record::{ExecutionRecord, Record};
+        // Regression for F-2 resurfacing: two ExecutionRecords both carry full paths
+        // (e.g. shimcache/userassist) with the same basename but different directories.
+        // Looking up one path must NOT return the other via the degraded (basename-only)
+        // fallback — degraded matching is reserved for sources that never had a path
+        // to begin with (JoinKey::Name), not for two full paths that merely disagree.
+        let sys32 = ExecutionRecord {
+            source: "shimcache".into(),
+            path: r"C:\Windows\System32\evil.exe".into(),
+            first_run: None,
+            last_run: None,
+            run_count: None,
+            sha1: None,
+            user_sid: None,
+            execution_confirmed: Some(true),
+        };
+        let temp = ExecutionRecord {
+            source: "shimcache".into(),
+            path: r"C:\Users\alice\AppData\Local\Temp\evil.exe".into(),
+            first_run: None,
+            last_run: None,
+            run_count: None,
+            sha1: None,
+            user_sid: None,
+            execution_confirmed: Some(true),
+        };
+        let records = vec![
+            Record::Execution(sys32.clone()),
+            Record::Execution(temp.clone()),
+        ];
+        let idx = build_cross_index(&records);
+
+        let (hits, degraded) = idx.lookup_exec(&join_key(r"C:\Windows\System32\evil.exe"));
+        assert_eq!(
+            hits.len(),
+            1,
+            "must match only the exact path, not the temp twin"
+        );
+        assert_eq!(hits[0].path, sys32.path);
+        assert!(
+            !degraded,
+            "exact path match must not be flagged as degraded"
+        );
+
+        let (hits, degraded) =
+            idx.lookup_exec(&join_key(r"C:\Users\alice\AppData\Local\Temp\evil.exe"));
+        assert_eq!(
+            hits.len(),
+            1,
+            "must match only the exact path, not the system32 twin"
+        );
+        assert_eq!(hits[0].path, temp.path);
+        assert!(!degraded);
+
+        // A path with no exact match at all must return empty, not fall back to
+        // basename-guessing against either full-path record above.
+        let (hits, degraded) = idx.lookup_exec(&join_key(r"D:\Other\evil.exe"));
+        assert!(
+            hits.is_empty(),
+            "unmatched full path must not degrade to basename guess"
+        );
+        assert!(!degraded);
     }
 }
