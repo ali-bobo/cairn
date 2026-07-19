@@ -135,7 +135,12 @@ impl Analyzer for LiveExecHeuristic {
                 vec!["T1036".to_string()]
             };
             f.artifact = if is_signal_a {
-                "process".to_string()
+                // Deliberately distinct from parentchild.rs's "process" artifact
+                // string: cairn-report's client_text.rs matches on this exact
+                // string to pick a zh-TW template, and "process" already means
+                // "unexpected parent process" there. Reusing it would mislabel
+                // this finding's client-facing description.
+                "no_execution_artifact".to_string()
             } else {
                 // At least one source matched (signal B requires it) — use the
                 // source that supplied the winning (earliest) first_run.
@@ -377,7 +382,7 @@ mod tests {
         let f = &findings[0];
         assert!(matches!(f.source, FindingSource::Heuristic));
         assert!(f.reason.is_some());
-        assert_eq!(f.artifact, "process");
+        assert_eq!(f.artifact, "no_execution_artifact");
         assert!(f.entity.process.is_some());
         assert_eq!(f.entity.process.as_ref().unwrap().pid, 100);
     }

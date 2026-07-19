@@ -1999,7 +1999,7 @@ author: test-integration
         let finding = outcome
             .findings
             .iter()
-            .find(|f| f.artifact == "process" && f.entity.process.is_some());
+            .find(|f| f.artifact == "no_execution_artifact" && f.entity.process.is_some());
         assert!(
             finding.is_some(),
             "live_exec finding must be present when a process has no execution \
