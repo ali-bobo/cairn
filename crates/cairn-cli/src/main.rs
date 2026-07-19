@@ -887,6 +887,7 @@ fn main() -> anyhow::Result<()> {
                 Box::new(cairn_heur::NetConnHeuristic),
                 Box::new(cairn_heur::PersistHeuristic),
                 Box::new(cairn_heur::TemporalWindowCorrelator),
+                Box::new(cairn_heur::LiveExecHeuristic),
                 // S2-N′: threshold from Config (fixed default 24h; no CLI flag).
                 Box::new(cairn_heur::TimestompHeuristic::new(
                     chrono::Duration::hours(cfg.timestomp_threshold_hours),
@@ -1292,6 +1293,7 @@ mod tests {
             Box::new(cairn_heur::NetConnHeuristic),
             Box::new(cairn_heur::PersistHeuristic),
             Box::new(cairn_heur::TemporalWindowCorrelator),
+            Box::new(cairn_heur::LiveExecHeuristic),
             Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
             Box::new(cairn_heur::AccountHeuristic),
             Box::new(cairn_heur::LogonBruteforceHeuristic::new(
@@ -1325,6 +1327,10 @@ mod tests {
         assert!(
             analyzers.iter().any(|a| a.name() == "heur_temporal"),
             "temporal window correlator must be registered"
+        );
+        assert!(
+            analyzers.iter().any(|a| a.name() == "heur_live_exec"),
+            "heur_live_exec must be in analyzer set"
         );
     }
 
@@ -1939,5 +1945,67 @@ author: test-integration
             "title: {}",
             outcome.findings[0].title
         );
+    }
+
+    /// Integration: LiveExecHeuristic fires in run_live's live outcome for a
+    /// process with zero execution-artifact matches (signal A), proving the
+    /// analyzer is correctly wired end-to-end through the CLI's collector/analyzer
+    /// plumbing, not just unit-testable in isolation.
+    #[test]
+    fn live_exec_heuristic_fires_in_live_outcome() {
+        use cairn_core::manifest::Privileges;
+        use cairn_core::orchestrator::run_live;
+        use cairn_core::record::{ProcessRecord, Record};
+        use cairn_core::traits::{CollectCtx, Collector};
+
+        struct FixedRecordsCollector(Vec<Record>);
+        impl Collector for FixedRecordsCollector {
+            fn name(&self) -> &str {
+                "fake_live_exec_records"
+            }
+            fn collect(&self, _ctx: &CollectCtx<'_>) -> cairn_core::Result<Vec<Record>> {
+                Ok(self.0.clone())
+            }
+        }
+
+        let ghost = ProcessRecord {
+            pid: 9001,
+            ppid: 1,
+            image: r"C:\Users\victim\AppData\Local\Temp\ghost.exe".to_string(),
+            cmdline: String::new(),
+            signed: None,
+            signer: None,
+            binary_sha256: None,
+            integrity: None,
+            user: None,
+            start_time: None,
+        };
+
+        let cfg = cairn_core::Config::default();
+        let privs = Privileges {
+            admin: false,
+            se_backup: false,
+            se_debug: false,
+        };
+        let collectors: Vec<Box<dyn Collector>> =
+            vec![Box::new(FixedRecordsCollector(vec![Record::Process(
+                ghost,
+            )]))];
+        let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> =
+            vec![Box::new(cairn_heur::LiveExecHeuristic)];
+
+        let outcome = run_live(&cfg, privs, "TEST".into(), &collectors, &analyzers);
+
+        let finding = outcome
+            .findings
+            .iter()
+            .find(|f| f.artifact == "process" && f.entity.process.is_some());
+        assert!(
+            finding.is_some(),
+            "live_exec finding must be present when a process has no execution \
+             artifact anywhere; got findings: {:?}",
+            outcome.findings
+        );
+        assert_eq!(finding.unwrap().entity.process.as_ref().unwrap().pid, 9001);
     }
 }
