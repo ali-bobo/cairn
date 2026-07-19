@@ -217,7 +217,11 @@ mod tests {
         let p = proc(r"C:\Users\a\AppData\Local\Temp\new.exe", Some(false));
         let records = vec![
             Record::Process(p.clone()),
-            Record::Execution(exec_rec("prefetch", "NEW.EXE", Some(now - Duration::days(5)))),
+            Record::Execution(exec_rec(
+                "prefetch",
+                r"C:\Users\a\AppData\Local\Temp\new.exe",
+                Some(now - Duration::days(5)),
+            )),
             Record::Execution(exec_rec(
                 "amcache",
                 r"C:\Users\a\AppData\Local\Temp\new.exe",
