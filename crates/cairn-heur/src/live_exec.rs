@@ -142,4 +142,113 @@ mod tests {
         let s = score_process(&p, &idx, Utc::now());
         assert_eq!(s.weight, 0, "any source match suppresses signal A");
     }
+
+    /// Signal B must NOT fire when signed is None — abstain, don't guess. A
+    /// collection failure (no WinVerifyTrust result) is not the same as a
+    /// confirmed-unsigned binary.
+    #[test]
+    fn signal_b_abstains_when_signed_is_none() {
+        let now = Utc::now();
+        let p = proc(r"C:\Users\a\AppData\Local\Temp\new.exe", None);
+        let records = vec![
+            Record::Process(p.clone()),
+            Record::Execution(exec_rec("prefetch", "NEW.EXE", Some(now - Duration::days(5)))),
+        ];
+        let idx = build_cross_index(&records);
+        let s = score_process(&p, &idx, now);
+        assert_eq!(s.weight, 0, "signed=None must abstain, not trigger signal B");
+    }
+
+    /// Signal B must NOT fire when the binary is explicitly signed.
+    #[test]
+    fn signal_b_does_not_fire_when_signed_true() {
+        let now = Utc::now();
+        let p = proc(r"C:\Users\a\AppData\Local\Temp\new.exe", Some(true));
+        let records = vec![
+            Record::Process(p.clone()),
+            Record::Execution(exec_rec("prefetch", "NEW.EXE", Some(now - Duration::days(5)))),
+        ];
+        let idx = build_cross_index(&records);
+        let s = score_process(&p, &idx, now);
+        assert_eq!(s.weight, 0);
+    }
+
+    /// Signal B must NOT fire when the earliest first_run is older than RECENT_DAYS.
+    #[test]
+    fn signal_b_does_not_fire_when_first_run_too_old() {
+        let now = Utc::now();
+        let p = proc(r"C:\Users\a\AppData\Local\Temp\old.exe", Some(false));
+        let records = vec![
+            Record::Process(p.clone()),
+            Record::Execution(exec_rec(
+                "prefetch",
+                "OLD.EXE",
+                Some(now - Duration::days(RECENT_DAYS + 1)),
+            )),
+        ];
+        let idx = build_cross_index(&records);
+        let s = score_process(&p, &idx, now);
+        assert_eq!(s.weight, 0);
+    }
+
+    /// Signal B fires when the earliest first_run is within the window and the
+    /// process is confirmed unsigned.
+    #[test]
+    fn signal_b_fires_when_recent_and_unsigned() {
+        let now = Utc::now();
+        let p = proc(r"C:\Users\a\AppData\Local\Temp\new.exe", Some(false));
+        let records = vec![
+            Record::Process(p.clone()),
+            Record::Execution(exec_rec("prefetch", "NEW.EXE", Some(now - Duration::days(5)))),
+        ];
+        let idx = build_cross_index(&records);
+        let s = score_process(&p, &idx, now);
+        assert_eq!(s.weight, SIGNAL_B_WEIGHT);
+    }
+
+    /// Multi-source: prefetch has a recent first_run (5 days), amcache has an older
+    /// one (40 days) for the same binary. The earliest (40 days, amcache) must win
+    /// the comparison, pushing the age past RECENT_DAYS and suppressing signal B —
+    /// proving "take the earliest across all matched sources" rather than "any
+    /// source within the window fires".
+    #[test]
+    fn signal_b_uses_earliest_first_run_across_sources_not_any_source() {
+        let now = Utc::now();
+        let p = proc(r"C:\Users\a\AppData\Local\Temp\new.exe", Some(false));
+        let records = vec![
+            Record::Process(p.clone()),
+            Record::Execution(exec_rec("prefetch", "NEW.EXE", Some(now - Duration::days(5)))),
+            Record::Execution(exec_rec(
+                "amcache",
+                r"C:\Users\a\AppData\Local\Temp\new.exe",
+                Some(now - Duration::days(40)),
+            )),
+        ];
+        let idx = build_cross_index(&records);
+        let s = score_process(&p, &idx, now);
+        assert_eq!(
+            s.weight, 0,
+            "earliest first_run (40 days, amcache) must suppress signal B"
+        );
+    }
+
+    /// The amcache-approximation caveat is included in the reason text only when
+    /// amcache supplied the winning (earliest) first_run.
+    #[test]
+    fn signal_b_reason_notes_amcache_approximation_when_amcache_wins() {
+        let now = Utc::now();
+        let p = proc(r"C:\Users\a\AppData\Local\Temp\new.exe", Some(false));
+        let records = vec![
+            Record::Process(p.clone()),
+            Record::Execution(exec_rec(
+                "amcache",
+                r"C:\Users\a\AppData\Local\Temp\new.exe",
+                Some(now - Duration::days(3)),
+            )),
+        ];
+        let idx = build_cross_index(&records);
+        let s = score_process(&p, &idx, now);
+        assert_eq!(s.weight, SIGNAL_B_WEIGHT);
+        assert!(s.reasons[0].contains("registry LastWrite approximation"));
+    }
 }
