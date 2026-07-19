@@ -1,17 +1,16 @@
 //! heur_persist (spec §4.2): dispositive-signal gate over persistence records. A record
 //! that clears the gate (>=1 rare/dispositive signal) becomes a Finding; everything else
 //! is inventory surfaced via `observe()` as an Observation (spec §6).
-use crate::score::{escalate, join_key, JoinKey};
+use crate::score::{build_cross_index, escalate, join_key};
 use crate::trust::{
     is_masquerade, is_system_or_program_files, is_user_writable_path, winlogon_value_is_default,
 };
 use cairn_core::finding::{EntityFile, EntityProcess, EntityRegistry, EvidenceItem};
 use cairn_core::observation::Observation;
-use cairn_core::record::{ExecutionRecord, PersistenceRecord, ProcessRecord, Record};
+use cairn_core::record::{ExecutionRecord, PersistenceRecord, Record};
 use cairn_core::traits::Analyzer;
 use cairn_core::{Entity, Finding, FindingSource, Result, Severity};
 use chrono::{DateTime, Duration, Utc};
-use std::collections::HashMap;
 
 /// Days within which a LastWrite counts as "recent" (a freshly-planted persistence entry).
 const RECENT_DAYS: i64 = 7;
@@ -245,90 +244,6 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     }
 
     hits
-}
-
-/// Index execution + process records for corroboration lookups. 用兩層索引：
-/// exact（JoinKey 完全相等，Path 對 Path 或 Name 對 Name 且字串相同）對**所有**
-/// 記錄建立；degraded（純 basename）**只**收「來源本身就缺路徑資訊」的記錄
-/// （`JoinKey::Name`，如 prefetch 檔名、srum 的 `id:<n>` 回退）——有完整路徑的
-/// 記錄（`JoinKey::Path`）不會被放進 degraded 索引。查詢端不論自己是 `Path`
-/// 還是 `Name`，exact 沒命中時都會查 degraded；但因為 degraded 索引本身只裝得
-/// 下缺路徑的記錄，兩個「都有完整路徑、只是目錄不同」的記錄永遠不會在
-/// degraded 裡相遇——不會重現 F-2 的同名誤判。
-struct CrossIndex<'a> {
-    exec_exact: HashMap<JoinKey, Vec<&'a ExecutionRecord>>,
-    exec_degraded: HashMap<String, Vec<&'a ExecutionRecord>>,
-    proc_exact: HashMap<JoinKey, Vec<&'a ProcessRecord>>,
-    proc_degraded: HashMap<String, Vec<&'a ProcessRecord>>,
-}
-
-impl<'a> CrossIndex<'a> {
-    /// 查找 exec 佐證：先試 exact key；沒命中時查 degraded（僅檔名）索引。
-    /// degraded 索引只收「來源缺路徑」的記錄（`JoinKey::Name`，如 prefetch），
-    /// 所以即使查詢端是 `Path`（如 run_key 的完整 binary_path），也只會匹配
-    /// 到同樣缺路徑的一方，不會匹配到另一個同 basename 但目錄不同的完整路徑
-    /// 記錄（那種記錄根本沒被放進 degraded 索引）。回傳 (命中清單, 是否為
-    /// 降級命中)。
-    fn lookup_exec(&self, key: &JoinKey) -> (Vec<&'a ExecutionRecord>, bool) {
-        if let Some(hits) = self.exec_exact.get(key) {
-            if !hits.is_empty() {
-                return (hits.clone(), false);
-            }
-        }
-        match self.exec_degraded.get(&key.degraded_key()) {
-            Some(hits) if !hits.is_empty() => (hits.clone(), true),
-            _ => (Vec::new(), false),
-        }
-    }
-
-    /// 同 lookup_exec，查 process 側。
-    fn lookup_proc(&self, key: &JoinKey) -> (Vec<&'a ProcessRecord>, bool) {
-        if let Some(hits) = self.proc_exact.get(key) {
-            if !hits.is_empty() {
-                return (hits.clone(), false);
-            }
-        }
-        match self.proc_degraded.get(&key.degraded_key()) {
-            Some(hits) if !hits.is_empty() => (hits.clone(), true),
-            _ => (Vec::new(), false),
-        }
-    }
-}
-
-fn build_cross_index(records: &[Record]) -> CrossIndex<'_> {
-    let mut exec_exact: HashMap<JoinKey, Vec<&ExecutionRecord>> = HashMap::new();
-    let mut exec_degraded: HashMap<String, Vec<&ExecutionRecord>> = HashMap::new();
-    let mut proc_exact: HashMap<JoinKey, Vec<&ProcessRecord>> = HashMap::new();
-    let mut proc_degraded: HashMap<String, Vec<&ProcessRecord>> = HashMap::new();
-    for r in records {
-        match r {
-            Record::Execution(e) => {
-                let k = join_key(&e.path);
-                if !k.degraded_key().is_empty() {
-                    if let JoinKey::Name(n) = &k {
-                        exec_degraded.entry(n.clone()).or_default().push(e);
-                    }
-                    exec_exact.entry(k).or_default().push(e);
-                }
-            }
-            Record::Process(p) => {
-                let k = join_key(&p.image);
-                if !k.degraded_key().is_empty() {
-                    if let JoinKey::Name(n) = &k {
-                        proc_degraded.entry(n.clone()).or_default().push(p);
-                    }
-                    proc_exact.entry(k).or_default().push(p);
-                }
-            }
-            _ => {}
-        }
-    }
-    CrossIndex {
-        exec_exact,
-        exec_degraded,
-        proc_exact,
-        proc_degraded,
-    }
 }
 
 /// Return the bare file name from a command/path string (strips surrounding quotes too).
@@ -663,7 +578,7 @@ mod tests {
         }
     }
 
-    use cairn_core::record::Record;
+    use cairn_core::record::{ProcessRecord, Record};
     use cairn_core::traits::Analyzer;
 
     /// The analyzer emits one Heuristic finding for a malicious IFEO record (reason +
@@ -1175,71 +1090,6 @@ mod tests {
         assert!(PersistHeuristic.analyze(&records, &[]).unwrap().is_empty());
         let obs = PersistHeuristic.observe(&records).unwrap();
         assert_eq!(obs[0].category, "winlogon_default");
-    }
-
-    #[test]
-    fn cross_index_full_paths_with_same_basename_never_collide_via_degraded() {
-        // Regression for F-2 resurfacing: two ExecutionRecords both carry full paths
-        // (e.g. shimcache/userassist) with the same basename but different directories.
-        // Looking up one path must NOT return the other via the degraded (basename-only)
-        // fallback — degraded matching is reserved for sources that never had a path
-        // to begin with (JoinKey::Name), not for two full paths that merely disagree.
-        let sys32 = ExecutionRecord {
-            source: "shimcache".into(),
-            path: r"C:\Windows\System32\evil.exe".into(),
-            first_run: None,
-            last_run: None,
-            run_count: None,
-            sha1: None,
-            user_sid: None,
-            execution_confirmed: Some(true),
-        };
-        let temp = ExecutionRecord {
-            source: "shimcache".into(),
-            path: r"C:\Users\alice\AppData\Local\Temp\evil.exe".into(),
-            first_run: None,
-            last_run: None,
-            run_count: None,
-            sha1: None,
-            user_sid: None,
-            execution_confirmed: Some(true),
-        };
-        let records = vec![
-            Record::Execution(sys32.clone()),
-            Record::Execution(temp.clone()),
-        ];
-        let idx = build_cross_index(&records);
-
-        let (hits, degraded) = idx.lookup_exec(&join_key(r"C:\Windows\System32\evil.exe"));
-        assert_eq!(
-            hits.len(),
-            1,
-            "must match only the exact path, not the temp twin"
-        );
-        assert_eq!(hits[0].path, sys32.path);
-        assert!(
-            !degraded,
-            "exact path match must not be flagged as degraded"
-        );
-
-        let (hits, degraded) =
-            idx.lookup_exec(&join_key(r"C:\Users\alice\AppData\Local\Temp\evil.exe"));
-        assert_eq!(
-            hits.len(),
-            1,
-            "must match only the exact path, not the system32 twin"
-        );
-        assert_eq!(hits[0].path, temp.path);
-        assert!(!degraded);
-
-        // A path with no exact match at all must return empty, not fall back to
-        // basename-guessing against either full-path record above.
-        let (hits, degraded) = idx.lookup_exec(&join_key(r"D:\Other\evil.exe"));
-        assert!(
-            hits.is_empty(),
-            "unmatched full path must not degrade to basename guess"
-        );
-        assert!(!degraded);
     }
 
     // ── S1c: WMI event subscription persistence ─────────────────────────────

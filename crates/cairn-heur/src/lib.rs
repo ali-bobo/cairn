@@ -5,6 +5,7 @@
 
 pub mod account;
 pub mod byovd;
+pub mod live_exec;
 pub mod logon_bruteforce;
 pub mod netconn;
 pub mod parentchild;
@@ -18,6 +19,7 @@ pub mod trust;
 // Public API: the analyzers wired into the CLI live run (and reusable elsewhere).
 pub use account::AccountHeuristic;
 pub use byovd::ByovdHeuristic;
+pub use live_exec::LiveExecHeuristic;
 pub use logon_bruteforce::LogonBruteforceHeuristic;
 pub use netconn::NetConnHeuristic;
 pub use parentchild::ParentChildHeuristic;
