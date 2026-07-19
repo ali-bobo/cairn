@@ -29,7 +29,11 @@ const SIGNAL_B_WEIGHT: u32 = 55;
 /// Signal A (no artifact anywhere) and signal B (recent + unsigned) are mutually
 /// exclusive by construction: A requires zero matches across all three sources; B
 /// requires at least one match. See the spec's "Signal互斥" section.
-fn score_process(p: &ProcessRecord, idx: &crate::score::CrossIndex<'_>, now: chrono::DateTime<Utc>) -> Score {
+fn score_process(
+    p: &ProcessRecord,
+    idx: &crate::score::CrossIndex<'_>,
+    now: chrono::DateTime<Utc>,
+) -> Score {
     let mut s = Score::default();
     let key = join_key(&p.image);
     let (hits, _degraded) = idx.lookup_exec(&key);
@@ -98,7 +102,11 @@ mod tests {
         }
     }
 
-    fn exec_rec(source: &str, path: &str, first_run: Option<chrono::DateTime<Utc>>) -> ExecutionRecord {
+    fn exec_rec(
+        source: &str,
+        path: &str,
+        first_run: Option<chrono::DateTime<Utc>>,
+    ) -> ExecutionRecord {
         ExecutionRecord {
             source: source.into(),
             path: path.into(),
@@ -120,9 +128,10 @@ mod tests {
         let idx = build_cross_index(&records);
         let s = score_process(&p, &idx, Utc::now());
         assert_eq!(s.weight, SIGNAL_A_WEIGHT);
-        assert!(s.reasons.iter().any(|r| r.contains("prefetch")
-            && r.contains("amcache")
-            && r.contains("shimcache")));
+        assert!(s
+            .reasons
+            .iter()
+            .any(|r| r.contains("prefetch") && r.contains("amcache") && r.contains("shimcache")));
     }
 
     /// Signal A must NOT fire when any one of the three sources has a match, even
@@ -152,11 +161,18 @@ mod tests {
         let p = proc(r"C:\Users\a\AppData\Local\Temp\new.exe", None);
         let records = vec![
             Record::Process(p.clone()),
-            Record::Execution(exec_rec("prefetch", "NEW.EXE", Some(now - Duration::days(5)))),
+            Record::Execution(exec_rec(
+                "prefetch",
+                "NEW.EXE",
+                Some(now - Duration::days(5)),
+            )),
         ];
         let idx = build_cross_index(&records);
         let s = score_process(&p, &idx, now);
-        assert_eq!(s.weight, 0, "signed=None must abstain, not trigger signal B");
+        assert_eq!(
+            s.weight, 0,
+            "signed=None must abstain, not trigger signal B"
+        );
     }
 
     /// Signal B must NOT fire when the binary is explicitly signed.
@@ -166,7 +182,11 @@ mod tests {
         let p = proc(r"C:\Users\a\AppData\Local\Temp\new.exe", Some(true));
         let records = vec![
             Record::Process(p.clone()),
-            Record::Execution(exec_rec("prefetch", "NEW.EXE", Some(now - Duration::days(5)))),
+            Record::Execution(exec_rec(
+                "prefetch",
+                "NEW.EXE",
+                Some(now - Duration::days(5)),
+            )),
         ];
         let idx = build_cross_index(&records);
         let s = score_process(&p, &idx, now);
@@ -199,7 +219,11 @@ mod tests {
         let p = proc(r"C:\Users\a\AppData\Local\Temp\new.exe", Some(false));
         let records = vec![
             Record::Process(p.clone()),
-            Record::Execution(exec_rec("prefetch", "NEW.EXE", Some(now - Duration::days(5)))),
+            Record::Execution(exec_rec(
+                "prefetch",
+                "NEW.EXE",
+                Some(now - Duration::days(5)),
+            )),
         ];
         let idx = build_cross_index(&records);
         let s = score_process(&p, &idx, now);
