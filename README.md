@@ -77,8 +77,9 @@ detection is circumstantial rather than proven, the tool says so explicitly
 
 ## Privileges
 
-Some collectors require Administrator and `SeBackupPrivilege` (raw disk / locked
-files). Cairn degrades gracefully without them: missing-privilege collectors are
+Some collectors require an elevated Administrator token (raw `\\.\C:` volume
+reads for $MFT, $J, locked registry hives and SRUM; Prefetch). `SeBackupPrivilege`
+is not required. Cairn degrades gracefully without them: missing-privilege collectors are
 skipped and the reason is recorded in `manifest.json`.
 
 ## Build

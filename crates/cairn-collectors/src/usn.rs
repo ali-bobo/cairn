@@ -267,7 +267,7 @@ fn next_aligned(pos: usize) -> usize {
 
 /// UsnCollector: privilege-gated, read-only $Extend\$UsnJrnl:$J parse.
 ///
-/// Requires Administrator + SeBackupPrivilege (raw \\.\C: open). Emits
+/// Requires Administrator (raw \\.\C: open). Emits
 /// Record::UsnEvent for each parsed USN_RECORD_V2/V3, bounded by Config.max_usn_records.
 #[derive(Default)]
 pub struct UsnCollector {
@@ -282,10 +282,10 @@ impl Collector for UsnCollector {
 
     fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
         // Privilege gate BEFORE any volume open (mirrors mft).
-        if !(ctx.admin && ctx.se_backup) {
+        if !crate::can_read_raw_volume(ctx) {
             return Err(CairnError::Privilege {
                 what: "usn".into(),
-                need: "Administrator + SeBackupPrivilege".into(),
+                need: "Administrator".into(),
             });
         }
 
@@ -455,7 +455,7 @@ mod tests {
         let r = UsnCollector::default().collect(&ctx);
         assert!(
             matches!(r, Err(CairnError::Privilege { .. })),
-            "no admin/se_backup must yield Privilege err before any volume open"
+            "no admin must yield Privilege err before any volume open"
         );
     }
 
@@ -707,7 +707,7 @@ mod tests {
     /// Opens the real \\.\C:, parses $Extend\$UsnJrnl:$J, and asserts at least one event
     /// with a non-empty reason was decoded. CI never runs this (no privilege, no real disk).
     #[test]
-    #[ignore = "requires Administrator + SeBackupPrivilege and a real NTFS C: volume"]
+    #[ignore = "requires Administrator and a real NTFS C: volume"]
     fn elevated_e2e_real_j() {
         let cfg = Config::default();
         let ctx = CollectCtx {

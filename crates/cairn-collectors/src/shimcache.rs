@@ -161,7 +161,7 @@ fn utf16le_lossy(bytes: &[u8]) -> String {
 }
 
 /// ShimCollector: privilege-gated, read-only AppCompatCache read from SYSTEM hive.
-/// Requires Administrator + SeBackupPrivilege (raw \\.\C: open). Emits
+/// Requires Administrator (raw \\.\C: open). Emits
 /// Record::Execution (source="shimcache", execution_confirmed reflects the data flag).
 #[derive(Default)]
 pub struct ShimCollector {
@@ -181,13 +181,13 @@ impl Collector for ShimCollector {
     }
 
     fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
-        // Privilege gate BEFORE any volume open (mirrors usn/mft). SeBackupPrivilege is
-        // required because the SYSTEM hive is held open/locked by the running OS, so it's
-        // only reachable via a raw \\.\C: read, not the normal file API.
-        if !(ctx.admin && ctx.se_backup) {
+        // Privilege gate BEFORE any volume open (mirrors usn/mft). The SYSTEM hive is
+        // held open/locked by the running OS, so it's only reachable via a raw \\.\C:
+        // read (Administrator), not the normal file API.
+        if !crate::can_read_raw_volume(ctx) {
             return Err(CairnError::Privilege {
                 what: "shimcache".into(),
-                need: "Administrator + SeBackupPrivilege".into(),
+                need: "Administrator".into(),
             });
         }
 
@@ -304,7 +304,7 @@ mod tests {
         let r = ShimCollector::default().collect(&ctx);
         assert!(
             matches!(r, Err(CairnError::Privilege { .. })),
-            "no admin/se_backup must yield Privilege err before any volume open"
+            "no admin must yield Privilege err before any volume open"
         );
     }
 
@@ -357,7 +357,7 @@ mod tests {
     /// Proves the full chain: raw \\.\C: -> ntfs locate SYSTEM -> notatin parse
     /// (+ log replay) -> AppCompatCache -> Record::Execution. Mirrors usn elevated_e2e_real_j.
     #[test]
-    #[ignore = "requires Administrator + SeBackupPrivilege and a real NTFS C: volume"]
+    #[ignore = "requires Administrator and a real NTFS C: volume"]
     fn shimcache_e2e_real_system_hive() {
         let cfg = Config::default();
         let ctx = CollectCtx {

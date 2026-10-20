@@ -117,23 +117,18 @@ finishing-a-branch → post-merge). Split responsibility:
 - **Post-merge**: do not re-run the full suite again; the pre-merge gate already
   covered HEAD.
 
-## SeBackupPrivilege constraint (real-machine e2e limitation)
-A normal Administrator token does NOT include `SeBackupPrivilege` by default (it
-must be explicitly enabled, which most interactive admin sessions don't do). The
-7 collectors that depend on raw-NTFS / raw-hive reads for real-machine e2e
-verification — amcache, mft, usn, shimcache, bam, userassist, srum — will
-silently produce zero records under a normal admin session, not because of a
-bug but because of this privilege gap. When validating this class of feature:
-- Do not treat an empty real-machine e2e run as a regression signal by itself —
-  first check whether the run actually had the privilege.
-- Prefer synthetic integration tests that exercise the pipeline without needing
-  the real privilege, following the existing pattern of tests like
-  `byovd_driver_list_override_pipeline_end_to_end` and
-  `sigma_analyzer_findings_appear_in_live_outcome` (fake collector data fed
-  through the real `run_live` + analyzer + report path).
-- Real-machine e2e with the privilege genuinely enabled remains the final
-  acceptance bar for these 7 collectors, but is not the day-to-day dev loop
-  verification method.
+## Raw-volume privilege (real-machine e2e)
+The 7 raw-NTFS / raw-hive collectors (amcache, mft, usn, shimcache, bam,
+userassist, srum) gate on `cairn_collectors::can_read_raw_volume` — an elevated
+Administrator token. They used to also require `SeBackupPrivilege` to be
+*enabled*, which a normal admin token never has (present but disabled), so all
+seven silently produced zero records on every ordinary admin run (fixed
+2026-10-20). Do not reintroduce that gate.
+- Prefer synthetic integration tests that exercise the pipeline (pattern:
+  `byovd_driver_list_override_pipeline_end_to_end`,
+  `sigma_analyzer_findings_appear_in_live_outcome`).
+- Real-machine e2e as elevated admin remains the final acceptance bar for these
+  7 collectors; an empty run there is now a real regression signal.
 
 ## Legitimacy work (must exist before first real client use, any stage)
 Authenticode-sign + timestamp releases; ship README intent statement (done);

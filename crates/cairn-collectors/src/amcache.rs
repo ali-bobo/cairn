@@ -36,7 +36,7 @@ const APP_FILE_SPEC: InventorySpec = InventorySpec {
 };
 
 /// AmcacheCollector: privilege-gated, read-only InventoryApplicationFile read from a
-/// locked Amcache.hve. Requires Administrator + SeBackupPrivilege (raw \\.\C: open).
+/// locked Amcache.hve. Requires Administrator (raw \\.\C: open).
 /// Emits Record::Execution (source="amcache", execution_confirmed=Some(true)).
 #[derive(Default)]
 pub struct AmcacheCollector {
@@ -62,10 +62,10 @@ impl Collector for AmcacheCollector {
     fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
         // Privilege gate BEFORE any volume open (mirrors shimcache). Amcache.hve is
         // held open by the OS, so it is only reachable via a raw \\.\C: read.
-        if !(ctx.admin && ctx.se_backup) {
+        if !crate::can_read_raw_volume(ctx) {
             return Err(CairnError::Privilege {
                 what: "amcache".into(),
-                need: "Administrator + SeBackupPrivilege".into(),
+                need: "Administrator".into(),
             });
         }
 
@@ -298,7 +298,7 @@ mod tests {
         let r = AmcacheCollector::default().collect(&ctx);
         assert!(
             matches!(r, Err(CairnError::Privilege { .. })),
-            "no admin/se_backup must yield Privilege err before any volume open"
+            "no admin must yield Privilege err before any volume open"
         );
     }
 
@@ -481,7 +481,7 @@ mod tests {
     /// Proves the full chain: raw \\.\C: -> ntfs locate Amcache.hve -> notatin parse
     /// (+ log replay) -> InventoryApplicationFile -> Record::Execution.
     #[test]
-    #[ignore = "requires Administrator + SeBackupPrivilege and a real NTFS C: volume"]
+    #[ignore = "requires Administrator and a real NTFS C: volume"]
     fn amcache_e2e_real_system_hive() {
         let cfg = Config::default();
         let ctx = CollectCtx {

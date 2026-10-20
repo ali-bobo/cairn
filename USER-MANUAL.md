@@ -87,15 +87,15 @@ Cairn 以 **MIT License** 授權（詳見 `LICENSE` / `NOTICE`）；內建的 Si
 | `cairn evtx`（EVTX 解析） | 標準使用者（可讀 .evtx） | |
 | live proc / net 枚舉 | 標準使用者 | 其他 user 的 process 需 Admin |
 | persistence 枚舉（Run keys、services、sched tasks、WMI subs） | 標準使用者（部分）/ Admin（全部） | |
-| raw-NTFS $MFT / $J | **Administrator + SeBackupPrivilege** | |
-| 離線 hive（SYSTEM / NTUSER.DAT / Amcache） | **Administrator + SeBackupPrivilege** | |
+| raw-NTFS $MFT / $J | **Administrator**（raw `\\.\C:` 讀取） | |
+| 離線 hive（SYSTEM / NTUSER.DAT / Amcache） | **Administrator**（raw `\\.\C:` 讀取） | |
 | Prefetch | Administrator | `C:\Windows\Prefetch` ACL |
-| SRUM（SRUDB.dat） | **Administrator + SeBackupPrivilege** | |
-| BAM / UserAssist | **Administrator + SeBackupPrivilege** | SYSTEM hive ACL |
+| SRUM（SRUDB.dat） | **Administrator**（raw `\\.\C:` 讀取） | |
+| BAM / UserAssist | **Administrator**（raw `\\.\C:` 讀取） | SYSTEM hive ACL |
 
 **缺少權限時 Cairn 不會 crash**：該 collector 會被跳過，在 `manifest.json` 的 `sources[].errors` 中留下說明，其餘 collector 繼續執行（golden rule 8）。
 
-> 一般 Administrator 登入 token 預設**不含** `SeBackupPrivilege`（需另外顯式啟用）。若用 `cairn-launcher` 或一般 Admin PowerShell 執行，上表標「+SeBackupPrivilege」的 collector 可能不會產生任何紀錄——這不是錯誤，是權限不足的正常降級，manifest 會記錄原因。
+> 2026-10-20 更正：raw `\\.\C:` 讀取只需要提升權限的 Administrator，不需要 `SeBackupPrivilege`。先前版本要求兩者同時具備，導致一般 Admin 執行時這 7 個 collector 一律被跳過。
 
 ### 以提升權限執行
 
@@ -151,7 +151,7 @@ CHECKSUMS.txt         每個檔案的 SHA-256（打包時自動產生）
 - **[1] 選擇 Profile 掃描**：先選擇掃描的 Profile（模組集），再對本機執行最近 24 小時掃描：
   - `Minimal`（最小模組集，速度優先）——跳過耗時的 raw-NTFS 全解析，適合快速確認或資源受限的環境。
   - `Standard`（標準模組集，預設）——一般 triage 的建議選項。
-  - `Verbose`（完整模組集，含耗時的 raw-NTFS 收集）——涵蓋 $MFT/$J 等 raw 磁碟解析，最完整但耗時最長，需要 Admin + SeBackupPrivilege 才能取得完整資料。
+  - `Verbose`（完整模組集，含耗時的 raw-NTFS 收集）——涵蓋 $MFT/$J 等 raw 磁碟解析，最完整但耗時最長，需要 Admin 才能取得完整資料。
 - **[2] 離線 EVTX 分析**：適用於手邊已經有 `.evtx` 檔案（例如從其他機器匯出、或不方便/不需要對本機即時掃描）的情境。可以輸入單一 `.evtx` 檔案路徑，也可以輸入一個資料夾路徑——輸入資料夾時會自動抓出該資料夾下所有 `.evtx` 檔案一併分析。
 
 ### 工程師：從源碼編譯
@@ -203,7 +203,7 @@ cairn evtx Security.evtx Sysmon.evtx --rules rules/sigma
 cairn verify out/manifest.json --rules rules/sigma
 ```
 
-### 情境 B：完整 live triage（需 Admin + SeBackup）
+### 情境 B：完整 live triage（需 Admin）
 
 ```powershell
 # 在 Admin PowerShell 執行
@@ -463,7 +463,7 @@ cairn run --target live --output D:\IR\quick --profile minimal
 ### 完整掃描（含耗時的 raw-NTFS 收集）
 
 ```powershell
-# --profile verbose 開啟完整模組集，需 Admin + SeBackupPrivilege 才能取得完整資料
+# --profile verbose 開啟完整模組集，需 Admin 才能取得完整資料
 cairn run --target live --output D:\IR\full --admin-features --profile verbose
 ```
 
@@ -509,4 +509,3 @@ cairn verify old_run/manifest.json --rules rules/sigma
 | **Velociraptor 封裝**（FR20 延伸） | 尚未實作 |
 | **`--collect-raw`**（完整 raw artifact 打包） | 尚未實作；目前封存只含 findings/manifest/run.log |
 | **VSS（Volume Shadow Copy）** | `--use-vss` 旗標已定義，實作尚未完成 |
-| **一般 Admin token 預設無 SeBackupPrivilege** | 標「+SeBackupPrivilege」的 collector（$MFT/$J/hive/Amcache/Prefetch/SRUM/BAM/UserAssist）在一般 Admin 權限下可能靜默產生 0 筆紀錄，需另外顯式啟用該權限才能取得完整資料 |

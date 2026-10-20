@@ -24,7 +24,7 @@ use crate::hive_reader::{list_subkeys, list_values, open_hive, LogStatus, SYSTEM
 
 /// BamCollector: privilege-gated, read-only parse of the SYSTEM hive's bam UserSettings
 /// into per-SID Record::Execution (source="bam", execution_confirmed=Some(true)).
-/// Requires Administrator + SeBackupPrivilege (raw \\.\C: open).
+/// Requires Administrator (raw \\.\C: open).
 #[derive(Default)]
 pub struct BamCollector {
     /// SYSTEM hive exceeded the memory ceiling (parse abstained). NFR10/NFR12.
@@ -64,10 +64,10 @@ impl Collector for BamCollector {
         // Privilege gate BEFORE any volume open (mirrors amcache/shimcache). The bam
         // UserSettings key is SYSTEM-ACL-protected and the SYSTEM hive is OS-locked, so
         // it is only reachable via a raw \\.\C: read.
-        if !(ctx.admin && ctx.se_backup) {
+        if !crate::can_read_raw_volume(ctx) {
             return Err(CairnError::Privilege {
                 what: "bam".into(),
-                need: "Administrator + SeBackupPrivilege".into(),
+                need: "Administrator".into(),
             });
         }
 
@@ -266,7 +266,7 @@ mod tests {
         let r = BamCollector::default().collect(&ctx);
         assert!(
             matches!(r, Err(CairnError::Privilege { .. })),
-            "no admin/se_backup must yield Privilege err before any volume open"
+            "no admin must yield Privilege err before any volume open"
         );
     }
 
@@ -326,7 +326,7 @@ mod tests {
     /// Proves the full chain: raw \\.\C: -> ntfs locate SYSTEM -> notatin parse
     /// (+ log replay) -> bam UserSettings -> Record::Execution.
     #[test]
-    #[ignore = "requires Administrator + SeBackupPrivilege and a real NTFS C: volume"]
+    #[ignore = "requires Administrator and a real NTFS C: volume"]
     fn bam_e2e_real_system_hive() {
         let cfg = Config::default();
         let ctx = CollectCtx {

@@ -48,10 +48,10 @@ impl Collector for SrumCollector {
     }
 
     fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
-        if !(ctx.admin && ctx.se_backup) {
+        if !crate::can_read_raw_volume(ctx) {
             return Err(CairnError::Privilege {
                 what: "srum".into(),
-                need: "Administrator + SeBackupPrivilege".into(),
+                need: "Administrator".into(),
             });
         }
 
@@ -318,7 +318,7 @@ mod tests {
 
     /// ELEVATED E2E (manual): run as Administrator with SeBackupPrivilege:
     ///   cargo test -p cairn-collectors srum::tests::elevated_e2e_srum -- --ignored
-    #[ignore = "requires Administrator + SeBackupPrivilege and a real NTFS C: volume"]
+    #[ignore = "requires Administrator and a real NTFS C: volume"]
     #[test]
     fn elevated_e2e_srum() {
         use cairn_core::record::Record;

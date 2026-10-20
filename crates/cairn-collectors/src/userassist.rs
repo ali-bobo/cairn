@@ -102,7 +102,7 @@ fn build_profilelist_map(parser: &mut notatin::parser::Parser) -> HashMap<String
 
 /// UserAssistCollector: privilege-gated, read-only parse of every user's NTUSER.DAT
 /// UserAssist into Record::Execution (source="userassist", execution_confirmed=
-/// Some(true)). Requires Administrator + SeBackupPrivilege (raw \\.\C: open).
+/// Some(true)). Requires Administrator (raw \\.\C: open).
 #[derive(Default)]
 pub struct UserAssistCollector {
     /// C:\Users enumeration failed — cannot find any user hive (abstained). NFR12.
@@ -128,10 +128,10 @@ impl Collector for UserAssistCollector {
     fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
         // Privilege gate BEFORE any volume open (mirrors bam/amcache). NTUSER.DAT and
         // SOFTWARE are OS-locked, reachable only via a raw \\.\C: read.
-        if !(ctx.admin && ctx.se_backup) {
+        if !crate::can_read_raw_volume(ctx) {
             return Err(CairnError::Privilege {
                 what: "userassist".into(),
-                need: "Administrator + SeBackupPrivilege".into(),
+                need: "Administrator".into(),
             });
         }
 
@@ -414,7 +414,7 @@ mod tests {
         let r = UserAssistCollector::default().collect(&ctx);
         assert!(
             matches!(r, Err(CairnError::Privilege { .. })),
-            "no admin/se_backup must yield Privilege err before any volume open"
+            "no admin must yield Privilege err before any volume open"
         );
     }
 
@@ -475,7 +475,7 @@ mod tests {
     /// open (+ log replay) -> UserAssist\<GUID>\Count -> rot13 + 72-byte parse ->
     /// Record::Execution, with SOFTWARE ProfileList SID reverse-lookup.
     #[test]
-    #[ignore = "requires Administrator + SeBackupPrivilege and a real NTFS C: volume"]
+    #[ignore = "requires Administrator and a real NTFS C: volume"]
     fn userassist_e2e_real_hives() {
         use cairn_core::record::Record;
         let cfg = Config::default();

@@ -117,7 +117,7 @@ fn resolve_path(start: u64, index: &HashMap<u64, (String, u64)>) -> (String, boo
 
 /// MftCollector: privilege-gated, read-only, full $MFT scan with SI/FN times.
 ///
-/// Requires `Administrator + SeBackupPrivilege`. On success emits
+/// Requires `Administrator`. On success emits
 /// `Record::FileMeta` for each file record found in the $MFT (up to
 /// `Config.max_mft_records`), populating `si_btime`, `si_mtime`, `fn_btime`,
 /// and `fn_mtime` via `filetime_to_utc`.
@@ -135,13 +135,15 @@ impl Collector for MftCollector {
     }
 
     fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
-        // Privilege gate: both Administrator AND SeBackupPrivilege are required
-        // to open \\.\C: for raw volume reads. Check BEFORE any volume open so
-        // the privilege error is emitted cleanly without touching the host.
-        if !(ctx.admin && ctx.se_backup) {
+        // Privilege gate: opening \\.\C: with GENERIC_READ needs an elevated
+        // Administrator token. SeBackupPrivilege is NOT required (and is disabled by
+        // default on an admin token, so gating on it skipped this collector on every
+        // normal admin run). Check BEFORE any volume open so the privilege error is
+        // emitted cleanly without touching the host.
+        if !crate::can_read_raw_volume(ctx) {
             return Err(CairnError::Privilege {
                 what: "mft".into(),
-                need: "Administrator + SeBackupPrivilege".into(),
+                need: "Administrator".into(),
             });
         }
 
@@ -520,7 +522,7 @@ mod tests {
         let r = MftCollector::default().collect(&ctx);
         assert!(
             matches!(r, Err(CairnError::Privilege { .. })),
-            "no admin/se_backup must yield Privilege err before any volume open"
+            "no admin must yield Privilege err before any volume open"
         );
     }
 
