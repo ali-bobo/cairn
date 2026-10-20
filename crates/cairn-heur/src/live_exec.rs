@@ -25,20 +25,50 @@ const SIGNAL_A_WEIGHT: u32 = 55;
 /// so there is no double-counting to guard against.
 const SIGNAL_B_WEIGHT: u32 = 55;
 
+/// The execution-artifact sources signal A claims to have checked. Absence from a
+/// source only means something if that source was actually collected.
+const SIGNAL_A_SOURCES: [&str; 3] = ["prefetch", "amcache", "shimcache"];
+
+/// True when every source signal A relies on produced at least one record in this
+/// run. If any is missing (collector skipped for privilege, prefetch disabled on
+/// Windows Server, parser abstained on an unknown build), "no record anywhere" is
+/// not evidence, and signal A must abstain rather than flag every live process.
+fn signal_a_sources_collected(records: &[Record]) -> bool {
+    SIGNAL_A_SOURCES.iter().all(|src| {
+        records
+            .iter()
+            .any(|r| matches!(r, Record::Execution(e) if e.source == *src))
+    })
+}
+
+/// True for images that are not a filesystem path: pseudo-processes (`System`,
+/// `Registry`, `MemCompression`, `Secure System`) and processes whose full image path
+/// could not be resolved, which fall back to a bare file name. Neither can be judged
+/// against execution artifacts.
+fn is_pathless_image(image: &str) -> bool {
+    !image.contains(['\\', '/'])
+}
+
 /// Score one live process against the three-source execution-artifact index.
 /// Signal A (no artifact anywhere) and signal B (recent + unsigned) are mutually
 /// exclusive by construction: A requires zero matches across all three sources; B
 /// requires at least one match. See the spec's "Signal互斥" section.
+/// `sources_collected` is `signal_a_sources_collected` for this run; without it
+/// signal A abstains.
 fn score_process(
     p: &ProcessRecord,
     idx: &crate::score::CrossIndex<'_>,
     now: chrono::DateTime<Utc>,
+    sources_collected: bool,
 ) -> Score {
     let mut s = Score::default();
     let key = join_key(&p.image);
     let (hits, _degraded) = idx.lookup_exec(&key);
 
     if hits.is_empty() {
+        if !sources_collected || is_pathless_image(&p.image) {
+            return s;
+        }
         s.add(
             SIGNAL_A_WEIGHT,
             format!(
@@ -95,10 +125,11 @@ impl Analyzer for LiveExecHeuristic {
     fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
         let now = Utc::now();
         let idx = build_cross_index(records);
+        let sources_collected = signal_a_sources_collected(records);
         let mut out = Vec::new();
         for r in records {
             let Record::Process(p) = r else { continue };
-            let score = score_process(p, &idx, now);
+            let score = score_process(p, &idx, now, sources_collected);
             if score.weight == 0 {
                 continue;
             }
@@ -213,7 +244,7 @@ mod tests {
         let p = proc(r"C:\Users\a\AppData\Local\Temp\ghost.exe", None);
         let records = vec![Record::Process(p.clone())];
         let idx = build_cross_index(&records);
-        let s = score_process(&p, &idx, Utc::now());
+        let s = score_process(&p, &idx, Utc::now(), true);
         assert_eq!(s.weight, SIGNAL_A_WEIGHT);
         assert!(s
             .reasons
@@ -235,7 +266,7 @@ mod tests {
             )),
         ];
         let idx = build_cross_index(&records);
-        let s = score_process(&p, &idx, Utc::now());
+        let s = score_process(&p, &idx, Utc::now(), true);
         assert_eq!(s.weight, 0, "any source match suppresses signal A");
     }
 
@@ -255,7 +286,7 @@ mod tests {
             )),
         ];
         let idx = build_cross_index(&records);
-        let s = score_process(&p, &idx, now);
+        let s = score_process(&p, &idx, now, true);
         assert_eq!(
             s.weight, 0,
             "signed=None must abstain, not trigger signal B"
@@ -276,7 +307,7 @@ mod tests {
             )),
         ];
         let idx = build_cross_index(&records);
-        let s = score_process(&p, &idx, now);
+        let s = score_process(&p, &idx, now, true);
         assert_eq!(s.weight, 0);
     }
 
@@ -294,7 +325,7 @@ mod tests {
             )),
         ];
         let idx = build_cross_index(&records);
-        let s = score_process(&p, &idx, now);
+        let s = score_process(&p, &idx, now, true);
         assert_eq!(s.weight, 0);
     }
 
@@ -313,7 +344,7 @@ mod tests {
             )),
         ];
         let idx = build_cross_index(&records);
-        let s = score_process(&p, &idx, now);
+        let s = score_process(&p, &idx, now, true);
         assert_eq!(s.weight, SIGNAL_B_WEIGHT);
     }
 
@@ -340,7 +371,7 @@ mod tests {
             )),
         ];
         let idx = build_cross_index(&records);
-        let s = score_process(&p, &idx, now);
+        let s = score_process(&p, &idx, now, true);
         assert_eq!(
             s.weight, 0,
             "earliest first_run (40 days, amcache) must suppress signal B"
@@ -362,7 +393,7 @@ mod tests {
             )),
         ];
         let idx = build_cross_index(&records);
-        let s = score_process(&p, &idx, now);
+        let s = score_process(&p, &idx, now, true);
         assert_eq!(s.weight, SIGNAL_B_WEIGHT);
         assert!(s.reasons[0].contains("registry LastWrite approximation"));
     }
@@ -372,12 +403,63 @@ mod tests {
         assert!(LiveExecHeuristic.depends_on().is_empty());
     }
 
+    /// One unrelated record per signal-A source, so the run counts as having
+    /// collected prefetch, amcache and shimcache.
+    fn full_coverage() -> Vec<Record> {
+        SIGNAL_A_SOURCES
+            .iter()
+            .map(|src| Record::Execution(exec_rec(src, r"C:\Tools\unrelated.exe", None)))
+            .collect()
+    }
+
+    /// Signal A abstains when any of its sources was not collected: on a run where
+    /// shimcache was skipped, "no record anywhere" is not evidence, and firing would
+    /// flag every live process as High.
+    #[test]
+    fn signal_a_abstains_when_a_source_was_not_collected() {
+        let p = proc(r"C:\Users\a\AppData\Local\Temp\ghost.exe", None);
+        let mut records = vec![Record::Process(p)];
+        records.extend(
+            full_coverage()
+                .into_iter()
+                .filter(|r| !matches!(r, Record::Execution(e) if e.source == "shimcache")),
+        );
+        let findings = LiveExecHeuristic.analyze(&records, &[]).expect("analyze");
+        assert!(
+            findings.is_empty(),
+            "missing shimcache must abstain signal A"
+        );
+    }
+
+    /// Signal A abstains with no execution records at all (e.g. every collector
+    /// skipped): processes alone must never produce signal-A findings.
+    #[test]
+    fn signal_a_abstains_with_processes_only() {
+        let records = vec![
+            Record::Process(proc(r"C:\Windows\System32\svchost.exe", Some(true))),
+            Record::Process(proc(r"C:\Users\a\AppData\Local\Temp\ghost.exe", None)),
+        ];
+        let findings = LiveExecHeuristic.analyze(&records, &[]).expect("analyze");
+        assert!(findings.is_empty());
+    }
+
+    /// Pseudo-processes and unresolved images (no path) are never signal-A findings.
+    #[test]
+    fn signal_a_skips_pathless_images() {
+        let mut records = full_coverage();
+        for name in ["System", "Registry", "MemCompression", "Secure System"] {
+            records.push(Record::Process(proc(name, None)));
+        }
+        let findings = LiveExecHeuristic.analyze(&records, &[]).expect("analyze");
+        assert!(findings.is_empty(), "got {findings:?}");
+    }
+
     #[test]
     fn analyzer_emits_finding_for_signal_a() {
         let p = proc(r"C:\Users\a\AppData\Local\Temp\ghost.exe", None);
-        let findings = LiveExecHeuristic
-            .analyze(&[Record::Process(p)], &[])
-            .expect("analyze");
+        let mut records = vec![Record::Process(p)];
+        records.extend(full_coverage());
+        let findings = LiveExecHeuristic.analyze(&records, &[]).expect("analyze");
         assert_eq!(findings.len(), 1);
         let f = &findings[0];
         assert!(matches!(f.source, FindingSource::Heuristic));
@@ -423,9 +505,9 @@ mod tests {
     #[test]
     fn severity_is_high_for_signal_a() {
         let p = proc(r"C:\Users\a\AppData\Local\Temp\ghost.exe", None);
-        let findings = LiveExecHeuristic
-            .analyze(&[Record::Process(p)], &[])
-            .expect("analyze");
+        let mut records = vec![Record::Process(p)];
+        records.extend(full_coverage());
+        let findings = LiveExecHeuristic.analyze(&records, &[]).expect("analyze");
         assert_eq!(findings[0].severity, cairn_core::Severity::High);
     }
 }
