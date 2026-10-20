@@ -127,13 +127,13 @@ CHECKSUMS.txt         每個檔案的 SHA-256（打包時自動產生）
 雙擊 `cairn-launcher.exe` 會開啟一個文字選單，主畫面：
 
 ```
-[1] 快速掃描（最近 24 小時）
+[1] 快速掃描（最近 7 天）
 [2] 自訂時間範圍
 [3] 工程師模式
 [Q] 離開
 ```
 
-- **[1] 快速掃描**：對本機執行最近 24 小時的標準掃描，跑完自動打包成 zip、顯示結果摘要（是否發現高風險項目）。
+- **[1] 快速掃描**：對本機執行最近 7 天的標準掃描，跑完自動打包成 zip、顯示結果摘要（是否發現高風險項目）。
 - **[2] 自訂時間範圍**：選擇 1 / 6 / 24 / 72 小時或 7 天的掃描範圍。
 - **[3] 工程師模式**：進入子選單，見下一節。
 - **[Q] 離開**。
@@ -148,7 +148,7 @@ CHECKSUMS.txt         每個檔案的 SHA-256（打包時自動產生）
 [B] 返回主選單
 ```
 
-- **[1] 選擇 Profile 掃描**：先選擇掃描的 Profile（模組集），再對本機執行最近 24 小時掃描：
+- **[1] 選擇 Profile 掃描**：先選擇掃描的 Profile（模組集），再對本機執行最近 7 天掃描：
   - `Minimal`（最小模組集，速度優先）——跳過耗時的 raw-NTFS 全解析，適合快速確認或資源受限的環境。
   - `Standard`（標準模組集，預設）——一般 triage 的建議選項。
   - `Verbose`（完整模組集，含耗時的 raw-NTFS 收集）——涵蓋 $MFT/$J 等 raw 磁碟解析，最完整但耗時最長，需要 Admin 才能取得完整資料。
@@ -258,7 +258,7 @@ cairn run --target <TARGET> --output <OUTPUT> [OPTIONS]
 | `--rules-plain` | 讀取未 XOR 編碼的 .yml 規則（供 SOC 稽核用） |
 | `--profile minimal\|standard\|verbose` | `minimal`：最小模組集，跳過 raw-NTFS 全解析；`standard`（預設）：標準模組集；`verbose`：完整模組集，含耗時的 raw-NTFS 收集 |
 | `--only evtx,process,...` | 只跑指定 collector（逗號分隔） |
-| `--since <RFC3339>` | 只分析指定時間之後的事件 |
+| `--since <RFC3339>` | 只分析指定時間之後的事件（預設：執行前 7 天） |
 | `--case-id <id>` | 案件編號（記入 manifest） |
 | `--operator <name>` | 分析師姓名（記入 manifest） |
 | `--bodyfile <path>` | 同時輸出 mactime bodyfile（供 plaso 使用） |

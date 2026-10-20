@@ -33,7 +33,7 @@ pub fn print_main_menu(hostname: &str, rules_ver: &str, rules_loaded: bool) {
     println!("║  主機名稱：{:<30}║", truncate(hostname, 28));
     println!("║  {:<40}║", truncate(&rules_info, 38));
     println!("╠══════════════════════════════════════════╣");
-    println!("║  [1] 快速掃描（最近 24 小時）            ║");
+    println!("║  [1] 快速掃描（最近 7 天）               ║");
     println!("║  [2] 自訂時間範圍                        ║");
     println!("║  [3] 工程師模式                          ║");
     println!("║  [Q] 離開                               ║");
@@ -50,15 +50,17 @@ pub fn print_time_menu() -> (u64, &'static str) {
     println!("  [3] 最近 24 小時");
     println!("  [4] 最近 72 小時");
     println!("  [5] 最近 7 天（168 小時）");
-    print!("請選擇（預設 3）：");
+    println!("  [6] 最近 30 天");
+    print!("請選擇（預設 5）：");
     let _ = io::stdout().flush();
     let choice = read_choice();
     match choice {
         '1' => (1, "最近 1 小時"),
         '2' => (6, "最近 6 小時"),
+        '3' => (24, "最近 24 小時"),
         '4' => (72, "最近 72 小時"),
-        '5' => (168, "最近 7 天"),
-        _ => (24, "最近 24 小時"),
+        '6' => (720, "最近 30 天"),
+        _ => (168, "最近 7 天"),
     }
 }
 

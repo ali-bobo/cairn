@@ -107,6 +107,8 @@ struct RunArgs {
     /// comma-separated module allow-list, e.g. evtx,process,persist
     #[arg(long)]
     only: Option<String>,
+    /// Only analyze live EVTX events at or after this RFC3339 UTC time.
+    /// Default: 7 days before the run.
     #[arg(long)]
     since: Option<String>,
     #[arg(long)]
@@ -161,6 +163,16 @@ fn evtx_plan(cfg: &Config) -> String {
 }
 
 /// True if the run target selects the live host (vs an offline artifact dir).
+/// Default live-EVTX look-back when `--since` is not given. Incidents are routinely
+/// found days after initial access, and a 24h window silently dropped exactly the
+/// events an investigation needs. EVTX logs are size-bounded, so a week costs little.
+const DEFAULT_SINCE_DAYS: i64 = 7;
+
+/// `now - DEFAULT_SINCE_DAYS`: the start of the default live-EVTX window.
+fn default_since(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
+    now - chrono::Duration::days(DEFAULT_SINCE_DAYS)
+}
+
 fn is_live_target(target: &str) -> bool {
     target.eq_ignore_ascii_case("live")
 }
@@ -742,12 +754,13 @@ fn main() -> anyhow::Result<()> {
             cfg.governance.low_priority = is_live && !args.full_speed;
             cfg.normalize_for_profile();
 
-            // Default 24h window for live EVTX; overridable with --since (ISO8601 UTC).
+            // Default look-back for live EVTX (DEFAULT_SINCE_DAYS); overridable with
+            // --since (ISO8601 UTC).
             cfg.since = Some(match args.since.as_deref() {
                 Some(s) => s
                     .parse::<chrono::DateTime<chrono::Utc>>()
                     .map_err(|e| anyhow::anyhow!("--since parse error: {e}"))?,
-                None => chrono::Utc::now() - chrono::Duration::hours(24),
+                None => default_since(chrono::Utc::now()),
             });
 
             let available = std::thread::available_parallelism()
@@ -859,7 +872,7 @@ fn main() -> anyhow::Result<()> {
                     let channels = sa.channels().to_vec();
                     let since = cfg
                         .since
-                        .unwrap_or_else(|| chrono::Utc::now() - chrono::Duration::hours(24));
+                        .unwrap_or_else(|| default_since(chrono::Utc::now()));
                     collectors.push(Box::new(
                         cairn_collectors::evtx_live::EvtxLiveCollector::new(channels, since),
                     ));
@@ -1262,6 +1275,12 @@ mod tests {
         sort_findings(&mut v);
         assert_eq!(v[0].title, "a-title");
         assert_eq!(v[1].title, "b-title");
+    }
+
+    #[test]
+    fn default_since_looks_back_seven_days() {
+        let now = chrono::Utc::now();
+        assert_eq!(now - default_since(now), chrono::Duration::days(7));
     }
 
     #[test]

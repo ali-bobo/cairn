@@ -215,7 +215,7 @@ fn main() -> anyhow::Result<()> {
 
         match menu::read_choice() {
             '1' => {
-                if let Err(e) = run_scan_flow(&env, 24, "最近 24 小時", None) {
+                if let Err(e) = run_scan_flow(&env, 168, "最近 7 天", None) {
                     eprintln!("\n掃描發生錯誤：{e}");
                     menu::wait_enter("按 Enter 繼續...");
                 }
@@ -233,8 +233,8 @@ fn main() -> anyhow::Result<()> {
                 match menu::read_choice() {
                     '1' => {
                         let (profile_value, profile_desc) = menu::print_profile_menu();
-                        let desc = format!("最近 24 小時（{profile_desc} profile）");
-                        if let Err(e) = run_scan_flow(&env, 24, &desc, Some(profile_value)) {
+                        let desc = format!("最近 7 天（{profile_desc} profile）");
+                        if let Err(e) = run_scan_flow(&env, 168, &desc, Some(profile_value)) {
                             eprintln!("\n掃描發生錯誤：{e}");
                             menu::wait_enter("按 Enter 繼續...");
                         }
