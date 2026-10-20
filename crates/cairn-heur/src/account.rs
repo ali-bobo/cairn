@@ -69,7 +69,7 @@ fn parse_account_event(ev: &EventRecord) -> Option<AccountEvent> {
             group: Some(extract_str(d, "TargetUserName")),
             subject: extract_str(d, "SubjectUserName"),
             ts: ev.ts,
-            mitre: "T1098.001",
+            mitre: "T1098.007",
             event_id: ev.event_id,
         }),
         _ => None,
@@ -284,7 +284,7 @@ mod tests {
         let findings = AccountHeuristic.analyze(&records, &[]).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
-        assert!(findings[0].mitre.contains(&"T1098.001".to_string()));
+        assert!(findings[0].mitre.contains(&"T1098.007".to_string()));
         assert!(
             findings[0].title.contains("Administrators"),
             "title: {}",
@@ -303,7 +303,7 @@ mod tests {
         let findings = AccountHeuristic.analyze(&records, &[]).unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, Severity::High);
-        assert!(findings[0].mitre.contains(&"T1098.001".to_string()));
+        assert!(findings[0].mitre.contains(&"T1098.007".to_string()));
     }
 
     #[test]
