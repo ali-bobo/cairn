@@ -763,6 +763,42 @@ mod win {
     }
 }
 
+/// Extended ASEP catalog (crate::asep) + PowerShell profiles. Command-line targets get
+/// their binary_path from the same candidate model as the core readers; DLL targets
+/// arrive already resolved.
+fn read_extended_aseps() -> Vec<PersistenceRecord> {
+    let mut out = Vec::new();
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var("SystemRoot")
+            .or_else(|_| std::env::var("windir"))
+            .unwrap_or_else(|_| r"C:\Windows".to_string());
+        out.extend(crate::asep::read_catalog(
+            &crate::asep::WinReg,
+            &system_root,
+        ));
+    }
+    out.extend(crate::asep::read_ps_profiles(
+        &crate::asep::ps_profile_paths(|name| std::env::var(name).ok()),
+    ));
+    fill_command_binary_paths(&mut out, |p| std::path::Path::new(p).exists());
+    out
+}
+
+/// For records whose binary_path is unset but carry a command line, derive it with the
+/// S2-F candidate model (same as `make_record`). Injectable `exists` for tests.
+fn fill_command_binary_paths(records: &mut [PersistenceRecord], exists: impl Fn(&str) -> bool) {
+    for r in records.iter_mut() {
+        if r.binary_path.is_some() {
+            continue;
+        }
+        if let Some(cmd) = r.command.as_deref() {
+            let candidates = extract_binary_path_candidates(cmd, |name| std::env::var(name).ok());
+            r.binary_path = pick_binary_path(&candidates, &exists);
+        }
+    }
+}
+
 /// A verifier that never verifies (always None). Cross-platform default + test default; on
 /// non-Windows it is also what the real collector uses (no WinTrust off-Windows).
 #[allow(dead_code)]
@@ -859,6 +895,7 @@ impl Collector for PersistCollector {
         records.extend(read_ifeo());
         records.extend(read_startup_folders());
         records.extend(read_scheduled_tasks());
+        records.extend(read_extended_aseps());
         resolve_relative_binary_paths(&mut records);
         apply_signatures(&mut records, self.verifier.as_ref());
         Ok(records.into_iter().map(Record::Persistence).collect())
@@ -888,6 +925,44 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name: &str| map.get(name).cloned()
+    }
+
+    /// Catalog command-line records get a binary_path; DLL records keep theirs.
+    #[test]
+    fn fill_command_binary_paths_only_fills_missing() {
+        let mut recs = vec![
+            PersistenceRecord {
+                mechanism: "cmd_autorun".into(),
+                location: r"HKCU\Software\Microsoft\Command Processor".into(),
+                value: Some("AutoRun".into()),
+                command: Some(r#""C:\Users\Public\run.exe" /q"#.into()),
+                binary_path: None,
+                binary_sha256: None,
+                signed: None,
+                signer: None,
+                last_write: None,
+            },
+            PersistenceRecord {
+                mechanism: "netsh_helper".into(),
+                location: r"HKLM\SOFTWARE\Microsoft\NetSh".into(),
+                value: Some("x".into()),
+                command: Some("x.dll".into()),
+                binary_path: Some(r"C:\Windows\System32\x.dll".into()),
+                binary_sha256: None,
+                signed: None,
+                signer: None,
+                last_write: None,
+            },
+        ];
+        fill_command_binary_paths(&mut recs, |_| false);
+        assert_eq!(
+            recs[0].binary_path.as_deref(),
+            Some(r"C:\Users\Public\run.exe")
+        );
+        assert_eq!(
+            recs[1].binary_path.as_deref(),
+            Some(r"C:\Windows\System32\x.dll")
+        );
     }
 
     #[test]
