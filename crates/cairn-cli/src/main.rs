@@ -2006,10 +2006,22 @@ author: test-integration
             se_backup: false,
             se_debug: false,
         };
-        let collectors: Vec<Box<dyn Collector>> =
-            vec![Box::new(FixedRecordsCollector(vec![Record::Process(
-                ghost,
-            )]))];
+        // Signal A only fires when prefetch, amcache and shimcache were all collected,
+        // so give each one an unrelated record.
+        let mut records = vec![Record::Process(ghost)];
+        for source in ["prefetch", "amcache", "shimcache"] {
+            records.push(Record::Execution(cairn_core::record::ExecutionRecord {
+                source: source.into(),
+                path: r"C:\Tools\unrelated.exe".into(),
+                first_run: None,
+                last_run: None,
+                run_count: None,
+                sha1: None,
+                user_sid: None,
+                execution_confirmed: None,
+            }));
+        }
+        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedRecordsCollector(records))];
         let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> =
             vec![Box::new(cairn_heur::LiveExecHeuristic)];
 
