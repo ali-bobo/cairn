@@ -62,6 +62,14 @@ Do not use Cairn to access systems without authorization. Doing so may be illega
   attaches nearby USN/network activity to already-flagged processes as
   honestly-labeled circumstantial evidence (never presented as proven
   causation).
+- **Broad persistence coverage** across ~25 autostart locations beyond Run
+  keys and services — LSA packages/SSPs, password filters, netsh helpers,
+  AppInit/AppCert DLLs, port monitors, time providers, IFEO/accessibility
+  backdoors, SilentProcessExit, HKCU COM hijacks, Office Test, logon scripts,
+  cmd AutoRun and PowerShell profiles — each mapped to its ATT&CK technique.
+  `cairn coverage` prints exactly which techniques this build detects, and
+  `docs/COVERAGE.md` explains how to verify each one on a lab VM with Atomic
+  Red Team.
 - **WMI persistence detection** specifically covers the case most heuristics
   miss: an `ActiveScriptEventConsumer` running inline script content with no
   invoked executable to pattern-match against.
@@ -110,6 +118,9 @@ cairn evtx Security.evtx Sysmon.evtx --rules rules/sigma
 cairn run --target live --output D:\IR\case001 --admin-features `
   --case-id IR-2026-001 --operator analyst --zip
 
+# Which ATT&CK techniques can this build detect?
+cairn coverage
+
 # Verify run integrity
 cairn verify D:\IR\case001\manifest.json --rules rules/sigma
 
@@ -146,6 +157,7 @@ directly, use `--rules-plain`. Expand or update the set by editing
 | [USER-MANUAL.md](USER-MANUAL.md) | Full usage guide, flag reference, output format |
 | [cairn-SRS.md](cairn-SRS.md) | Software requirements spec |
 | [docs/threat-model.md](docs/threat-model.md) | Threat model + golden rules |
+| [docs/COVERAGE.md](docs/COVERAGE.md) | Detected ATT&CK techniques and how to verify each one |
 | [docs/sigma-rule-catalog.md](docs/sigma-rule-catalog.md) | Every bundled Sigma rule: what it detects, prerequisites, verification status |
 | [docs/SOC-runbook-template.md](docs/SOC-runbook-template.md) | Pre-engagement SOC allow-listing template |
 | [docs/verifying-a-release.md](docs/verifying-a-release.md) | Binary integrity verification |
