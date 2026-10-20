@@ -192,7 +192,14 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     // `startup`, Windows already put it in ProgramData/AppData by design, so those same
     // path-trust checks would flag every legitimate startup shortcut (e.g. AnyDesk.lnk).
     // Mirrors the pre-gate model's `mechanism != "startup"` path-signal exemption.
-    let path_signals_apply = p.mechanism != "startup";
+    // Same for PowerShell profiles: the script file IS the persistence location, judged
+    // by its content in crate::asep, not by where Windows keeps it.
+    let path_signals_apply = p.mechanism != "startup" && p.mechanism != "ps_profile";
+
+    // Extended catalog / accessibility IFEO / PowerShell profile signals.
+    if let Some(hit) = crate::asep::asep_signal(p) {
+        hits.push(hit);
+    }
 
     // S2: explicitly unsigned + user-writable drop zone.
     if path_signals_apply && p.signed == Some(false) && is_user_writable_path(path) {
@@ -232,7 +239,7 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
                     reason: format!(
                         "created/modified within {RECENT_DAYS} days, signature unverifiable, non-system path: {path}"
                     ),
-                    mitre: "T1547",
+                    mitre: crate::asep::mechanism_mitre(&p.mechanism),
                 });
             }
         }
@@ -498,7 +505,7 @@ impl Analyzer for PersistHeuristic {
 /// Build the entity: registry-backed mechanisms -> entity.registry; the file-backed
 /// `startup` mechanism -> entity.file (SRS §5.1 mapping in the design spec).
 fn persistence_entity(p: &PersistenceRecord) -> Entity {
-    if p.mechanism == "startup" {
+    if p.mechanism == "startup" || p.mechanism == "ps_profile" {
         Entity {
             file: Some(EntityFile {
                 path: p

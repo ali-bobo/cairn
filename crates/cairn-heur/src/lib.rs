@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod account;
+pub mod asep;
 pub mod byovd;
 pub mod live_exec;
 pub mod logon_bruteforce;
