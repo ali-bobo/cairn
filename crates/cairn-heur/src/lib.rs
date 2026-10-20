@@ -6,6 +6,7 @@
 pub mod account;
 pub mod asep;
 pub mod byovd;
+pub mod coverage;
 pub mod live_exec;
 pub mod logon_bruteforce;
 pub mod netconn;

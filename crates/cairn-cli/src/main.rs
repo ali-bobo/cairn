@@ -67,6 +67,17 @@ enum Cmd {
         #[arg(long)]
         pin: Option<String>,
     },
+    /// Print which ATT&CK techniques this build can detect: built-in heuristics plus
+    /// the Sigma rules' technique tags. Use it to know what a clean result does NOT
+    /// rule out.
+    Coverage {
+        /// Rules dir to count Sigma techniques from (default: bundled rules/sigma).
+        #[arg(long)]
+        rules: Option<PathBuf>,
+        /// Treat the rules dir as un-encoded `.yml`.
+        #[arg(long)]
+        rules_plain: bool,
+    },
     /// Re-hash a run's outputs (and optionally its ruleset) against the manifest.
     Verify {
         /// Path to manifest.json. Outputs are resolved relative to its directory.
@@ -171,6 +182,60 @@ const DEFAULT_SINCE_DAYS: i64 = 7;
 /// `now - DEFAULT_SINCE_DAYS`: the start of the default live-EVTX window.
 fn default_since(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
     now - chrono::Duration::days(DEFAULT_SINCE_DAYS)
+}
+
+/// `cairn coverage` text: one line per built-in technique (with the Sigma rule count
+/// when rules are loaded), then the techniques only Sigma covers. Pure for testing.
+fn coverage_report(sigma: Option<&std::collections::BTreeMap<String, usize>>) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "Built-in detections (heuristics over live state and EVTX):"
+    );
+    let _ = writeln!(
+        out,
+        "{:<11} {:<5} {:<40} WHAT IS CHECKED",
+        "TECHNIQUE", "SIGMA", "NAME"
+    );
+    for c in cairn_heur::coverage::BUILTIN {
+        let n = sigma
+            .and_then(|m| m.get(c.technique))
+            .map_or("-".to_string(), |n| n.to_string());
+        let _ = writeln!(
+            out,
+            "{:<11} {:<5} {:<40} {}",
+            c.technique, n, c.name, c.what
+        );
+    }
+    match sigma {
+        Some(map) => {
+            let extra: Vec<_> = map
+                .iter()
+                .filter(|(t, _)| {
+                    !cairn_heur::coverage::BUILTIN
+                        .iter()
+                        .any(|c| c.technique == *t)
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "\nSigma-only techniques (need the matching event log enabled):"
+            );
+            for (t, n) in extra {
+                let _ = writeln!(out, "{t:<11} {n} rule(s)");
+            }
+        }
+        None => {
+            let _ = writeln!(out, "\nNo Sigma rules loaded; Sigma coverage not shown.");
+        }
+    }
+    let _ = writeln!(
+        out,
+        "\nVerify a technique on a lab VM with Atomic Red Team, e.g.\n  Invoke-AtomicTest T1547.001 -ShowDetailsBrief\n\
+         then run cairn and confirm a finding tagged with that technique (docs/COVERAGE.md)."
+    );
+    out
 }
 
 /// The bundled rules directory used when `--rules` is omitted: `rules/sigma` next to
@@ -1099,6 +1164,22 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
+                Cmd::Coverage { rules, rules_plain } => {
+                    let sigma = match rules.or_else(default_rules_dir) {
+                        Some(dir) => {
+                            let mut engine = Engine::default();
+                            match engine.load(&dir, rules_plain) {
+                                Ok(_) => Some(engine.technique_counts()),
+                                Err(e) => {
+                                    tracing::warn!(error = %e, dir = %dir.display(), "rule load failed");
+                                    None
+                                }
+                            }
+                        }
+                        None => None,
+                    };
+                    print!("{}", coverage_report(sigma.as_ref()));
+                }
                 Cmd::Verify {
                     manifest,
                     rules,
@@ -1312,6 +1393,18 @@ mod tests {
         sort_findings(&mut v);
         assert_eq!(v[0].title, "a-title");
         assert_eq!(v[1].title, "b-title");
+    }
+
+    #[test]
+    fn coverage_report_lists_builtin_and_sigma_only_techniques() {
+        let mut sigma = std::collections::BTreeMap::new();
+        sigma.insert("T1547.001".to_string(), 3);
+        sigma.insert("T1003.001".to_string(), 2);
+        let text = coverage_report(Some(&sigma));
+        let run_line = text.lines().find(|l| l.starts_with("T1547.001")).unwrap();
+        assert!(run_line.contains(" 3 "), "{run_line}");
+        assert!(text.contains("T1003.001   2 rule(s)"), "{text}");
+        assert!(coverage_report(None).contains("No Sigma rules loaded"));
     }
 
     /// The manifest records when the run started, not when the manifest was built.

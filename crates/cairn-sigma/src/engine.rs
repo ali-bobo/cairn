@@ -68,6 +68,25 @@ impl Engine {
         }
     }
 
+    /// Number of loaded rules tagged with each ATT&CK technique, keyed by the
+    /// upper-case technique ID (`attack.t1059.001` -> `T1059.001`). Tactic tags
+    /// (`attack.execution`) and non-ATT&CK tags are ignored.
+    pub fn technique_counts(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for rule in &self.rules {
+            let mut seen = std::collections::BTreeSet::new();
+            for tag in rule.tags.iter().flatten() {
+                if let Some(id) = technique_from_tag(tag) {
+                    seen.insert(id);
+                }
+            }
+            for id in seen {
+                *counts.entry(id).or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
     /// Version string recorded by `load()` from the PROVENANCE file in the rules dir.
     /// Format: `"<pin>+<aggregate>"` (ADR-0003). Empty when no rules were loaded via `load()`.
     pub fn ruleset_ver(&self) -> &str {
@@ -143,6 +162,24 @@ impl Engine {
         f.evidence_ref = Some(ev.record_id.to_string());
         f
     }
+}
+
+/// `attack.t1059.001` -> `Some("T1059.001")`; tactic or other tags -> None.
+fn technique_from_tag(tag: &str) -> Option<String> {
+    let id = tag.strip_prefix("attack.")?;
+    let rest = id.strip_prefix('t').or_else(|| id.strip_prefix('T'))?;
+    let (major, sub) = rest
+        .split_once('.')
+        .map_or((rest, None), |(a, b)| (a, Some(b)));
+    if major.len() != 4 || !major.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Some(sub) = sub {
+        if sub.len() != 3 || !sub.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(format!("T{}", rest))
 }
 
 /// Map sigma-rust's `Level` to our `Severity`. sigma-rust does not re-export the
@@ -248,6 +285,20 @@ detection:
             record_id: 1,
             data,
         }
+    }
+
+    #[test]
+    fn technique_tags_are_parsed_and_tactics_ignored() {
+        assert_eq!(
+            technique_from_tag("attack.t1059.001").as_deref(),
+            Some("T1059.001")
+        );
+        assert_eq!(technique_from_tag("attack.t1218").as_deref(), Some("T1218"));
+        assert_eq!(technique_from_tag("attack.execution"), None);
+        assert_eq!(technique_from_tag("attack.g0016"), None);
+        assert_eq!(technique_from_tag("car.2013-05-004"), None);
+        let engine = Engine::from_rules(&[RULE]).unwrap();
+        assert_eq!(engine.technique_counts().get("T1059"), Some(&1));
     }
 
     /// A matching event fires the rule and the Finding carries author (DRL 1.1),
