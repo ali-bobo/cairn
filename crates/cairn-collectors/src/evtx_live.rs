@@ -45,8 +45,12 @@ pub(crate) fn collect_from_dir(
         }
     };
 
-    let wanted_filenames: HashSet<String> =
-        channels.iter().map(|c| channel_to_filename(c)).collect();
+    // NTFS file names are case-insensitive, so compare lowercased: a channel named
+    // "Security" must still find "SECURITY.EVTX" or "security.evtx".
+    let wanted_filenames: HashSet<String> = channels
+        .iter()
+        .map(|c| channel_to_filename(c).to_lowercase())
+        .collect();
 
     let mut records = Vec::new();
 
@@ -58,7 +62,7 @@ pub(crate) fn collect_from_dir(
         let Some(fname) = path.file_name().and_then(|f| f.to_str()) else {
             continue;
         };
-        if !wanted_filenames.contains(fname) {
+        if !wanted_filenames.contains(&fname.to_lowercase()) {
             continue;
         }
         let channel = filename_to_channel(fname).unwrap_or_else(|| fname.to_string());
@@ -253,6 +257,29 @@ mod tests {
         );
         assert!(result.is_ok());
         assert!(result.unwrap().is_empty());
+    }
+
+    /// File selection is case-insensitive (NTFS semantics): channel "Security" picks up
+    /// a file named "SECURITY.evtx". The file here is not valid EVTX, so it lands as a
+    /// source entry with a parse error — which proves it was selected.
+    #[test]
+    fn channel_file_match_is_case_insensitive() {
+        let dir = std::env::temp_dir().join("cairn_evtx_live_case_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("SECURITY.evtx"), b"not an evtx file").unwrap();
+        std::fs::write(dir.join("Unrelated.evtx"), b"not an evtx file").unwrap();
+        let mut sources = Vec::new();
+        let result = collect_from_dir(
+            &dir,
+            &["Security".to_string()],
+            chrono::Utc::now(),
+            &mut sources,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.unwrap().is_empty());
+        assert_eq!(sources.len(), 1, "only SECURITY.evtx should be selected");
+        assert!(sources[0].path.ends_with("SECURITY.evtx"));
     }
 
     fn make_ctx() -> CollectCtx<'static> {

@@ -38,17 +38,32 @@ impl Engine {
     }
 
     fn from_parsed(rules: Vec<Rule>) -> Self {
-        // Distinct channels referenced via logsource.service (used as a channel hint).
+        let logsource = LogsourceMap::windows_builtin();
+        // Distinct EVTX channel names the rules' logsources resolve to (e.g.
+        // `service: security` -> "Security", `category: process_creation` -> "Security"
+        // + Sysmon). These are real channel names, so EvtxLiveCollector can map them to
+        // on-disk `.evtx` files. A rule whose logsource is unmapped contributes nothing.
         let mut channels: Vec<String> = rules
             .iter()
-            .filter_map(|r| r.logsource.service.clone())
+            .flat_map(|r| {
+                let ls = &r.logsource;
+                logsource
+                    .resolve(
+                        ls.category.as_deref(),
+                        ls.product.as_deref(),
+                        ls.service.as_deref(),
+                    )
+                    .into_iter()
+                    .map(|e| e.channel.clone())
+                    .collect::<Vec<_>>()
+            })
             .collect();
         channels.sort();
         channels.dedup();
         Engine {
             rules,
             channels,
-            logsource: LogsourceMap::windows_builtin(),
+            logsource,
             ruleset_ver: String::new(),
         }
     }
@@ -85,8 +100,29 @@ impl Engine {
 
     /// Convert one normalized EventRecord into a sigma-rust Event by serializing its
     /// flattened `data` map to JSON (the fields Sigma matches against).
-    fn to_sigma_event(ev: &EventRecord) -> Result<sigma_rust::Event> {
-        let json = serde_json::Value::Object(ev.data.clone()).to_string();
+    ///
+    /// Field aliases from every LogsourceMap entry matching the event's channel/EID are
+    /// applied first: e.g. a Security 4688 carries `NewProcessName`, so `Image` is added
+    /// with the same value, letting process_creation rules written against Sysmon
+    /// field names match it. An alias never overwrites a field the event already has.
+    fn to_sigma_event(&self, ev: &EventRecord) -> Result<sigma_rust::Event> {
+        let mut data = ev.data.clone();
+        for entry in self
+            .logsource
+            .entries
+            .iter()
+            .filter(|e| e.channel == ev.channel && e.event_id == ev.event_id)
+        {
+            for (sigma_field, evtx_field) in &entry.field_aliases {
+                if data.contains_key(sigma_field) {
+                    continue;
+                }
+                if let Some(v) = ev.data.get(evtx_field) {
+                    data.insert(sigma_field.clone(), v.clone());
+                }
+            }
+        }
+        let json = serde_json::Value::Object(data).to_string();
         sigma_rust::event_from_json(&json)
             .map_err(|e| CairnError::Other(format!("event to sigma: {e}")))
     }
@@ -158,7 +194,7 @@ impl SigmaMatcher for Engine {
     }
 
     fn match_event(&self, ev: &EventRecord) -> Result<Vec<Finding>> {
-        let sigma_ev = Self::to_sigma_event(ev)?;
+        let sigma_ev = self.to_sigma_event(ev)?;
         let findings = self
             .rules
             .iter()
@@ -249,6 +285,70 @@ detection:
     fn referenced_channels_is_available() {
         let engine = Engine::from_rules(&[RULE]).unwrap();
         let _ = engine.referenced_channels();
+    }
+
+    /// referenced_channels() returns real EVTX channel names resolved from each rule's
+    /// logsource (not raw Sigma service names like "security"), so the live collector
+    /// can map them to on-disk files. process_creation -> Security + Sysmon.
+    #[test]
+    fn referenced_channels_are_resolved_channel_names() {
+        const SVC: &str = r#"
+title: Svc rule
+id: svc-0001
+author: T
+level: low
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4625
+    condition: selection
+"#;
+        let engine = Engine::from_rules(&[RULE, SVC]).unwrap();
+        assert_eq!(
+            engine.referenced_channels(),
+            &[
+                "Microsoft-Windows-Sysmon/Operational".to_string(),
+                "Security".to_string(),
+            ]
+        );
+    }
+
+    /// A real Security 4688 carries `NewProcessName`/`ParentProcessName`, not the Sysmon
+    /// `Image`/`ParentImage` names that process_creation rules use. The 4688 field
+    /// aliases bridge that, so the rule fires on a real-shaped 4688.
+    #[test]
+    fn process_creation_rule_fires_on_real_shaped_4688() {
+        let engine = Engine::from_rules(&[RULE]).unwrap();
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "NewProcessName".into(),
+            serde_json::json!(r"C:\Windows\System32\cmd.exe"),
+        );
+        let ev = EventRecord {
+            ts: Utc::now(),
+            channel: "Security".into(),
+            event_id: 4688,
+            provider: "Microsoft-Windows-Security-Auditing".into(),
+            computer: "WS01".into(),
+            record_id: 1,
+            data,
+        };
+        assert_eq!(engine.match_event(&ev).unwrap().len(), 1);
+    }
+
+    /// Aliases only fill in missing fields: an event that already carries `Image`
+    /// keeps its own value even if `NewProcessName` says otherwise.
+    #[test]
+    fn field_alias_never_overwrites_existing_field() {
+        let engine = Engine::from_rules(&[RULE]).unwrap();
+        let mut ev = event(r"C:\Windows\System32\notepad.exe");
+        ev.data.insert(
+            "NewProcessName".into(),
+            serde_json::json!(r"C:\Windows\System32\cmd.exe"),
+        );
+        assert!(engine.match_event(&ev).unwrap().is_empty());
     }
 
     /// Logsource gate (T8 follow-up): a `process_creation` rule must fire on a
