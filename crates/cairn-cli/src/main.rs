@@ -173,6 +173,23 @@ fn default_since(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono:
     now - chrono::Duration::days(DEFAULT_SINCE_DAYS)
 }
 
+/// The bundled rules directory used when `--rules` is omitted: `rules/sigma` next to
+/// the running binary (the packaged layout), else `rules/sigma` under the current
+/// directory (a source checkout). None if neither exists — the run then logs that
+/// Sigma is skipped.
+fn default_rules_dir() -> Option<PathBuf> {
+    let beside_exe = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|d| d.join("rules").join("sigma")));
+    let in_cwd = std::env::current_dir()
+        .ok()
+        .map(|d| d.join("rules").join("sigma"));
+    [beside_exe, in_cwd]
+        .into_iter()
+        .flatten()
+        .find(|d| d.is_dir())
+}
+
 fn is_live_target(target: &str) -> bool {
     target.eq_ignore_ascii_case("live")
 }
@@ -394,7 +411,13 @@ fn ruleset_ver(cfg: &Config) -> String {
 /// Assemble the run manifest (SRS §5.3). Stage-1 evtx run: user-space, no privileges,
 /// sources hashing is added when the collector reports provenance (T8+); for now the
 /// manifest carries tool identity, the command, host, and detection counts.
-fn build_manifest(cfg: &Config, hostname: &str, records: u64, findings: &[Finding]) -> Manifest {
+fn build_manifest(
+    cfg: &Config,
+    hostname: &str,
+    records: u64,
+    findings: &[Finding],
+    started_utc: chrono::DateTime<chrono::Utc>,
+) -> Manifest {
     // Reuse the report crate's severity tally instead of recomputing it here.
     let by_sev = cairn_report::Summary::from_findings(findings, records).by_severity;
     Manifest {
@@ -406,7 +429,7 @@ fn build_manifest(cfg: &Config, hostname: &str, records: u64, findings: &[Findin
             sigma_ruleset_ver: ruleset_ver(cfg), // "<pin>+<aggregate>" (ADR-0003)
         },
         run: RunInfo {
-            started_utc: chrono::Utc::now(),
+            started_utc,
             finished_utc: Some(chrono::Utc::now()),
             cmdline: std::env::args().collect::<Vec<_>>().join(" "),
             operator: cfg.operator.clone(),
@@ -505,7 +528,9 @@ fn main() -> anyhow::Result<()> {
             rules,
             rules_plain,
         } => {
-            let cfg = Config::for_evtx(files, rules).with_rules_plain(rules_plain);
+            let started_utc = chrono::Utc::now();
+            let cfg = Config::for_evtx(files, rules.or_else(default_rules_dir))
+                .with_rules_plain(rules_plain);
             let dir = output_dir(&cfg);
             std::fs::create_dir_all(&dir)?;
 
@@ -568,7 +593,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                tracing::info!("no --rules dir; skipping Sigma (parse-only run)");
+                tracing::warn!("no --rules and no bundled rules/sigma beside the binary or in the current directory; skipping Sigma (parse-only run)");
             }
             tracing::info!(findings = findings.len(), "analysis complete");
 
@@ -580,7 +605,13 @@ fn main() -> anyhow::Result<()> {
                 .first()
                 .map(|r| r.computer.clone())
                 .unwrap_or_default();
-            let mut manifest = build_manifest(&cfg, &hostname, records.len() as u64, &findings);
+            let mut manifest = build_manifest(
+                &cfg,
+                &hostname,
+                records.len() as u64,
+                &findings,
+                started_utc,
+            );
             for f in &mut findings {
                 client_text::fill_details_client(f);
             }
@@ -601,6 +632,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Run(args) => {
             use cairn_core::orchestrator::run_live;
             use cairn_core::traits::Collector;
+
+            let started_utc = chrono::Utc::now();
 
             if !is_live_target(&args.target) {
                 // Offline-artifact orchestration is the raw-NTFS sub-segment; be honest.
@@ -743,7 +776,11 @@ fn main() -> anyhow::Result<()> {
                 output: output_kind,
                 ..Config::default()
             };
-            cfg.rules_dir = args.rules.clone();
+            // No --rules: use the bundled rules next to the binary (or under the current
+            // directory) so a plain `cairn run` still runs Sigma and live EVTX.
+            cfg.rules_dir = args.rules.clone().or_else(default_rules_dir);
+            cfg.case_id = args.case_id.clone().unwrap_or_default();
+            cfg.operator = args.operator.clone().unwrap_or_default();
             cfg.rules_plain = args.rules_plain;
 
             // ── Resource governance (NFR9/NFR10) ──────────────────────────────────────
@@ -807,7 +844,7 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                tracing::info!("no --rules; skipping Sigma and live EVTX");
+                tracing::warn!("no --rules and no bundled rules/sigma beside the binary or in the current directory; skipping Sigma and live EVTX");
                 None
             };
 
@@ -972,18 +1009,18 @@ fn main() -> anyhow::Result<()> {
                     sigma_ruleset_ver: ruleset_ver(&cfg),
                 },
                 run: RunInfo {
-                    started_utc: chrono::Utc::now(),
+                    started_utc,
                     finished_utc: Some(chrono::Utc::now()),
                     cmdline: std::env::args().collect::<Vec<_>>().join(" "),
-                    operator: String::new(),
-                    case_id: String::new(),
+                    operator: cfg.operator.clone(),
+                    case_id: cfg.case_id.clone(),
                     profile: format!("{:?}", cfg.profile).to_lowercase(),
                     selected_modules: selection.selected.clone(),
                 },
                 host: HostInfo {
                     hostname: outcome.hostname.clone(),
-                    os_build: String::new(),
-                    timezone: "UTC".into(),
+                    os_build: cairn_collectors::host_info::os_build(),
+                    timezone: cairn_collectors::host_info::timezone(),
                     wall_clock_utc_skew: "unknown".into(),
                 },
                 privileges: outcome.privileges.clone(),
@@ -1277,6 +1314,38 @@ mod tests {
         assert_eq!(v[1].title, "b-title");
     }
 
+    /// The manifest records when the run started, not when the manifest was built.
+    #[test]
+    fn build_manifest_keeps_the_given_start_time() {
+        let cfg = Config::for_evtx(vec![], None);
+        let started = chrono::Utc::now() - chrono::Duration::minutes(5);
+        let m = build_manifest(&cfg, "WS01", 0, &[], started);
+        assert_eq!(m.run.started_utc, started);
+        assert!(m.run.finished_utc.expect("finished set") > started);
+    }
+
+    /// --case-id / --operator parse (main copies them into the live manifest).
+    #[test]
+    fn run_args_case_id_and_operator_parse() {
+        let cli = Cli::parse_from([
+            "cairn",
+            "run",
+            "--target",
+            "live",
+            "--output",
+            "out",
+            "--case-id",
+            "IR-1",
+            "--operator",
+            "sam",
+        ]);
+        let Cmd::Run(args) = cli.cmd else {
+            panic!("expected run");
+        };
+        assert_eq!(args.case_id.as_deref(), Some("IR-1"));
+        assert_eq!(args.operator.as_deref(), Some("sam"));
+    }
+
     #[test]
     fn default_since_looks_back_seven_days() {
         let now = chrono::Utc::now();
@@ -1404,7 +1473,7 @@ mod tests {
         f.rule_author = Some("A".into());
         let findings = vec![f];
         let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], None);
-        let mut manifest = build_manifest(&cfg, "WS01", 1, &findings);
+        let mut manifest = build_manifest(&cfg, "WS01", 1, &findings, chrono::Utc::now());
         let mut sink = DirSink::new(dir.to_path_buf());
         sink.write_timeline_csv(&findings).unwrap();
         sink.write_findings_jsonl(&findings).unwrap();
@@ -1453,7 +1522,7 @@ mod tests {
         use cairn_core::finding::{Finding, FindingSource, Severity};
         let findings = vec![Finding::new(Severity::Low, "t", FindingSource::Sigma)];
         let cfg = Config::for_evtx(vec![], Some(rules.clone())).with_rules_plain(true);
-        let mut manifest = build_manifest(&cfg, "WS01", 0, &findings);
+        let mut manifest = build_manifest(&cfg, "WS01", 0, &findings, chrono::Utc::now());
         let mut sink = DirSink::new(dir.clone());
         sink.write_timeline_csv(&findings).unwrap();
         sink.write_findings_jsonl(&findings).unwrap();
