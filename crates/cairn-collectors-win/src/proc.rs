@@ -46,7 +46,7 @@ mod win {
     };
     use windows::Win32::System::Threading::{
         GetProcessTimes, OpenProcess, OpenProcessToken, QueryFullProcessImageNameW,
-        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     };
 
     /// RAII guard for a snapshot HANDLE.
@@ -241,43 +241,25 @@ mod win {
             let file_name = String::from_utf16_lossy(&entry.szExeFile[..len]);
             let pid = entry.th32ProcessID;
 
-            // AV false-positive mitigation: open the process ONCE per pid instead of up
-            // to 4 times. Try the union of every query's access mask first; if that's
-            // denied (e.g. a protected process refusing PROCESS_VM_READ), fall back to
-            // the base mask so image/integrity/start_time still resolve — only cmdline
-            // is sacrificed. This preserves golden rule 8 (graceful degrade): a denied
-            // capability degrades that one field, never the whole pid.
+            // Open each process ONCE with PROCESS_QUERY_LIMITED_INFORMATION only. That
+            // mask is enough for the image path, token integrity, start time and (via
+            // ProcessCommandLineInformation) the command line. PROCESS_VM_READ is never
+            // requested: opening lsass.exe with it is the credential-dumping pattern
+            // EDRs alert on, and we no longer need it. A denied open degrades this one
+            // pid to its snapshot file name (golden rule 8).
             // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
-            let full_handle = unsafe {
-                OpenProcess(
-                    PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
-                    false,
-                    pid,
-                )
-            }
-            .ok();
+            let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok();
 
-            let (image, cmdline, integrity_raw, start_time) = if let Some(h) = full_handle {
-                let guard = ProcHandle(h);
-                let image = full_image_path(guard.0).unwrap_or_else(|| file_name.clone());
-                let cmdline = crate::cmdline_reader::read_cmdline(guard.0);
-                let integrity_raw = read_integrity(guard.0);
-                let start_time = read_start_time(guard.0);
-                (image, cmdline, integrity_raw, start_time)
-            } else {
-                // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
-                let base_handle =
-                    unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok();
-                match base_handle {
-                    Some(h) => {
-                        let guard = ProcHandle(h);
-                        let image = full_image_path(guard.0).unwrap_or_else(|| file_name.clone());
-                        let integrity_raw = read_integrity(guard.0);
-                        let start_time = read_start_time(guard.0);
-                        (image, None, integrity_raw, start_time)
-                    }
-                    None => (file_name.clone(), None, None, None),
+            let (image, cmdline, integrity_raw, start_time) = match handle {
+                Some(h) => {
+                    let guard = ProcHandle(h);
+                    let image = full_image_path(guard.0).unwrap_or_else(|| file_name.clone());
+                    let cmdline = crate::cmdline_reader::read_cmdline(guard.0);
+                    let integrity_raw = read_integrity(guard.0);
+                    let start_time = read_start_time(guard.0);
+                    (image, cmdline, integrity_raw, start_time)
                 }
+                None => (file_name.clone(), None, None, None),
             };
 
             out.push(RawProc {
@@ -359,35 +341,17 @@ mod tests {
         );
     }
 
-    /// Our own process's cmdline should be readable (we are not WOW64, not
-    /// protected, and PROCESS_VM_READ against our own process always succeeds).
+    /// Our own process's cmdline should be readable via ProcessCommandLineInformation,
+    /// and must contain our own executable name.
     #[test]
     fn current_process_cmdline_resolves() {
         let me = std::process::id();
         let procs = enumerate().expect("enumerate");
         let mine = procs.iter().find(|p| p.pid == me).expect("self in list");
-        assert!(
-            mine.cmdline.is_some(),
-            "expected a cmdline for our own process"
-        );
-    }
-
-    /// Documents the two-stage fallback contract: this test can't force a real
-    /// PROCESS_VM_READ denial (would need a genuinely protected process), but it
-    /// confirms the union-mask path is what's actually exercised for an unprotected
-    /// process — the fallback branch remains logic-reviewed rather than
-    /// integration-tested against a real protected target. Tracked as a known gap.
-    #[test]
-    fn enumerate_uses_union_mask_path_for_unprotected_process() {
-        let me = std::process::id();
-        let procs = enumerate().expect("enumerate");
-        let mine = procs.iter().find(|p| p.pid == me).expect("self in list");
-        // If the union-mask OpenProcess had failed and fallen back to the base mask,
-        // cmdline would be None. Since our own process is never protected, cmdline
-        // resolving proves the primary (non-fallback) path executed.
-        assert!(
-            mine.cmdline.is_some(),
-            "expected the union-mask path (not fallback) for our own unprotected process"
-        );
+        let cmd = mine
+            .cmdline
+            .as_deref()
+            .expect("expected a cmdline for our own process");
+        assert!(!cmd.trim().is_empty());
     }
 }
