@@ -10,8 +10,47 @@ use std::collections::HashMap;
 
 /// Gate floor (spec §4.2 S7): single weak signals (rare port 20, public+rare 45,
 /// suspicious-path owner 30) are inventory-grade and never emit alone; a finding
-/// requires a corroborated combo (e.g. public+rare+unsigned = 65).
+/// requires a corroborated combo (e.g. public+rare+unsigned = 65). The one exception
+/// is an unsigned owner in a drop zone (see [`owner_is_unsigned_dropzone`]), which
+/// emits on its own at Medium.
 const NETCONN_GATE_FLOOR: u32 = 50;
+
+/// Weight of "owner is unsigned and runs from a user-writable folder": Medium on its
+/// own (an unsigned per-user tool talking to the network is worth a look, not an
+/// alarm); any further signal lifts it to High.
+const UNSIGNED_DROPZONE_OWNER: u32 = 40;
+
+/// Remote-access services whose LOCAL port is the listening port: a connection to
+/// one of them from a public address is someone on the internet logged in to (or
+/// knocking on) this host.
+const INBOUND_REMOTE_SERVICES: &[(u16, &str, &str)] = &[
+    (3389, "RDP", "T1021.001"),
+    (445, "SMB", "T1021.002"),
+    (22, "SSH", "T1021.004"),
+];
+
+/// True if the connection's owner is explicitly unsigned AND runs from a drop zone.
+fn owner_is_unsigned_dropzone(owner: Option<&ProcessRecord>) -> bool {
+    owner.is_some_and(|o| o.signed == Some(false) && is_user_writable_path(&o.image))
+}
+
+/// The remote-access service a public peer is connected to on this host, if any:
+/// local port 3389/445/22, a public remote address, not a listening socket, and the
+/// remote port is not itself that service port (an outbound session from here has an
+/// ephemeral local port, so it never matches).
+fn inbound_public_service(c: &NetConnRecord) -> Option<(&'static str, &'static str)> {
+    if c.state.as_deref() == Some("listen") {
+        return None;
+    }
+    let raddr = c.raddr.as_deref()?;
+    if !is_public_ipv4(raddr) {
+        return None;
+    }
+    let (port, name, mitre) = INBOUND_REMOTE_SERVICES
+        .iter()
+        .find(|(p, _, _)| *p == c.lport)?;
+    (c.rport != Some(*port)).then_some((name, mitre))
+}
 
 /// Score one connection against its (optional) owning process.
 fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
@@ -22,7 +61,14 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
     // stays quiet.
     // A remote port of 0 (or None) means "no remote endpoint" — a listening socket, not
     // egress. Only a real (non-zero) remote port can be a rare-egress signal.
-    let rare = c.rport.is_some_and(|p| p != 0 && is_rare_port(p));
+    // An inbound session's remote port is the client's ephemeral port, not egress, so
+    // the rare-port signals do not apply to it.
+    let inbound = inbound_public_service(c);
+    let serving = c.state.as_deref() != Some("listen")
+        && INBOUND_REMOTE_SERVICES
+            .iter()
+            .any(|(p, _, _)| *p == c.lport && c.rport != Some(*p));
+    let rare = !serving && c.rport.is_some_and(|p| p != 0 && is_rare_port(p));
     if let Some(raddr) = c.raddr.as_deref() {
         if is_public_ipv4(raddr) && rare {
             s.add(
@@ -37,6 +83,20 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
             s.add(20, format!("uncommon remote port {rport}"), &[]);
         }
     }
+    // 3389/445/22 are "common" only as REMOTE ports (this host connecting out). As the
+    // LOCAL port with a public peer they mean the service is exposed to the internet
+    // and someone is using it: High on its own (T1021 remote services / T1133).
+    if let Some((name, mitre)) = inbound {
+        s.add(
+            55,
+            format!(
+                "inbound {name} connection from public IP {} to local port {}",
+                c.raddr.as_deref().unwrap_or("-"),
+                c.lport
+            ),
+            &[mitre, "T1133"],
+        );
+    }
     if let Some(o) = owner {
         let mut owner_path_suspicious = false;
         // 獨立訊號（段 11）：owner 未簽章 + 可疑路徑的組合，不需要連線本身先觸發
@@ -48,7 +108,7 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
         // parentchild.rs 對同性質訊號的標籤。
         if is_user_writable_path(&o.image) && o.signed == Some(false) {
             s.add(
-                50,
+                UNSIGNED_DROPZONE_OWNER,
                 format!(
                     "owning process is unsigned and runs from a suspicious path: {}",
                     o.image
@@ -160,7 +220,9 @@ impl Analyzer for NetConnHeuristic {
                 }
             }
 
-            if score.weight < NETCONN_GATE_FLOOR {
+            // Below the floor only the unsigned drop-zone owner emits (alone: Medium).
+            let standalone = owner_is_unsigned_dropzone(owner);
+            if score.weight < NETCONN_GATE_FLOOR && !standalone {
                 continue;
             }
             let Some(severity) = severity_for(score.weight) else {
@@ -185,12 +247,22 @@ impl Analyzer for NetConnHeuristic {
                 })
                 .or_else(|| c.pid.map(|pid| pid.to_string()))
                 .unwrap_or_else(|| "unknown".into());
-            f.details = format!(
-                "{} → {}:{}",
-                proc_label,
-                c.raddr.as_deref().unwrap_or("-"),
-                c.rport.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-            );
+            f.details = if inbound_public_service(c).is_some() {
+                format!(
+                    "{} ← {}:{} (local port {})",
+                    proc_label,
+                    c.raddr.as_deref().unwrap_or("-"),
+                    c.rport.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                    c.lport,
+                )
+            } else {
+                format!(
+                    "{} → {}:{}",
+                    proc_label,
+                    c.raddr.as_deref().unwrap_or("-"),
+                    c.rport.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                )
+            };
             f.entity = Entity {
                 netconn: Some(EntityNetConn {
                     laddr: c.laddr.clone(),
@@ -299,9 +371,9 @@ mod tests {
     }
 
     /// An unsigned process running from a suspicious path (Temp), connecting to a
-    /// public IP on port 443 (common port — the real-world C2 disguise this segment
-    /// fixes), must now score independently of port rarity: suspicious-path(30) +
-    /// unsigned(20) as a single combined signal = 50, clearing the gate floor.
+    /// public IP on port 443 (common port — the real-world C2 disguise), scores
+    /// independently of port rarity: the combined unsigned+drop-zone signal (40) emits
+    /// on its own, at Medium — no longer High without a second signal.
     #[test]
     fn unsigned_suspicious_path_owner_scores_independently_of_port_443() {
         let c = conn(
@@ -314,11 +386,7 @@ mod tests {
         );
         let o = owner(r"C:\Users\a\AppData\Local\Temp\evil.exe", Some(false));
         let s = score_conn(&c, Some(&o));
-        assert!(
-            s.weight >= NETCONN_GATE_FLOOR,
-            "weight {} must clear the gate floor even on a common port",
-            s.weight
-        );
+        assert_eq!(s.weight, UNSIGNED_DROPZONE_OWNER);
         assert!(s
             .reasons
             .iter()
@@ -327,10 +395,12 @@ mod tests {
         let findings = NetConnHeuristic
             .analyze(&[Record::NetConn(c), Record::Process(o)], &[])
             .expect("analyze");
-        assert!(
-            !findings.is_empty(),
+        assert_eq!(
+            findings.len(),
+            1,
             "a 443-port C2 disguise with an unsigned+suspicious-path owner must be flagged"
         );
+        assert_eq!(findings[0].severity, cairn_core::Severity::Medium);
     }
 
     /// A signed, normal-path owner connecting on port 443 must still stay quiet —
@@ -386,8 +456,8 @@ mod tests {
         let c = conn("tcp", 4444, None, None, Some("listen"), Some(1));
         let o = owner(r"C:\Users\a\AppData\Local\Temp\svc.exe", Some(false));
         let s = score_conn(&c, Some(&o));
-        // suspicious path (30) + unsigned (20) + listener (25) = 75
-        assert!(s.weight >= 70, "weight {}", s.weight);
+        // unsigned + suspicious path (40) + listener (25) = 65 (High)
+        assert_eq!(s.weight, 65);
         assert!(s
             .reasons
             .iter()
@@ -539,12 +609,88 @@ mod tests {
         // signal (50) — NOT suspicious-path(30) and unsigned(20) added separately, since
         // those would double-count the same underlying fact. owner_path_suspicious is
         // still set true by that branch, so the listener signal (25) still fires on top:
-        // 50 + 25 = 75.
-        assert_eq!(s.weight, 75);
+        // 40 + 25 = 65.
+        assert_eq!(s.weight, 65);
         assert!(s
             .reasons
             .iter()
             .any(|r| r.contains("listening on high port")));
+    }
+
+    /// Inbound RDP / SMB / SSH from a public address is High on its own, even with a
+    /// signed system owner; the same ports used outbound, or from a private peer, are
+    /// not.
+    #[test]
+    fn inbound_public_remote_service_is_high() {
+        let svchost = owner(r"C:\Windows\System32\svchost.exe", Some(true));
+        for (lport, mitre) in [(3389, "T1021.001"), (445, "T1021.002"), (22, "T1021.004")] {
+            let c = conn(
+                "tcp",
+                lport,
+                Some("45.33.32.156"),
+                Some(51234),
+                Some("established"),
+                Some(1),
+            );
+            let s = score_conn(&c, Some(&svchost));
+            assert_eq!(s.weight, 55, "{lport}");
+            assert!(s.mitre.contains(&mitre.to_string()));
+            assert!(s.mitre.contains(&"T1133".to_string()));
+            let f = NetConnHeuristic
+                .analyze(&[Record::NetConn(c), Record::Process(svchost.clone())], &[])
+                .unwrap();
+            assert_eq!(f.len(), 1, "{lport}");
+            assert_eq!(f[0].severity, cairn_core::Severity::High);
+            assert!(f[0].details.contains('←'), "{}", f[0].details);
+        }
+        // outbound RDP from this host: ephemeral local port -> not inbound
+        let out = conn(
+            "tcp",
+            50123,
+            Some("45.33.32.156"),
+            Some(3389),
+            Some("established"),
+            Some(1),
+        );
+        assert_eq!(score_conn(&out, Some(&svchost)).weight, 0);
+        // inbound from a private peer -> quiet
+        let lan = conn(
+            "tcp",
+            3389,
+            Some("10.0.0.5"),
+            Some(51234),
+            Some("established"),
+            Some(1),
+        );
+        assert_eq!(score_conn(&lan, Some(&svchost)).weight, 0);
+        // the listening socket itself -> quiet
+        let listen = conn(
+            "tcp",
+            3389,
+            Some("0.0.0.0"),
+            Some(0),
+            Some("listen"),
+            Some(1),
+        );
+        assert_eq!(score_conn(&listen, Some(&svchost)).weight, 0);
+    }
+
+    /// Unsigned drop-zone owner plus one more signal (rare port) is High.
+    #[test]
+    fn unsigned_dropzone_owner_with_another_signal_is_high() {
+        let c = conn(
+            "tcp",
+            50000,
+            Some("10.0.0.5"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        );
+        let o = owner(r"C:\Users\a\AppData\Roaming\x\x.exe", Some(false));
+        let f = NetConnHeuristic
+            .analyze(&[Record::NetConn(c), Record::Process(o)], &[])
+            .unwrap();
+        assert_eq!(f[0].severity, cairn_core::Severity::High);
     }
 
     use cairn_core::record::Record;
