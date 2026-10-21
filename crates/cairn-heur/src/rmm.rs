@@ -14,6 +14,11 @@
 //! - High: it runs from a user-writable folder, is unsigned, is renamed (the signer is
 //!   the tool's but the exe name is not, or the exe name is the tool's but a valid
 //!   signature names someone else), or has an established connection to a public IP.
+//! - Medium at least: the tool's own log ([`RmmLogRecord`], from `dropscan`: AnyDesk
+//!   `connection_trace.txt`, TeamViewer `Connections_incoming.txt`) records incoming
+//!   connections inside the collection window; the entries are the evidence. The other
+//!   self-logs (AnyDesk `ad.trace`, TeamViewer `*_Logfile.log`, ScreenConnect client
+//!   `*.log`) only show the tool is present.
 //!
 //! Two or more distinct tools on one host add one Medium finding.
 
@@ -22,7 +27,8 @@ use std::net::{IpAddr, Ipv6Addr};
 
 use cairn_core::finding::{EntityFile, EntityProcess, EvidenceItem, FindingSource, Severity};
 use cairn_core::record::{
-    Mechanism, NetConnRecord, PersistenceRecord, ProcessRecord, ProgramDir, Record,
+    Mechanism, NetConnRecord, PersistenceRecord, ProcessRecord, ProgramDir, Record, RmmLogKind,
+    RmmLogRecord,
 };
 use cairn_core::traits::Analyzer;
 use cairn_core::{Finding, Result};
@@ -33,6 +39,9 @@ use crate::trust::{exe_name, is_user_writable_path};
 
 /// "Recently installed" window, in days before the run start.
 pub const RECENT_DAYS: i64 = 30;
+
+/// Incoming connections from a tool's own log listed as evidence, per tool.
+pub const MAX_LOG_EVIDENCE: usize = 20;
 
 /// One remote-access tool. All strings lowercase; exe names without `.exe`; path
 /// fragments are `\`-delimited folder names (`\anydesk\`).
@@ -301,6 +310,16 @@ pub const RMM_TOOLS: &[RmmTool] = &[
     ),
 ];
 
+/// The [`RMM_TOOLS`] entry whose own log this is.
+pub fn log_tool(kind: RmmLogKind) -> Option<&'static RmmTool> {
+    let name = match kind {
+        RmmLogKind::AnyDeskTrace | RmmLogKind::AnyDeskConnectionTrace => "AnyDesk",
+        RmmLogKind::TeamViewerIncoming | RmmLogKind::TeamViewerLogfile => "TeamViewer",
+        RmmLogKind::ScreenConnectLog => "ScreenConnect / ConnectWise Control",
+    };
+    RMM_TOOLS.iter().find(|t| t.name == name)
+}
+
 fn by_exe(exe: &str) -> Option<&'static RmmTool> {
     RMM_TOOLS.iter().find(|t| t.exes.contains(&exe))
 }
@@ -366,6 +385,10 @@ struct Hits {
     seen: Vec<String>,
     high: Vec<String>,
     recent: Vec<String>,
+    /// Incoming connections from the tool's own log, inside the window.
+    incoming: Vec<String>,
+    /// Newest incoming connection: (time, remote ID).
+    last_incoming: Option<(DateTime<Utc>, String)>,
     evidence: Vec<EvidenceItem>,
     process: Option<EntityProcess>,
     file: Option<EntityFile>,
@@ -549,6 +572,58 @@ fn on_dir(d: &ProgramDir, ctx: &Ctx, hits: &mut BTreeMap<&'static str, Hits>) {
     h.stamp(d.last_write);
 }
 
+fn on_log(l: &RmmLogRecord, hits: &mut BTreeMap<&'static str, Hits>) {
+    let Some(tool) = log_tool(l.log_kind) else {
+        return;
+    };
+    let h = hits.entry(tool.name).or_default();
+    h.seen.push(format!(
+        "self-log {} ({} bytes, last_write {}{})",
+        l.path,
+        l.size,
+        l.modified.map(fmt_ts).unwrap_or_else(|| "unknown".into()),
+        if l.truncated { ", read capped" } else { "" }
+    ));
+    h.evidence.push(EvidenceItem {
+        artifact: "rmm_log".into(),
+        path: Some(l.path.clone()),
+        ts: l.modified,
+        detail: format!(
+            "{} log {} ({} bytes): {} incoming connection(s) in the window",
+            tool.name,
+            l.path,
+            l.size,
+            l.incoming.len()
+        ),
+    });
+    h.stamp(l.modified);
+    for c in &l.incoming {
+        let mut line = format!("{} from ID {}", fmt_ts(c.ts), c.remote_id);
+        if let Some(n) = &c.remote_name {
+            line.push_str(&format!(" ({n})"));
+        }
+        if let Some(u) = &c.user {
+            line.push_str(&format!(" as {u}"));
+        }
+        if let Some(d) = &c.detail {
+            line.push_str(&format!(" [{d}]"));
+        }
+        if h.incoming.len() < MAX_LOG_EVIDENCE {
+            h.evidence.push(EvidenceItem {
+                artifact: "rmm_log".into(),
+                path: Some(l.path.clone()),
+                ts: Some(c.ts),
+                detail: format!("incoming connection {line}"),
+            });
+        }
+        h.incoming.push(line);
+        h.stamp(Some(c.ts));
+        if h.last_incoming.as_ref().is_none_or(|(t, _)| c.ts >= *t) {
+            h.last_incoming = Some((c.ts, c.remote_id.clone()));
+        }
+    }
+}
+
 fn on_conn(
     c: &NetConnRecord,
     pids: &BTreeMap<u32, &'static str>,
@@ -616,6 +691,7 @@ impl Analyzer for RmmHeuristic {
                         on_dir(d, &ctx, &mut hits);
                     }
                 }
+                Record::RmmLog(l) => on_log(l, &mut hits),
                 _ => {}
             }
         }
@@ -627,8 +703,31 @@ impl Analyzer for RmmHeuristic {
 
         let mut out = Vec::new();
         for (tool, h) in &hits {
+            let incoming = (!h.incoming.is_empty()).then(|| {
+                let shown: Vec<&str> = h.incoming.iter().take(10).map(String::as_str).collect();
+                format!(
+                    "{} incoming connection(s) inside the collection window recorded by the \
+                     tool's own log: {}{}",
+                    h.incoming.len(),
+                    shown.join("; "),
+                    if h.incoming.len() > shown.len() {
+                        "; ..."
+                    } else {
+                        ""
+                    }
+                )
+            });
             let (severity, why) = if !h.high.is_empty() {
-                (Severity::High, h.high.join("; "))
+                let mut why = h.high.join("; ");
+                if let Some(i) = &incoming {
+                    why.push_str(&format!("; {i}"));
+                }
+                (Severity::High, why)
+            } else if let Some(mut i) = incoming {
+                if !h.recent.is_empty() {
+                    i.push_str(&format!("; recently installed: {}", h.recent.join("; ")));
+                }
+                (Severity::Medium, i)
             } else if !h.recent.is_empty() {
                 (
                     Severity::Medium,
@@ -651,9 +750,18 @@ impl Analyzer for RmmHeuristic {
                 h.seen.join(", ")
             ));
             f.details = h.seen.join("\n");
+            let log_note = match &h.last_incoming {
+                Some((ts, id)) => format!(
+                    "它自己的連線紀錄顯示，收集期間內有 {} 次從外部連入（最近一次 {}，來源 ID {id}），\
+                     請一併確認這些連線是否為資訊人員或廠商的支援作業。",
+                    h.incoming.len(),
+                    ts.format("%Y-%m-%d %H:%M UTC")
+                ),
+                None => String::new(),
+            };
             f.details_client = Some(format!(
                 "這台主機上有遠端控制軟體 {tool}。這類軟體常是資訊人員或廠商合法使用的，但攻擊者也常安裝它來\
-                 遠端操控電腦；請向資訊人員確認是否為公司核准安裝，不是的話應立即移除並更換密碼。"
+                 遠端操控電腦；請向資訊人員確認是否為公司核准安裝，不是的話應立即移除並更換密碼。{log_note}"
             ));
             f.entity.process = h.process.clone();
             f.entity.file = h.file.clone();
@@ -946,5 +1054,114 @@ mod tests {
         assert!(!is_public_ip("2001:db8::1"));
         assert!(is_public_ip("::ffff:8.8.8.8"));
         assert!(!is_public_ip("192.168.0.1"));
+    }
+
+    fn rmm_log(kind: RmmLogKind, path: &str, incoming: &[(&str, i64)]) -> Record {
+        use cairn_core::record::RmmConnection;
+        Record::RmmLog(RmmLogRecord {
+            log_kind: kind,
+            path: path.into(),
+            size: 4096,
+            modified: Some(now() - Duration::days(1)),
+            incoming: incoming
+                .iter()
+                .map(|(id, days_ago)| RmmConnection {
+                    ts: now() - Duration::days(*days_ago),
+                    remote_id: (*id).into(),
+                    remote_name: None,
+                    user: Some("bob".into()),
+                    detail: Some("User".into()),
+                })
+                .collect(),
+            truncated: false,
+        })
+    }
+
+    const AD_TRACE: &str = r"C:\ProgramData\AnyDesk\connection_trace.txt";
+
+    #[test]
+    fn every_log_kind_names_a_tool() {
+        for k in [
+            RmmLogKind::AnyDeskTrace,
+            RmmLogKind::AnyDeskConnectionTrace,
+            RmmLogKind::TeamViewerIncoming,
+            RmmLogKind::TeamViewerLogfile,
+            RmmLogKind::ScreenConnectLog,
+        ] {
+            assert!(log_tool(k).is_some(), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn a_self_log_without_incoming_connections_is_presence_only() {
+        let f = run(&[rmm_log(
+            RmmLogKind::TeamViewerLogfile,
+            r"C:\Program Files\TeamViewer\TeamViewer15_Logfile.log",
+            &[],
+        )]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].title, "遠端控制工具：TeamViewer");
+        assert_eq!(f[0].severity, Severity::Low);
+        assert!(f[0].reason.as_deref().unwrap().contains("self-log"));
+    }
+
+    #[test]
+    fn incoming_connections_in_the_window_raise_to_medium() {
+        let f = run(&[
+            proc(10, ANYDESK, Some(true), Some("AnyDesk Software GmbH")),
+            rmm_log(
+                RmmLogKind::AnyDeskConnectionTrace,
+                AD_TRACE,
+                &[("123456789", 3), ("987654321", 1)],
+            ),
+        ]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].severity, Severity::Medium);
+        let r = f[0].reason.as_deref().unwrap();
+        assert!(r.contains("2 incoming connection(s)"), "{r}");
+        assert!(r.contains("from ID 123456789 as bob [User]"), "{r}");
+        let conns: Vec<_> = f[0]
+            .evidence
+            .iter()
+            .filter(|e| e.detail.starts_with("incoming connection"))
+            .collect();
+        assert_eq!(conns.len(), 2);
+        assert_eq!(conns[0].path.as_deref(), Some(AD_TRACE));
+        let client = f[0].details_client.as_deref().unwrap();
+        assert!(
+            client.contains("2 次從外部連入") && client.contains("987654321"),
+            "{client}"
+        );
+    }
+
+    #[test]
+    fn incoming_connections_are_kept_in_a_high_finding_and_evidence_is_capped() {
+        let many: Vec<(String, i64)> = (0..30).map(|i| (format!("{}", 100 + i), 1)).collect();
+        let many: Vec<(&str, i64)> = many.iter().map(|(s, d)| (s.as_str(), *d)).collect();
+        let f = run(&[
+            proc(
+                7,
+                r"C:\Users\bob\Downloads\AnyDesk.exe",
+                Some(true),
+                Some("AnyDesk Software GmbH"),
+            ),
+            rmm_log(
+                RmmLogKind::AnyDeskConnectionTrace,
+                r"C:\Users\bob\AppData\Roaming\AnyDesk\connection_trace.txt",
+                &many,
+            ),
+        ]);
+        assert_eq!(f[0].severity, Severity::High);
+        let r = f[0].reason.as_deref().unwrap();
+        assert!(
+            r.contains("user-writable") && r.contains("30 incoming"),
+            "{r}"
+        );
+        let conns = f[0]
+            .evidence
+            .iter()
+            .filter(|e| e.detail.starts_with("incoming connection"))
+            .count();
+        assert_eq!(conns, MAX_LOG_EVIDENCE);
     }
 }
