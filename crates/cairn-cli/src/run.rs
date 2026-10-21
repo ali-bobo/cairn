@@ -730,6 +730,27 @@ author: test-integration
                 1,
                 &[("ShareName", r"\\*\ADMIN$"), ("IpAddress", "10.1.2.3")],
             )),
+            // Phase 3H: a backup-catalog deletion with no deletion command nearby, and
+            // an AnyDesk connection_trace.txt with one incoming connection.
+            Record::Event(EventRecord {
+                channel: "Application".into(),
+                provider: "Microsoft-Windows-Backup".into(),
+                ..event(524, 2, &[])
+            }),
+            Record::RmmLog(cairn_core::record::RmmLogRecord {
+                log_kind: cairn_core::record::RmmLogKind::AnyDeskConnectionTrace,
+                path: r"C:\ProgramData\AnyDesk\connection_trace.txt".into(),
+                size: 64,
+                modified: Some(Utc::now()),
+                incoming: vec![cairn_core::record::RmmConnection {
+                    ts: Utc::now(),
+                    remote_id: "123456789".into(),
+                    remote_name: None,
+                    user: None,
+                    detail: Some("User".into()),
+                }],
+                truncated: false,
+            }),
         ];
         let cfg = Config::default();
         let analyzers = registry::analyzers(&cfg, Mode::Live, None);
@@ -739,6 +760,7 @@ author: test-integration
             (cairn_core::analyzers::CRED_DUMP, "T1003.001"),
             (cairn_core::analyzers::RANSOM, "T1490"),
             (cairn_core::analyzers::LATERAL, "T1021.002"),
+            (cairn_core::analyzers::RMM, "T1219"),
         ] {
             let f = outcome
                 .findings
@@ -748,5 +770,109 @@ author: test-integration
             assert!(f.reason.is_some(), "golden rule 6: reason must be set");
             assert_eq!(f.mitre[0], mitre);
         }
+        assert!(
+            outcome
+                .findings
+                .iter()
+                .any(|f| f.analyzer == cairn_core::analyzers::RANSOM
+                    && f.event_id == Some(524)
+                    && f.severity == cairn_core::Severity::Medium),
+            "backup catalog deletion finding missing"
+        );
+        let rmm = outcome
+            .findings
+            .iter()
+            .find(|f| f.analyzer == cairn_core::analyzers::RMM)
+            .unwrap();
+        assert_eq!(rmm.severity, cairn_core::Severity::Medium);
+        assert!(rmm.reason.as_deref().unwrap().contains("123456789"));
+    }
+
+    /// Integration: the phase 3H heur_lateral branches (RDP across Security and
+    /// TerminalServices, 4648, WMI-Activity 5861) fire through the offline (evtx)
+    /// analyzer set, with UserData payloads nested the way the EVTX collector
+    /// flattens them.
+    #[test]
+    fn phase3h_lateral_detections_fire_in_evtx_mode() {
+        let user_data = |channel: &str, eid: u32, rid: u64, element: &str, v: serde_json::Value| {
+            let mut data = serde_json::Map::new();
+            data.insert(element.to_string(), v);
+            EventRecord {
+                channel: channel.into(),
+                provider: String::new(),
+                data,
+                ..event(eid, rid, &[])
+            }
+        };
+        let events = vec![
+            event(
+                4624,
+                1,
+                &[
+                    ("LogonType", "10"),
+                    ("IpAddress", "8.8.8.8"),
+                    ("TargetUserName", "bob"),
+                    ("TargetDomainName", "CORP"),
+                ],
+            ),
+            user_data(
+                "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+                21,
+                2,
+                "EventXML",
+                serde_json::json!({"User": r"CORP\bob", "SessionID": 2, "Address": "8.8.8.8"}),
+            ),
+            event(
+                4648,
+                3,
+                &[
+                    ("SubjectUserName", "bob"),
+                    ("SubjectDomainName", "CORP"),
+                    ("TargetUserName", "da_admin"),
+                    ("TargetDomainName", "CORP"),
+                    ("TargetServerName", "FS01"),
+                    ("ProcessName", r"C:\Windows\System32\net.exe"),
+                ],
+            ),
+            user_data(
+                "Microsoft-Windows-WMI-Activity/Operational",
+                5861,
+                4,
+                "Operation_ESStoConsumerBinding",
+                serde_json::json!({
+                    "Namespace": "//./root/subscription",
+                    "ESS": "Updater",
+                    "CONSUMER": "CommandLineEventConsumer=\"Updater\"",
+                    "PossibleCause": "Perm. Consumer: instance of CommandLineEventConsumer { CommandLineTemplate = \"cmd /c calc\"; };"
+                }),
+            ),
+        ];
+        let cfg = Config::default();
+        let analyzers = registry::analyzers(&cfg, Mode::Evtx, None);
+        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedEvents(events))];
+        let outcome = run_live(&cfg, privs(), "TEST".into(), &collectors, &analyzers);
+        let lateral: Vec<&cairn_core::Finding> = outcome
+            .findings
+            .iter()
+            .filter(|f| f.analyzer == cairn_core::analyzers::LATERAL)
+            .collect();
+        for (mitre, severity) in [
+            ("T1021.001", cairn_core::Severity::High),
+            ("T1021", cairn_core::Severity::Medium),
+            ("T1546.003", cairn_core::Severity::High),
+        ] {
+            let f = lateral
+                .iter()
+                .find(|f| f.mitre[0] == mitre)
+                .unwrap_or_else(|| panic!("{mitre} finding missing: {lateral:?}"));
+            assert_eq!(f.severity, severity, "{mitre}");
+            assert!(f.reason.is_some(), "golden rule 6: reason must be set");
+        }
+        let rdp = lateral.iter().find(|f| f.mitre[0] == "T1021.001").unwrap();
+        assert_eq!(
+            rdp.evidence.len(),
+            2,
+            "4624 and LSM 21 grouped into one finding"
+        );
     }
 }
