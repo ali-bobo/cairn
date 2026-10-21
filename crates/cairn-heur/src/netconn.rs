@@ -94,13 +94,18 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
 /// Analyzer: scores every connection against its owning process.
 pub struct NetConnHeuristic;
 
+impl NetConnHeuristic {
+    /// This analyzer's `name()`, also stamped into `Finding.analyzer`.
+    pub const NAME: &'static str = cairn_core::analyzers::NETCONN;
+}
+
 impl Analyzer for NetConnHeuristic {
     fn name(&self) -> &str {
-        "heur_netconn"
+        Self::NAME
     }
 
     fn depends_on(&self) -> &[&str] {
-        &["heur_persist"]
+        &[crate::persist::PersistHeuristic::NAME]
     }
 
     fn analyze(&self, records: &[Record], prior_findings: &[Finding]) -> Result<Vec<Finding>> {
@@ -134,9 +139,7 @@ impl Analyzer for NetConnHeuristic {
                 let owner_key = join_key(&o.image);
                 let owner_degraded = owner_key.degraded_key();
                 let corroborated = prior_findings.iter().any(|f| {
-                    f.reason
-                        .as_deref()
-                        .is_some_and(|r| r.contains(crate::persist::PERSIST_SOURCE_MARKER))
+                    f.analyzer == crate::persist::PersistHeuristic::NAME
                         && f.evidence
                             .iter()
                             .filter_map(|e| e.path.as_deref())
@@ -208,7 +211,7 @@ impl Analyzer for NetConnHeuristic {
             };
             out.push(f);
         }
-        Ok(out)
+        Ok(crate::stamped(out, Self::NAME))
     }
 }
 
@@ -776,12 +779,17 @@ mod tests {
         );
     }
 
-    /// A connection whose owner also appears in a prior_findings entry sourced from
-    /// heur_persist (same image path) gets a +30 corroboration bonus, which can push
-    /// a below-floor connection over the gate.
+    /// A connection whose owner also has a heur_persist finding (same image path)
+    /// gets a +30 corroboration bonus, which pushes a below-floor connection over the
+    /// gate. The prior finding comes from the real PersistHeuristic, and the match is
+    /// on the typed `Finding.analyzer`, not on reason text.
     #[test]
     fn netconn_corroborated_by_persist_finding_clears_gate() {
-        // Connection alone: public+rare (25+20=45) — below the 50 gate floor.
+        use crate::persist::PersistHeuristic;
+        use cairn_core::record::{Mechanism, PersistenceRecord};
+        // Connection alone: public+rare (25+20=45) — below the 50 gate floor, and the
+        // owner is outside every drop zone so no owner-path signal adds weight.
+        let image = r"C:\Tools\evil.exe";
         let c = conn(
             "tcp",
             50000,
@@ -790,30 +798,26 @@ mod tests {
             Some("established"),
             Some(1),
         );
-        let o = owner(r"C:\Users\a\AppData\Local\Temp\evil.exe", None);
-        let proc_rec = Record::Process(o);
+        let records = vec![Record::NetConn(c), Record::Process(owner(image, None))];
+        assert!(NetConnHeuristic.analyze(&records, &[]).unwrap().is_empty());
 
-        // A prior_findings entry from heur_persist, whose evidence includes the SAME
-        // image path as the netconn owner.
-        let mut persist_finding = Finding::new(
-            cairn_core::Severity::High,
-            "Persistence: evil.exe",
-            FindingSource::Heuristic,
-        );
-        persist_finding.reason = Some(format!(
-            "some persist reason; {}",
-            crate::persist::PERSIST_SOURCE_MARKER
-        ));
-        persist_finding.evidence = vec![cairn_core::finding::EvidenceItem {
-            artifact: "run_key".into(),
-            path: Some(r"C:\Users\a\AppData\Local\Temp\evil.exe".into()),
-            ts: None,
-            detail: "".into(),
-        }];
+        // Recent, unverifiable, non-system run key -> persist S4 finding on evil.exe.
+        let persist_rec = Record::Persistence(PersistenceRecord {
+            mechanism: Mechanism::RunKey,
+            location: r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run".into(),
+            value: Some("evil".into()),
+            command: Some(image.into()),
+            binary_path: Some(image.into()),
+            binary_sha256: None,
+            signed: None,
+            signer: None,
+            last_write: Some(chrono::Utc::now()),
+        });
+        let prior = PersistHeuristic.analyze(&[persist_rec], &[]).unwrap();
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0].analyzer, PersistHeuristic::NAME);
 
-        let findings = NetConnHeuristic
-            .analyze(&[Record::NetConn(c), proc_rec], &[persist_finding])
-            .expect("analyze");
+        let findings = NetConnHeuristic.analyze(&records, &prior).expect("analyze");
         assert_eq!(
             findings.len(),
             1,
@@ -827,6 +831,37 @@ mod tests {
             "reason must mention the corroborating source: {:?}",
             findings[0].reason
         );
+    }
+
+    /// Only a finding whose `analyzer` is heur_persist corroborates; reason text
+    /// that merely mentions it (the old string-marker contract) does not.
+    #[test]
+    fn netconn_corroboration_keys_on_analyzer_field_not_reason_text() {
+        let image = r"C:\Tools\evil.exe";
+        let c = conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        );
+        let mut other = Finding::new(cairn_core::Severity::High, "x", FindingSource::Heuristic);
+        other.analyzer = "heur_eventlog".into();
+        other.reason = Some("source: heur_persist".into());
+        other.evidence = vec![cairn_core::finding::EvidenceItem {
+            artifact: "run_key".into(),
+            path: Some(image.into()),
+            ts: None,
+            detail: String::new(),
+        }];
+        let findings = NetConnHeuristic
+            .analyze(
+                &[Record::NetConn(c), Record::Process(owner(image, None))],
+                &[other],
+            )
+            .unwrap();
+        assert!(findings.is_empty());
     }
 
     /// Without a matching prior_findings entry, the connection's score is unaffected

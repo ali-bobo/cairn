@@ -124,9 +124,14 @@ pub(crate) fn lolbas_suspicious(cmdline: &str) -> bool {
 /// Analyzer: scores every process against its parent and emits findings above the floor.
 pub struct ParentChildHeuristic;
 
+impl ParentChildHeuristic {
+    /// This analyzer's `name()`, also stamped into `Finding.analyzer`.
+    pub const NAME: &'static str = cairn_core::analyzers::PARENTCHILD;
+}
+
 impl Analyzer for ParentChildHeuristic {
     fn name(&self) -> &str {
-        "heur_parentchild"
+        Self::NAME
     }
 
     fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
@@ -182,7 +187,7 @@ impl Analyzer for ParentChildHeuristic {
             };
             out.push(f);
         }
-        Ok(out)
+        Ok(crate::stamped(out, Self::NAME))
     }
 }
 

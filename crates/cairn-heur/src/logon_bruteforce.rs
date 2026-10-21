@@ -273,9 +273,14 @@ impl LogonBruteforceHeuristic {
     }
 }
 
+impl LogonBruteforceHeuristic {
+    /// This analyzer's `name()`, also stamped into `Finding.analyzer`.
+    pub const NAME: &'static str = cairn_core::analyzers::LOGON_BRUTEFORCE;
+}
+
 impl Analyzer for LogonBruteforceHeuristic {
     fn name(&self) -> &str {
-        "heur_logon_bruteforce"
+        Self::NAME
     }
 
     fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
@@ -289,7 +294,7 @@ impl Analyzer for LogonBruteforceHeuristic {
 
         let mut findings = self.analyze_bruteforce(&attempts);
         findings.extend(self.analyze_spraying(&attempts));
-        Ok(findings)
+        Ok(crate::stamped(findings, Self::NAME))
     }
 }
 

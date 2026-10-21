@@ -87,9 +87,14 @@ fn is_recent(ts: DateTime<Utc>, now: DateTime<Utc>) -> bool {
 /// All findings carry an explainable reason (golden rule 6).
 pub struct AccountHeuristic;
 
+impl AccountHeuristic {
+    /// This analyzer's `name()`, also stamped into `Finding.analyzer`.
+    pub const NAME: &'static str = cairn_core::analyzers::ACCOUNT;
+}
+
 impl Analyzer for AccountHeuristic {
     fn name(&self) -> &str {
-        "heur_account"
+        Self::NAME
     }
 
     fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
@@ -186,7 +191,7 @@ impl Analyzer for AccountHeuristic {
             findings.push(f);
         }
 
-        Ok(findings)
+        Ok(crate::stamped(findings, Self::NAME))
     }
 }
 

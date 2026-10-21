@@ -319,9 +319,14 @@ fn defender_detections(events: &[&EventRecord]) -> Vec<Finding> {
 /// Native event-log detections (see module docs).
 pub struct EventLogHeuristic;
 
+impl EventLogHeuristic {
+    /// This analyzer's `name()`, also stamped into `Finding.analyzer`.
+    pub const NAME: &'static str = cairn_core::analyzers::EVENTLOG;
+}
+
 impl Analyzer for EventLogHeuristic {
     fn name(&self) -> &str {
-        "heur_eventlog"
+        Self::NAME
     }
 
     fn analyze(&self, records: &[Record], _prior: &[Finding]) -> Result<Vec<Finding>> {
@@ -340,7 +345,7 @@ impl Analyzer for EventLogHeuristic {
             }
         }
         out.extend(defender_detections(&detections));
-        Ok(out)
+        Ok(crate::stamped(out, Self::NAME))
     }
 }
 

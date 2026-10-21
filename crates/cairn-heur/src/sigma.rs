@@ -29,9 +29,14 @@ impl SigmaAnalyzer {
     }
 }
 
+impl SigmaAnalyzer {
+    /// This analyzer's `name()`, also stamped into `Finding.analyzer`.
+    pub const NAME: &'static str = cairn_core::analyzers::SIGMA;
+}
+
 impl Analyzer for SigmaAnalyzer {
     fn name(&self) -> &str {
-        "sigma"
+        Self::NAME
     }
 
     fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
@@ -44,7 +49,7 @@ impl Analyzer for SigmaAnalyzer {
                 }
             }
         }
-        Ok(findings)
+        Ok(crate::stamped(findings, Self::NAME))
     }
 }
 

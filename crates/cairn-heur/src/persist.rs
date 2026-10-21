@@ -6,7 +6,9 @@ use crate::trust::{
     exe_name, invoked_exe, is_interpreter, is_masquerade, is_system_or_program_files,
     is_user_writable_path, script_markers, winlogon_value_is_default, MarkerKind,
 };
-use cairn_core::finding::{EntityFile, EntityProcess, EntityRegistry, EvidenceItem};
+use cairn_core::finding::{
+    EntityFile, EntityPersistence, EntityProcess, EntityRegistry, EvidenceItem,
+};
 use cairn_core::observation::Observation;
 use cairn_core::record::{ExecutionRecord, Mechanism, PersistenceRecord, Record};
 use cairn_core::traits::Analyzer;
@@ -15,11 +17,6 @@ use chrono::{DateTime, Duration, Utc};
 
 /// Days within which a LastWrite counts as "recent" (a freshly-planted persistence entry).
 const RECENT_DAYS: i64 = 7;
-
-/// Marker appended to every persist Finding's reason, letting other analyzers
-/// (netconn, segment 11) identify persist-originated findings in prior_findings
-/// without a dedicated source-analyzer field on Finding.
-pub const PERSIST_SOURCE_MARKER: &str = "source: heur_persist";
 
 /// One dispositive-signal hit (spec §4.2). `label` feeds the Finding title;
 /// `reason` feeds Finding.reason (golden rule 6).
@@ -171,11 +168,10 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     // signal (S2/S3/S4) assumes the path is where an attacker CHOSE to hide the binary. For
     // `startup`, Windows already put it in ProgramData/AppData by design, so those same
     // path-trust checks would flag every legitimate startup shortcut (e.g. AnyDesk.lnk).
-    // Mirrors the pre-gate model's `mechanism != Mechanism::Startup` path-signal exemption.
+    // Mirrors the pre-gate model's startup path-signal exemption.
     // Same for PowerShell profiles: the script file IS the persistence location, judged
     // by its content in crate::asep, not by where Windows keeps it.
-    let path_signals_apply =
-        p.mechanism != Mechanism::Startup && p.mechanism != Mechanism::PsProfile;
+    let path_signals_apply = !p.mechanism.is_file_backed();
 
     // Extended catalog / accessibility IFEO / PowerShell profile signals.
     if let Some(hit) = crate::asep::asep_signal(p) {
@@ -332,9 +328,14 @@ fn sev_rank(s: Severity) -> u8 {
 /// Analyzer: ranks persistence records, emitting findings above the noise floor.
 pub struct PersistHeuristic;
 
+impl PersistHeuristic {
+    /// This analyzer's `name()`, also stamped into `Finding.analyzer`.
+    pub const NAME: &'static str = cairn_core::analyzers::PERSIST;
+}
+
 impl Analyzer for PersistHeuristic {
     fn name(&self) -> &str {
-        "heur_persist"
+        Self::NAME
     }
 
     fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
@@ -424,9 +425,6 @@ impl Analyzer for PersistHeuristic {
                 format!("{}: {short}", top.label),
                 FindingSource::Heuristic,
             );
-            // Cross-analyzer marker (segment 11): lets netconn identify persist-originated
-            // findings in prior_findings without a dedicated source-analyzer field.
-            reasons.push(PERSIST_SOURCE_MARKER.to_string());
             f.reason = Some(reasons.join("; "));
             f.mitre = {
                 let mut m: Vec<String> = hits.iter().map(|h| h.mitre.to_string()).collect();
@@ -450,7 +448,7 @@ impl Analyzer for PersistHeuristic {
             f.evidence = evidence;
             out.push(f);
         }
-        Ok(out)
+        Ok(crate::stamped(out, Self::NAME))
     }
 
     fn observe(&self, records: &[Record]) -> Result<Vec<Observation>> {
@@ -484,9 +482,21 @@ impl Analyzer for PersistHeuristic {
 }
 
 /// Build the entity: registry-backed mechanisms -> entity.registry; the file-backed
-/// `startup` mechanism -> entity.file (SRS §5.1 mapping in the design spec).
+/// `startup` mechanism -> entity.file (SRS §5.1 mapping in the design spec). Always
+/// also carries entity.persistence (typed mechanism + location) for the report.
 fn persistence_entity(p: &PersistenceRecord) -> Entity {
-    if p.mechanism == Mechanism::Startup || p.mechanism == Mechanism::PsProfile {
+    let mut entity = location_entity(p);
+    entity.persistence = Some(EntityPersistence {
+        mechanism: p.mechanism,
+        location: p.location.clone(),
+    });
+    entity
+}
+
+/// Where the entry lives: entity.file for file-backed mechanisms, entity.registry
+/// (registry key, or the WMI binding) otherwise.
+fn location_entity(p: &PersistenceRecord) -> Entity {
+    if p.mechanism.is_file_backed() {
         Entity {
             file: Some(EntityFile {
                 path: p
@@ -591,12 +601,10 @@ mod tests {
         assert!(f.mitre.contains(&"T1546.012".to_string()));
     }
 
-    /// Every persist Finding's reason carries a "source: heur_persist" marker so
-    /// other analyzers (netconn, segment 11) can identify persist-originated
-    /// findings in prior_findings without a dedicated source-analyzer field on
-    /// Finding.
+    /// Every persist Finding carries `analyzer = "heur_persist"` so other analyzers
+    /// (netconn) identify persist-originated findings by a typed field.
     #[test]
-    fn finding_reason_carries_source_marker_for_cross_analyzer_lookup() {
+    fn finding_carries_analyzer_name_for_cross_analyzer_lookup() {
         let now = Utc::now();
         let bad = Record::Persistence(rec(
             Mechanism::Ifeo,
@@ -605,14 +613,12 @@ mod tests {
         ));
         let findings = PersistHeuristic.analyze(&[bad], &[]).expect("analyze");
         assert_eq!(findings.len(), 1);
-        assert!(
-            findings[0]
-                .reason
-                .as_deref()
-                .is_some_and(|r| r.contains(PERSIST_SOURCE_MARKER)),
-            "reason must carry the source marker: {:?}",
-            findings[0].reason
-        );
+        assert_eq!(findings[0].analyzer, PersistHeuristic::NAME);
+        assert!(!findings[0]
+            .reason
+            .as_deref()
+            .unwrap_or("")
+            .contains("source: heur_persist"));
     }
 
     /// An S9 execution-corroboration hit (a live ProcessRecord whose image matches the
@@ -1181,5 +1187,8 @@ mod tests {
             .expect("wmi_subscription must populate entity.registry");
         assert_eq!(reg.hive, "WMI");
         assert_eq!(reg.key, "Filter -> Consumer");
+        let pe = entity.persistence.expect("typed persistence entity");
+        assert_eq!(pe.mechanism, Mechanism::WmiSubscription);
+        assert_eq!(pe.location, "Filter -> Consumer");
     }
 }

@@ -25,3 +25,15 @@ pub use netconn::NetConnHeuristic;
 pub use parentchild::ParentChildHeuristic;
 pub use persist::PersistHeuristic;
 pub use sigma::SigmaAnalyzer;
+
+/// Stamp `Finding.analyzer` on every finding an analyzer returns (typed provenance;
+/// other analyzers and the report match on it instead of parsing `reason`).
+pub(crate) fn stamped(
+    mut findings: Vec<cairn_core::Finding>,
+    analyzer: &str,
+) -> Vec<cairn_core::Finding> {
+    for f in &mut findings {
+        f.analyzer = analyzer.to_string();
+    }
+    findings
+}

@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)] // raw-volume/WinAPI unsafe lives only in collector crates, behind review.
 
+pub mod analyzers;
 pub mod collectors;
 pub mod config;
 pub mod finding;

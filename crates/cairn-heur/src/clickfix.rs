@@ -51,9 +51,14 @@ fn payload_markers(cmd: &str) -> Vec<&'static str> {
 /// Run-dialog (RunMRU) payload commands.
 pub struct ClickFixHeuristic;
 
+impl ClickFixHeuristic {
+    /// This analyzer's `name()`, also stamped into `Finding.analyzer`.
+    pub const NAME: &'static str = cairn_core::analyzers::CLICKFIX;
+}
+
 impl Analyzer for ClickFixHeuristic {
     fn name(&self) -> &str {
-        "heur_clickfix"
+        Self::NAME
     }
 
     fn analyze(&self, records: &[Record], _prior: &[Finding]) -> Result<Vec<Finding>> {
@@ -92,12 +97,6 @@ impl Analyzer for ClickFixHeuristic {
             f.mitre = vec!["T1204.004".into()];
             f.details = format!("{}\\{} value {}: {}", rv.hive, rv.key, rv.value, rv.data);
             f.reason = Some(reason);
-            f.details_client = Some(format!(
-                "有人在這台主機的「執行」對話框（Win+R）輸入了：{}。\
-                 假驗證碼或假錯誤頁面常要使用者貼上這類指令來下載惡意程式（ClickFix 手法）；\
-                 請詢問使用者當時看到什麼畫面，並檢查這個指令下載或執行了什麼。",
-                rv.data
-            ));
             f.entity.registry = Some(EntityRegistry {
                 hive: rv.hive.clone(),
                 key: rv.key.clone(),
@@ -107,7 +106,7 @@ impl Analyzer for ClickFixHeuristic {
             });
             out.push(f);
         }
-        Ok(out)
+        Ok(crate::stamped(out, Self::NAME))
     }
 }
 

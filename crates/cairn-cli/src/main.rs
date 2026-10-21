@@ -635,7 +635,7 @@ fn main() -> anyhow::Result<()> {
                 started_utc,
             );
             for f in &mut findings {
-                client_text::fill_details_client(f);
+                client_text::fill_details_client(f, manifest.run.started_utc);
             }
             let mut sink = DirSink::new(dir.clone());
             sink.write_timeline_csv(&findings)?;
@@ -959,7 +959,7 @@ fn main() -> anyhow::Result<()> {
             };
 
             for f in &mut outcome.findings {
-                client_text::fill_details_client(f);
+                client_text::fill_details_client(f, manifest.run.started_utc);
             }
             let mut sink = build_sink(&cfg.output);
             sink.write_timeline_csv(&outcome.findings)?;
