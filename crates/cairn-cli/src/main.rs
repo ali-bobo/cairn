@@ -9,9 +9,8 @@ use cairn_core::finding::Finding;
 use cairn_core::manifest::{Counts, HostInfo, Manifest, Privileges, RunInfo, ToolInfo};
 use cairn_core::traits::OutputSink;
 use cairn_core::{Config, OutputKind, Target};
-use cairn_report::bodyfile;
 use cairn_report::client_text;
-use cairn_report::{AgeSink, DirSink, DryRunSink, ZipSink};
+use cairn_report::{DirSink, DryRunSink, ZipSink};
 use cairn_sigma::{engine::Engine, SigmaMatcher};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -102,8 +101,6 @@ struct RunArgs {
     #[arg(long)]
     zip: bool,
     #[arg(long)]
-    encrypt: Option<PathBuf>,
-    #[arg(long)]
     dry_run: bool,
     /// enable Administrator-only collectors (only effective if priv present).
     #[arg(long)]
@@ -126,9 +123,6 @@ struct RunArgs {
     case_id: Option<String>,
     #[arg(long)]
     operator: Option<String>,
-    /// Write mactime bodyfile to PATH (FR20). Skipped with --dry-run.
-    #[arg(long)]
-    bodyfile: Option<PathBuf>,
     #[arg(long)]
     use_vss: bool,
     /// Hard cap on $MFT records the mft collector scans (NFR10). Default 1,000,000.
@@ -162,7 +156,6 @@ fn evtx_plan(cfg: &Config) -> String {
     let out = match &cfg.output {
         OutputKind::Dir(p) => p.display().to_string(),
         OutputKind::Zip(p) => format!("{} (zip)", p.display()),
-        OutputKind::EncryptedZip { path, .. } => format!("{} (encrypted)", path.display()),
         OutputKind::DryRun => "<dry-run, no writes>".to_string(),
     };
     let encoding = if cfg.rules_plain { "plain" } else { "xor" };
@@ -443,7 +436,7 @@ fn write_records_jsonl(
 
 /// Write the manifest via the sink, then finalize and log each output entry.
 /// manifest.outputs is left empty for all sink types (S3 design decision):
-/// DirSink records per-file sha256 via finalize() log; zip/age sinks are
+/// DirSink records per-file sha256 via finalize() log; the zip sink is
 /// self-contained and track integrity at the archive level.
 fn manifest_outputs_then_write(
     sink: &mut dyn OutputSink,
@@ -458,19 +451,12 @@ fn manifest_outputs_then_write(
 }
 
 /// Construct the correct OutputSink variant from the resolved OutputKind (FR15/FR16).
-/// AgeSink::new may return Err on an invalid pubkey — propagated to the caller.
-fn build_sink(output: &OutputKind) -> anyhow::Result<Box<dyn OutputSink + Send>> {
-    use anyhow::Context as _;
-    Ok(match output {
+fn build_sink(output: &OutputKind) -> Box<dyn OutputSink + Send> {
+    match output {
         OutputKind::Dir(p) => Box::new(DirSink::new(p)),
         OutputKind::Zip(p) => Box::new(ZipSink::new(p)),
-        OutputKind::EncryptedZip { path, pubkey } => {
-            let key = std::fs::read_to_string(pubkey)
-                .with_context(|| format!("reading age public key file: {}", pubkey.display()))?;
-            Box::new(AgeSink::new(path, key.trim()).map_err(|e| anyhow::anyhow!("{}", e))?)
-        }
         OutputKind::DryRun => Box::new(DryRunSink),
-    })
+    }
 }
 
 /// Off-target output directory for a Stage-1 evtx run (golden rule 4). Resolved from
@@ -478,7 +464,6 @@ fn build_sink(output: &OutputKind) -> anyhow::Result<Box<dyn OutputSink + Send>>
 fn output_dir(cfg: &Config) -> PathBuf {
     match &cfg.output {
         OutputKind::Dir(p) | OutputKind::Zip(p) => p.clone(),
-        OutputKind::EncryptedZip { path, .. } => path.clone(),
         OutputKind::DryRun => PathBuf::from("."),
     }
 }
@@ -776,11 +761,11 @@ fn main() -> anyhow::Result<()> {
                     .init();
                 None
             } else {
-                // For archive modes (--zip / --encrypt), run.log goes to the archive's
+                // For --zip, run.log goes to the archive's
                 // parent directory, NOT to args.output itself.  create_dir_all on a .zip
                 // path would create a directory named "cairn_out.zip", which then
-                // conflicts when ZipSink / AgeSink tries to open that path as a file.
-                let log_dir: std::path::PathBuf = if args.zip || args.encrypt.is_some() {
+                // conflicts when ZipSink tries to open that path as a file.
+                let log_dir: std::path::PathBuf = if args.zip {
                     args.output
                         .parent()
                         .map(|p| {
@@ -857,14 +842,9 @@ fn main() -> anyhow::Result<()> {
                 "collector selection"
             );
 
-            // Resolve the OutputKind from CLI flags: --dry-run > --encrypt > --zip > plain dir.
+            // Resolve the OutputKind from CLI flags: --dry-run > --zip > plain dir.
             let output_kind = if dry_run {
                 OutputKind::DryRun
-            } else if let Some(ref pubkey) = args.encrypt {
-                OutputKind::EncryptedZip {
-                    path: args.output.clone(),
-                    pubkey: pubkey.clone(),
-                }
             } else if args.zip {
                 OutputKind::Zip(args.output.clone())
             } else {
@@ -1116,7 +1096,7 @@ fn main() -> anyhow::Result<()> {
             for f in &mut outcome.findings {
                 client_text::fill_details_client(f);
             }
-            let mut sink = build_sink(&cfg.output)?;
+            let mut sink = build_sink(&cfg.output);
             sink.write_timeline_csv(&outcome.findings)?;
             sink.write_findings_jsonl(&outcome.findings)?;
             sink.write_observations(&outcome.observations)?;
@@ -1130,14 +1110,6 @@ fn main() -> anyhow::Result<()> {
                 write_records_jsonl(d, &outcome.records)?;
             }
             manifest_outputs_then_write(&mut *sink, manifest)?;
-            if !dry_run {
-                if let Some(bf_path) = &args.bodyfile {
-                    let bf = std::fs::File::create(bf_path)
-                        .map_err(|e| anyhow::anyhow!("bodyfile create: {e}"))?;
-                    bodyfile::write_bodyfile(&outcome.records, bf)?;
-                    tracing::info!(path = %bf_path.display(), "bodyfile written");
-                }
-            }
             if dry_run {
                 println!(
                     "dry-run: {} records, {} findings — no files written (would have gone to {})",

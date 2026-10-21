@@ -1,14 +1,11 @@
 //! cairn-report: timeline + summary + manifest + output sinks. SRS §5.2, §6, §12.
 #![forbid(unsafe_code)] // pure formatting + hashing + file I/O; no raw-volume/WinAPI.
 
-pub mod age_sink;
-pub mod bodyfile;
 pub mod client_text;
 pub mod dry_run;
 pub mod html;
 pub mod zip_sink;
 
-pub use age_sink::AgeSink;
 pub use dry_run::DryRunSink;
 pub use zip_sink::ZipSink;
 
@@ -330,7 +327,6 @@ impl OutputSink for DirSink {
         Ok(std::mem::take(&mut self.outputs))
     }
 }
-// TODO(claude-code) S3: ZipSink + EncryptedZipSink (asymmetric, public key only); DryRunSink.
 
 /// One file's integrity status during `verify` (SRS §12 / stage1-plan T9).
 #[derive(Debug, Clone, PartialEq, Eq)]

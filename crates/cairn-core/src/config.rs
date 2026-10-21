@@ -85,7 +85,6 @@ pub fn resolve_max_threads(requested: Option<usize>, available: usize) -> usize 
 pub enum OutputKind {
     Dir(PathBuf),
     Zip(PathBuf),
-    EncryptedZip { path: PathBuf, pubkey: PathBuf },
     DryRun,
 }
 
