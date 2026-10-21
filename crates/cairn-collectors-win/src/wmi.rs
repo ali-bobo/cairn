@@ -197,7 +197,10 @@ mod win {
         WBEM_FLAG_RETURN_IMMEDIATELY,
     };
 
-    const CLSID_WBEM_LOCATOR: GUID = GUID::from_u128(0xdc12a687_737f_11cf_884d_00aa004b2e24);
+    // CLSID_WbemLocator {4590F811-1D3A-11D0-891F-00AA004B2E24}. The value used here
+    // before (dc12a687-...) is IID_IWbemLocator, the interface id, which made every
+    // CoCreateInstance fail with REGDB_E_CLASSNOTREG; the old Ok(vec![]) fallback hid it.
+    const CLSID_WBEM_LOCATOR: GUID = windows::Win32::System::Wmi::WbemLocator;
 
     /// RAII guard: calls CoUninitialize on drop. Constructed ONLY after a CoInitializeEx
     /// call that succeeded (S_OK or S_FALSE), so every guard matches exactly one
