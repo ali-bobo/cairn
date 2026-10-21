@@ -25,4 +25,11 @@ ignore = [
   # it without replacing the age crate. Re-evaluate if age removes the dependency or
   # a real CVE is filed against `proc-macro-error2`.
   "RUSTSEC-2026-0173",
+  # RUSTSEC-2026-0374: the `basic-toml` crate is unmaintained. It is a transitive
+  # dependency of `age` (via i18n-embed-fl -> i18n-config, which reads age's own
+  # localisation config at build time). It is NOT a vulnerability — only an
+  # unmaintained flag — and it runs only inside a compile-time proc-macro (no runtime
+  # attack surface). We cannot drop it without replacing the age crate. Re-evaluate if
+  # age removes the dependency or a real CVE is filed against `basic-toml`.
+  "RUSTSEC-2026-0374",
 ]
