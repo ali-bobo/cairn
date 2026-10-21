@@ -22,9 +22,6 @@
 /tests/fixtures/
 /tests/EVTX-ATTACK-SAMPLES/
 
-# Decoded plain rules (the encoded form is the bundled one; ADR-0002)
-/rules/plain/
-
 # Machine-specific cargo target-dir override. The committed .cargo/config.toml contains
 # cross-machine settings (CRT static link rustflags). The target-dir line in that file is
 # a sensible default; override with CARGO_TARGET_DIR env var on other machines.

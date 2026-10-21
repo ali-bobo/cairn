@@ -199,10 +199,9 @@ fn level_to_severity<L: std::fmt::Debug>(level: &Option<L>) -> Severity {
     }
 }
 
-/// Recursively collect decoded rule YAML strings from `dir` and all subdirectories.
-/// Bundled rules are XOR-encoded (`plain=false`); `--rules-plain` passes `true`.
+/// Recursively collect rule YAML strings from `dir` and all subdirectories.
 /// A directory that cannot be read is skipped (graceful degrade, golden rule 8).
-fn collect_rule_yamls(dir: &Path, plain: bool, out: &mut Vec<String>) -> Result<()> {
+fn collect_rule_yamls(dir: &Path, out: &mut Vec<String>) -> Result<()> {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => return Ok(()),
@@ -210,9 +209,9 @@ fn collect_rule_yamls(dir: &Path, plain: bool, out: &mut Vec<String>) -> Result<
     for entry in rd {
         let path = entry?.path();
         if path.is_dir() {
-            collect_rule_yamls(&path, plain, out)?;
+            collect_rule_yamls(&path, out)?;
         } else if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
-            let bytes = crate::codec::load_rule_bytes(&path, plain)?;
+            let bytes = std::fs::read(&path)?;
             out.push(String::from_utf8_lossy(&bytes).into_owned());
         }
     }
@@ -220,13 +219,13 @@ fn collect_rule_yamls(dir: &Path, plain: bool, out: &mut Vec<String>) -> Result<
 }
 
 impl SigmaMatcher for Engine {
-    fn load(&mut self, rules_dir: &Path, plain: bool) -> Result<usize> {
+    fn load(&mut self, rules_dir: &Path) -> Result<usize> {
         let mut yamls: Vec<String> = Vec::new();
-        collect_rule_yamls(rules_dir, plain, &mut yamls)?;
+        collect_rule_yamls(rules_dir, &mut yamls)?;
         let refs: Vec<&str> = yamls.iter().map(String::as_str).collect();
         *self = Engine::from_rules(&refs)?;
         // Populate ruleset_ver from the PROVENANCE file for manifest integrity (ADR-0003).
-        self.ruleset_ver = crate::ruleset::ruleset_version(rules_dir, plain).unwrap_or_default();
+        self.ruleset_ver = crate::ruleset::ruleset_version(rules_dir).unwrap_or_default();
         Ok(self.rules.len())
     }
 
@@ -467,35 +466,20 @@ detection:
         );
     }
 
-    /// `--rules-plain` parity (ADR-0002 / T8b): loading the SAME rule from a plain `.yml`
-    /// dir (plain=true) and from an XOR-encoded dir (plain=false) yields an engine that
-    /// matches identically — the codec layer is invisible to detection results.
+    /// `load` reads every `.yml` under a directory tree as plain YAML.
     #[test]
-    fn load_plain_and_encoded_dirs_match_identically() {
+    fn load_reads_plain_yaml_dir() {
         let root = std::env::temp_dir().join("cairn_engine_plain_test");
         let _ = std::fs::remove_dir_all(&root);
-        let plain_dir = root.join("plain");
-        let enc_dir = root.join("encoded");
-        std::fs::create_dir_all(&plain_dir).unwrap();
-        std::fs::create_dir_all(&enc_dir).unwrap();
+        let dir = root.join("sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("r.yml"), RULE).unwrap();
 
-        std::fs::write(plain_dir.join("r.yml"), RULE).unwrap();
-        std::fs::write(enc_dir.join("r.yml"), crate::codec::xor(RULE.as_bytes())).unwrap();
-
-        let mut plain_engine = Engine::default();
-        let n_plain = plain_engine.load(&plain_dir, true).unwrap();
-        let mut enc_engine = Engine::default();
-        let n_enc = enc_engine.load(&enc_dir, false).unwrap();
-        assert_eq!(n_plain, 1);
-        assert_eq!(n_enc, 1);
-
-        let ev = event(r"C:\Windows\System32\cmd.exe");
-        let p = plain_engine.match_event(&ev).unwrap();
-        let e = enc_engine.match_event(&ev).unwrap();
-        assert_eq!(p.len(), 1);
-        assert_eq!(e.len(), 1);
-        assert_eq!(p[0].rule_id, e[0].rule_id);
-        assert_eq!(p[0].rule_author, e[0].rule_author);
-        assert_eq!(p[0].severity, e[0].severity);
+        let mut engine = Engine::default();
+        assert_eq!(engine.load(&root).unwrap(), 1);
+        let hits = engine
+            .match_event(&event(r"C:\Windows\System32\cmd.exe"))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }

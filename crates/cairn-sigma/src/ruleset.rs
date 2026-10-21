@@ -8,9 +8,7 @@
 //!
 //! Canonicalization (must be reproducible across machines, ADR-0003):
 //!   1. enumerate every `.yml`/`.yaml` file under the dir (recursively),
-//!   2. compute each file's SHA-256 over its **decoded plain YAML** bytes, so the
-//!      §ADR-0002 XOR codec does not change the hash (encoded and `--rules-plain`
-//!      trees of the same rules hash identically),
+//!   2. compute each file's SHA-256 over its bytes,
 //!   3. sort by relative path (lexicographic, `/`-separated, stable across OSes),
 //!   4. feed `"<relpath>\n<hex-file-hash>\n"` for each file, in order, into a final
 //!      SHA-256. That digest is the aggregate.
@@ -59,19 +57,15 @@ fn collect_rule_files(dir: &Path) -> Result<Vec<(String, std::path::PathBuf)>> {
 
 /// Compute the ADR-0003 aggregate SHA-256 (hex) over the rule set in `dir`.
 ///
-/// `plain` mirrors `codec::load_rule_bytes`: `false` decodes XOR-encoded bundled
-/// rules, `true` reads plain `.yml` as-is (`--rules-plain`). Either way the per-file
-/// hash is over the *decoded* YAML, so the two trees of the same rules agree.
-///
 /// An empty (or rule-free) directory hashes to the SHA-256 of the empty input — a
 /// stable, well-defined value, not an error.
-pub fn aggregate_hash(dir: &Path, plain: bool) -> Result<String> {
+pub fn aggregate_hash(dir: &Path) -> Result<String> {
     let mut files = collect_rule_files(dir)?;
     files.sort_by(|a, b| a.0.cmp(&b.0));
 
     let mut agg = Sha256::new();
     for (rel, path) in &files {
-        let bytes = crate::codec::load_rule_bytes(path, plain)?;
+        let bytes = std::fs::read(path)?;
         let file_hash = hex(&Sha256::digest(&bytes));
         agg.update(rel.as_bytes());
         agg.update(b"\n");
@@ -100,16 +94,15 @@ fn read_pin(dir: &Path) -> String {
 /// The commit-sha is the upstream pin (provenance: *where rules came from*); the
 /// aggregate is computed over the actual rules used (integrity: *they haven't changed*).
 /// `cairn verify` (T9) recomputes the aggregate to catch a swapped/edited ruleset.
-pub fn ruleset_version(dir: &Path, plain: bool) -> Result<String> {
+pub fn ruleset_version(dir: &Path) -> Result<String> {
     let pin = read_pin(dir);
-    let aggregate = aggregate_hash(dir, plain)?;
+    let aggregate = aggregate_hash(dir)?;
     Ok(format!("{pin}+{aggregate}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codec::xor;
 
     fn write(dir: &Path, name: &str, bytes: &[u8]) {
         let path = dir.join(name);
@@ -117,35 +110,6 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(path, bytes).unwrap();
-    }
-
-    /// The aggregate hash is identical whether the rules are XOR-encoded on disk
-    /// (loaded with plain=false) or stored as plain `.yml` (loaded with plain=true).
-    /// This is the ADR-0003 invariant: the hash is over decoded YAML, so the XOR
-    /// codec layer cannot change it.
-    #[test]
-    fn aggregate_hash_is_stable_under_xor_codec() {
-        let root = std::env::temp_dir().join("cairn_ruleset_xor_test");
-        let _ = std::fs::remove_dir_all(&root);
-        let enc = root.join("encoded");
-        let plain = root.join("plain");
-
-        let rule_a = b"title: A\nid: a\ndetection:\n  selection:\n  condition: selection\n";
-        let rule_b = b"title: B\nid: b\ndetection:\n  selection:\n  condition: selection\n";
-
-        // Encoded tree: XOR-encoded bytes, loaded with plain=false (decoded).
-        write(&enc, "a.yml", &xor(rule_a));
-        write(&enc, "b.yml", &xor(rule_b));
-        // Plain tree: same YAML verbatim, loaded with plain=true.
-        write(&plain, "a.yml", rule_a);
-        write(&plain, "b.yml", rule_b);
-
-        let h_enc = aggregate_hash(&enc, false).unwrap();
-        let h_plain = aggregate_hash(&plain, true).unwrap();
-        assert_eq!(
-            h_enc, h_plain,
-            "XOR codec must not change the aggregate hash"
-        );
     }
 
     /// The hash is deterministic regardless of filesystem enumeration order: two
@@ -166,8 +130,8 @@ mod tests {
         write(&two, "linux/persist.yml", r2);
         write(&two, "windows/exec.yml", r1);
 
-        let h1 = aggregate_hash(&one, true).unwrap();
-        let h2 = aggregate_hash(&two, true).unwrap();
+        let h1 = aggregate_hash(&one).unwrap();
+        let h2 = aggregate_hash(&two).unwrap();
         assert_eq!(h1, h2, "hash must be independent of enumeration order");
         assert_eq!(h1.len(), 64, "SHA-256 hex is 64 chars");
         assert!(h1.bytes().all(|b| b.is_ascii_hexdigit()));
@@ -185,8 +149,8 @@ mod tests {
         write(&clean, "a.yml", b"title: clean\n");
         write(&tampered, "a.yml", b"title: tampered\n");
 
-        let h_clean = aggregate_hash(&clean, true).unwrap();
-        let h_tampered = aggregate_hash(&tampered, true).unwrap();
+        let h_clean = aggregate_hash(&clean).unwrap();
+        let h_tampered = aggregate_hash(&tampered).unwrap();
         assert_ne!(
             h_clean, h_tampered,
             "a changed rule must change the aggregate"
@@ -200,7 +164,7 @@ mod tests {
         let dir = std::env::temp_dir().join("cairn_ruleset_empty_test");
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let h = aggregate_hash(&dir, true).unwrap();
+        let h = aggregate_hash(&dir).unwrap();
         // SHA-256 of the empty byte string.
         assert_eq!(
             h,
@@ -218,8 +182,8 @@ mod tests {
         write(&dir, "a.yml", b"title: a\n");
         std::fs::write(dir.join("PROVENANCE"), "pin = deadbeefcafe\n").unwrap();
 
-        let agg = aggregate_hash(&dir, true).unwrap();
-        let ver = ruleset_version(&dir, true).unwrap();
+        let agg = aggregate_hash(&dir).unwrap();
+        let ver = ruleset_version(&dir).unwrap();
         assert_eq!(ver, format!("deadbeefcafe+{agg}"));
     }
 
@@ -231,8 +195,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         write(&dir, "a.yml", b"title: a\n");
 
-        let agg = aggregate_hash(&dir, true).unwrap();
-        let ver = ruleset_version(&dir, true).unwrap();
+        let agg = aggregate_hash(&dir).unwrap();
+        let ver = ruleset_version(&dir).unwrap();
         assert_eq!(ver, format!("unpinned+{agg}"));
     }
 

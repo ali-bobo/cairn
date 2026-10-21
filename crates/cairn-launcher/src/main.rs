@@ -57,7 +57,7 @@ fn hostname() -> String {
 
 fn rules_ver(rules_dir: Option<&Path>) -> String {
     rules_dir
-        .and_then(|d| cairn_sigma::ruleset::ruleset_version(d, false).ok())
+        .and_then(|d| cairn_sigma::ruleset::ruleset_version(d).ok())
         .unwrap_or_default()
 }
 

@@ -56,10 +56,6 @@ enum Cmd {
         files: Vec<PathBuf>,
         #[arg(long)]
         rules: Option<PathBuf>,
-        /// Load un-encoded `.yml` rules instead of the XOR-encoded bundle (ADR-0002).
-        /// Lets a SOC audit exactly what runs; off by default (bundle is encoded).
-        #[arg(long)]
-        rules_plain: bool,
     },
     /// Print which ATT&CK techniques this build can detect: built-in heuristics plus
     /// the Sigma rules' technique tags. Use it to know what a clean result does NOT
@@ -68,9 +64,6 @@ enum Cmd {
         /// Rules dir to count Sigma techniques from (default: bundled rules/sigma).
         #[arg(long)]
         rules: Option<PathBuf>,
-        /// Treat the rules dir as un-encoded `.yml`.
-        #[arg(long)]
-        rules_plain: bool,
     },
     /// Re-hash a run's outputs (and optionally its ruleset) against the manifest.
     Verify {
@@ -80,9 +73,6 @@ enum Cmd {
         /// Omit to skip the ruleset check and verify only the output/source hashes.
         #[arg(long)]
         rules: Option<PathBuf>,
-        /// Treat the rules dir as un-encoded `.yml` (matches the run's --rules-plain).
-        #[arg(long)]
-        rules_plain: bool,
     },
 }
 
@@ -102,9 +92,6 @@ struct RunArgs {
     admin_features: bool,
     #[arg(long)]
     rules: Option<PathBuf>,
-    /// Load un-encoded `.yml` rules instead of the XOR-encoded bundle (ADR-0002).
-    #[arg(long)]
-    rules_plain: bool,
     #[arg(long, default_value = "standard")]
     profile: String,
     /// comma-separated module allow-list, e.g. evtx,process,persist
@@ -145,8 +132,7 @@ fn evtx_plan(cfg: &Config) -> String {
         OutputKind::Zip(p) => format!("{} (zip)", p.display()),
         OutputKind::DryRun => "<dry-run, no writes>".to_string(),
     };
-    let encoding = if cfg.rules_plain { "plain" } else { "xor" };
-    format!("plan: evtx triage of {n} file(s); rules={rules} (encoding={encoding}); output={out}")
+    format!("plan: evtx triage of {n} file(s); rules={rules}; output={out}")
 }
 
 /// True if the run target selects the live host (vs an offline artifact dir).
@@ -423,9 +409,7 @@ fn output_dir(cfg: &Config) -> PathBuf {
 /// rule-load path already surfaces real load errors to run.log.
 fn ruleset_ver(cfg: &Config) -> String {
     match cfg.rules_dir.as_deref() {
-        Some(dir) => {
-            cairn_sigma::ruleset::ruleset_version(dir, cfg.rules_plain).unwrap_or_default()
-        }
+        Some(dir) => cairn_sigma::ruleset::ruleset_version(dir).unwrap_or_default(),
         None => String::new(),
     }
 }
@@ -488,11 +472,7 @@ fn build_manifest(
 /// sources) the manifest lists, and — if a rules dir is given — recompute the ADR-0003
 /// ruleset aggregate and compare it to `tool.sigma_ruleset_ver`. Logs every check and
 /// returns `true` only if all pass. A tampered output byte OR a modified rule fails it.
-fn run_verify(
-    manifest_path: &std::path::Path,
-    rules: Option<PathBuf>,
-    rules_plain: bool,
-) -> anyhow::Result<bool> {
+fn run_verify(manifest_path: &std::path::Path, rules: Option<PathBuf>) -> anyhow::Result<bool> {
     let manifest = cairn_report::read_manifest(manifest_path)?;
     let base_dir = manifest_path
         .parent()
@@ -517,7 +497,7 @@ fn run_verify(
     // with no recorded ruleset version (parse-only run) has nothing to check.
     match (rules, manifest.tool.sigma_ruleset_ver.as_str()) {
         (Some(dir), recorded) if !recorded.is_empty() => {
-            let computed = cairn_sigma::ruleset::ruleset_version(&dir, rules_plain)?;
+            let computed = cairn_sigma::ruleset::ruleset_version(&dir)?;
             if computed == recorded {
                 tracing::info!("ruleset ok ({recorded})");
             } else {
@@ -545,14 +525,9 @@ fn run_verify(
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Evtx {
-            files,
-            rules,
-            rules_plain,
-        } => {
+        Cmd::Evtx { files, rules } => {
             let started_utc = chrono::Utc::now();
-            let cfg = Config::for_evtx(files, rules.or_else(default_rules_dir))
-                .with_rules_plain(rules_plain);
+            let cfg = Config::for_evtx(files, rules.or_else(default_rules_dir));
             let dir = output_dir(&cfg);
             std::fs::create_dir_all(&dir)?;
 
@@ -600,9 +575,9 @@ fn main() -> anyhow::Result<()> {
             let mut findings = Vec::new();
             if let Some(rules_dir) = cfg.rules_dir.as_deref() {
                 let mut engine = Engine::default();
-                match engine.load(rules_dir, cfg.rules_plain) {
+                match engine.load(rules_dir) {
                     Ok(n) => {
-                        tracing::info!(rules = n, dir = %rules_dir.display(), plain = cfg.rules_plain, "loaded sigma rules");
+                        tracing::info!(rules = n, dir = %rules_dir.display(), "loaded sigma rules");
                         for ev in &records {
                             match engine.match_event(ev) {
                                 Ok(mut fs) => findings.append(&mut fs),
@@ -794,7 +769,6 @@ fn main() -> anyhow::Result<()> {
             cfg.rules_dir = args.rules.clone().or_else(default_rules_dir);
             cfg.case_id = args.case_id.clone().unwrap_or_default();
             cfg.operator = args.operator.clone().unwrap_or_default();
-            cfg.rules_plain = args.rules_plain;
 
             // ── Resource governance (NFR9/NFR10) ──────────────────────────────────────
             // Always true in this handler (a non-live --target exits earlier); kept to
@@ -840,12 +814,11 @@ fn main() -> anyhow::Result<()> {
                 cfg.rules_dir
             {
                 let mut engine = Engine::default();
-                match engine.load(rules_dir, cfg.rules_plain) {
+                match engine.load(rules_dir) {
                     Ok(n) => {
                         tracing::info!(
                             rules = n,
                             dir = %rules_dir.display(),
-                            plain = cfg.rules_plain,
                             "loaded sigma rules"
                         );
                         Some(cairn_heur::SigmaAnalyzer::new(engine))
@@ -1030,11 +1003,11 @@ fn main() -> anyhow::Result<()> {
                 .with_target(false)
                 .init();
             match other {
-                Cmd::Coverage { rules, rules_plain } => {
+                Cmd::Coverage { rules } => {
                     let sigma = match rules.or_else(default_rules_dir) {
                         Some(dir) => {
                             let mut engine = Engine::default();
-                            match engine.load(&dir, rules_plain) {
+                            match engine.load(&dir) {
                                 Ok(_) => Some(engine.technique_counts()),
                                 Err(e) => {
                                     tracing::warn!(error = %e, dir = %dir.display(), "rule load failed");
@@ -1046,13 +1019,9 @@ fn main() -> anyhow::Result<()> {
                     };
                     print!("{}", coverage_report(sigma.as_ref()));
                 }
-                Cmd::Verify {
-                    manifest,
-                    rules,
-                    rules_plain,
-                } => {
+                Cmd::Verify { manifest, rules } => {
                     // Non-zero exit on any integrity failure so scripts/CI can detect it.
-                    let ok = run_verify(&manifest, rules, rules_plain)?;
+                    let ok = run_verify(&manifest, rules)?;
                     if !ok {
                         std::process::exit(1);
                     }
@@ -1256,19 +1225,6 @@ mod tests {
         assert!(evtx_plan(&cfg).contains("rules=<bundled>"));
     }
 
-    /// The plan records the rule-encoding mode so run.log shows whether `--rules-plain`
-    /// was used (transparency: a SOC reading the log knows if rules were decoded).
-    #[test]
-    fn evtx_plan_records_rules_plain_mode() {
-        let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], Some(PathBuf::from("./r")));
-        assert!(
-            evtx_plan(&cfg).contains("encoding=xor"),
-            "default is encoded"
-        );
-        let cfg = cfg.with_rules_plain(true);
-        assert!(evtx_plan(&cfg).contains("encoding=plain"));
-    }
-
     /// With no rules dir the manifest's sigma_ruleset_ver is empty (no rules ran).
     #[test]
     fn ruleset_ver_is_empty_without_rules() {
@@ -1276,7 +1232,7 @@ mod tests {
         assert_eq!(ruleset_ver(&cfg), "");
     }
 
-    /// With the bundled (encoded) rules dir, sigma_ruleset_ver is "<pin>+<aggregate>"
+    /// With the bundled rules dir, sigma_ruleset_ver is "<pin>+<aggregate>"
     /// (ADR-0003): the pin from PROVENANCE and a 64-char aggregate, computed over the
     /// real bundled rules this binary ships.
     #[test]
@@ -1316,7 +1272,7 @@ mod tests {
         let dir = std::env::temp_dir().join("cairn_run_verify_clean");
         let _ = std::fs::remove_dir_all(&dir);
         write_run(&dir);
-        let ok = run_verify(&dir.join("manifest.json"), None, false).unwrap();
+        let ok = run_verify(&dir.join("manifest.json"), None).unwrap();
         assert!(ok, "clean run must verify");
     }
 
@@ -1331,7 +1287,7 @@ mod tests {
         let mut c = std::fs::read(&p).unwrap();
         c.push(b' ');
         std::fs::write(&p, &c).unwrap();
-        let ok = run_verify(&dir.join("manifest.json"), None, false).unwrap();
+        let ok = run_verify(&dir.join("manifest.json"), None).unwrap();
         assert!(!ok, "tampered output must fail verify");
     }
 
@@ -1349,7 +1305,7 @@ mod tests {
 
         use cairn_core::finding::{Finding, FindingSource, Severity};
         let findings = vec![Finding::new(Severity::Low, "t", FindingSource::Sigma)];
-        let cfg = Config::for_evtx(vec![], Some(rules.clone())).with_rules_plain(true);
+        let cfg = Config::for_evtx(vec![], Some(rules.clone()));
         let mut manifest = build_manifest(&cfg, "WS01", 0, &findings, chrono::Utc::now());
         let mut sink = DirSink::new(dir.clone());
         sink.write_timeline_csv(&findings).unwrap();
@@ -1360,7 +1316,7 @@ mod tests {
 
         // Now modify a rule and verify against the modified dir: ruleset check must fail.
         std::fs::write(rules.join("r.yml"), b"title: TAMPERED\n").unwrap();
-        let ok = run_verify(&dir.join("manifest.json"), Some(rules), true).unwrap();
+        let ok = run_verify(&dir.join("manifest.json"), Some(rules)).unwrap();
         assert!(!ok, "modified ruleset must fail verify");
     }
 

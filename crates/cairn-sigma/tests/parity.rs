@@ -17,8 +17,8 @@ use chrono::Utc;
 use serde_json::json;
 use std::path::PathBuf;
 
-/// The bundled, XOR-encoded rule directory (committed at workspace root). Loaded with
-/// plain=false. CARGO_MANIFEST_DIR is this crate, so the workspace root is ../../.
+/// The bundled plain-YAML rule directory (committed at workspace root).
+/// CARGO_MANIFEST_DIR is this crate, so the workspace root is ../../.
 fn bundled_rules_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../rules/sigma")
 }
@@ -97,7 +97,7 @@ fn system_event(event_id: u32, fields: serde_json::Value) -> EventRecord {
 fn load_bundled() -> Engine {
     let mut engine = Engine::default();
     let n = engine
-        .load(&bundled_rules_dir(), false)
+        .load(&bundled_rules_dir())
         .expect("bundled rules load (decode)");
     assert!(n >= 3, "expected >= 3 bundled rules, loaded {n}");
     engine
