@@ -684,4 +684,57 @@ author: test-integration
         assert!(f.reason.is_some(), "golden rule 6: reason must be set");
         assert_eq!(f.mitre, vec!["T1110.001".to_string()]);
     }
+
+    struct FixedRecords(Vec<Record>);
+    impl Collector for FixedRecords {
+        fn name(&self) -> &str {
+            "fake_records"
+        }
+        fn collect(&self, _ctx: &CollectCtx<'_>) -> cairn_core::Result<Vec<Record>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Integration: the phase 3F analyzers are in the live set and fire end to end on
+    /// dropscan-shaped records (fake collector -> run_live -> RunOutcome.findings).
+    #[test]
+    fn phase3f_heuristics_fire_in_live_outcome() {
+        use cairn_core::record::{FileListingRecord, ShadowCopyRecord};
+        let records = vec![
+            Record::FileListing(FileListingRecord {
+                path: r"C:\Users\Public\lsass.dmp".into(),
+                size: 50_000_000,
+                modified: Some(Utc::now()),
+                magic: Some(cairn_core::record::MAGIC_MINIDUMP.into()),
+                created: None,
+            }),
+            Record::ShadowCopies(ShadowCopyRecord {
+                count: Some(0),
+                client_os: Some(true),
+                system_restore_enabled: Some(true),
+            }),
+            Record::Event(event(
+                5145,
+                1,
+                &[("ShareName", r"\\*\ADMIN$"), ("IpAddress", "10.1.2.3")],
+            )),
+        ];
+        let cfg = Config::default();
+        let analyzers = registry::analyzers(&cfg, Mode::Live, None);
+        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedRecords(records))];
+        let outcome = run_live(&cfg, privs(), "TEST".into(), &collectors, &analyzers);
+        for (name, mitre) in [
+            (cairn_core::analyzers::CRED_DUMP, "T1003.001"),
+            (cairn_core::analyzers::RANSOM, "T1490"),
+            (cairn_core::analyzers::LATERAL, "T1021.002"),
+        ] {
+            let f = outcome
+                .findings
+                .iter()
+                .find(|f| f.analyzer == name)
+                .unwrap_or_else(|| panic!("{name} finding missing"));
+            assert!(f.reason.is_some(), "golden rule 6: reason must be set");
+            assert_eq!(f.mitre[0], mitre);
+        }
+    }
 }

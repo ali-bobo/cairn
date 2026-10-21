@@ -183,6 +183,21 @@ const ANALYZERS: &[AnalyzerEntry] = &[
             ))
         },
     },
+    AnalyzerEntry {
+        name: cairn_core::analyzers::LATERAL,
+        events_only: true,
+        build: |_| Box::new(cairn_heur::LateralHeuristic),
+    },
+    AnalyzerEntry {
+        name: cairn_core::analyzers::CRED_DUMP,
+        events_only: false,
+        build: |_| Box::new(cairn_heur::CredDumpHeuristic),
+    },
+    AnalyzerEntry {
+        name: cairn_core::analyzers::RANSOM,
+        events_only: false,
+        build: |_| Box::new(cairn_heur::RansomHeuristic),
+    },
 ];
 
 /// The analyzers for `mode`, in registry order, then Sigma (when rules loaded).
@@ -278,7 +293,8 @@ mod tests {
             vec![
                 cairn_core::analyzers::ACCOUNT,
                 cairn_core::analyzers::EVENTLOG,
-                cairn_core::analyzers::LOGON_BRUTEFORCE
+                cairn_core::analyzers::LOGON_BRUTEFORCE,
+                cairn_core::analyzers::LATERAL
             ]
         );
         assert!(evtx.iter().all(|n| live.contains(n)));
