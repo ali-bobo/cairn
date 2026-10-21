@@ -673,6 +673,15 @@ pub fn html_report(
                     cairn_core::finding::FindingSource::Heuristic => "啟發式",
                 });
                 let desc = esc(f.details_client.as_deref().unwrap_or(&f.details));
+                // Sigma: always show rule title, DRL author, level and matched record.
+                let rule_html = crate::client_text::sigma_rule_line(f)
+                    .map(|l| {
+                        format!(
+                            "<div class=\"rule-line\" style=\"color:#6b7280;font-size:.8em;margin-top:.25rem\">{}</div>",
+                            esc(&l)
+                        )
+                    })
+                    .unwrap_or_default();
                 let ev_html = if f.evidence.is_empty() {
                     String::new()
                 } else {
@@ -706,7 +715,7 @@ pub fn html_report(
                   <td style=\"font-weight:500\">{title}</td>\
                   <td style=\"font-size:0.85em;color:#6b7280\">{mitre}</td>\
                   <td style=\"font-size:0.85em\">{src}</td>\
-                  <td style=\"font-size:0.85em;color:#374151\">{desc}{ev_html}</td>\
+                  <td style=\"font-size:0.85em;color:#374151\">{desc}{rule_html}{ev_html}</td>\
                 </tr>"
                 )
             })
@@ -842,6 +851,7 @@ tr:hover td{{background:#f9fafb}}
 {obs_html}
 
 <div class="footer">
+  <p>原始資料檔案：<a href="records.jsonl">records.jsonl</a> · <a href="findings.jsonl">findings.jsonl</a> · <a href="timeline.csv">timeline.csv</a> · <a href="manifest.json">manifest.json</a>（雜湊值見 manifest.json，可用 cairn verify 驗證）</p>
   <p>{int_note}</p>
   <p style="margin-top:.25rem">cairn v{tool_ver} &nbsp;·&nbsp; 報告產生時間：{generated}</p>
 </div>
@@ -887,6 +897,9 @@ mod tests {
                 os_build: String::new(),
                 timezone: "UTC".into(),
                 wall_clock_utc_skew: "unknown".into(),
+                utc_offset_seconds: None,
+                reference_time_utc: None,
+                skew_seconds: None,
             },
             privileges: Privileges {
                 admin: true,
@@ -1015,6 +1028,18 @@ mod tests {
         f.artifact = "evtx:Security".into();
         let html = html_report(&[f], &[], &[], &minimal_manifest());
         assert!(html.contains("發現高風險事件"));
+    }
+
+    #[test]
+    fn html_report_shows_sigma_rule_line_and_raw_data_links() {
+        let mut f = Finding::new(Severity::High, "Rule T", FindingSource::Sigma);
+        f.rule_author = Some("Jane <x>".into());
+        f.evidence_ref = Some("77".into());
+        let html = html_report(&[f], &[], &[], &minimal_manifest());
+        assert!(html.contains("rule-line"), "rule line rendered");
+        assert!(html.contains("Jane &lt;x&gt;"), "author escaped and shown");
+        assert!(html.contains("record 77"));
+        assert!(html.contains("href=\"records.jsonl\""));
     }
 
     #[test]

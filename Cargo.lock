@@ -230,6 +230,7 @@ dependencies = [
  "cairn-sigma",
  "chrono",
  "serde_json",
+ "sha2",
  "tempfile",
  "winresource",
  "zip",

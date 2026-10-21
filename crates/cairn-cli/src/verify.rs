@@ -1,17 +1,56 @@
-//! `cairn verify <manifest> [--rules <dir>]`: re-hash a run's outputs (and sources)
-//! against its manifest, and optionally the ruleset against `tool.sigma_ruleset_ver`.
+//! `cairn verify <manifest.json | archive.zip> [--rules <dir>]`: re-hash a run's
+//! outputs (and sources) against its manifest, and optionally the ruleset against
+//! `tool.sigma_ruleset_ver`. For a `--zip` archive the manifest is read from inside it
+//! and the archive is also checked against its `<zip>.sha256` sidecar.
 use std::path::{Path, PathBuf};
+
+/// True when `path` is a zip archive (by its `PK` magic), not a manifest.json.
+fn is_zip(path: &Path) -> bool {
+    use std::io::Read;
+    let mut magic = [0u8; 2];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
+        && &magic == b"PK"
+}
 
 /// Re-hash the outputs (and sources) the manifest lists, and — if a rules dir is given —
 /// recompute the ADR-0003 ruleset aggregate and compare it to `tool.sigma_ruleset_ver`.
-/// Logs every check and returns `true` only if all pass. A tampered output byte OR a
-/// modified rule fails it.
+/// Logs every check and returns `true` only if all pass. A tampered output byte, a
+/// manifest that lists no outputs at all, OR a modified rule fails it.
 pub fn run_verify(manifest_path: &Path, rules: Option<PathBuf>) -> anyhow::Result<bool> {
-    let manifest = cairn_report::read_manifest(manifest_path)?;
-    let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
-
-    let report = cairn_report::verify_manifest(&manifest, base_dir);
-    for c in report.outputs.iter().chain(report.sources.iter()) {
+    let (manifest, report) = if is_zip(manifest_path) {
+        let (m, r) = cairn_report::verify_zip(manifest_path)?;
+        match &r.archive {
+            None => tracing::warn!(
+                "no {}.sha256 sidecar beside the archive; archive hash not checked \
+                 (members are still verified against the manifest inside it)",
+                manifest_path.display()
+            ),
+            Some(c) if c.status == cairn_report::CheckStatus::Ok => {
+                tracing::info!(file = %c.file, "archive matches its .sha256 sidecar")
+            }
+            Some(_) => {}
+        }
+        (m, r)
+    } else {
+        let manifest = cairn_report::read_manifest(manifest_path)?;
+        let base_dir = manifest_path.parent().unwrap_or_else(|| Path::new("."));
+        let report = cairn_report::verify_manifest(&manifest, base_dir);
+        (manifest, report)
+    };
+    if report.no_outputs {
+        tracing::error!(
+            "manifest lists NO outputs: nothing to verify, so integrity cannot be \
+             established (a real run always records its outputs)"
+        );
+    }
+    for c in report
+        .outputs
+        .iter()
+        .chain(report.sources.iter())
+        .chain(report.archive.iter())
+    {
         match &c.status {
             cairn_report::CheckStatus::Ok => tracing::info!(file = %c.file, "verify ok"),
             cairn_report::CheckStatus::Mismatch { expected, actual } => {

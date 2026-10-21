@@ -10,14 +10,11 @@
 use cairn_core::traits::{Analyzer, Collector};
 use cairn_core::{collectors as names, Config, ModuleInfo};
 
-/// Default live-EVTX look-back when `--since` is not given. Incidents are routinely
-/// found days after initial access, and a 24h window silently dropped exactly the
-/// events an investigation needs. EVTX logs are size-bounded, so a week costs little.
-pub const DEFAULT_SINCE_DAYS: i64 = 7;
-
-/// `now - DEFAULT_SINCE_DAYS`: the start of the default live-EVTX window.
+/// `now - cairn_core::config::DEFAULT_SINCE_HOURS` (30 days): the start of the default
+/// live-EVTX window when `--since` is not given. Incidents are routinely found weeks
+/// after initial access, and EVTX logs are size-bounded, so a month costs little.
 pub fn default_since(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono::Utc> {
-    now - chrono::Duration::days(DEFAULT_SINCE_DAYS)
+    now - chrono::Duration::hours(cairn_core::config::DEFAULT_SINCE_HOURS)
 }
 
 /// Channels the live EVTX collector reads: whatever the loaded Sigma rules reference,
@@ -301,8 +298,8 @@ mod tests {
     }
 
     #[test]
-    fn default_since_looks_back_seven_days() {
+    fn default_since_looks_back_thirty_days() {
         let now = chrono::Utc::now();
-        assert_eq!(now - default_since(now), chrono::Duration::days(7));
+        assert_eq!(now - default_since(now), chrono::Duration::days(30));
     }
 }

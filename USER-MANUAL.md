@@ -122,11 +122,13 @@ CHECKSUMS.txt         每個檔案的 SHA-256（打包時自動產生）
 **雙擊 `cairn-launcher.exe` 就會直接開始掃描，沒有選單。**
 
 1. Windows 會跳出「使用者帳戶控制」詢問是否允許執行，按「是」。以系統管理員身分執行，才讀得到 Security 事件記錄和其他使用者的登錄資料；如果你沒有管理員權限，仍然可以掃描，但部分檢查會略過，報告會寫明略過了什麼。
-2. 掃描這台主機最近 7 天的狀況，通常需要幾分鐘，期間不要關閉視窗。
-3. 跑完後畫面會顯示是否發現高風險項目，並自動做兩件事：
-   - 把結果壓縮成一個 zip（路徑會顯示在畫面上），這就是要交給資安人員的檔案；
+2. 如果 `cairn-launcher.exe` 放在系統磁碟（通常是 C:），畫面會警告「結果會寫進這台被調查電腦的硬碟」，並詢問是否繼續（預設 N，直接按 Enter 就會取消、不寫入任何檔案）。建議把整個資料夾複製到 USB 隨身碟再執行。
+3. 輸入案件編號與操作人員（都是選填，直接按 Enter 略過），會記錄在 manifest.json。
+4. 掃描這台主機最近 30 天的狀況，並把這段期間的事件記錄匯出到結果資料夾的 `evidence\evtx\`，通常需要幾分鐘，期間不要關閉視窗。
+5. 跑完後畫面會顯示是否發現高風險項目，並自動做兩件事：
+   - 把結果壓縮成一個 zip（路徑會顯示在畫面上），旁邊另有一個 `.zip.sha256` 記錄壓縮檔的雜湊值，兩個檔案一起交給資安人員；
    - 用預設瀏覽器打開 `report.html`。
-4. 按 Enter 關閉視窗。
+6. 按 Enter 關閉視窗。
 
 **分析別台電腦匯出的事件記錄**：把 `.evtx` 檔（或裝著 `.evtx` 的資料夾）直接拖到 `cairn-launcher.exe` 上。這時不會掃描這台主機，只分析拖進來的記錄，結果一樣會打包並打開報告。
 
@@ -191,6 +193,9 @@ cairn run --target live --output D:\IR\case001 --case-id "IR-2026-001" --operato
 #   D:\IR\case001\timeline.csv
 #   D:\IR\case001\findings.jsonl
 #   D:\IR\case001\report.html
+#   D:\IR\case001\observations.jsonl
+#   D:\IR\case001\records.jsonl
+#   D:\IR\case001\evidence\evtx\*.evtx   （匯出的事件記錄，--no-export-evtx 可關閉）
 #   D:\IR\case001\manifest.json
 #   D:\IR\case001\run.log
 #   （加上各 collector 子目錄的原始 record）
@@ -202,8 +207,9 @@ cairn verify D:\IR\case001\manifest.json --rules rules/sigma
 ### 情境 C：打包輸出 / 試跑
 
 ```powershell
-# --zip 把輸出打包成 .zip
+# --zip 把輸出打包成 .zip（另寫 case001.zip.sha256），可直接驗證壓縮檔
 cairn run --target live --output D:\IR\case001.zip --zip
+cairn verify D:\IR\case001.zip
 
 # dry-run：不寫入任何檔案，確認流程
 cairn run --target live --output D:\IR\case001 --dry-run
@@ -232,7 +238,9 @@ cairn run --output <OUTPUT> [OPTIONS]
 | `--rules <dir>` | 指定 Sigma 規則目錄（預設 `rules/sigma`） |
 | `--profile minimal\|standard` | `standard`（預設）：全部 collector；`minimal`：跳過 Prefetch 與 live EVTX |
 | `--only evtx_live,process,...` | 只跑指定 collector（逗號分隔） |
-| `--since <RFC3339>` | 只分析指定時間之後的事件（預設：執行前 7 天） |
+| `--since <RFC3339>` | 只分析（及匯出）指定時間之後的事件（預設：執行前 30 天） |
+| `--export-evtx` / `--no-export-evtx` | 把 live EVTX 頻道（`--since` 範圍）匯出到輸出位置的 `evidence/evtx/<頻道>.evtx`，雜湊記入 manifest（預設開啟；`--dry-run` 或未選 `evtx_live` 模組時略過） |
+| `--reference-time <RFC3339>` | 開始執行當下、從可信時鐘（手機 / NTP）讀到的 UTC 時間；manifest 會記錄主機時鐘偏差秒數（未提供時記為 not measured） |
 | `--case-id <id>` | 案件編號（記入 manifest） |
 | `--operator <name>` | 分析師姓名（記入 manifest） |
 | `--full-speed` | 不降低 process 優先權（預設為 below-normal） |
@@ -254,7 +262,7 @@ cairn evtx [FILES]... [--rules <dir>]
 cairn verify <MANIFEST> [--rules <dir>]
 ```
 
-重新計算 manifest 所列所有輸出的 SHA-256，並驗證 Sigma 規則集版本（ADR-0003）。任何不一致則 exit code 非零。
+重新計算 manifest 所列所有輸出的 SHA-256，並驗證 Sigma 規則集版本（ADR-0003）。任何不一致、或 manifest 的 outputs 是空的，則 exit code 非零。`<MANIFEST>` 也可以直接給 `--zip` 產生的 .zip：會讀取壓縮檔內的 manifest.json 驗證每個成員，並以旁邊的 `<zip>.sha256` 驗證壓縮檔本身（沒有 sidecar 時只警告）。
 
 ### `cairn coverage` — 偵測覆蓋範圍
 
@@ -275,8 +283,10 @@ cairn coverage [--rules <dir>]
 CSV 格式，每列代表一筆規則命中。欄位：
 
 ```
-Timestamp, Host, Channel, EventID, Severity, RecordID, RuleTitle, RuleAuthor, MITRE, Details
+Timestamp, Host, Channel, EventID, Severity, RecordID, RuleTitle, RuleAuthor, MITRE, Details, Reason, Entity, DetailsClient
 ```
+
+- Reason：heuristic 的判斷理由；Sigma 命中則寫「規則名稱、作者、等級、比對到的事件記錄編號」
 
 - Severity：`critical` / `high` / `medium` / `low` / `info`
 - MITRE：ATT&CK 技術 ID（例如 `T1059.001`）
@@ -320,15 +330,21 @@ JSON Lines 格式，每行一個 Finding。關鍵欄位：
 {
   "schema": "cairn.manifest/1",
   "run_id": "uuid",
-  "host": { "name": "...", "os": "...", "os_build": "...", "tz": "..." },
+  "host": {
+    "hostname": "...", "os_build": "...", "timezone": "Taipei Standard Time (UTC+08:00)",
+    "utc_offset_seconds": 28800,
+    "wall_clock_utc_skew": "not measured (no network time source)",  // 有 --reference-time 時為 "+12s"
+    "reference_time_utc": "...", "skew_seconds": 12                   // 只在有 --reference-time 時出現
+  },
   "tool": { "version": "0.1.0", "build_sha": "...", "sigma_ruleset_ver": "<pin>+<hash>" },
   "sources": [
     { "name": "evtx:Security", "record_count": 1234, "sha256": "...", "errors": [] }
   ],
-  "outputs": [
-    { "name": "timeline.csv", "sha256": "..." },
-    { "name": "findings.jsonl", "sha256": "..." },
-    { "name": "report.html", "sha256": "..." }
+  "outputs": [   // 每個寫出的檔案（manifest.json 與 run.log 本身除外），dir 與 zip 皆同
+    { "file": "timeline.csv", "sha256": "...", "size": 1234 },
+    { "file": "records.jsonl", "sha256": "...", "size": 56789 },
+    { "file": "report.html", "sha256": "...", "size": 4321 },
+    { "file": "evidence/evtx/Security.evtx", "sha256": "...", "size": 1052672 }
   ],
   "governance": {
     "low_priority_applied": true
@@ -381,12 +397,12 @@ cairn verify out/manifest.json --rules rules/sigma
 $OUT = "E:\IR\$CaseId"
 
 # 4. 執行（Admin PowerShell）
-.\cairn.exe run --target live --output $OUT `
+.\cairn.exe run --target live --output "$OUT.zip" `
   --case-id $CaseId --operator $AnalystName `
   --zip
 
-# 5. 驗證輸出
-.\cairn.exe verify "$OUT\manifest.json" --rules .\rules\sigma
+# 5. 驗證輸出（壓縮檔內每個成員 + 旁邊的 .zip.sha256）
+.\cairn.exe verify "$OUT.zip" --rules .\rules\sigma
 
 # 6. 透過受控管道傳輸 zip
 ```

@@ -2,6 +2,12 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Default live-EVTX look-back, in hours (30 days), when `--since` is not given. Shared
+/// by the CLI default and the launcher's double-click scan so the two cannot drift.
+/// Incidents are routinely found weeks after initial access, and EVTX logs are
+/// size-bounded, so a month costs little.
+pub const DEFAULT_SINCE_HOURS: i64 = 720;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Target {
     /// Analyze an explicit list of files (the `cairn evtx <files...>` entry, SRS §6).

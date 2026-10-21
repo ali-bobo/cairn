@@ -14,6 +14,33 @@ pub fn read_choice() -> char {
         .unwrap_or('\0')
 }
 
+/// 讀取使用者輸入的一整行（去頭尾空白）。EOF 回傳空字串。
+pub fn read_line() -> String {
+    let mut line = String::new();
+    let _ = io::stdin().lock().read_line(&mut line);
+    line.trim().to_string()
+}
+
+/// 顯示提示並讀一行。
+pub fn prompt(msg: &str) -> String {
+    print!("{msg}");
+    let _ = io::stdout().flush();
+    read_line()
+}
+
+/// Y/N 回答：只有 Y / YES / 是（不分大小寫）算同意；Enter、N 或其他都算不同意
+/// （預設 N）。純函式，可測試。
+pub fn is_yes(input: &str) -> bool {
+    let t = input.trim();
+    t.eq_ignore_ascii_case("y") || t.eq_ignore_ascii_case("yes") || t == "是"
+}
+
+/// 選填欄位：空白（直接按 Enter）回傳 None，否則回傳去頭尾空白後的內容。
+pub fn optional_field(input: &str) -> Option<String> {
+    let t = input.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
 /// 印掃描摘要框
 pub fn print_summary(s: &crate::summary::ScanSummary) {
     use crate::summary::Verdict;
@@ -109,6 +136,28 @@ pub fn truncate_rules_ver(ver: &str) -> String {
         format!("{short_pin}+{short_agg}")
     } else {
         truncate(ver, 20)
+    }
+}
+
+#[cfg(test)]
+mod prompt_tests {
+    use super::{is_yes, optional_field};
+
+    #[test]
+    fn only_explicit_yes_continues() {
+        for y in ["y", "Y", "yes", " YES ", "是"] {
+            assert!(is_yes(y), "{y}");
+        }
+        for n in ["", "n", "N", "no", "ok", "否"] {
+            assert!(!is_yes(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn optional_field_skips_on_enter() {
+        assert_eq!(optional_field(""), None);
+        assert_eq!(optional_field("   "), None);
+        assert_eq!(optional_field(" IR-1 "), Some("IR-1".to_string()));
     }
 }
 

@@ -13,6 +13,7 @@ mod cli;
 mod coverage;
 mod enrich;
 mod evtx;
+mod export;
 mod output;
 mod registry;
 mod run;

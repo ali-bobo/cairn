@@ -103,7 +103,11 @@ checksums) with `.\scripts\package.ps1` → `dist\cairn-forensics\`.
 
 **One click (recommended):** double-click `cairn-launcher.exe` in the packaged
 distribution. It asks for elevation through a normal UAC prompt, scans the last
-7 days of this host, zips the results and opens `report.html` in the browser.
+30 days of this host (and exports those event logs to `evidence\evtx\` in the
+output folder), zips the results and opens `report.html` in the browser. If the
+output folder is on the system drive it warns first and asks before writing
+anything (run it from a USB drive instead). It also asks for an optional case ID
+and operator name.
 Drop `.evtx` files or a folder onto it to analyze exported logs instead.
 
 **Command line:**
@@ -119,9 +123,16 @@ cairn run --target live --output D:\IR\case001 `
 # Which ATT&CK techniques can this build detect?
 cairn coverage
 
-# Verify run integrity
+# Verify run integrity (every output's SHA-256 is in manifest.outputs)
 cairn verify D:\IR\case001\manifest.json --rules rules/sigma
+# ...or a --zip archive directly (inner manifest + <zip>.sha256 sidecar)
+cairn verify D:\IR\case001.zip
 ```
+
+`cairn run` looks back 30 days of EVTX by default (`--since` overrides), exports
+those channels to `evidence/evtx/*.evtx` in the output location
+(`--no-export-evtx` to skip; never under `--dry-run`), and records host clock
+skew only when you pass `--reference-time <RFC3339>` from a trusted clock.
 
 For complete flag reference and output format descriptions, see **[USER-MANUAL.md](USER-MANUAL.md)**.
 
