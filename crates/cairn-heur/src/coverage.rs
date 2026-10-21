@@ -52,10 +52,16 @@ pub const BUILTIN: &[Coverage] = &[
         "heur_cred_dump",
     ),
     c(
+        "T1021",
+        "Remote Services",
+        "Security 4648 logon with another account's credentials to another host",
+        "heur_lateral",
+    ),
+    c(
         "T1021.001",
         "Remote Desktop Protocol",
-        "inbound RDP (local port 3389) connection from a public IP",
-        "heur_netconn",
+        "inbound RDP (local port 3389) connection from a public IP; RDP logons per source and account (4624 type 10 / type 7 remote, 4778, TerminalServices 1149 / 21 / 24 / 25): public or tunneled source High, private Low, Medium with 4625 failures or a first logon",
+        "heur_netconn, heur_lateral",
     ),
     c(
         "T1021.002",
@@ -90,8 +96,8 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1047",
         "Windows Management Instrumentation",
-        "wmiprvse.exe spawning cmd/PowerShell (wmiexec output to ADMIN$ escalates)",
-        "heur_parentchild",
+        "wmiprvse.exe spawning cmd/PowerShell (wmiexec output to ADMIN$ escalates); WMI-Activity 5860 temporary consumers (not local system agents), 5857 providers loaded from user-writable paths",
+        "heur_parentchild, heur_lateral",
     ),
     c(
         "T1053.005",
@@ -210,13 +216,13 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1219",
         "Remote Access Tools",
-        "RMM / remote-access tools (AnyDesk, ScreenConnect, TeamViewer, Atera, ngrok, ...) from processes, services and install folders",
+        "RMM / remote-access tools (AnyDesk, ScreenConnect, TeamViewer, Atera, ngrok, ...) from processes, services and install folders; their own logs, with incoming connections from AnyDesk connection_trace.txt and TeamViewer Connections_incoming.txt",
         "heur_rmm",
     ),
     c(
         "T1490",
         "Inhibit System Recovery",
-        "vssadmin / wmic / wbadmin / bcdedit recovery deletion; client with System Restore on and zero shadow copies",
+        "vssadmin / wmic / wbadmin / bcdedit recovery deletion; client with System Restore on and zero shadow copies; Application 524 backup catalog deleted, System 7040 VSS disabled (VSS 7036 / 8193 / 8194 / 12289 only as evidence near a deletion command)",
         "heur_ransom",
     ),
     c(
@@ -252,8 +258,8 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1546.003",
         "WMI Event Subscription",
-        "root\\subscription filter/consumer bindings",
-        "heur_persist",
+        "root\\subscription filter/consumer bindings; WMI-Activity 5861 permanent consumer bound",
+        "heur_persist, heur_lateral",
     ),
     c(
         "T1546.007",
@@ -340,6 +346,12 @@ pub const BUILTIN: &[Coverage] = &[
         "heur_persist",
     ),
     c(
+        "T1550",
+        "Use Alternate Authentication Material",
+        "Security 4648 explicit-credential logon to another host, as context",
+        "heur_lateral",
+    ),
+    c(
         "T1550.002",
         "Pass the Hash",
         "NewCredentials logons (4624 type 9, seclogo), as context",
@@ -377,6 +389,28 @@ mod tests {
                 "{} / {}",
                 w[0].technique,
                 w[1].technique
+            );
+        }
+    }
+
+    /// The techniques heur_lateral tags (admin shares, services, RDP, 4648, WMI) are
+    /// each listed with heur_lateral as an analyzer.
+    #[test]
+    fn lateral_techniques_are_listed() {
+        for t in [
+            "T1021",
+            "T1021.001",
+            "T1021.002",
+            "T1047",
+            "T1546.003",
+            "T1550",
+            "T1550.002",
+            "T1569.002",
+        ] {
+            let row = BUILTIN.iter().find(|c| c.technique == t);
+            assert!(
+                row.is_some_and(|c| c.analyzer.contains("heur_lateral")),
+                "{t} missing or not attributed to heur_lateral"
             );
         }
     }

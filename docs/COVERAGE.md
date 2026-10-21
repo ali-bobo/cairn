@@ -39,7 +39,7 @@
 
 ## 事件記錄：內建偵測（不需要 Sigma 規則）
 
-這些事件 Windows 預設就會寫入，不需要安裝 Sysmon；即使 `rules\sigma` 不在，也會讀取 Security、System 和 Defender Operational 這三個記錄。
+這些事件 Windows 預設就會寫入，不需要安裝 Sysmon；即使 `rules\sigma` 不在，也會讀取 Security、System、Application、Defender Operational、TerminalServices-RemoteConnectionManager／LocalSessionManager Operational 和 WMI-Activity Operational 這些記錄（後面幾節的遠端桌面、WMI、VSS 偵測要用）。
 
 | 技術 | 事件 | 判斷方式 |
 |---|---|---|
@@ -70,7 +70,7 @@ FileFix 是同一招的變形：假的文件分享頁面要使用者把「檔案
 | T1562.001 | `Windows Defender\Features\TamperProtection` | 不是 5（防竄改保護未開啟）：Medium，屬於設定弱點，不代表已被入侵 |
 | T1053.005 | `Schedule\TaskCache\Tree` 底下的排程工作 | 缺少 `SD` 值（Tarrask 手法，工作排程器看不到），或 `System32\Tasks` 沒有對應檔案：High |
 | T1546.008 | System32 的 sethc／utilman／osk／magnify／narrator／displayswitch／atbroker | 版本資訊 OriginalFilename 是 cmd、PowerShell 或 explorer，或檔案未簽章：High；OriginalFilename 和預期不符：Medium（簽章有效時 Low） |
-| T1219 | 遠端控制工具：AnyDesk、ScreenConnect、TeamViewer、Atera、Splashtop、NetSupport、RustDesk、Supremo、LogMeIn、GoTo／LogMeIn Rescue、Action1、MeshAgent、ngrok、cloudflared、Tailscale、ZeroTier、Radmin、UltraVNC／TightVNC／RealVNC、Chrome Remote Desktop、Level、SimpleHelp、Tactical RMM（行程、服務、安裝資料夾） | 只是存在：Low，說明會請你確認是否經過核准；安裝資料夾或服務機碼 30 天內有變動：Medium；從使用者可寫入路徑執行、未簽章、改名（簽章是該工具但檔名不是，或檔名是該工具但簽章是別人）、或有連往公網 IP 的連線：High。同一台主機有兩種以上：另報一筆 Medium |
+| T1219 | 遠端控制工具：AnyDesk、ScreenConnect、TeamViewer、Atera、Splashtop、NetSupport、RustDesk、Supremo、LogMeIn、GoTo／LogMeIn Rescue、Action1、MeshAgent、ngrok、cloudflared、Tailscale、ZeroTier、Radmin、UltraVNC／TightVNC／RealVNC、Chrome Remote Desktop、Level、SimpleHelp、Tactical RMM（行程、服務、安裝資料夾） | 只是存在：Low，說明會請你確認是否經過核准；安裝資料夾或服務機碼 30 天內有變動：Medium；從使用者可寫入路徑執行、未簽章、改名（簽章是該工具但檔名不是，或檔名是該工具但簽章是別人）、或有連往公網 IP 的連線：High。同一台主機有兩種以上：另報一筆 Medium。工具自己的記錄檔（見下方「遠端控制工具自己的記錄檔」）在收集期間內有外部連入：至少 Medium |
 
 記錄缺口（不是偵測）：「稽核處理程序建立」沒開、4688 沒有命令列、登入／排程工作／帳號／群組變更沒有稽核、PowerShell 4104 沒開、沒有 Sysmon，會各列一筆 observation（`logging_posture`）。沒開的記錄，對應的 Sigma 規則和事件記錄偵測就不可能命中；讀不到的設定會寫「無法確認」，不要假設它有開。
 
@@ -79,10 +79,16 @@ FileFix 是同一招的變形：假的文件分享頁面要使用者把「檔案
 ## 橫向移動、竊取帳密、勒索前置動作
 
 - 橫向移動（`heur_lateral`，只看事件記錄，離線 `cairn evtx` 也會跑）：遠端位址存取 `ADMIN$` 或磁碟共用 `C$`（Security 5140／5145，需開啟「檔案共用」稽核），同一來源和帳號合併成一筆，Medium（T1021.002）；之後 10 分鐘內有新服務安裝（System 7045）升為 High（加上 T1569.002）。7045 的服務名稱或 ImagePath 是 PSEXESVC、指到 `ADMIN$`／`\\127.0.0.1\`、或是 `%COMSPEC%`／`cmd.exe /c` 單行指令（smbexec）報 High，並寫出前 10 分鐘內的網路登入（4624 type 3）或共用存取來源。4624 type 9（`seclogo`，runas /netonly 和 pass-the-hash 都長這樣）只報 Low（T1550.002），當作其他 finding 的背景。
+- 遠端桌面（`heur_lateral`，T1021.001）：Security 4624 type 10、帶遠端位址的 type 7、4778（重新連線，需開啟「其他登入／登出事件」稽核，預設沒開），TerminalServices-RemoteConnectionManager 1149（RDP 驗證成功，含來源 IP），TerminalServices-LocalSessionManager 21／24／25（登入、中斷、重新連線，含來源位址），同一來源位址和帳號合併成一筆。來源是公網 IP：High；4624 type 10 來自本機（127.0.0.1／::1），或 LocalSessionManager 位址帶 `%16777216`（ngrok 之類通道轉送的特徵）：High；私有 IP：Low，當作背景，同一來源對這個帳號也有 4625 登入失敗，或這是該帳號在收集期間內第一次登入（而且 Security 記錄至少涵蓋之前 24 小時）時升為 Medium。`LOCAL`（主控台）、本機、空白來源不報。
+- 以其他帳號的密碼連到其他主機（`heur_lateral`，T1021／T1550）：Security 4648 的 TargetServerName 不是 localhost、不是這台電腦，而且目標帳號和執行者不同，依（執行者、目標帳號、主機、程式）合併，Medium；reason 會寫出程式、目標主機和帳號。同一帳號（lsass／svchost 用自己的憑證）和電腦帳號對電腦帳號不報。
+- WMI-Activity Operational（`heur_lateral`）：5861 綁定永久事件訂閱（T1546.003），consumer 是 CommandLineEventConsumer 或 ActiveScriptEventConsumer：High，其他類型：Medium，Windows 內建的 BVTConsumer、SCM Event Log Consumer 不報。5860 建立暫時事件訂閱（T1047）：Medium，系統帳號（SYSTEM、LOCAL SERVICE、NETWORK SERVICE）從本機建立的不報（大多是監控或管理代理程式）。5857 載入 WMI provider（T1047）：只有 DLL 在使用者可寫入路徑時報 Medium。
 - 竊取帳密（`heur_cred_dump`）：`dropscan` 只列出放置區（每位使用者的 Desktop、Downloads、`AppData\Local\Temp`，`C:\Windows\Temp`、`C:\Users\Public`、`C:\ProgramData` 根目錄、`C:\PerfLogs`）中 `--since` 期間內建立或修改的 dmp／mdmp／bin／zip／7z／rar 檔，只讀檔案資訊和前 8 個位元組，最多 3 層、5000 筆，不跟隨連結，絕不開啟 LSASS。有 `MDMP` 簽章且檔名含 lsass：High；有簽章但檔名不含：Medium；檔名像 lsass 傾印但沒有簽章：Medium（T1003.001）。`HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\lsass.exe` 存在：High。行程與 4688 命令列含 comsvcs.dll MiniDump、ProcDump lsass、Mimikatz 模組、Out-Minidump（T1003.001）、`reg save HKLM\SAM／SECURITY`（T1003.002）、ntdsutil IFM 或複製 ntds.dit（T1003.003）：High。
-- 勒索前置動作（`heur_ransom`，T1490）：命令列含 `vssadmin delete shadows`／`resize shadowstorage`、`wmic shadowcopy delete`、以 WMI／PowerShell 刪除 `Win32_ShadowCopy`、`wbadmin delete catalog／systemstatebackup／backup`、`bcdedit` 關閉復原或忽略開機失敗：High。用戶端版本、系統還原已開啟、但 `Win32_ShadowCopy` 為 0 個：Medium（剛重灌或清理工具也會這樣，reason 會註明）；三項任一讀不到就不報。
+- 勒索前置動作（`heur_ransom`，T1490）：命令列含 `vssadmin delete shadows`／`resize shadowstorage`、`wmic shadowcopy delete`、以 WMI／PowerShell 刪除 `Win32_ShadowCopy`、`wbadmin delete catalog／systemstatebackup／backup`、`bcdedit` 關閉復原或忽略開機失敗：High。用戶端版本、系統還原已開啟、但 `Win32_ShadowCopy` 為 0 個：Medium（剛重灌或清理工具也會這樣，reason 會註明）；三項任一讀不到就不報。另外讀取 Windows 預設就會寫的 VSS／備份事件：Application 524（`Microsoft-Windows-Backup`，備份目錄被刪除）、System 7040（「磁碟區陰影複製」服務被設為停用）、System 7036（VSS 服務啟動／停止）、Application `VSS` 8193／8194／12289 錯誤。刪除指令前後 30 分鐘內的這些事件會附在那筆 High 上當證據，reason 也會寫出來；附近沒有刪除指令時，524 和 7040 停用各報一筆 Medium（4688 沒開命令列時看不到指令，IT 整理備份也會這樣），7036 和 VSS 錯誤單獨出現不報（VSS 每次閒置都會停止，健康的主機也常有寫入程式錯誤）。
+- 遠端控制工具自己的記錄檔（`dropscan` 收集、`heur_rmm` 判斷，T1219）：只讀取檔案資訊，不修改。AnyDesk 的 `ad.trace`、`ad_svc.trace`、`connection_trace.txt`（`C:\ProgramData\AnyDesk` 和每位使用者的 `AppData\Roaming\AnyDesk`）；TeamViewer 的 `Connections_incoming.txt` 和 `TeamViewer*_Logfile.log`（Program Files 下的 TeamViewer 資料夾，以及每位使用者的 `AppData\Roaming\TeamViewer`）；ScreenConnect／ConnectWise Control 用戶端資料夾裡的 `*.log`。`connection_trace.txt` 和 `Connections_incoming.txt` 是簡單的文字格式，會解析 `--since` 期間內的外部連入（時間、對方 ID、本機帳號），每個檔案只讀最後 2 MB、最多保留最新 500 筆，讀到上限會寫進 manifest。有外部連入時，該工具的 finding 至少是 Medium，連入紀錄附為證據（最多 20 筆）；其他記錄檔只代表工具存在。這兩種格式和時區（當成 UTC）來自公開的鑑識文章，尚未在真機上驗證。
 
 驗證：在 VM 上執行 `vssadmin list shadows` 不應有 finding；執行 `cmd /c echo vssadmin delete shadows /all /quiet` 不會刪除任何東西，但 4688 有命令列時會出現一筆 High 的 T1490（含 `vssadmin delete shadows` 字樣）。不要在客戶主機上執行真正的刪除指令。
+
+遠端桌面與 WMI 的驗證：在 VM 上從另一台電腦用遠端桌面登入，應看到一筆 T1021.001（私有 IP 為 Low，先故意輸錯一次密碼再登入則為 Medium）；執行 `net use \\<另一台電腦>\IPC$ /user:<其他帳號> *` 會產生 4648，應看到一筆 Medium 的 T1021；用 Atomic Red Team T1546.003 建立 CommandLineEventConsumer，應看到 5861 的 High（`heur_persist` 也會從 `root\subscription` 報一筆）。安裝 AnyDesk 並從另一台電腦連入一次，再執行 cairn，AnyDesk 的 finding 應為 Medium 並附上這次連入。
 
 ## 每位使用者的位置
 

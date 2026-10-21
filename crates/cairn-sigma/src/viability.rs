@@ -229,7 +229,9 @@ fn requirements_for(
         TASK_SCHEDULER => {
             reqs.insert(R::TaskSchedulerLog);
         }
-        // System, Application, WMI-Activity, Defender: written by default.
+        // System, Application, WMI-Activity, Defender and the TerminalServices
+        // LocalSessionManager / RemoteConnectionManager operational logs: written by
+        // default; the live run always collects them for the built-in heuristics.
         _ => {}
     }
     Some(reqs)
