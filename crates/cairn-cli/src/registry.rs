@@ -73,7 +73,7 @@ pub const COLLECTORS: &[CollectorEntry] = &[
     },
     CollectorEntry {
         info: light(names::LOGON_SESSION),
-        build: |_| Box::new(cairn_collectors::logon_session::LogonSessionCollector),
+        build: |_| Box::new(cairn_collectors::logon_session::LogonSessionCollector::default()),
     },
     CollectorEntry {
         info: light(names::PERSIST),
