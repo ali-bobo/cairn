@@ -166,8 +166,8 @@ pub fn invocation_args(cmd: &str) -> &str {
 /// File extensions of code a proxy-execution host loads or runs: DLLs, control-panel
 /// items, scriptlets, installers and script files.
 pub const PAYLOAD_EXTS: &[&str] = &[
-    ".dll", ".ocx", ".cpl", ".sct", ".msi", ".hta", ".js", ".jse", ".vbs", ".vbe", ".wsf",
-    ".ps1", ".bat", ".cmd",
+    ".dll", ".ocx", ".cpl", ".sct", ".msi", ".hta", ".js", ".jse", ".vbs", ".vbe", ".wsf", ".ps1",
+    ".bat", ".cmd",
 ];
 
 /// Environment-variable spellings of drop zones, mapped to a representative path so
@@ -451,7 +451,10 @@ pub const CANONICAL_SYSTEM_DIRS: &[(&str, &[&str])] = &[
     ("smss.exe", &[r"\windows\system32"]),
     ("wininit.exe", &[r"\windows\system32"]),
     ("explorer.exe", &[r"\windows", r"\windows\syswow64"]),
-    ("rundll32.exe", &[r"\windows\system32", r"\windows\syswow64"]),
+    (
+        "rundll32.exe",
+        &[r"\windows\system32", r"\windows\syswow64"],
+    ),
     ("dllhost.exe", &[r"\windows\system32", r"\windows\syswow64"]),
     ("taskhostw.exe", &[r"\windows\system32"]),
 ];
@@ -667,7 +670,10 @@ mod tests {
         assert!(!is_masquerade(r#""C:\Windows\System32\rundll32.exe""#));
         assert!(!is_masquerade(r"\SystemRoot\System32\smss.exe")); // NT path: abstain
         for n in PROTECTED_SYSTEM_NAMES {
-            assert!(canonical_system_dirs(n).is_some(), "{n} has no canonical dir");
+            assert!(
+                canonical_system_dirs(n).is_some(),
+                "{n} has no canonical dir"
+            );
         }
     }
 }
