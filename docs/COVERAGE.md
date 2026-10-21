@@ -76,6 +76,14 @@ FileFix 是同一招的變形：假的文件分享頁面要使用者把「檔案
 
 驗證：在 VM 上 `Add-MpPreference -ExclusionPath C:\Users\Public`、`copy C:\Windows\System32\cmd.exe` 蓋過 sethc.exe（先取得檔案擁有權）、安裝 AnyDesk，再執行 cairn，應分別看到 T1562.001、T1546.008（High）和 T1219。
 
+## 橫向移動、竊取帳密、勒索前置動作
+
+- 橫向移動（`heur_lateral`，只看事件記錄，離線 `cairn evtx` 也會跑）：遠端位址存取 `ADMIN$` 或磁碟共用 `C$`（Security 5140／5145，需開啟「檔案共用」稽核），同一來源和帳號合併成一筆，Medium（T1021.002）；之後 10 分鐘內有新服務安裝（System 7045）升為 High（加上 T1569.002）。7045 的服務名稱或 ImagePath 是 PSEXESVC、指到 `ADMIN$`／`\\127.0.0.1\`、或是 `%COMSPEC%`／`cmd.exe /c` 單行指令（smbexec）報 High，並寫出前 10 分鐘內的網路登入（4624 type 3）或共用存取來源。4624 type 9（`seclogo`，runas /netonly 和 pass-the-hash 都長這樣）只報 Low（T1550.002），當作其他 finding 的背景。
+- 竊取帳密（`heur_cred_dump`）：`dropscan` 只列出放置區（每位使用者的 Desktop、Downloads、`AppData\Local\Temp`，`C:\Windows\Temp`、`C:\Users\Public`、`C:\ProgramData` 根目錄、`C:\PerfLogs`）中 `--since` 期間內建立或修改的 dmp／mdmp／bin／zip／7z／rar 檔，只讀檔案資訊和前 8 個位元組，最多 3 層、5000 筆，不跟隨連結，絕不開啟 LSASS。有 `MDMP` 簽章且檔名含 lsass：High；有簽章但檔名不含：Medium；檔名像 lsass 傾印但沒有簽章：Medium（T1003.001）。`HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\lsass.exe` 存在：High。行程與 4688 命令列含 comsvcs.dll MiniDump、ProcDump lsass、Mimikatz 模組、Out-Minidump（T1003.001）、`reg save HKLM\SAM／SECURITY`（T1003.002）、ntdsutil IFM 或複製 ntds.dit（T1003.003）：High。
+- 勒索前置動作（`heur_ransom`，T1490）：命令列含 `vssadmin delete shadows`／`resize shadowstorage`、`wmic shadowcopy delete`、以 WMI／PowerShell 刪除 `Win32_ShadowCopy`、`wbadmin delete catalog／systemstatebackup／backup`、`bcdedit` 關閉復原或忽略開機失敗：High。用戶端版本、系統還原已開啟、但 `Win32_ShadowCopy` 為 0 個：Medium（剛重灌或清理工具也會這樣，reason 會註明）；三項任一讀不到就不報。
+
+驗證：在 VM 上執行 `vssadmin list shadows` 不應有 finding；執行 `cmd /c echo vssadmin delete shadows /all /quiet` 不會刪除任何東西，但 4688 有命令列時會出現一筆 High 的 T1490（含 `vssadmin delete shadows` 字樣）。不要在客戶主機上執行真正的刪除指令。
+
 ## 每位使用者的位置
 
 Run／RunOnce、COM 劫持、登入腳本、螢幕保護程式、cmd AutoRun、RunMRU 會讀 `HKEY_USERS` 底下每個已載入的使用者，不只是執行 cairn 的那個帳號；Startup 資料夾和 PowerShell profile 會檢查 `C:\Users` 下每個使用者。所以資訊人員用自己的管理員帳號提權執行時，也看得到受害使用者的項目（前提是該使用者目前已登入，或其登錄檔已載入）。

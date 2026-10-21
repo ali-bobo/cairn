@@ -12,3 +12,6 @@ pub const PARENTCHILD: &str = "heur_parentchild";
 pub const PERSIST: &str = "heur_persist";
 pub const RMM: &str = "heur_rmm";
 pub const DEFENSE: &str = "heur_defense";
+pub const LATERAL: &str = "heur_lateral";
+pub const CRED_DUMP: &str = "heur_cred_dump";
+pub const RANSOM: &str = "heur_ransom";

@@ -84,11 +84,11 @@ mod tests {
     fn coverage_report_lists_builtin_and_sigma_only_techniques() {
         let mut sigma = std::collections::BTreeMap::new();
         sigma.insert("T1547.001".to_string(), 3);
-        sigma.insert("T1003.001".to_string(), 2);
+        sigma.insert("T1112".to_string(), 2);
         let text = coverage_report(Some(&sigma));
         let run_line = text.lines().find(|l| l.starts_with("T1547.001")).unwrap();
         assert!(run_line.contains(" 3 "), "{run_line}");
-        assert!(text.contains("T1003.001   2 rule(s)"), "{text}");
+        assert!(text.contains("T1112       2 rule(s)"), "{text}");
         assert!(coverage_report(None).contains("No Sigma rules loaded"));
     }
 }

@@ -34,6 +34,24 @@ const fn c(
 /// what `asep::mechanism_mitre` emits for that mechanism (checked by a test).
 pub const BUILTIN: &[Coverage] = &[
     c(
+        "T1003.001",
+        "OS Credential Dumping: LSASS Memory",
+        "minidumps in drop zones, WER LocalDumps for lsass.exe, comsvcs MiniDump / ProcDump / Mimikatz command lines",
+        "heur_cred_dump",
+    ),
+    c(
+        "T1003.002",
+        "OS Credential Dumping: Security Account Manager",
+        "reg save of HKLM\\SAM / SECURITY",
+        "heur_cred_dump",
+    ),
+    c(
+        "T1003.003",
+        "OS Credential Dumping: NTDS",
+        "ntdsutil IFM, copies of ntds.dit",
+        "heur_cred_dump",
+    ),
+    c(
         "T1021.001",
         "Remote Desktop Protocol",
         "inbound RDP (local port 3389) connection from a public IP",
@@ -42,8 +60,8 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1021.002",
         "SMB/Windows Admin Shares",
-        "inbound SMB (local port 445) from a public IP; loopback ADMIN$ output of wmiexec/smbexec",
-        "heur_netconn, heur_parentchild",
+        "inbound SMB (local port 445) from a public IP; loopback ADMIN$ output of wmiexec/smbexec; remote ADMIN$/C$ access (5140/5145)",
+        "heur_netconn, heur_parentchild, heur_lateral",
     ),
     c(
         "T1021.004",
@@ -196,6 +214,12 @@ pub const BUILTIN: &[Coverage] = &[
         "heur_rmm",
     ),
     c(
+        "T1490",
+        "Inhibit System Recovery",
+        "vssadmin / wmic / wbadmin / bcdedit recovery deletion; client with System Restore on and zero shadow copies",
+        "heur_ransom",
+    ),
+    c(
         "T1505.003",
         "Web Shell",
         "w3wp/sqlservr/httpd/nginx/Tomcat spawning cmd, PowerShell or whoami",
@@ -316,6 +340,12 @@ pub const BUILTIN: &[Coverage] = &[
         "heur_persist",
     ),
     c(
+        "T1550.002",
+        "Pass the Hash",
+        "NewCredentials logons (4624 type 9, seclogo), as context",
+        "heur_lateral",
+    ),
+    c(
         "T1556.002",
         "Password Filter DLL",
         "LSA Notification Packages non-stock entries",
@@ -330,8 +360,8 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1569.002",
         "Service Execution",
-        "services.exe -> cmd.exe writing to \\\\127.0.0.1\\ADMIN$, PSEXESVC (PsExec / Impacket)",
-        "heur_parentchild",
+        "services.exe -> cmd.exe writing to \\\\127.0.0.1\\ADMIN$, PSEXESVC (PsExec / Impacket); 7045 remote-exec services tied to the preceding remote logon",
+        "heur_parentchild, heur_lateral",
     ),
 ];
 

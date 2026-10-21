@@ -12,3 +12,4 @@ pub const PREFETCH: &str = "prefetch";
 pub const WMI_SUBSCRIPTION: &str = "wmi_subscription";
 pub const EVTX_LIVE: &str = "evtx_live";
 pub const POSTURE: &str = "posture";
+pub const DROPSCAN: &str = "dropscan";

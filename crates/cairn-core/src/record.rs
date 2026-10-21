@@ -29,6 +29,45 @@ pub enum Record {
     /// PowerShell logging, Sysmon, TaskCache, accessibility binaries, installed program
     /// folders). One per live run, from the `posture` collector. Additive (phase 3E).
     Posture(PostureRecord),
+    /// File metadata from a drop-zone listing (no content beyond a short magic read).
+    /// Additive variant (phase 3F).
+    FileListing(FileListingRecord),
+    /// Volume shadow copy / System Restore state of the host. Additive variant (phase 3F).
+    ShadowCopies(ShadowCopyRecord),
+}
+
+/// `FileListingRecord.magic` of a file that starts with the minidump signature `MDMP`.
+pub const MAGIC_MINIDUMP: &str = "MDMP";
+
+/// Registry key (under HKLM) whose presence makes Windows Error Reporting write a full
+/// dump of lsass.exe when it crashes: a known way to get an LSASS dump without opening
+/// the process. Shared by the collector that reads it and the analyzer that judges it.
+pub const WER_LSASS_LOCALDUMPS_KEY: &str =
+    r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\lsass.exe";
+
+/// One file found in a drop zone (Desktop, Downloads, Temp, Public, ...): metadata only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileListingRecord {
+    pub path: String,
+    pub size: u64,
+    pub modified: Option<DateTime<Utc>>,
+    /// Signature label from the first 8 bytes: [`MAGIC_MINIDUMP`], `PK` (zip), `7z`,
+    /// `Rar!`, else the bytes as lowercase hex. None when the file could not be read.
+    pub magic: Option<String>,
+    /// File creation time, when the filesystem reports it. Additive; omitted when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<DateTime<Utc>>,
+}
+
+/// Shadow-copy state at collection time. Each field is None when it could not be read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowCopyRecord {
+    /// Number of `Win32_ShadowCopy` instances.
+    pub count: Option<u32>,
+    /// True on a workstation (client) edition of Windows (ProductType `WinNT`).
+    pub client_os: Option<bool>,
+    /// True when System Restore / System Protection is turned on and not disabled by policy.
+    pub system_restore_enabled: Option<bool>,
 }
 
 /// EVTX event normalized to JSON-ish fields (Stage 1 primary input).
@@ -631,6 +670,33 @@ mod tests {
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains(r#""kind":"command_history""#), "{json}");
         assert!(!json.contains("last_write"), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    /// Phase 3F variants: snake_case kind tags, optional fields omitted when None.
+    #[test]
+    fn phase3f_variants_round_trip() {
+        let rec = Record::FileListing(FileListingRecord {
+            path: r"C:\Windows\Temp\lsass.dmp".into(),
+            size: 42,
+            modified: None,
+            magic: Some(MAGIC_MINIDUMP.into()),
+            created: None,
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""kind":"file_listing""#), "{json}");
+        assert!(!json.contains("created"), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+
+        let rec = Record::ShadowCopies(ShadowCopyRecord {
+            count: Some(0),
+            client_os: Some(true),
+            system_restore_enabled: None,
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""kind":"shadow_copies""#), "{json}");
         let back: Record = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }

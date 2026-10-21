@@ -57,8 +57,8 @@ const fn standard_only(name: &'static str) -> ModuleInfo {
     }
 }
 
-/// Every live collector in canonical run order. `--profile minimal` skips the two that
-/// scan many files (prefetch, live EVTX).
+/// Every live collector in canonical run order. `--profile minimal` skips the ones that
+/// scan many files (prefetch, drop-zone listing, live EVTX).
 pub const COLLECTORS: &[CollectorEntry] = &[
     CollectorEntry {
         info: light(names::PROC),
@@ -79,6 +79,16 @@ pub const COLLECTORS: &[CollectorEntry] = &[
     CollectorEntry {
         info: standard_only(names::PREFETCH),
         build: |_| Box::new(cairn_collectors::prefetch::PrefetchCollector::default()),
+    },
+    CollectorEntry {
+        info: standard_only(names::DROPSCAN),
+        build: |ctx| {
+            let since = ctx
+                .cfg
+                .since
+                .unwrap_or_else(|| default_since(chrono::Utc::now()));
+            Box::new(cairn_collectors::dropscan::DropScanCollector::new(since))
+        },
     },
     CollectorEntry {
         info: light(names::WMI_SUBSCRIPTION),
@@ -187,6 +197,21 @@ const ANALYZERS: &[AnalyzerEntry] = &[
             ))
         },
     },
+    AnalyzerEntry {
+        name: cairn_core::analyzers::LATERAL,
+        events_only: true,
+        build: |_| Box::new(cairn_heur::LateralHeuristic),
+    },
+    AnalyzerEntry {
+        name: cairn_core::analyzers::CRED_DUMP,
+        events_only: false,
+        build: |_| Box::new(cairn_heur::CredDumpHeuristic),
+    },
+    AnalyzerEntry {
+        name: cairn_core::analyzers::RANSOM,
+        events_only: false,
+        build: |_| Box::new(cairn_heur::RansomHeuristic),
+    },
 ];
 
 /// The analyzers for `mode`, in registry order, then Sigma (when rules loaded).
@@ -245,10 +270,11 @@ mod tests {
         let sel = select_modules(Profile::Standard, None, &module_infos());
         assert_eq!(names_of(&sel.selected).len(), COLLECTORS.len());
 
-        // --profile minimal skips prefetch and evtx_live.
+        // --profile minimal skips prefetch, dropscan and evtx_live.
         let sel = select_modules(Profile::Minimal, None, &module_infos());
         let built = names_of(&sel.selected);
         assert!(!built.contains(&names::PREFETCH.to_string()));
+        assert!(!built.contains(&names::DROPSCAN.to_string()));
         assert!(!built.contains(&names::EVTX_LIVE.to_string()));
         assert!(built.contains(&names::PROC.to_string()));
     }
@@ -281,7 +307,8 @@ mod tests {
             vec![
                 cairn_core::analyzers::ACCOUNT,
                 cairn_core::analyzers::EVENTLOG,
-                cairn_core::analyzers::LOGON_BRUTEFORCE
+                cairn_core::analyzers::LOGON_BRUTEFORCE,
+                cairn_core::analyzers::LATERAL
             ]
         );
         assert!(evtx.iter().all(|n| live.contains(n)));
