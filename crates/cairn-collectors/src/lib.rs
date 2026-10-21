@@ -19,6 +19,7 @@ pub mod persist;
 pub mod posture;
 pub mod prefetch;
 pub mod proc;
+pub mod rmm_logs;
 pub mod wmi_subscription;
 
 pub use hash::hash_file_capped;

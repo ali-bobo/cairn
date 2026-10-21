@@ -34,6 +34,61 @@ pub enum Record {
     FileListing(FileListingRecord),
     /// Volume shadow copy / System Restore state of the host. Additive variant (phase 3F).
     ShadowCopies(ShadowCopyRecord),
+    /// A remote-access tool's own log file: metadata, plus the incoming connections
+    /// it records for the formats cairn parses. Additive variant (phase 3H).
+    RmmLog(RmmLogRecord),
+}
+
+/// Which remote-access self-log a [`RmmLogRecord`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RmmLogKind {
+    /// AnyDesk `ad.trace` / `ad_svc.trace` (debug trace; metadata only).
+    AnyDeskTrace,
+    /// AnyDesk `connection_trace.txt` (one line per incoming connection; parsed).
+    AnyDeskConnectionTrace,
+    /// TeamViewer `Connections_incoming.txt` (tab-separated; parsed).
+    TeamViewerIncoming,
+    /// TeamViewer `TeamViewer<N>_Logfile.log` (debug log; metadata only).
+    TeamViewerLogfile,
+    /// A `*.log` in a ScreenConnect / ConnectWise Control client folder (metadata only).
+    ScreenConnectLog,
+}
+
+/// A remote-access tool's own log file. Read-only: metadata plus a bounded read of the
+/// file's tail for the parsed kinds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RmmLogRecord {
+    /// Which log (not `kind`: that is the [`Record`] tag).
+    pub log_kind: RmmLogKind,
+    pub path: String,
+    pub size: u64,
+    pub modified: Option<DateTime<Utc>>,
+    /// Incoming connections inside the collection window, oldest first, capped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incoming: Vec<RmmConnection>,
+    /// The read stopped at a cap (only the file's tail was read, or older entries in
+    /// the window were dropped).
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// One incoming connection a remote-access tool logged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RmmConnection {
+    /// Connection start, read as UTC.
+    pub ts: DateTime<Utc>,
+    /// The remote side's tool ID (AnyDesk / TeamViewer ID).
+    pub remote_id: String,
+    /// Remote computer / display name, when logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_name: Option<String>,
+    /// Local account the session ran as, when logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Connection / authentication type column (`User`, `Passwd`, `RemoteControl`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 /// `FileListingRecord.magic` of a file that starts with the minidump signature `MDMP`.
@@ -697,6 +752,31 @@ mod tests {
         });
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains(r#""kind":"shadow_copies""#), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    /// Phase 3H variant: snake_case kind tags, empty / None fields omitted.
+    #[test]
+    fn rmm_log_record_round_trips() {
+        let rec = Record::RmmLog(RmmLogRecord {
+            log_kind: RmmLogKind::AnyDeskConnectionTrace,
+            path: r"C:\ProgramData\AnyDesk\connection_trace.txt".into(),
+            size: 120,
+            modified: None,
+            incoming: vec![RmmConnection {
+                ts: DateTime::UNIX_EPOCH,
+                remote_id: "123456789".into(),
+                remote_name: None,
+                user: None,
+                detail: Some("User".into()),
+            }],
+            truncated: false,
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""kind":"rmm_log""#), "{json}");
+        assert!(json.contains(r#""any_desk_connection_trace""#), "{json}");
+        assert!(!json.contains("remote_name"), "{json}");
         let back: Record = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }

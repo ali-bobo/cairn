@@ -18,8 +18,13 @@
 //! 3. **Shadow copies** ([`Record::ShadowCopies`]): the `Win32_ShadowCopy` count
 //!    (cairn-collectors-win `vss`), whether this is a client edition, and whether
 //!    System Restore is on.
+//! 4. **Remote-access tools' own logs** ([`Record::RmmLog`], see [`crate::rmm_logs`]):
+//!    AnyDesk, TeamViewer and ScreenConnect self-logs by metadata; AnyDesk
+//!    `connection_trace.txt` and TeamViewer `Connections_incoming.txt` also parsed for
+//!    incoming connections inside the `--since` window (bounded tail read).
 //!
-//! Judging any of this is left to `cairn-heur` (`heur_cred_dump`, `heur_ransom`).
+//! Judging any of this is left to `cairn-heur` (`heur_cred_dump`, `heur_ransom`,
+//! `heur_rmm`).
 
 use crate::asep::{Hive, RegData, RegRead};
 use cairn_core::manifest::SourceEntry;
@@ -410,12 +415,20 @@ impl Collector for DropScanCollector {
 
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
         let mut sources = Vec::new();
-        let zones = drop_zones(|v| std::env::var(v).ok(), &user_profile_dirs());
+        let homes = user_profile_dirs();
+        let zones = drop_zones(|v| std::env::var(v).ok(), &homes);
         let mut budget = Budget::new(MAX_ENTRIES, MAX_VISITED);
         let mut records: Vec<Record> = scan_zones(&zones, self.since, &mut budget, &mut sources)
             .into_iter()
             .map(Record::FileListing)
             .collect();
+
+        let rmm = crate::rmm_logs::candidates(|v| std::env::var(v).ok(), &homes);
+        records.extend(
+            crate::rmm_logs::collect(&rmm, self.since, &mut sources)
+                .into_iter()
+                .map(Record::RmmLog),
+        );
 
         #[cfg(windows)]
         let reg = crate::asep::WinReg;
