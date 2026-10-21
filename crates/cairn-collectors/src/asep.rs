@@ -442,6 +442,8 @@ fn read_spec_at(
             signed: None,
             signer: None,
             last_write: lw,
+            bound: None,
+            signer_source: None,
         });
     };
     match spec.select {
@@ -672,6 +674,8 @@ pub fn read_ps_profiles(paths: &[String]) -> Vec<PersistenceRecord> {
             signed: None,
             signer: None,
             last_write,
+            bound: None,
+            signer_source: None,
         });
     }
     out

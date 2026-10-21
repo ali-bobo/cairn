@@ -313,6 +313,8 @@ mod tests {
             signed,
             signer: None,
             last_write,
+            bound: None,
+            signer_source: None,
         }
     }
 

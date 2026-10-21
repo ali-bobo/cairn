@@ -568,6 +568,8 @@ mod tests {
             signed: None,
             signer: None,
             last_write,
+            bound: None,
+            signer_source: None,
         }
     }
 
@@ -643,6 +645,7 @@ mod tests {
             integrity: Some("Medium".to_string()),
             user: None,
             start_time: None,
+            signer_source: None,
         });
         let findings = PersistHeuristic
             .analyze(&[bad, running], &[])
@@ -680,6 +683,8 @@ mod tests {
             signed: None,
             signer: None,
             last_write: Some(now),
+            bound: None,
+            signer_source: None,
         };
         let findings = PersistHeuristic
             .analyze(&[Record::Persistence(r)], &[])
@@ -709,6 +714,8 @@ mod tests {
             signed,
             signer: None,
             last_write,
+            bound: None,
+            signer_source: None,
         }
     }
 
@@ -1180,6 +1187,8 @@ mod tests {
             signed: None,
             signer: None,
             last_write: None,
+            bound: None,
+            signer_source: None,
         };
         let entity = persistence_entity(&p);
         let reg = entity

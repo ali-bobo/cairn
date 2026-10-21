@@ -1202,6 +1202,7 @@ mod tests {
             integrity: Some("medium".into()),
             user: None,
             start_time: None,
+            signer_source: None,
         })
     }
 
@@ -1271,6 +1272,8 @@ mod tests {
             source: source.map(String::from),
             session_id: Some(sid),
             state_active: false,
+            logon_server: None,
+            session_state: None,
         })
     }
 
@@ -1303,6 +1306,8 @@ mod tests {
                 source: None,
                 session_id: Some(1),
                 state_active: true,
+                logon_server: None,
+                session_state: None,
             }),
             cairn_core::Record::LogonSession(cairn_core::record::LogonSessionRecord {
                 user: r"PC\bob".into(),
@@ -1311,6 +1316,8 @@ mod tests {
                 source: None,
                 session_id: Some(2),
                 state_active: false,
+                logon_server: None,
+                session_state: None,
             }),
         ];
         let html = html_report(&[], &[], &recs, &minimal_manifest());
@@ -1347,6 +1354,8 @@ mod tests {
             signed: Some(true),
             signer: None,
             last_write: None,
+            bound: None,
+            signer_source: None,
         })
     }
 

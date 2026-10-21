@@ -31,6 +31,8 @@ impl Collector for LogonSessionCollector {
                     source: s.client_address,
                     session_id: Some(s.session_id),
                     state_active: s.state_active,
+                    logon_server: None,
+                    session_state: None,
                 })
             })
             .collect())
@@ -81,6 +83,8 @@ mod tests {
             source: None,
             session_id: Some(1),
             state_active: true,
+            logon_server: None,
+            session_state: None,
         });
         match rec {
             Record::LogonSession(s) => assert!(s.state_active),

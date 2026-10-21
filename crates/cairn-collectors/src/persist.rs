@@ -393,6 +393,8 @@ fn task_records_from_xml(
             signed: None,
             signer: None,
             last_write,
+            bound: None,
+            signer_source: None,
         });
     }
     out
@@ -427,6 +429,8 @@ fn make_record_with_exists(
         signed: None,
         signer: None,
         last_write,
+        bound: None,
+        signer_source: None,
     }
 }
 
@@ -587,6 +591,8 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
                 signed: None,
                 signer: None,
                 last_write,
+                bound: None,
+                signer_source: None,
             });
         }
     }
@@ -765,6 +771,8 @@ mod win {
                 signed: None,
                 signer: None,
                 last_write: lw,
+                bound: None,
+                signer_source: None,
             });
         }
         out
@@ -1006,6 +1014,8 @@ mod tests {
                 signed: None,
                 signer: None,
                 last_write: None,
+                bound: None,
+                signer_source: None,
             },
             PersistenceRecord {
                 mechanism: Mechanism::NetshHelper,
@@ -1017,6 +1027,8 @@ mod tests {
                 signed: None,
                 signer: None,
                 last_write: None,
+                bound: None,
+                signer_source: None,
             },
         ];
         fill_command_binary_paths(&mut recs, |_| false);
@@ -1185,6 +1197,8 @@ mod tests {
                 signed: None,
                 signer: None,
                 last_write: None,
+                bound: None,
+                signer_source: None,
             },
             PersistenceRecord {
                 mechanism: Mechanism::RunKey,
@@ -1196,6 +1210,8 @@ mod tests {
                 signed: None,
                 signer: None,
                 last_write: None,
+                bound: None,
+                signer_source: None,
             },
         ];
         apply_signatures(&mut recs, &verifier);
@@ -1221,6 +1237,8 @@ mod tests {
             signed: None,
             signer: None,
             last_write: None,
+            bound: None,
+            signer_source: None,
         };
         let mut records = vec![
             mk("a", Some(r"C:\trusted\a.exe")),
@@ -1699,6 +1717,8 @@ mod tests {
             signed: None,
             signer: None,
             last_write: None,
+            bound: None,
+            signer_source: None,
         }
     }
 

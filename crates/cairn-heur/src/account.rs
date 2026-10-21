@@ -347,6 +347,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         })];
         assert!(AccountHeuristic.analyze(&records, &[]).unwrap().is_empty());
     }

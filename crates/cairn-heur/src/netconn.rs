@@ -254,6 +254,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         }
     }
 
@@ -592,6 +593,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         });
         let findings = NetConnHeuristic
             .analyze(&[bad, proc_rec], &[])
@@ -661,6 +663,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         });
         let findings = NetConnHeuristic
             .analyze(&[bad, proc_rec], &[])
@@ -812,6 +815,8 @@ mod tests {
             signed: None,
             signer: None,
             last_write: Some(chrono::Utc::now()),
+            bound: None,
+            signer_source: None,
         });
         let prior = PersistHeuristic.analyze(&[persist_rec], &[]).unwrap();
         assert_eq!(prior.len(), 1);

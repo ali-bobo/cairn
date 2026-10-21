@@ -316,6 +316,8 @@ mod tests {
             signed: None,
             signer: None,
             last_write: None,
+            bound: None,
+            signer_source: None,
         }
     }
 

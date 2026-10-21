@@ -106,6 +106,7 @@ pub fn build_process_records(raw: &[RawProc]) -> Vec<Record> {
                 integrity: r.integrity_raw.map(integrity_label),
                 user: r.user.clone(),
                 start_time: r.start_time,
+                signer_source: None,
             })
         })
         .collect()
@@ -173,6 +174,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         };
         let mut recs = vec![
             mk(1, r"C:\evil\b.exe"),    // absolute, known false
