@@ -817,6 +817,7 @@ mod tests {
             last_write: Some(chrono::Utc::now()),
             bound: None,
             signer_source: None,
+            service_start: None,
         });
         let prior = PersistHeuristic.analyze(&[persist_rec], &[]).unwrap();
         assert_eq!(prior.len(), 1);

@@ -582,6 +582,7 @@ mod tests {
             sha1: None,
             user_sid: None,
             execution_confirmed: Some(true),
+            full_path: None,
         };
         let temp = ExecutionRecord {
             source: "shimcache".into(),
@@ -592,6 +593,7 @@ mod tests {
             sha1: None,
             user_sid: None,
             execution_confirmed: Some(true),
+            full_path: None,
         };
         let records = vec![
             Record::Execution(sys32.clone()),

@@ -1241,6 +1241,7 @@ mod tests {
             sha1: None,
             user_sid: None,
             execution_confirmed: Some(true),
+            full_path: None,
         })
     }
 
@@ -1356,6 +1357,7 @@ mod tests {
             last_write: None,
             bound: None,
             signer_source: None,
+            service_start: None,
         })
     }
 

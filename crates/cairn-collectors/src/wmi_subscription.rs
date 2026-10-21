@@ -70,6 +70,7 @@ pub fn build_wmi_records(raw: Vec<RawWmiSubscription>) -> Vec<Record> {
                 last_write: None,
                 bound: Some(sub.bound),
                 signer_source: None,
+                service_start: None,
             })
         })
         .collect()

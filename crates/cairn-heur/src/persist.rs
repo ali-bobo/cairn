@@ -570,6 +570,7 @@ mod tests {
             last_write,
             bound: None,
             signer_source: None,
+            service_start: None,
         }
     }
 
@@ -685,6 +686,7 @@ mod tests {
             last_write: Some(now),
             bound: None,
             signer_source: None,
+            service_start: None,
         };
         let findings = PersistHeuristic
             .analyze(&[Record::Persistence(r)], &[])
@@ -716,6 +718,7 @@ mod tests {
             last_write,
             bound: None,
             signer_source: None,
+            service_start: None,
         }
     }
 
@@ -1047,6 +1050,7 @@ mod tests {
                 sha1: None,
                 user_sid: None,
                 execution_confirmed: Some(true),
+                full_path: None,
             }),
         ];
         let findings = PersistHeuristic.analyze(&records, &[]).unwrap();
@@ -1189,6 +1193,7 @@ mod tests {
             last_write: None,
             bound: None,
             signer_source: None,
+            service_start: None,
         };
         let entity = persistence_entity(&p);
         let reg = entity
