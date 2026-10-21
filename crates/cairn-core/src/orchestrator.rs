@@ -79,9 +79,129 @@ fn topo_sort(analyzers: &[Box<dyn Analyzer>]) -> Vec<usize> {
     order
 }
 
+/// Text of a caught panic payload (`panic!("..")` carries a `&str` or a `String`).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Run `f`, turning a panic into `Err("panicked: <msg>")`. One misbehaving collector or
+/// analyzer must not abort the whole run (golden rule 8). `AssertUnwindSafe` is sound
+/// here: on a panic the callee's partial output is dropped and never observed, and the
+/// trait objects hold no state the run reads afterwards.
+fn guarded<T>(f: impl FnOnce() -> T) -> std::result::Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|p| format!("panicked: {}", panic_message(p.as_ref())))
+}
+
+/// A manifest source entry for a collector that produced nothing usable.
+fn failure_entry(collector: &str, error: String) -> SourceEntry {
+    SourceEntry {
+        collector: collector.to_string(),
+        artifact: collector.to_string(),
+        path: format!("live:{collector}"),
+        method: "api".into(),
+        size: 0,
+        sha256: String::new(),
+        errors: vec![error],
+    }
+}
+
+/// A manifest source entry recording an analyzer that failed or panicked. Analyzers
+/// read no host artifact, so the entry has no path or hash; `collector` is
+/// `analyzer:<name>` so reports never mistake it for a collector.
+fn analyzer_failure_entry(analyzer: &str, error: String) -> SourceEntry {
+    SourceEntry {
+        collector: format!("analyzer:{analyzer}"),
+        artifact: format!("analyzer:{analyzer}"),
+        path: format!("analyzer:{analyzer}"),
+        method: "analyzer".into(),
+        size: 0,
+        sha256: String::new(),
+        errors: vec![error],
+    }
+}
+
+/// The collector's own provenance, each entry stamped with its canonical name. A
+/// panicking `sources()` yields one failure entry instead.
+fn stamped_sources(c: &dyn Collector) -> Vec<SourceEntry> {
+    match guarded(|| c.sources()) {
+        Ok(mut entries) => {
+            for e in &mut entries {
+                e.collector = c.name().to_string();
+            }
+            entries
+        }
+        Err(msg) => vec![failure_entry(c.name(), format!("sources(): {msg}"))],
+    }
+}
+
+/// Output of the analyzer fan-in.
+#[derive(Debug, Default)]
+pub struct AnalysisOutcome {
+    pub findings: Vec<Finding>,
+    pub observations: Vec<Observation>,
+    /// One `analyzer:<name>` entry per failed or panicked analyze/observe call, for
+    /// the manifest's `sources` (graceful degrade is recorded, not silent).
+    pub errors: Vec<SourceEntry>,
+}
+
+/// Fan analyzers in over `records` (SRS §3), in `depends_on()` order. Each analyzer
+/// sees the records plus every earlier analyzer's findings. A failing or panicking
+/// analyzer is logged, recorded in `errors`, and skipped. Shared by the live run and
+/// the offline `cairn evtx` path so both behave the same. Findings whose analyzer left
+/// `Finding.analyzer` empty are stamped with its `name()`.
+pub fn run_analyzers(records: &[Record], analyzers: &[Box<dyn Analyzer>]) -> AnalysisOutcome {
+    let order = topo_sort(analyzers);
+    let mut out = AnalysisOutcome::default();
+    for &idx in &order {
+        let a = &analyzers[idx];
+        let result = guarded(|| a.analyze(records, &out.findings))
+            .and_then(|r| r.map_err(|e| e.to_string()));
+        match result {
+            Ok(mut fs) => {
+                for f in &mut fs {
+                    if f.analyzer.is_empty() {
+                        f.analyzer = a.name().to_string();
+                    }
+                }
+                out.findings.append(&mut fs);
+            }
+            Err(e) => {
+                tracing::warn!(analyzer = a.name(), error = %e, "analyzer failed; skipping");
+                out.errors.push(analyzer_failure_entry(a.name(), e));
+            }
+        }
+    }
+    // Observation fan-in (spec §6): inventory from analyzers that own one, with the
+    // same failure contract as analyze.
+    for a in analyzers {
+        let result = guarded(|| a.observe(records)).and_then(|r| r.map_err(|e| e.to_string()));
+        match result {
+            Ok(mut os) => out.observations.append(&mut os),
+            Err(e) => {
+                tracing::warn!(analyzer = a.name(), error = %e, "observe failed; skipping");
+                out.errors
+                    .push(analyzer_failure_entry(a.name(), format!("observe(): {e}")));
+            }
+        }
+    }
+    out
+}
+
 /// Run the given collectors against the host, then fan-in analyzers over the accumulated
 /// records. `privileges`/`hostname` are provided by the caller (real probe in the bin;
 /// fakes in tests) so this stays pure + testable.
+///
+/// Graceful degrade (golden rule 8): a collector that returns `Err` or panics is
+/// recorded and skipped. Its own `sources()` entries are kept (with their partial
+/// errors) and the failure reason is appended to them; only a collector with no
+/// provenance of its own gets a generic `live:<name>` entry.
 pub fn run_live(
     cfg: &Config,
     privileges: Privileges,
@@ -100,7 +220,8 @@ pub fn run_live(
     for c in collectors {
         let started = std::time::Instant::now();
         tracing::info!(collector = c.name(), "collector started");
-        match c.collect(&ctx) {
+        let result = guarded(|| c.collect(&ctx)).and_then(|r| r.map_err(|e| e.to_string()));
+        match result {
             Ok(mut recs) => {
                 tracing::info!(
                     collector = c.name(),
@@ -109,57 +230,35 @@ pub fn run_live(
                     "collector finished"
                 );
                 records.append(&mut recs);
-                sources.extend(c.sources());
+                sources.extend(stamped_sources(c.as_ref()));
             }
             Err(e) => {
-                // Graceful degrade: record the failure as a source entry, keep going.
                 tracing::warn!(
                     collector = c.name(),
                     error = %e,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "collector failed; skipping"
                 );
-                sources.push(SourceEntry {
-                    collector: String::new(),
-                    artifact: c.name().to_string(),
-                    path: format!("live:{}", c.name()),
-                    method: "api".into(),
-                    size: 0,
-                    sha256: String::new(),
-                    errors: vec![e.to_string()],
-                });
+                let mut own = stamped_sources(c.as_ref());
+                if own.is_empty() {
+                    sources.push(failure_entry(c.name(), e));
+                } else {
+                    for entry in &mut own {
+                        if !entry.errors.contains(&e) {
+                            entry.errors.push(e.clone());
+                        }
+                    }
+                    sources.extend(own);
+                }
             }
         }
     }
-    // Analyzer fan-in (SRS §3): each analyzer reads the accumulated records + prior
-    // analyzers' findings (dependency-ordered) and emits findings. A failing analyzer is
-    // logged + skipped (graceful degrade), never aborts.
-    let order = topo_sort(analyzers);
-    let mut findings = Vec::new();
-    for &idx in &order {
-        let a = &analyzers[idx];
-        match a.analyze(&records, &findings) {
-            Ok(mut fs) => findings.append(&mut fs),
-            Err(e) => {
-                tracing::warn!(analyzer = a.name(), error = %e, "analyzer failed; skipping");
-            }
-        }
-    }
-    // Observation fan-in (spec §6): inventory from analyzers that own one. A failing
-    // observe is logged + skipped, mirroring the analyze contract.
-    let mut observations = Vec::new();
-    for a in analyzers {
-        match a.observe(&records) {
-            Ok(mut os) => observations.append(&mut os),
-            Err(e) => {
-                tracing::warn!(analyzer = a.name(), error = %e, "observe failed; skipping");
-            }
-        }
-    }
+    let analysis = run_analyzers(&records, analyzers);
+    sources.extend(analysis.errors);
     RunOutcome {
         records,
-        findings,
-        observations,
+        findings: analysis.findings,
+        observations: analysis.observations,
         sources,
         privileges,
         hostname,
@@ -437,7 +536,9 @@ mod tests {
         assert_eq!(out.findings.len(), 1);
     }
 
-    /// A failing analyzer is skipped; the run still returns the other's findings.
+    /// A failing analyzer is skipped; the run still returns the other's findings, and
+    /// the failure is recorded as an `analyzer:<name>` source entry (golden rule 8:
+    /// degrade is recorded, not silent).
     #[test]
     fn failing_analyzer_is_skipped_run_continues() {
         let cfg = Config::default();
@@ -448,12 +549,133 @@ mod tests {
         ];
         let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
         assert_eq!(out.findings.len(), 1, "good analyzer still ran");
-        // The failing analyzer must NOT pollute provenance: sources holds only the
-        // collector's entry (analyzer failures are logged, not recorded as sources).
+        assert_eq!(out.findings[0].analyzer, "good", "stamped with name()");
+        let bad = out
+            .sources
+            .iter()
+            .find(|s| s.collector == "analyzer:bad")
+            .expect("analyzer failure recorded");
+        assert!(bad.errors[0].contains("boom"), "{:?}", bad.errors);
+        assert!(bad.sha256.is_empty(), "nothing for verify to re-hash");
+    }
+
+    /// A collector that panics.
+    struct PanickingCollector;
+    impl Collector for PanickingCollector {
+        fn name(&self) -> &str {
+            "boom_collector"
+        }
+        fn collect(&self, _ctx: &CollectCtx<'_>) -> crate::Result<Vec<Record>> {
+            panic!("index out of range in parser")
+        }
+    }
+
+    /// One panicking collector does NOT abort the run: later collectors and analyzers
+    /// still run, and the manifest records "panicked: <msg>" for it.
+    #[test]
+    fn panicking_collector_is_recorded_and_run_continues() {
+        let cfg = Config::default();
+        let collectors: Vec<Box<dyn Collector>> = vec![
+            Box::new(PanickingCollector),
+            FakeCollector::ok("net", vec![net_rec()]),
+        ];
+        let analyzers = vec![FakeAnalyzer::ok("h", vec![a_finding()])];
+        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
+        assert_eq!(out.records.len(), 1, "net still collected");
+        assert_eq!(out.findings.len(), 1, "analyzers still ran");
+        let failed = out
+            .sources
+            .iter()
+            .find(|s| s.collector == "boom_collector")
+            .expect("panicking collector recorded");
         assert_eq!(
-            out.sources.len(),
-            1,
-            "analyzer failure must not add a source"
+            failed.errors,
+            vec!["panicked: index out of range in parser".to_string()]
         );
+        let net = out.sources.iter().find(|s| s.artifact == "net").unwrap();
+        assert_eq!(
+            net.collector, "net",
+            "orchestrator stamps the collector name"
+        );
+    }
+
+    struct PanickingAnalyzer;
+    impl Analyzer for PanickingAnalyzer {
+        fn name(&self) -> &str {
+            "boom_analyzer"
+        }
+        fn analyze(&self, _r: &[Record], _p: &[Finding]) -> crate::Result<Vec<Finding>> {
+            panic!("{}", String::from("bad regex"))
+        }
+    }
+
+    #[test]
+    fn panicking_analyzer_is_recorded_and_others_still_run() {
+        let cfg = Config::default();
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![
+            Box::new(PanickingAnalyzer),
+            FakeAnalyzer::ok("good", vec![a_finding()]),
+        ];
+        let out = run_live(&cfg, privs(), "WS01".into(), &[], &analyzers);
+        assert_eq!(out.findings.len(), 1);
+        let e = out
+            .sources
+            .iter()
+            .find(|s| s.collector == "analyzer:boom_analyzer")
+            .expect("recorded");
+        assert_eq!(e.errors, vec!["panicked: bad regex".to_string()]);
+    }
+
+    /// A collector that fails but reported its own provenance (e.g. which hive or log
+    /// it could not open): those entries and their reasons survive, the top-level
+    /// error is appended, and no generic `live:<name>` entry replaces them.
+    struct PartialCollector;
+    impl Collector for PartialCollector {
+        fn name(&self) -> &str {
+            "persist"
+        }
+        fn collect(&self, _ctx: &CollectCtx<'_>) -> crate::Result<Vec<Record>> {
+            Err(CairnError::Collector {
+                collector: "persist".into(),
+                reason: "registry unavailable".into(),
+            })
+        }
+        fn sources(&self) -> Vec<SourceEntry> {
+            vec![SourceEntry {
+                collector: String::new(),
+                artifact: "persistence".into(),
+                path: r"live:HKLM\SOFTWARE".into(),
+                method: "api".into(),
+                size: 0,
+                sha256: String::new(),
+                errors: vec!["RegOpenKeyEx: access denied".into()],
+            }]
+        }
+    }
+
+    #[test]
+    fn failing_collector_keeps_its_own_sources_and_reasons() {
+        let cfg = Config::default();
+        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(PartialCollector)];
+        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &[]);
+        assert_eq!(out.sources.len(), 1, "{:?}", out.sources);
+        let s = &out.sources[0];
+        assert_eq!(s.collector, "persist");
+        assert_eq!(s.artifact, "persistence");
+        assert!(s.path.contains("HKLM"), "real path kept: {}", s.path);
+        assert_eq!(s.errors[0], "RegOpenKeyEx: access denied");
+        assert!(
+            s.errors[1].contains("registry unavailable"),
+            "{:?}",
+            s.errors
+        );
+    }
+
+    #[test]
+    fn run_analyzers_is_usable_without_collectors() {
+        let analyzers = vec![FakeAnalyzer::ok("solo", vec![a_finding()])];
+        let out = run_analyzers(&[proc_rec()], &analyzers);
+        assert_eq!(out.findings.len(), 1);
+        assert!(out.errors.is_empty());
     }
 }
