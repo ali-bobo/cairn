@@ -1,6 +1,6 @@
 //! T8 parity harness (deterministic core).
 //!
-//! Proves the bundled, XOR-encoded SigmaHQ rule set (rules/sigma/, pinned per
+//! Proves the bundled plain-YAML SigmaHQ rule set (rules/sigma/, pinned per
 //! ADR-0003) loads and fires correctly against synthetic EventRecords that stand in
 //! for the EVTX-ATTACK-SAMPLES techniques. This is the committed, network-free parity
 //! signal; the full corpus pull + Hayabusa throughput comparison is the environment-

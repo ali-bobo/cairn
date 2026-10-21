@@ -3,7 +3,7 @@
 Stage-1 acceptance (docs/stage1-plan.md T8) has two halves:
 
 1. **Deterministic parity core** — committed, network-free, runs in CI:
-   `crates/cairn-sigma/tests/parity.rs` loads the bundled XOR-encoded SigmaHQ rules
+   `crates/cairn-sigma/tests/parity.rs` loads the bundled plain-YAML SigmaHQ rules
    (`rules/sigma/`, pinned per ADR-0003) and asserts each fires on a technique-matching
    synthetic Sysmon EID-1 event (with a real `author`, DRL 1.1) and not on a benign one.
    This is the always-on regression signal.

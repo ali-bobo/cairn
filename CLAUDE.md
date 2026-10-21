@@ -1,21 +1,18 @@
 # CLAUDE.md — Cairn project guide for Claude Code
 
-> **Status: S1–S4 complete; post-S4 hardening merged (gate redesign, IR panels,
-> BYOVD, dependency-audit fix). Current backlog: `docs/REMAINING-WORK.md`.**
+> **Status: S1–S4 complete; post-S4 hardening merged. Phase 0 cleanup removed the
+> raw-disk collectors, the updater, age/bodyfile output and rule XOR encoding.
+> Current backlog: `docs/REMAINING-WORK.md`.**
 
 This file is the operating contract for Claude Code working in this repo. Read it
 fully before writing code. Authoritative spec: `cairn-SRS.md`.
 Backlog + per-segment known risks: `docs/REMAINING-WORK.md`.
 Decision context: `cairn-decision-summary.md`.
 
-Before diving into any individual spec/plan under `docs/dev-history/`, check
-`docs/dev-history/INDEX.md` first — it records merge status per topic so you
-don't have to open a spec just to find out it's already shipped.
-
 ## What this is
 A single signed Rust binary: agentless, **user-space only**, on-host Windows
-live-forensics triage. It parses live state + EVTX + offline NTFS artifacts,
-runs Sigma rules + heuristics, and emits a small severity/ATT&CK-tagged, hashed
+live-forensics triage. It reads live state (processes, network, logon sessions,
+persistence/ASEPs, WMI subscriptions, scheduled tasks, prefetch) + EVTX, runs Sigma rules + heuristics, and emits a small severity/ATT&CK-tagged, hashed
 timeline. Model = Hayabusa(engine)+Chainsaw(artifact hunt)+KAPE(collect/process
 split)+Velociraptor offline-collector(packaging), fused in one process.
 
@@ -51,16 +48,15 @@ split)+Velociraptor offline-collector(packaging), fused in one process.
 
 ## Workspace map
 - `crates/cairn-core`  — typed contracts: Record, Finding (+ EvidenceItem), Manifest, traits, Config, orchestrator. Depend-on-only crate; no host or external-forensic deps.
-- `crates/cairn-collectors` — artifact->Record collectors (evtx live; proc/net/persist pure logic; offline raw-NTFS/hive/prefetch/srum parsers). `#![forbid(unsafe_code)]`.
-- `crates/cairn-collectors-win` — Windows unsafe FFI ONLY (proc/net/host/privilege/logon; raw `\\.\C:` VolumeReader). The single `#![allow(unsafe_code)]` crate; `cfg(windows)`, empty shell elsewhere.
-- `crates/cairn-sigma` — SigmaMatcher trait + sigma-rust engine + LogsourceMap + XOR rule codec.
-- `crates/cairn-heur`  — heuristic analyzers (parentchild/persist gate/netconn/account/timestomp/byovd) + trust.rs path-trust knowledge + known-vulnerable-drivers list.
-- `crates/cairn-report`— timeline(csv)/findings(jsonl)/observations(jsonl)/manifest/report.html, sha256, output sinks (Dir/Zip/Age/DryRun), bodyfile, client_text (zh-TW).
-- `crates/cairn-updater` — `cairn update-rules`: SSRF-gated SigmaHQ fetch + DRL 1.1 + XOR encode + PROVENANCE. `#![forbid(unsafe_code)]`.
-- `crates/cairn-cli`   — `cairn` binary, clap CLI (SRS §6). Subcommands: run / evtx / update-rules / verify.
+- `crates/cairn-collectors` — artifact->Record collectors (evtx file + live; proc/net/logon_session; persist + asep incl. per-user HKU; WMI subscriptions; scheduled tasks; prefetch). `#![forbid(unsafe_code)]`.
+- `crates/cairn-collectors-win` — Windows unsafe FFI ONLY (proc/net/host/privilege/logon/signature/WMI/priority). The single `#![allow(unsafe_code)]` crate; `cfg(windows)`, empty shell elsewhere.
+- `crates/cairn-sigma` — SigmaMatcher trait + sigma-rust engine + LogsourceMap + ruleset aggregate hash (ADR-0003).
+- `crates/cairn-heur`  — heuristic analyzers (parentchild/netconn/account/logon_bruteforce/eventlog/clickfix/persist/asep) + score.rs cross-artifact corroboration + trust.rs path-trust knowledge + coverage table.
+- `crates/cairn-report`— timeline(csv)/findings(jsonl)/observations(jsonl)/manifest/report.html, sha256, output sinks (Dir/Zip/DryRun), verify, client_text (zh-TW).
+- `crates/cairn-cli`   — `cairn` binary, clap CLI (SRS §6). Subcommands: run / evtx / coverage / verify.
 - `crates/cairn-launcher` — interactive CLI launcher for end users; double-click entry point that wraps cairn.exe.
-- `rules/`             — bundled Sigma (DRL 1.1) + config maps. XOR-encoded on disk (avoid AV FP on .yml; encode RULES, never the tool). Subset list: `rules/ruleset.toml`.
-- `docs/`              — REMAINING-WORK (backlog), threat-model, SOC-runbook, dev-history (INDEX.md first).
+- `rules/`             — bundled Sigma (DRL 1.1, plain YAML under `rules/sigma/`) + config maps. Bundle manifest: `rules/ruleset.toml` (a test keeps it in sync with `rules/sigma/`).
+- `docs/`              — REMAINING-WORK (backlog), COVERAGE, threat-model, SOC-runbook, ADRs.
 - `tests/`             — EVTX-ATTACK-SAMPLES fixtures + Sigma match-parity tests.
 
 ## Build / test commands
@@ -96,7 +92,7 @@ There is no project-specific "skill" to install — for Claude Code the equivale
 is THIS file. Use the available engineering workflow skills where they fit:
 - architecture / system-design : when adding a new collector or the orchestrator.
 - testing-strategy : when building the EVTX-ATTACK-SAMPLES parity harness (T8).
-- code-review : before each task's acceptance gate, esp. the unsafe raw-NTFS module.
+- code-review : before each task's acceptance gate, esp. the unsafe cairn-collectors-win FFI.
 - debug : EVTX/Sigma match mismatches.
 Do not invent new skills; do not add SKILL.md files (that format is for claude.ai
 /Cowork, not Claude Code).
@@ -117,18 +113,12 @@ finishing-a-branch → post-merge). Split responsibility:
 - **Post-merge**: do not re-run the full suite again; the pre-merge gate already
   covered HEAD.
 
-## Raw-volume privilege (real-machine e2e)
-The 7 raw-NTFS / raw-hive collectors (amcache, mft, usn, shimcache, bam,
-userassist, srum) gate on `cairn_collectors::can_read_raw_volume` — an elevated
-Administrator token. They used to also require `SeBackupPrivilege` to be
-*enabled*, which a normal admin token never has (present but disabled), so all
-seven silently produced zero records on every ordinary admin run (fixed
-2026-10-20). Do not reintroduce that gate.
-- Prefer synthetic integration tests that exercise the pipeline (pattern:
-  `byovd_driver_list_override_pipeline_end_to_end`,
-  `sigma_analyzer_findings_appear_in_live_outcome`).
-- Real-machine e2e as elevated admin remains the final acceptance bar for these
-  7 collectors; an empty run there is now a real regression signal.
+## Testing collectors and analyzers
+- Prefer synthetic integration tests that exercise the pipeline through `run_live`
+  with a fake collector (pattern: `sigma_analyzer_findings_appear_in_live_outcome`,
+  `logon_bruteforce_heuristic_fires_in_live_outcome` in cairn-cli).
+- Real-machine e2e as elevated admin remains the final acceptance bar for the live
+  collectors.
 
 ## Legitimacy work (must exist before first real client use, any stage)
 Authenticode-sign + timestamp releases; ship README intent statement (done);

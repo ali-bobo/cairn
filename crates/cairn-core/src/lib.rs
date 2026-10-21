@@ -8,8 +8,6 @@
 //!
 //! Design rule: Collectors NEVER analyze; Analyzers NEVER touch the host.
 //! See ../../docs (SRS §3-§5) for the authoritative spec.
-//!
-//! NOTE: not yet compiled in the authoring environment. Run `cargo check` first.
 
 #![forbid(unsafe_code)] // raw-volume/WinAPI unsafe lives only in collector crates, behind review.
 

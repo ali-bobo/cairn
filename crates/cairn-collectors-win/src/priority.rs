@@ -23,8 +23,8 @@ pub fn lower_priority() -> Result<()> {
 /// processes but above idle. Enough to avoid starving the production workload.
 ///
 /// Step 2 (`PROCESS_MODE_BACKGROUND_BEGIN`): Windows background processing mode
-/// lowers BOTH CPU priority further AND IO priority, so disk reads from raw-volume
-/// collectors (`\\.\C:`) do not contend with I/O-bound production processes.
+/// lowers BOTH CPU priority further AND IO priority, so collector disk reads (EVTX,
+/// prefetch, task XML) do not contend with I/O-bound production processes.
 ///
 /// Both steps check the return value; either failure propagates as an error so the
 /// caller can log it and decide whether to abort or continue at normal priority.

@@ -16,8 +16,8 @@ any contribution that crosses the line.
    artifacts; output written off-target by default; footprint minimized.
 2. Evidence integrity: SHA-256 over bytes-as-collected; provenance + privileges +
    UTC times in manifest; `cairn verify` re-checks. Chain of custody defensible.
-3. Confidentiality of output: optional asymmetric encryption of the result archive
-   (public key embedded only; private key never on the host).
+3. Confidentiality of output: written off-target (optionally as a zip); protect the
+   transfer channel. (Built-in age encryption was removed in Phase 0, 2026-10-21.)
 4. Transparency: the tool logs its own actions; it is open-source and signed.
 
 ## FORBIDDEN capabilities (auto-reject by default)

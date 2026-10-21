@@ -8,9 +8,8 @@
 //! subscriptions are created, modified, or deleted.
 //!
 //! Hand-rolled COM call chain (CoInitializeEx -> CoCreateInstance -> ConnectServer
-//! -> ExecQuery -> IWbemClassObject::Get) rather than the `wmi` crate — see
-//! docs/dev-history/2026-07-16-wmi-persistence-research.md for why (the `wmi`
-//! crate has a known, unresolved (WONTFIX) UB issue mixing its own COM lifecycle
+//! -> ExecQuery -> IWbemClassObject::Get) rather than the `wmi` crate, because the
+//! `wmi` crate has a known, unresolved (WONTFIX) UB issue mixing its own COM lifecycle
 //! management with windows-rs's).
 
 use cairn_core::Result;

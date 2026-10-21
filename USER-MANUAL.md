@@ -1,6 +1,6 @@
 # Cairn 使用手冊
 
-> 版本：0.1.0 ｜ 最後更新：2026-07-09 ｜ 適用 commit：`33184b4`
+> 版本：0.1.0 ｜ 最後更新：2026-10-21
 
 ---
 
@@ -46,7 +46,7 @@ Cairn 每次執行都分三步走：
 
 - **不修改主機**：所有收集動作都是唯讀的，不會寫入、刪除或竄改這台電腦上的任何原始資料。
 - **不迴避防護軟體**：Cairn 刻意設計成會被防毒/EDR（端點偵測與應變）軟體看見並辨識為正常程式，不會嘗試隱藏自己或繞過安全防護的偵測機制——這是設計原則，不是疏漏。
-- **平時不連網**：日常掃描完全在本機執行，不會把你的資料傳到任何外部伺服器。唯一的例外是 `update-rules` 這個指令——那是給工程師手動執行、用來更新 Sigma 偵測規則庫的維護動作，一般使用者平常掃描完全不會觸發任何連網行為。
+- **不連網**：所有指令都完全在本機執行，不會把你的資料傳到任何外部伺服器；程式本身不含任何連網功能。
 
 ---
 
@@ -56,8 +56,8 @@ Cairn 每次執行都分三步走：
 
 - 解析 **EVTX 事件日誌**並比對 Sigma 規則
 - 枚舉**即時系統狀態**（process tree、網路連線、persistence 機制、登入 session）
-- 從 **raw 磁碟**讀取被鎖定的離線 artifact（$MFT、$J、hive、Amcache、Shimcache、UserAssist、BAM、Prefetch、SRUM）
-- 套用**可解釋的 heuristic**（parent-child 異常、persistence dispositive-signal 判定、可疑網路連線、帳號異動、timestomp、BYOVD 驅動比對）
+- 讀取 **Prefetch** 執行紀錄、WMI 訂閱與排程工作
+- 套用**可解釋的 heuristic**（parent-child 異常、persistence dispositive-signal 判定、可疑網路連線、帳號異動、登入暴力破解、事件記錄清除與服務安裝、ClickFix）
 - 輸出**帶 MITRE ATT&CK 標籤、SHA-256 完整性簽章的時間軸**、`report.html` 網頁報告和 manifest
 - 提供 **`cairn-launcher`** 雙擊執行檔，讓非工程師使用者不需要背指令就能完成掃描
 
@@ -76,7 +76,7 @@ Cairn 以 **MIT License** 授權（詳見 `LICENSE` / `NOTICE`）；內建的 Si
 | **Windows arm64** | ⚠️ 計畫中 | 目前僅 x64 CI |
 | Linux / macOS | ❌ 不支援 | `cairn evtx` 可在 Linux 編譯，但 live collector 全部 Windows-only |
 
-> **重要**：live process / network / raw-NTFS / hive 等 collector 全部依賴 Windows API，在非 Windows 環境下會被自動跳過（graceful degrade），並在 manifest 中記錄原因。`cairn evtx`（純 EVTX + Sigma）可跨平台使用。
+> **重要**：live process / network / persistence 等 collector 全部依賴 Windows API，在非 Windows 環境下會被自動跳過（graceful degrade），並在 manifest 中記錄原因。`cairn evtx`（純 EVTX + Sigma）可跨平台使用。
 
 ---
 
@@ -87,21 +87,16 @@ Cairn 以 **MIT License** 授權（詳見 `LICENSE` / `NOTICE`）；內建的 Si
 | `cairn evtx`（EVTX 解析） | 標準使用者（可讀 .evtx） | |
 | live proc / net 枚舉 | 標準使用者 | 其他 user 的 process 需 Admin |
 | persistence 枚舉（Run keys、services、sched tasks、WMI subs） | 標準使用者（部分）/ Admin（全部） | |
-| raw-NTFS $MFT / $J | **Administrator**（raw `\\.\C:` 讀取） | |
-| 離線 hive（SYSTEM / NTUSER.DAT / Amcache） | **Administrator**（raw `\\.\C:` 讀取） | |
 | Prefetch | Administrator | `C:\Windows\Prefetch` ACL |
-| SRUM（SRUDB.dat） | **Administrator**（raw `\\.\C:` 讀取） | |
-| BAM / UserAssist | **Administrator**（raw `\\.\C:` 讀取） | SYSTEM hive ACL |
+| Security 事件記錄（live EVTX） | Administrator | |
 
 **缺少權限時 Cairn 不會 crash**：該 collector 會被跳過，在 `manifest.json` 的 `sources[].errors` 中留下說明，其餘 collector 繼續執行（golden rule 8）。
-
-> 2026-10-20 更正：raw `\\.\C:` 讀取只需要提升權限的 Administrator，不需要 `SeBackupPrivilege`。先前版本要求兩者同時具備，導致一般 Admin 執行時這 7 個 collector 一律被跳過。
 
 ### 以提升權限執行
 
 ```powershell
 # 在 Admin PowerShell 執行（建議）
-.\cairn.exe run --target live --output C:\IR\case001 --admin-features
+.\cairn.exe run --target live --output C:\IR\case001
 
 # 或透過 runas
 runas /user:Administrator "cairn.exe run --target live --output D:\IR\out"
@@ -190,7 +185,7 @@ cairn verify out/manifest.json --rules rules/sigma
 
 ```powershell
 # 在 Admin PowerShell 執行
-cairn run --target live --output D:\IR\case001 --admin-features --case-id "IR-2026-001" --operator "analyst"
+cairn run --target live --output D:\IR\case001 --case-id "IR-2026-001" --operator "analyst"
 
 # 輸出：
 #   D:\IR\case001\timeline.csv
@@ -204,11 +199,11 @@ cairn run --target live --output D:\IR\case001 --admin-features --case-id "IR-20
 cairn verify D:\IR\case001\manifest.json --rules rules/sigma
 ```
 
-### 情境 C：打包並加密輸出
+### 情境 C：打包輸出 / 試跑
 
 ```powershell
-# --zip 打包成 .zip，--encrypt 加 X25519 公鑰加密（輸出 .zip.age）
-cairn run --target live --output D:\IR\case001 --admin-features --zip --encrypt age1xxxx...
+# --zip 把輸出打包成 .zip
+cairn run --target live --output D:\IR\case001.zip --zip
 
 # dry-run：不寫入任何檔案，確認流程
 cairn run --target live --output D:\IR\case001 --dry-run
@@ -225,72 +220,49 @@ cairn run --target live --output D:\IR\case001 --dry-run
 ### `cairn run` — 完整 triage
 
 ```
-cairn run --target <TARGET> --output <OUTPUT> [OPTIONS]
+cairn run --output <OUTPUT> [OPTIONS]
 ```
 
 | 參數 | 說明 |
 |------|------|
-| `--target live` | 對當前 host 執行 live collection |
-| `--target <dir>` | 從離線 artifact 目錄讀取 |
+| `--target live` | 對當前 host 執行 live collection（預設值，也是唯一支援的值；離線 EVTX 請用 `cairn evtx`） |
 | `--output <dir>` | 輸出目錄（建議 off-target：USB / 網路磁碟） |
-| `--admin-features` | 啟用 Admin-only collector（需要實際有 Admin 權限） |
 | `--zip` | 輸出打包為 .zip |
-| `--encrypt <pubkey>` | .zip 再以 age X25519 公鑰加密（.zip.age） |
 | `--dry-run` | 模擬執行，零寫入 |
 | `--rules <dir>` | 指定 Sigma 規則目錄（預設 `rules/sigma`） |
-| `--rules-plain` | 讀取未 XOR 編碼的 .yml 規則（供 SOC 稽核用） |
-| `--profile minimal\|standard\|verbose` | `minimal`：最小模組集，跳過 raw-NTFS 全解析；`standard`（預設）：標準模組集；`verbose`：完整模組集，含耗時的 raw-NTFS 收集 |
-| `--only evtx,process,...` | 只跑指定 collector（逗號分隔） |
+| `--profile minimal\|standard` | `standard`（預設）：全部 collector；`minimal`：跳過 Prefetch 與 live EVTX |
+| `--only evtx_live,process,...` | 只跑指定 collector（逗號分隔） |
 | `--since <RFC3339>` | 只分析指定時間之後的事件（預設：執行前 7 天） |
 | `--case-id <id>` | 案件編號（記入 manifest） |
 | `--operator <name>` | 分析師姓名（記入 manifest） |
-| `--bodyfile <path>` | 同時輸出 mactime bodyfile（供 plaso 使用） |
-| `--driver-list <path>` | 覆蓋內建的已知漏洞驅動 SHA1 清單（BYOVD 偵測，一行一個小寫 40-hex SHA1，`#` 開頭為註解） |
-| `--use-vss` | 使用 Volume Shadow Copy（旗標已定義，實作尚未完成，見第 10 章） |
-| `--max-threads <N>` | 限制 rayon 執行緒數（預設 min(cores, 8)） |
 | `--full-speed` | 不降低 process 優先權（預設為 below-normal） |
-| `--max-mft-records <N>` | $MFT 記錄上限（預設 1,000,000） |
-| `--max-usn-records <N>` | $J 記錄上限（預設 1,000,000） |
 
 ### `cairn evtx` — 純 EVTX + Sigma
 
 ```
-cairn evtx [FILES]... [--rules <dir>] [--rules-plain]
+cairn evtx [FILES]... [--rules <dir>]
 ```
 
 | 參數 | 說明 |
 |------|------|
 | `[FILES]...` | 一或多個 .evtx 檔案路徑 |
 | `--rules <dir>` | Sigma 規則目錄 |
-| `--rules-plain` | 讀取未 XOR 編碼的 .yml 規則（供 SOC 稽核用） |
 
 ### `cairn verify` — 輸出完整性驗證
 
 ```
-cairn verify <MANIFEST> [--rules <dir>] [--rules-plain]
+cairn verify <MANIFEST> [--rules <dir>]
 ```
 
 重新計算 manifest 所列所有輸出的 SHA-256，並驗證 Sigma 規則集版本（ADR-0003）。任何不一致則 exit code 非零。
 
-### `cairn update-rules` — 更新 Sigma 規則
+### `cairn coverage` — 偵測覆蓋範圍
 
 ```
-cairn update-rules [--pin <40-hex-sha>]
+cairn coverage [--rules <dir>]
 ```
 
-從 SigmaHQ 抓取 `rules/ruleset.toml` 中列出的規則，XOR 編碼後寫入 `rules/sigma/`，並更新 `PROVENANCE` 檔案。**這是唯一會連網的指令**，且僅供工程師手動維護規則庫時使用；一般使用者的日常掃描完全不會觸發此行為。
-
-- `--pin <sha>`：覆蓋 ruleset.toml 裡的 pin，指定特定 SigmaHQ commit
-- 壞的 pin 格式在觸網前就會被拒絕（SSRF 防護）
-- 每條規則都要有 `author:` 欄位（DRL 1.1 驗證）
-
-```powershell
-# 用 ruleset.toml 中的預設 pin 更新
-cairn update-rules
-
-# 指定特定 SigmaHQ commit
-cairn update-rules --pin 98781da19cf60c48ce6e7f2d3ad11c9ba389191a
-```
+列出內建 heuristic 與已載入 Sigma 規則涵蓋的 ATT&CK 技術（詳見 `docs/COVERAGE.md`）。
 
 ---
 
@@ -333,12 +305,11 @@ JSON Lines 格式，每行一個 Finding。關鍵欄位：
 
 ### `report.html` — 網頁報告（IR 即時狀態面板）
 
-單一自包含 HTML 檔案，供不熟悉 CLI 的使用者或需要快速視覺化的分析師開啟閱讀。包含 5 個面板：
+單一自包含 HTML 檔案，供不熟悉 CLI 的使用者或需要快速視覺化的分析師開啟閱讀。包含以下面板：
 
 - **連線（Connections）**：目前/近期網路連線狀態
 - **程序（Processes）**：process tree 與可疑父子關係
-- **執行（Execution）**：各執行證據來源（Prefetch/Amcache/Shimcache/BAM/UserAssist/SRUM 等）彙整的程式執行紀錄
-- **檔案（Files）**：$MFT/$J 相關檔案活動
+- **執行（Execution）**：Prefetch 的程式執行紀錄
 - **登入（Logon）**：登入 session 紀錄
 
 報告內建**篩選與聚合功能**：可依嚴重度（critical/high/medium/low/info）、文物來源（artifact）、關鍵字篩選 finding 列表；同一個 binary（依路徑或雜湊判定同源）觸發的多筆 finding 會聚合到同一個面板，避免同一支程式的多筆事件洗版。
@@ -360,8 +331,7 @@ JSON Lines 格式，每行一個 Finding。關鍵欄位：
     { "name": "report.html", "sha256": "..." }
   ],
   "governance": {
-    "max_threads": 8,
-    "truncations": []
+    "low_priority_applied": true
   }
 }
 ```
@@ -370,36 +340,21 @@ JSON Lines 格式，每行一個 Finding。關鍵欄位：
 
 結構化 log（tracing 格式），記錄 Cairn 讀取的每個檔案、每個 collector 的執行狀態與任何跳過的原因。chain-of-custody 用。
 
-### `*.bodyfile`（可選，`--bodyfile` 旗標）
-
-mactime 格式，11 欄，供 plaso / log2timeline 使用。每列代表一個 `$MFT` / USN 條目的時間事件。
-
 ---
 
 ## 8. Sigma 規則管理
 
 ### 規則儲存方式
 
-`rules/sigma/` 中的 `.yml` 規則為 **XOR 編碼**，避免 AV 對偵測字串誤報（XOR key 是公開的，不是安全控制，詳見 ADR-0002）。
+`rules/sigma/` 中的 `.yml` 規則是 SigmaHQ 原始 YAML（純文字，未經任何編碼），固定在 `rules/sigma/PROVENANCE` 記錄的上游 commit。
 
 ### 查看 / 稽核規則
 
-```powershell
-# 讀取未編碼版本（供 SOC 稽核）
-cairn evtx *.evtx --rules rules/plain --rules-plain
-
-# 或直接看 rules/plain/ 目錄（需先有此目錄，或用 fetch-and-encode.sh 產生）
-```
+直接用文字編輯器打開 `rules/sigma/` 底下的 `.yml` 即可，這就是實際執行的內容。
 
 ### 擴充規則集
 
-編輯 `rules/ruleset.toml`，加入更多 SigmaHQ 規則路徑，然後執行：
-
-```powershell
-cairn update-rules
-```
-
-所有列出的規則必須有 `author:` 欄位（DRL 1.1），否則會被拒絕。
+從 SigmaHQ（同一個 pin commit）取得規則檔，放到 `rules/sigma/<SigmaHQ 相對路徑>`，並在 `rules/ruleset.toml` 加上對應的 `path`；測試會檢查兩者一致。所有規則必須有 `author:` 欄位（DRL 1.1）。
 
 ### 驗證規則集完整性
 
@@ -426,28 +381,21 @@ cairn verify out/manifest.json --rules rules/sigma
 $OUT = "E:\IR\$CaseId"
 
 # 4. 執行（Admin PowerShell）
-.\cairn.exe run --target live --output $OUT --admin-features `
+.\cairn.exe run --target live --output $OUT `
   --case-id $CaseId --operator $AnalystName `
-  --zip --encrypt $PubKey
+  --zip
 
 # 5. 驗證輸出
 .\cairn.exe verify "$OUT\manifest.json" --rules .\rules\sigma
 
-# 6. 傳輸加密封存（.zip.age）
+# 6. 透過受控管道傳輸 zip
 ```
 
-### 低影響掃描（不降速、不跑 raw-NTFS）
+### 低影響掃描
 
 ```powershell
-# --profile minimal 跳過 $MFT/$J 全解析
+# --profile minimal 跳過 Prefetch 與 live EVTX
 cairn run --target live --output D:\IR\quick --profile minimal
-```
-
-### 完整掃描（含耗時的 raw-NTFS 收集）
-
-```powershell
-# --profile verbose 開啟完整模組集，需 Admin 才能取得完整資料
-cairn run --target live --output D:\IR\full --admin-features --profile verbose
 ```
 
 ### 只跑 EVTX（Linux/macOS 也適用）
@@ -456,25 +404,13 @@ cairn run --target live --output D:\IR\full --admin-features --profile verbose
 cairn evtx C:\Windows\System32\winevt\Logs\Security.evtx --rules rules/sigma
 ```
 
-### 疑似 BYOVD（Bring Your Own Vulnerable Driver）攻擊排查
-
-Amcache 的 `amcache_driver` 資料來源會擷取本機已載入驅動程式的 SHA1，並與內建（或 `--driver-list` 指定）的已知漏洞驅動清單比對，協助找出攻擊者濫用合法簽章但有漏洞的驅動程式來取得核心層權限的手法：
-
-```powershell
-cairn run --target live --output D:\IR\case002 --admin-features --driver-list custom_drivers.txt
-```
-
 ### 非工程師使用者的日常巡檢
 
 雙擊 `cairn-launcher.exe` → 看畫面摘要和瀏覽器裡的報告是否顯示「發現高風險事件」→ 若有，聯絡資安工程師並提供自動產生的 zip 報告。詳見第 4 章。
 
-### 更新規則並驗證
+### 用規則集重新驗證舊的 manifest
 
 ```powershell
-# 更新到最新 pin
-cairn update-rules
-
-# 用新規則重新驗證舊的 manifest
 cairn verify old_run/manifest.json --rules rules/sigma
 ```
 
@@ -485,10 +421,8 @@ cairn verify old_run/manifest.json --rules rules/sigma
 | 限制 | 說明 |
 |------|------|
 | **僅 Windows x64**（live collector） | arm64 計畫中；Linux/macOS 只能跑 `cairn evtx` |
-| **規則集小**（目前 3 條） | `rules/ruleset.toml` 中只有 3 條示範規則；正式使用前需用 `update-rules` 擴充 |
+| **規則集固定**（80 條） | 規則更新需手動替換 `rules/sigma/` 並同步 `rules/ruleset.toml` |
 | **Binary 目前未 Authenticode 簽章** | 簽章工作列為 legitimacy layer，正式給客戶前必須完成；目前以 hash 識別 |
-| **SRUM 解析依賴暫存檔** | 需有可寫的 temp 目錄（`tempfile` crate）；隔離環境需確認 |
-| **Amcache / Shimcache / BAM 在未知 Windows build 會 abstain** | NFR12 誠實降級，而非謊報；若遇到新 build 需等待 parser 更新 |
+| **不讀 raw 磁碟** | 不解析 $MFT、USN、Amcache、Shimcache、BAM、UserAssist、SRUM |
 | **Velociraptor 封裝**（FR20 延伸） | 尚未實作 |
 | **`--collect-raw`**（完整 raw artifact 打包） | 尚未實作；目前封存只含 findings/manifest/run.log |
-| **VSS（Volume Shadow Copy）** | `--use-vss` 旗標已定義，實作尚未完成 |
