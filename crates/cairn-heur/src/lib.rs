@@ -37,6 +37,23 @@ pub use ransom::RansomHeuristic;
 pub use rmm::RmmHeuristic;
 pub use sigma::SigmaAnalyzer;
 
+/// Every event-log channel a built-in heuristic reads (each analyzer's own `CHANNELS`
+/// list), first spelling kept, duplicates dropped case-insensitively. The live EVTX
+/// collector reads all of them even when no Sigma rules are loaded.
+pub fn heuristic_channels() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for ch in eventlog::CHANNELS
+        .iter()
+        .chain(lateral::CHANNELS)
+        .chain(ransom::CHANNELS)
+    {
+        if !out.iter().any(|c| c.eq_ignore_ascii_case(ch)) {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 /// Stamp `Finding.analyzer` on every finding an analyzer returns (typed provenance;
 /// other analyzers and the report match on it instead of parsing `reason`).
 pub(crate) fn stamped(

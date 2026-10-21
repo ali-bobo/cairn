@@ -18,11 +18,13 @@ pub fn default_since(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chr
 }
 
 /// Channels the live EVTX collector reads: whatever the loaded Sigma rules reference,
-/// plus the channels the built-in event-log heuristics need, so account, brute-force
-/// and log-clearing detections still run when no rules are loaded.
+/// plus the channels the built-in event-log heuristics need
+/// ([`cairn_heur::heuristic_channels`]: Security, System, Defender, Application,
+/// TerminalServices, WMI-Activity), so account, brute-force, log-clearing, RDP, WMI
+/// and VSS detections still run when no rules are loaded.
 pub fn live_evtx_channels(sigma: Option<&[String]>) -> Vec<String> {
     let mut out: Vec<String> = sigma.map(<[String]>::to_vec).unwrap_or_default();
-    for ch in cairn_heur::eventlog::CHANNELS {
+    for ch in cairn_heur::heuristic_channels() {
         if !out.iter().any(|c| c.eq_ignore_ascii_case(ch)) {
             out.push((*ch).to_string());
         }
@@ -317,9 +319,28 @@ mod tests {
     #[test]
     fn live_evtx_channels_always_include_builtin_channels() {
         let none = live_evtx_channels(None);
-        for ch in cairn_heur::eventlog::CHANNELS {
+        for ch in cairn_heur::eventlog::CHANNELS
+            .iter()
+            .chain(cairn_heur::lateral::CHANNELS)
+            .chain(cairn_heur::ransom::CHANNELS)
+        {
             assert!(none.iter().any(|c| c == ch), "{ch} missing without Sigma");
         }
+        for ch in [
+            "Application",
+            "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational",
+            "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+            "Microsoft-Windows-WMI-Activity/Operational",
+        ] {
+            assert!(none.iter().any(|c| c == ch), "{ch} missing without Sigma");
+        }
+        assert_eq!(
+            none.iter()
+                .filter(|c| c.eq_ignore_ascii_case("System"))
+                .count(),
+            1,
+            "{none:?}"
+        );
         let sigma = vec![
             "security".to_string(),
             "Microsoft-Windows-PowerShell/Operational".to_string(),
