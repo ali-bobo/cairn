@@ -407,7 +407,7 @@ fn service_record(
         Some(d) if is_svchost(&image) => {
             Some(normalize_service_path(&expand_env_vars(&d, &env), windir))
         }
-        _ => extract_binary_path_with(&image, &env).map(|p| normalize_service_path(&p, windir)),
+        _ => extract_binary_path_with(&image, env).map(|p| normalize_service_path(&p, windir)),
     };
     Some(PersistenceRecord {
         mechanism: Mechanism::Service,
