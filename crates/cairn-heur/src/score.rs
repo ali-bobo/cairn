@@ -243,6 +243,16 @@ pub fn escalate(sev: Severity) -> Severity {
     }
 }
 
+/// Lower one severity band (a mitigating fact, e.g. a demand-start service). Floors
+/// at Low: a finding that cleared a gate never drops to Info.
+pub fn deescalate(sev: Severity) -> Severity {
+    match sev {
+        Severity::Critical => Severity::High,
+        Severity::High => Severity::Medium,
+        Severity::Medium | Severity::Low | Severity::Info => Severity::Low,
+    }
+}
+
 /// Index execution + process records for corroboration lookups. Two-layer index:
 /// exact (JoinKey equality — Path==Path or Name==Name with identical string) built
 /// for **all** records; degraded (basename-only) built **only** from records whose

