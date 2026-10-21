@@ -212,14 +212,16 @@ fn is_recent(ts: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     age >= Duration::zero() && age <= Duration::days(ACCOUNT_RECENT_DAYS)
 }
 
-/// True if a Sigma finding in `prior` already reports this exact event (same event
-/// ID and record id).
+/// True if a Sigma finding in `prior` already reports this exact event: same event ID
+/// and record id, or — for a finding that merged a flood of hits — one of its listed
+/// hits carries this event's timestamp.
 fn sigma_already_reported(prior: &[Finding], ae: &AccountEvent) -> bool {
     let rid = ae.record_id.to_string();
     prior.iter().any(|f| {
         f.analyzer == cairn_core::analyzers::SIGMA
             && f.event_id == Some(ae.event_id)
-            && f.evidence_ref.as_deref() == Some(rid.as_str())
+            && (f.evidence_ref.as_deref() == Some(rid.as_str())
+                || f.evidence.iter().any(|e| e.ts == Some(ae.ts)))
     })
 }
 
@@ -536,9 +538,26 @@ mod tests {
         // a Sigma hit on a different record does not suppress
         sigma.evidence_ref = Some("2".into());
         assert_eq!(
-            AccountHeuristic.analyze(&records, &[sigma]).unwrap().len(),
+            AccountHeuristic
+                .analyze(&records, std::slice::from_ref(&sigma))
+                .unwrap()
+                .len(),
             1
         );
+        // a merged Sigma finding listing this event among its hits suppresses
+        let Record::Event(ev) = &records[0] else {
+            unreachable!()
+        };
+        sigma.evidence = vec![cairn_core::finding::EvidenceItem {
+            artifact: "evtx:Security".into(),
+            path: None,
+            ts: Some(ev.ts),
+            detail: "record 1 (EID 4732)".into(),
+        }];
+        assert!(AccountHeuristic
+            .analyze(&records, &[sigma])
+            .unwrap()
+            .is_empty());
         assert_eq!(
             AccountHeuristic.depends_on(),
             &[cairn_core::analyzers::SIGMA]

@@ -13,6 +13,7 @@ use cairn_core::{finding::Finding, record::EventRecord, Result};
 
 pub mod engine;
 pub mod ruleset;
+pub mod viability;
 
 /// Swappable engine seam. Implement once an engine is chosen in T6.
 pub trait SigmaMatcher: Send + Sync {

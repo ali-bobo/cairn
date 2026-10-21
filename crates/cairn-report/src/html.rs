@@ -512,6 +512,107 @@ fn blind_spots_panel(records: &[cairn_core::Record], manifest: &Manifest) -> Str
     )
 }
 
+/// Which Sigma rules could fire on this run, from the analyzer's `sigma_rule`
+/// observations: a summary line, the settings that would unlock the most rules, and a
+/// collapsible list of every rule that cannot run or could not be checked. Empty when
+/// no Sigma rules were loaded.
+fn sigma_rules_panel(observations: &[cairn_core::Observation], findings: &[Finding]) -> String {
+    use cairn_core::observation::{LoggingRequirement, RuleViability, SigmaRuleStatus};
+    use std::collections::BTreeMap;
+    let rules: Vec<(&cairn_core::Observation, &SigmaRuleStatus)> = observations
+        .iter()
+        .filter(|o| o.category == cairn_core::observation::CATEGORY_SIGMA_RULE)
+        .filter_map(|o| o.sigma_rule.as_ref().map(|s| (o, s)))
+        .collect();
+    if rules.is_empty() {
+        return String::new();
+    }
+    let count = |v: RuleViability| rules.iter().filter(|(_, s)| s.viability == v).count();
+    let (runnable, missing, unknown) = (
+        count(RuleViability::Runnable),
+        count(RuleViability::MissingLogging),
+        count(RuleViability::Unknown),
+    );
+    let mut unlock: BTreeMap<LoggingRequirement, usize> = BTreeMap::new();
+    for (_, s) in &rules {
+        for r in &s.missing {
+            *unlock.entry(*r).or_default() += 1;
+        }
+    }
+    let mut unlock: Vec<(LoggingRequirement, usize)> = unlock.into_iter().collect();
+    unlock.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let unlock_html = if unlock.is_empty() {
+        String::new()
+    } else {
+        let items: String = unlock
+            .iter()
+            .map(|(r, n)| {
+                format!(
+                    "<li>{}：{n} 條規則需要</li>",
+                    crate::client_text::logging_requirement_text(*r)
+                )
+            })
+            .collect();
+        format!(
+            "<p style=\"margin-top:.5rem\">這台主機缺少的記錄設定：</p>\
+             <ul style=\"padding-left:1.25rem;line-height:1.8\">{items}</ul>"
+        )
+    };
+    let hits = |id: Option<&str>| {
+        findings
+            .iter()
+            .filter(|f| f.source == cairn_core::FindingSource::Sigma && f.rule_id.as_deref() == id)
+            .count()
+    };
+    let mut listed: Vec<&(&cairn_core::Observation, &SigmaRuleStatus)> = rules
+        .iter()
+        .filter(|(_, s)| s.viability != RuleViability::Runnable)
+        .collect();
+    listed.sort_by_key(|(o, s)| {
+        (
+            s.viability != RuleViability::MissingLogging,
+            o.title.as_str(),
+        )
+    });
+    let rows: String = listed
+        .iter()
+        .map(|(o, s)| {
+            let (status, reqs) = match s.viability {
+                RuleViability::MissingLogging => ("無法觸發", &s.missing),
+                _ => ("無法確認", &s.unknown),
+            };
+            let reqs: Vec<&str> = reqs
+                .iter()
+                .map(|r| crate::client_text::logging_requirement_text(*r))
+                .collect();
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{status}</td><td>{}</td><td>{}</td></tr>",
+                esc(&o.title),
+                esc(s.level.as_deref().unwrap_or("-")),
+                esc(&reqs.join("、")),
+                hits(s.rule_id.as_deref())
+            )
+        })
+        .collect();
+    let list_html = if listed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details style=\"margin-top:.5rem\"><summary>不能執行或無法確認的規則（{} 條）</summary>\
+             <table><tr><th>規則</th><th>等級</th><th>狀態</th><th>需要的記錄設定</th><th>命中</th></tr>{rows}</table></details>",
+            listed.len()
+        )
+    };
+    format!(
+        "<div class=\"card\"><div class=\"card-title\">Sigma 規則這次能不能跑</div>\
+         <p>這次載入 {} 條 Sigma 規則：<b>{runnable}</b> 條在這台主機的記錄上能觸發，\
+         <b>{missing}</b> 條因為缺少記錄設定不可能觸發，<b>{unknown}</b> 條無法確認。\
+         沒有命中的規則不代表沒有發生，只有「能觸發」的規則沒命中才有意義。</p>\
+         {unlock_html}{list_html}</div>",
+        rules.len()
+    )
+}
+
 pub fn html_report(
     findings: &[Finding],
     observations: &[cairn_core::Observation],
@@ -524,6 +625,14 @@ pub fn html_report(
     let logon_html = logon_panel(records);
     let overview_html = overview_panel(findings, records, manifest);
     let blind_spots_html = blind_spots_panel(records, manifest);
+    let sigma_rules_html = sigma_rules_panel(observations, findings);
+    // Rule-viability observations have their own panel; the inventory lists host items.
+    let observations: Vec<cairn_core::Observation> = observations
+        .iter()
+        .filter(|o| o.category != cairn_core::observation::CATEGORY_SIGMA_RULE)
+        .cloned()
+        .collect();
+    let observations = observations.as_slice();
     let critical = count_sev(findings, Severity::Critical);
     let high = count_sev(findings, Severity::High);
     let medium = count_sev(findings, Severity::Medium);
@@ -812,6 +921,8 @@ tr:hover td{{background:#f9fafb}}
 {overview_html}
 
 {blind_spots_html}
+
+{sigma_rules_html}
 
 <div class="stats">
   <div class="stat"><div class="stat-num" style="color:#b91c1c">{critical}</div><div class="stat-label">Critical</div></div>
@@ -1125,6 +1236,83 @@ mod tests {
         let html = html_report(&[f], &[], &[], &minimal_manifest());
         assert!(!html.contains("eval("), "must not use eval()");
         assert!(!html.contains("innerHTML ="), "must not assign innerHTML");
+    }
+
+    fn rule_obs(
+        title: &str,
+        id: &str,
+        viability: cairn_core::observation::RuleViability,
+        missing: Vec<cairn_core::observation::LoggingRequirement>,
+        unknown: Vec<cairn_core::observation::LoggingRequirement>,
+    ) -> cairn_core::Observation {
+        let mut o =
+            cairn_core::Observation::new(cairn_core::observation::CATEGORY_SIGMA_RULE, title);
+        o.details = "technical".into();
+        o.sigma_rule = Some(cairn_core::observation::SigmaRuleStatus {
+            rule_id: Some(id.into()),
+            level: Some("high".into()),
+            viability,
+            requirements: missing.iter().chain(&unknown).copied().collect(),
+            missing,
+            unknown,
+        });
+        o
+    }
+
+    /// Rule-viability observations get their own panel (counts, the settings that would
+    /// unlock rules, the rules that cannot run) and stay out of the host inventory.
+    #[test]
+    fn sigma_rules_panel_lists_unrunnable_rules_and_settings() {
+        use cairn_core::observation::{LoggingRequirement as R, RuleViability as V};
+        let obs = vec![
+            rule_obs("Runs Fine", "a", V::Runnable, vec![], vec![]),
+            rule_obs(
+                "Needs 4688",
+                "b",
+                V::MissingLogging,
+                vec![R::ProcessCreationAudit],
+                vec![],
+            ),
+            rule_obs(
+                "Needs 4688 Too",
+                "c",
+                V::MissingLogging,
+                vec![R::ProcessCreationAudit, R::CommandLineIn4688],
+                vec![],
+            ),
+            rule_obs(
+                "Maybe <DC>",
+                "d",
+                V::Unknown,
+                vec![],
+                vec![R::DomainController],
+            ),
+        ];
+        let mut f = Finding::new(Severity::High, "Needs 4688", FindingSource::Sigma);
+        f.rule_id = Some("b".into());
+        let html = html_report(&[f], &obs, &[], &minimal_manifest());
+        assert!(html.contains("Sigma 規則這次能不能跑"));
+        assert!(
+            html.contains("這次載入 4 條 Sigma 規則：<b>1</b> 條"),
+            "{html}"
+        );
+        assert!(html.contains("<b>2</b> 條因為缺少記錄設定"));
+        assert!(html.contains("稽核「行程建立」（4688，預設關閉）：2 條規則需要"));
+        assert!(html.contains("不能執行或無法確認的規則（3 條）"));
+        assert!(html.contains("Maybe &lt;DC&gt;"), "titles are escaped");
+        assert!(
+            !html.contains("Runs Fine"),
+            "runnable rules are only counted"
+        );
+        assert!(
+            !html.contains("主機盤點"),
+            "rule statuses are not host inventory"
+        );
+    }
+
+    #[test]
+    fn sigma_rules_panel_absent_without_rule_observations() {
+        assert_eq!(sigma_rules_panel(&[], &[]), "");
     }
 
     /// Findings render their evidence list (collapsible "佐證來源"), and observations

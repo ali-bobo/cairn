@@ -545,6 +545,18 @@ author: test-integration
             Some("test-integration"),
             "finding must carry DRL 1.1 rule_author"
         );
+        // Every loaded rule reports whether it could fire on this run's logs.
+        let statuses: Vec<_> = outcome
+            .observations
+            .iter()
+            .filter(|o| o.category == cairn_core::observation::CATEGORY_SIGMA_RULE)
+            .collect();
+        assert_eq!(statuses.len(), 1, "one status per loaded rule");
+        assert_eq!(
+            statuses[0].sigma_rule.as_ref().map(|s| s.viability),
+            Some(cairn_core::observation::RuleViability::Runnable),
+            "a collected 4688 proves process-creation auditing"
+        );
     }
 
     fn outcome_with_one_record() -> RunOutcome {
