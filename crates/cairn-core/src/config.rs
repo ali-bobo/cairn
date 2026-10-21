@@ -113,10 +113,6 @@ pub struct Config {
     /// Hitting it records a truncation note in the manifest and stops the scan, so a
     /// huge journal on a long-uptime server cannot exhaust memory. Mirrors max_mft_records.
     pub max_usn_records: u64,
-    /// Min FN−SI delta (hours), either axis, before a timestomp Finding fires (S2-N′).
-    /// Below this, sub-day SI/FN drift from legit ops (unzip/copy/install) is ignored.
-    /// Fixed default; no CLI flag — banding (Medium/High/Critical) carries severity.
-    pub timestomp_threshold_hours: i64,
     /// Time window (minutes) for grouping repeated failed logons (EID 4625) from the
     /// same (TargetUserName, IpAddress) pair before flagging bruteforce (segment 4-C).
     /// Fixed default; no CLI flag.
@@ -155,7 +151,6 @@ impl Default for Config {
             use_vss: false,
             max_mft_records: 1_000_000,
             max_usn_records: 1_000_000,
-            timestomp_threshold_hours: 24,
             logon_bruteforce_window_minutes: 5,
             logon_bruteforce_threshold: 5,
             password_spraying_window_minutes: 1,
@@ -332,12 +327,6 @@ mod tests {
     fn max_usn_records_defaults_to_one_million() {
         let cfg = Config::default();
         assert_eq!(cfg.max_usn_records, 1_000_000);
-    }
-
-    #[test]
-    fn timestomp_threshold_defaults_to_24_hours() {
-        let cfg = Config::default();
-        assert_eq!(cfg.timestomp_threshold_hours, 24);
     }
 
     #[test]

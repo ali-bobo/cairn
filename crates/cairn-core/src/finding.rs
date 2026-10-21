@@ -47,18 +47,6 @@ pub struct EntityFile {
     pub path: String,
     pub sha256: Option<String>,
     pub mtime: Option<DateTime<Utc>>,
-    pub si_btime: Option<DateTime<Utc>>,
-    pub fn_btime: Option<DateTime<Utc>>,
-    /// SI/FN modification times (S2-N′): exposed alongside the btimes so a
-    /// timestomp Finding carries all four axes as cross-checkable evidence.
-    pub si_mtime: Option<DateTime<Utc>>,
-    pub fn_mtime: Option<DateTime<Utc>>,
-    /// Path-resolution quality from the source MFT record (S2-O).
-    /// Some(true)  = full path walked clean to root (C:\);
-    /// Some(false) = best-effort partial path (orphan/truncated/cyclic ancestry);
-    /// None        = resolution disabled or no path available.
-    /// Mirrors `FileMetaRecord.path_complete`.
-    pub path_complete: Option<bool>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntityNetConn {
@@ -235,60 +223,16 @@ mod tests {
         assert_eq!(back.reason.as_deref(), f.reason.as_deref());
     }
 
-    /// EntityFile JSON written before S2-N′ (no si_mtime/fn_mtime) still deserializes,
-    /// with the two new fields defaulting to None (serde backward compat). And a full
-    /// four-axis EntityFile round-trips.
+    /// EntityFile JSON from older builds (which carried SI/FN timestamps and
+    /// path_complete) still deserializes; the extra keys are ignored.
     #[test]
-    fn entityfile_old_json_gets_none_mtimes_and_new_roundtrips() {
+    fn entityfile_old_json_with_removed_fields_still_parses() {
         use super::EntityFile;
-        // old JSON: lacks si_mtime / fn_mtime
-        let old = r#"{"path":"C:\\a.exe","sha256":null,"mtime":null,
-        "si_btime":null,"fn_btime":null}"#;
+        let old = r#"{"path":"C:\\a.exe","sha256":null,"mtime":null,"si_btime":null,"fn_btime":null,"si_mtime":null,"fn_mtime":null,"path_complete":true}"#;
         let e: EntityFile = serde_json::from_str(old).unwrap();
-        assert_eq!(e.si_mtime, None);
-        assert_eq!(e.fn_mtime, None);
-
-        // new EntityFile carries all four times and survives a round-trip
-        let t = chrono::DateTime::parse_from_rfc3339("2013-01-05T18:15:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let full = EntityFile {
-            path: "C:\\a.exe".into(),
-            sha256: None,
-            mtime: None,
-            si_btime: Some(t),
-            fn_btime: Some(t),
-            si_mtime: Some(t),
-            fn_mtime: Some(t),
-            path_complete: None,
-        };
-        let j = serde_json::to_string(&full).unwrap();
-        let back: EntityFile = serde_json::from_str(&j).unwrap();
-        assert_eq!(back.si_mtime, Some(t));
-        assert_eq!(back.fn_mtime, Some(t));
-    }
-
-    #[test]
-    fn entityfile_path_complete_roundtrips_and_old_json_none() {
-        use super::EntityFile;
-        // old JSON lacking path_complete -> None
-        let old = r#"{"path":"C:\\a.exe","sha256":null,"mtime":null,"si_btime":null,"fn_btime":null,"si_mtime":null,"fn_mtime":null}"#;
-        let e: EntityFile = serde_json::from_str(old).unwrap();
-        assert_eq!(e.path_complete, None);
-
-        let full = EntityFile {
-            path: "C:\\a.exe".into(),
-            sha256: None,
-            mtime: None,
-            si_btime: None,
-            fn_btime: None,
-            si_mtime: None,
-            fn_mtime: None,
-            path_complete: Some(false),
-        };
-        let j = serde_json::to_string(&full).unwrap();
-        let back: EntityFile = serde_json::from_str(&j).unwrap();
-        assert_eq!(back.path_complete, Some(false));
+        assert_eq!(e.path, "C:\\a.exe");
+        let back: EntityFile = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back.path, e.path);
     }
 
     #[test]

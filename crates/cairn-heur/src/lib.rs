@@ -5,31 +5,23 @@
 
 pub mod account;
 pub mod asep;
-pub mod byovd;
 pub mod clickfix;
 pub mod coverage;
 pub mod eventlog;
-pub mod live_exec;
 pub mod logon_bruteforce;
 pub mod netconn;
 pub mod parentchild;
 pub mod persist;
 pub mod score;
 pub mod sigma;
-pub mod temporal;
-pub mod timestomp;
 pub mod trust;
 
 // Public API: the analyzers wired into the CLI live run (and reusable elsewhere).
 pub use account::AccountHeuristic;
-pub use byovd::ByovdHeuristic;
 pub use clickfix::ClickFixHeuristic;
 pub use eventlog::EventLogHeuristic;
-pub use live_exec::LiveExecHeuristic;
 pub use logon_bruteforce::LogonBruteforceHeuristic;
 pub use netconn::NetConnHeuristic;
 pub use parentchild::ParentChildHeuristic;
 pub use persist::PersistHeuristic;
 pub use sigma::SigmaAnalyzer;
-pub use temporal::TemporalWindowCorrelator;
-pub use timestomp::TimestompHeuristic;

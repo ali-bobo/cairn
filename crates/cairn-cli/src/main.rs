@@ -129,10 +129,6 @@ struct RunArgs {
     /// Write mactime bodyfile to PATH (FR20). Skipped with --dry-run.
     #[arg(long)]
     bodyfile: Option<PathBuf>,
-    /// Override the built-in known-vulnerable driver hash list (BYOVD detection).
-    /// One lowercase 40-hex SHA1 per line; '#' comments allowed.
-    #[arg(long)]
-    driver_list: Option<PathBuf>,
     #[arg(long)]
     use_vss: bool,
     /// Hard cap on $MFT records the mft collector scans (NFR10). Default 1,000,000.
@@ -1019,33 +1015,10 @@ fn main() -> anyhow::Result<()> {
                     cairn_collectors::evtx_live::EvtxLiveCollector::new(channels, since),
                 ));
             }
-            // BYOVD driver hash list: --driver-list override, else the bundled list.
-            // Read failure falls back to bundled (graceful, golden rule 8).
-            let driver_hashes = match args.driver_list.as_deref() {
-                Some(p) => match std::fs::read_to_string(p) {
-                    Ok(text) => cairn_heur::byovd::parse_driver_hashes(&text),
-                    Err(e) => {
-                        tracing::warn!(error = %e, path = %p.display(),
-                            "driver-list read failed; using bundled list");
-                        cairn_heur::byovd::parse_driver_hashes(
-                            cairn_heur::byovd::BUNDLED_DRIVER_LIST,
-                        )
-                    }
-                },
-                None => {
-                    cairn_heur::byovd::parse_driver_hashes(cairn_heur::byovd::BUNDLED_DRIVER_LIST)
-                }
-            };
             let mut analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
                 Box::new(cairn_heur::ParentChildHeuristic),
                 Box::new(cairn_heur::NetConnHeuristic),
                 Box::new(cairn_heur::PersistHeuristic),
-                Box::new(cairn_heur::TemporalWindowCorrelator),
-                Box::new(cairn_heur::LiveExecHeuristic),
-                // S2-N′: threshold from Config (fixed default 24h; no CLI flag).
-                Box::new(cairn_heur::TimestompHeuristic::new(
-                    chrono::Duration::hours(cfg.timestomp_threshold_hours),
-                )),
                 Box::new(cairn_heur::AccountHeuristic),
                 Box::new(cairn_heur::EventLogHeuristic),
                 Box::new(cairn_heur::ClickFixHeuristic),
@@ -1055,7 +1028,6 @@ fn main() -> anyhow::Result<()> {
                     chrono::Duration::minutes(cfg.password_spraying_window_minutes),
                     cfg.password_spraying_threshold,
                 )),
-                Box::new(cairn_heur::ByovdHeuristic::new(driver_hashes)),
             ];
             if let Some(sa) = sigma_analyzer {
                 analyzers.push(Box::new(sa));
@@ -1529,57 +1501,6 @@ mod tests {
         assert!(line.contains("output="), "{line}");
     }
 
-    /// The live analyzer set includes all heuristics.
-    #[test]
-    fn live_analyzers_include_all_heuristics() {
-        use cairn_core::traits::Analyzer;
-        let threshold = chrono::Duration::hours(24);
-        let analyzers: Vec<Box<dyn Analyzer>> = vec![
-            Box::new(cairn_heur::ParentChildHeuristic),
-            Box::new(cairn_heur::NetConnHeuristic),
-            Box::new(cairn_heur::PersistHeuristic),
-            Box::new(cairn_heur::TemporalWindowCorrelator),
-            Box::new(cairn_heur::LiveExecHeuristic),
-            Box::new(cairn_heur::TimestompHeuristic::new(threshold)),
-            Box::new(cairn_heur::AccountHeuristic),
-            Box::new(cairn_heur::LogonBruteforceHeuristic::new(
-                chrono::Duration::minutes(5),
-                5,
-                chrono::Duration::minutes(1),
-                10,
-            )),
-            Box::new(cairn_heur::ByovdHeuristic::new(
-                std::collections::HashSet::new(),
-            )),
-        ];
-        assert!(
-            analyzers.iter().any(|a| a.name() == "heur_timestomp"),
-            "heur_timestomp must be in analyzer set"
-        );
-        assert!(
-            analyzers.iter().any(|a| a.name() == "heur_account"),
-            "heur_account must be in analyzer set"
-        );
-        assert!(
-            analyzers.iter().any(|a| a.name() == "heur_byovd"),
-            "heur_byovd must be in analyzer set"
-        );
-        assert!(
-            analyzers
-                .iter()
-                .any(|a| a.name() == "heur_logon_bruteforce"),
-            "logon bruteforce heuristic must be registered"
-        );
-        assert!(
-            analyzers.iter().any(|a| a.name() == "heur_temporal"),
-            "temporal window correlator must be registered"
-        );
-        assert!(
-            analyzers.iter().any(|a| a.name() == "heur_live_exec"),
-            "heur_live_exec must be in analyzer set"
-        );
-    }
-
     #[test]
     fn evtx_plan_shows_bundled_rules_when_none() {
         let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], None);
@@ -2014,256 +1935,5 @@ author: test-integration
             "golden rule 6: reason must be set"
         );
         assert_eq!(finding.mitre, vec!["T1110.001".to_string()]);
-    }
-
-    /// Integration: TemporalWindowCorrelator, wired after PersistHeuristic in
-    /// run_live's analyzer chain, attaches USN evidence to a persist Finding that
-    /// has entity.process populated (S9 execution hit) and escalates its severity.
-    #[test]
-    fn temporal_window_correlator_fires_in_live_outcome() {
-        use cairn_core::manifest::Privileges;
-        use cairn_core::orchestrator::run_live;
-        use cairn_core::record::{PersistenceRecord, ProcessRecord, Record, UsnEventRecord};
-        use cairn_core::traits::{CollectCtx, Collector};
-        use chrono::Utc;
-
-        struct FixedRecordsCollector(Vec<Record>);
-        impl Collector for FixedRecordsCollector {
-            fn name(&self) -> &str {
-                "fake_temporal_records"
-            }
-            fn collect(&self, _ctx: &CollectCtx<'_>) -> cairn_core::Result<Vec<Record>> {
-                Ok(self.0.clone())
-            }
-        }
-
-        let start = Utc::now();
-        let image_path = r"C:\Users\victim\AppData\Local\Temp\evil.exe";
-        let pr = ProcessRecord {
-            pid: 777,
-            ppid: 1,
-            image: image_path.to_string(),
-            cmdline: String::new(),
-            signed: Some(false),
-            signer: None,
-            binary_sha256: None,
-            integrity: None,
-            user: None,
-            start_time: Some(start),
-        };
-        // S9 execution-hit fixture: same construction pattern as persist.rs's
-        // `rec()` test helper (mechanism="ifeo", binary_path/command set to the
-        // same path as pr.image so PersistHeuristic's join_key matches this
-        // ProcessRecord and populates entity.process on the resulting Finding).
-        let persistence = PersistenceRecord {
-            mechanism: "ifeo".into(),
-            location: r"HKLM\...\Run".into(),
-            value: Some("Updater".into()),
-            command: Some(image_path.to_string()),
-            binary_path: Some(image_path.to_string()),
-            binary_sha256: None,
-            signed: None,
-            signer: None,
-            last_write: Some(start),
-        };
-        let usn = UsnEventRecord {
-            ts: start + chrono::Duration::minutes(1),
-            path: r"C:\Temp\dropped_payload.dll".to_string(),
-            reason: "create".to_string(),
-            mft_ref: 1,
-        };
-
-        let cfg = cairn_core::Config::default();
-        let privs = Privileges {
-            admin: false,
-            se_backup: false,
-            se_debug: false,
-        };
-        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedRecordsCollector(vec![
-            Record::Process(pr),
-            Record::Persistence(persistence),
-            Record::UsnEvent(usn),
-        ]))];
-        let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> = vec![
-            Box::new(cairn_heur::PersistHeuristic),
-            Box::new(cairn_heur::TemporalWindowCorrelator),
-        ];
-
-        let outcome = run_live(&cfg, privs, "TEST".into(), &collectors, &analyzers);
-
-        let temporal_finding = outcome
-            .findings
-            .iter()
-            .find(|f| f.artifact == "temporal_window");
-        assert!(
-            temporal_finding.is_some(),
-            "temporal window finding must be present when persist Finding has entity.process \
-             and a USN event falls within the window; got findings: {:?}",
-            outcome
-                .findings
-                .iter()
-                .map(|f| &f.title)
-                .collect::<Vec<_>>()
-        );
-    }
-
-    /// Integration: proves the whole BYOVD pipeline end-to-end — a --driver-list file
-    /// is read + parsed exactly as the live CLI path does, then ByovdHeuristic (wired
-    /// through run_live like any other analyzer) matches a real amcache_driver record
-    /// against it and emits a High finding. This substitutes for a real-machine e2e
-    /// scan on a host without SeBackupPrivilege (amcache_driver requires it), which
-    /// this dev environment lacks — same collector-injection pattern as
-    /// `sigma_analyzer_findings_appear_in_live_outcome` above.
-    #[test]
-    fn byovd_driver_list_override_pipeline_end_to_end() {
-        use cairn_core::manifest::Privileges;
-        use cairn_core::orchestrator::run_live;
-        use cairn_core::record::{ExecutionRecord, Record};
-        use cairn_core::traits::{CollectCtx, Collector};
-
-        const KNOWN_SHA1: &str = "4a68c2d7a4c471e062a32c83a36eedb45a619683"; // RTCore64.sys, bundled list
-
-        // Simulates writing --driver-list to a temp file and reading it back exactly
-        // as the CLI's Cmd::Run(args) branch does: std::fs::read_to_string then
-        // cairn_heur::byovd::parse_driver_hashes.
-        let dir = std::env::temp_dir();
-        let list_path = dir.join(format!("cairn-byovd-test-{}.txt", std::process::id()));
-        std::fs::write(
-            &list_path,
-            format!("{KNOWN_SHA1}  # RTCore64.sys test override\n"),
-        )
-        .expect("write temp driver list");
-        let text = std::fs::read_to_string(&list_path).expect("read temp driver list");
-        let hashes = cairn_heur::byovd::parse_driver_hashes(&text);
-        std::fs::remove_file(&list_path).ok();
-        assert!(
-            hashes.contains(KNOWN_SHA1),
-            "override file must parse back the known hash"
-        );
-
-        struct DriverCollector(ExecutionRecord);
-        impl Collector for DriverCollector {
-            fn name(&self) -> &str {
-                "fake_amcache_driver"
-            }
-            fn collect(&self, _ctx: &CollectCtx<'_>) -> cairn_core::Result<Vec<Record>> {
-                Ok(vec![Record::Execution(self.0.clone())])
-            }
-        }
-
-        let driver_rec = ExecutionRecord {
-            source: "amcache_driver".into(),
-            path: r"C:\Windows\System32\drivers\rtcore64.sys".into(),
-            first_run: None,
-            last_run: None,
-            run_count: None,
-            sha1: Some(KNOWN_SHA1.to_string()),
-            user_sid: None,
-            execution_confirmed: Some(true),
-        };
-
-        let cfg = cairn_core::Config::default();
-        let privs = Privileges {
-            admin: true,
-            se_backup: false,
-            se_debug: false,
-        };
-        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(DriverCollector(driver_rec))];
-        let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> =
-            vec![Box::new(cairn_heur::ByovdHeuristic::new(hashes))];
-
-        let outcome = run_live(&cfg, privs, "TEST".into(), &collectors, &analyzers);
-
-        assert_eq!(outcome.records.len(), 1, "driver record must be collected");
-        assert_eq!(
-            outcome.findings.len(),
-            1,
-            "byovd match must produce exactly one finding"
-        );
-        assert_eq!(outcome.findings[0].artifact, "byovd");
-        assert_eq!(
-            outcome.findings[0].severity,
-            cairn_core::finding::Severity::High
-        );
-        assert!(outcome.findings[0].mitre.contains(&"T1068".to_string()));
-        assert!(
-            outcome.findings[0].title.contains("rtcore64.sys"),
-            "title: {}",
-            outcome.findings[0].title
-        );
-    }
-
-    /// Integration: LiveExecHeuristic fires in run_live's live outcome for a
-    /// process with zero execution-artifact matches (signal A), proving the
-    /// analyzer is correctly wired end-to-end through the CLI's collector/analyzer
-    /// plumbing, not just unit-testable in isolation.
-    #[test]
-    fn live_exec_heuristic_fires_in_live_outcome() {
-        use cairn_core::manifest::Privileges;
-        use cairn_core::orchestrator::run_live;
-        use cairn_core::record::{ProcessRecord, Record};
-        use cairn_core::traits::{CollectCtx, Collector};
-
-        struct FixedRecordsCollector(Vec<Record>);
-        impl Collector for FixedRecordsCollector {
-            fn name(&self) -> &str {
-                "fake_live_exec_records"
-            }
-            fn collect(&self, _ctx: &CollectCtx<'_>) -> cairn_core::Result<Vec<Record>> {
-                Ok(self.0.clone())
-            }
-        }
-
-        let ghost = ProcessRecord {
-            pid: 9001,
-            ppid: 1,
-            image: r"C:\Users\victim\AppData\Local\Temp\ghost.exe".to_string(),
-            cmdline: String::new(),
-            signed: None,
-            signer: None,
-            binary_sha256: None,
-            integrity: None,
-            user: None,
-            start_time: None,
-        };
-
-        let cfg = cairn_core::Config::default();
-        let privs = Privileges {
-            admin: false,
-            se_backup: false,
-            se_debug: false,
-        };
-        // Signal A only fires when prefetch, amcache and shimcache were all collected,
-        // so give each one an unrelated record.
-        let mut records = vec![Record::Process(ghost)];
-        for source in ["prefetch", "amcache", "shimcache"] {
-            records.push(Record::Execution(cairn_core::record::ExecutionRecord {
-                source: source.into(),
-                path: r"C:\Tools\unrelated.exe".into(),
-                first_run: None,
-                last_run: None,
-                run_count: None,
-                sha1: None,
-                user_sid: None,
-                execution_confirmed: None,
-            }));
-        }
-        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedRecordsCollector(records))];
-        let analyzers: Vec<Box<dyn cairn_core::traits::Analyzer>> =
-            vec![Box::new(cairn_heur::LiveExecHeuristic)];
-
-        let outcome = run_live(&cfg, privs, "TEST".into(), &collectors, &analyzers);
-
-        let finding = outcome
-            .findings
-            .iter()
-            .find(|f| f.artifact == "no_execution_artifact" && f.entity.process.is_some());
-        assert!(
-            finding.is_some(),
-            "live_exec finding must be present when a process has no execution \
-             artifact anywhere; got findings: {:?}",
-            outcome.findings
-        );
-        assert_eq!(finding.unwrap().entity.process.as_ref().unwrap().pid, 9001);
     }
 }

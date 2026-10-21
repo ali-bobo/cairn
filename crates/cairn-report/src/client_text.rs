@@ -169,25 +169,8 @@ pub fn fill_details_client(f: &mut Finding) {
                     host, name
                 )
             }
-            "no_execution_artifact" => {
-                let name = entity_name(f);
-                format!(
-                    "主機 {} 上，{} 正在執行，但在既有執行紀錄（prefetch/amcache/\
-                     shimcache）中皆查無記錄，建議確認該程式的來源與執行原因（此現象\
-                     不代表程式必為惡意，也可能是紀錄機制本身的涵蓋缺口）。",
-                    host, name
-                )
-            }
             "persistence" => persistence_client_text(&host, f),
             "netconn" => netconn_client_text(&host, f),
-            "file_meta" => {
-                let name = entity_name(f);
-                format!(
-                    "主機 {} 上，{} 的時間戳記疑似遭到竄改，\
-                     建議進一步確認該檔案的真實建立時間。",
-                    host, name
-                )
-            }
             _ => format!("主機 {} 上偵測到疑似異常行為，建議分析師確認詳情。", host),
         },
         FindingSource::Sigma => {
@@ -255,22 +238,6 @@ mod tests {
         assert!(text.contains("cmd.exe"), "path missing: {text}");
     }
 
-    /// heur_live_exec's signal A must get its own honest client text, not the
-    /// parentchild "unexpected parent process" sentence — regression for the
-    /// "process" artifact string collision caught in final review.
-    #[test]
-    fn live_exec_no_artifact_heuristic_filled() {
-        let mut f = make_heuristic(Severity::High, "no_execution_artifact");
-        fill_details_client(&mut f);
-        let text = f.details_client.expect("must be Some for High");
-        assert!(text.contains("查無記錄"), "got: {text}");
-        assert!(
-            !text.contains("父行程"),
-            "must not reuse parentchild's wording: {text}"
-        );
-        assert!(text.contains("WS01"), "host missing: {text}");
-    }
-
     #[test]
     fn persist_heuristic_filled() {
         let mut f = make_heuristic(Severity::Medium, "persistence");
@@ -285,14 +252,6 @@ mod tests {
         fill_details_client(&mut f);
         let text = f.details_client.expect("must be Some for High");
         assert!(text.contains("對外連線"), "got: {text}");
-    }
-
-    #[test]
-    fn timestomp_heuristic_filled() {
-        let mut f = make_heuristic(Severity::High, "file_meta");
-        fill_details_client(&mut f);
-        let text = f.details_client.expect("must be Some for High");
-        assert!(text.contains("時間戳記疑似遭到竄改"), "got: {text}");
     }
 
     #[test]
