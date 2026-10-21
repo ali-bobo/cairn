@@ -410,6 +410,9 @@ mod tests {
                     signed: None,
                     signer: None,
                     last_write: None,
+                    service_start: None,
+                    signer_source: None,
+                    bound: None,
                 })])
             }
         }
