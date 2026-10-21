@@ -4,7 +4,7 @@ use cairn_core::finding::{EvidenceItem, Finding};
 use cairn_core::observation::{
     LoggingRequirement, RuleViability, SigmaRuleStatus, CATEGORY_SIGMA_RULE,
 };
-use cairn_core::record::{EventRecord, Record};
+use cairn_core::record::{EventRecord, PostureRecord, Record};
 use cairn_core::traits::Analyzer;
 use cairn_core::{Observation, Result};
 use cairn_sigma::engine::Engine;
@@ -58,7 +58,8 @@ impl Analyzer for SigmaAnalyzer {
     }
 
     /// One `sigma_rule` observation per loaded rule: could it fire on this host's logs?
-    /// Decided from the events this run collected (see `cairn_sigma::viability`).
+    /// Decided from the events this run collected (see `cairn_sigma::viability`), with
+    /// the live `posture` snapshot's settings filling in what the events cannot show.
     fn observe(&self, records: &[Record]) -> Result<Vec<Observation>> {
         let events: Vec<&EventRecord> = records
             .iter()
@@ -73,7 +74,13 @@ impl Analyzer for SigmaAnalyzer {
             .find(|c| !c.is_empty())
             .unwrap_or_default()
             .to_string();
-        let logging = HostLogging::from_events(events.iter().copied());
+        let mut logging = HostLogging::from_events(events.iter().copied());
+        if let Some(p) = records.iter().find_map(|r| match r {
+            Record::Posture(p) => Some(p),
+            _ => None,
+        }) {
+            apply_posture(&mut logging, p);
+        }
         Ok(self
             .engine
             .rule_statuses(&logging)
@@ -197,6 +204,37 @@ fn status_details(s: &SigmaRuleStatus) -> String {
         RuleViability::Runnable => "runnable".into(),
         RuleViability::MissingLogging => format!("cannot fire: missing {}", names(&s.missing)),
         RuleViability::Unknown => format!("unknown: could not check {}", names(&s.unknown)),
+    }
+}
+
+/// Feed the read settings from a posture snapshot into `logging`. A setting read as
+/// off does not override events that prove it was on during the collected window
+/// (the policy may have been changed since); unread settings (None) stay inferred.
+fn apply_posture(logging: &mut HostLogging, p: &PostureRecord) {
+    use LoggingRequirement as R;
+    let settings = [
+        (R::ProcessCreationAudit, p.audit_process_creation),
+        (R::CommandLineIn4688, p.cmdline_in_4688),
+        (R::ScriptBlockLogging, p.ps_scriptblock),
+        (R::ModuleLogging, p.ps_module_logging),
+        (R::Sysmon, p.sysmon_present),
+        (R::LogonAudit, p.audit_logon),
+        (
+            R::UserAccountManagementAudit,
+            p.audit_user_account_management,
+        ),
+        (
+            R::SecurityGroupManagementAudit,
+            p.audit_security_group_management,
+        ),
+        (R::OtherObjectAccessAudit, p.audit_other_object_access),
+    ];
+    for (req, read) in settings {
+        match read {
+            Some(true) => logging.set(req, true),
+            Some(false) if logging.state(req) != Some(true) => logging.set(req, false),
+            _ => {}
+        }
     }
 }
 
@@ -375,6 +413,39 @@ author: test
             obs[0].sigma_rule.as_ref().unwrap().viability,
             RuleViability::Runnable,
             "a seen 4688 proves auditing; the rule needs no command line"
+        );
+    }
+
+    #[test]
+    fn observe_takes_logging_settings_from_posture() {
+        use cairn_core::record::PostureRecord;
+        let analyzer = SigmaAnalyzer::new(Engine::from_rules(&[RULE_CMD]).unwrap());
+        let mut logon = make_event("x");
+        logon.event_id = 4624;
+        let on = PostureRecord {
+            audit_process_creation: Some(true),
+            ..Default::default()
+        };
+        let obs = analyzer
+            .observe(&[Record::Event(logon), Record::Posture(on)])
+            .unwrap();
+        assert_eq!(
+            obs[0].sigma_rule.as_ref().unwrap().viability,
+            RuleViability::Runnable,
+            "posture says process-creation auditing is on, though no 4688 was collected"
+        );
+
+        let off = PostureRecord {
+            audit_process_creation: Some(false),
+            ..Default::default()
+        };
+        let obs = analyzer
+            .observe(&[Record::Event(make_event(r"C:\a.exe")), Record::Posture(off)])
+            .unwrap();
+        assert_eq!(
+            obs[0].sigma_rule.as_ref().unwrap().viability,
+            RuleViability::Runnable,
+            "a collected 4688 outweighs a policy read as off now"
         );
     }
 
