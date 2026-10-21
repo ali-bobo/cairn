@@ -15,6 +15,12 @@ pub struct RunConfig<'a> {
     /// --profile 的值（"minimal"/"standard"）。None 時不帶旗標，
     /// cairn.exe 自身預設 "standard"（見 cairn-cli RunArgs::profile default_value）。
     pub profile: Option<&'a str>,
+    /// --case-id（案件編號），None 時不帶旗標。
+    pub case_id: Option<&'a str>,
+    /// --operator（操作人員），None 時不帶旗標。
+    pub operator: Option<&'a str>,
+    /// true 時明確帶 --export-evtx（把事件記錄匯出到輸出資料夾的 evidence\evtx\）。
+    pub export_evtx: bool,
 }
 
 /// 根據 `RunConfig` 建立 cairn.exe 的完整參數列表。
@@ -37,6 +43,19 @@ pub fn build_args(cfg: &RunConfig<'_>) -> Vec<String> {
         args.push("--profile".to_string());
         args.push(profile.to_string());
     }
+    if let Some(case_id) = cfg.case_id {
+        args.push("--case-id".to_string());
+        args.push(case_id.to_string());
+    }
+    if let Some(operator) = cfg.operator {
+        args.push("--operator".to_string());
+        args.push(operator.to_string());
+    }
+    args.push(if cfg.export_evtx {
+        "--export-evtx".to_string()
+    } else {
+        "--no-export-evtx".to_string()
+    });
     args
 }
 
@@ -115,6 +134,9 @@ mod tests {
             output_dir: output,
             since,
             profile: None,
+            case_id: None,
+            operator: None,
+            export_evtx: true,
         }
     }
 
@@ -128,6 +150,9 @@ mod tests {
             output_dir: &output,
             since: "2026-06-27T14:30:00Z",
             profile: Some("minimal"),
+            case_id: None,
+            operator: None,
+            export_evtx: true,
         };
         let args = build_args(&cfg);
         assert!(args.contains(&"--profile".to_string()));
@@ -144,6 +169,9 @@ mod tests {
             output_dir: &output,
             since: "2026-06-27T14:30:00Z",
             profile: None,
+            case_id: None,
+            operator: None,
+            export_evtx: true,
         };
         let args = build_args(&cfg);
         assert!(!args.contains(&"--profile".to_string()));
@@ -182,6 +210,32 @@ mod tests {
         let args = build_args(&cfg);
         assert!(args.contains(&"--output".to_string()));
         assert!(args.contains(&output.display().to_string()));
+    }
+
+    #[test]
+    fn build_args_passes_case_operator_and_export() {
+        let exe = PathBuf::from(r"C:\tools\cairn.exe");
+        let output = PathBuf::from(r"C:\tools\output\x");
+        let mut cfg = make_cfg(&exe, None, &output, "2026-06-27T14:30:00Z");
+        let args = build_args(&cfg);
+        assert!(
+            args.contains(&"--export-evtx".to_string()),
+            "export on by default"
+        );
+        assert!(!args.contains(&"--case-id".to_string()));
+        assert!(!args.contains(&"--operator".to_string()));
+        cfg.case_id = Some("IR-2026-07");
+        cfg.operator = Some("王小明");
+        cfg.export_evtx = false;
+        let args = build_args(&cfg);
+        let pos = |f: &str| args.iter().position(|a| a == f).unwrap();
+        assert_eq!(args[pos("--case-id") + 1], "IR-2026-07");
+        assert_eq!(args[pos("--operator") + 1], "王小明");
+        assert!(args.contains(&"--no-export-evtx".to_string()));
+        assert!(
+            !args.contains(&"--reference-time".to_string()),
+            "never prompted"
+        );
     }
 
     #[test]

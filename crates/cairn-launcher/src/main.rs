@@ -41,8 +41,9 @@ fn detect_env() -> anyhow::Result<Env> {
         }
     };
 
+    // Not created here: the live scan first checks whether this location is on the
+    // system drive and may stop without writing anything.
     let output_base = launcher_dir.join("output");
-    std::fs::create_dir_all(&output_base)?;
 
     Ok(Env {
         cairn_exe,
@@ -59,6 +60,67 @@ fn rules_ver(rules_dir: Option<&Path>) -> String {
     rules_dir
         .and_then(|d| cairn_sigma::ruleset::ruleset_version(d).ok())
         .unwrap_or_default()
+}
+
+/// The volume a Windows path lives on: `C:` (upper-cased) for a drive path, or
+/// `\\SERVER\SHARE` for a UNC path; the `\\?\` / `\\?\UNC\` verbatim prefixes are
+/// understood. None when the path names no volume (relative). Pure string logic so it
+/// is testable off Windows.
+fn volume_of(path: &str) -> Option<String> {
+    let p = path.trim();
+    let (p, unc) = if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
+        (rest, true)
+    } else if let Some(rest) = p.strip_prefix(r"\\?\") {
+        (rest, false)
+    } else if let Some(rest) = p.strip_prefix(r"\\") {
+        (rest, true)
+    } else {
+        (p, false)
+    };
+    if unc {
+        let mut parts = p.split(['\\', '/']).filter(|s| !s.is_empty());
+        let server = parts.next()?;
+        let share = parts.next()?;
+        return Some(format!(r"\\{}\{}", server, share).to_uppercase());
+    }
+    let b = p.as_bytes();
+    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+        .then(|| p[..2].to_ascii_uppercase())
+}
+
+/// True when `output` is on the same volume as `system_root` (%SystemRoot%), i.e.
+/// evidence would be written onto the disk under investigation.
+fn on_system_drive(output: &Path, system_root: &str) -> bool {
+    match (
+        volume_of(&output.display().to_string()),
+        volume_of(system_root),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Warn (zh-TW) and ask before writing evidence onto the system drive. Default N.
+/// Returns true when it is OK to continue.
+fn confirm_output_location(output_base: &Path) -> bool {
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    if !on_system_drive(output_base, &system_root) {
+        return true;
+    }
+    let vol = volume_of(&system_root).unwrap_or_default();
+    println!("⚠️  注意：結果資料夾位於系統磁碟 {vol}（與 Windows 安裝在同一顆硬碟）：");
+    println!("    {}", output_base.display());
+    println!("    掃描結果與匯出的事件記錄會寫進這台「被調查的電腦」的硬碟，");
+    println!("    可能覆蓋已刪除檔案的殘留痕跡，影響之後的鑑識。");
+    println!("    建議：把整個 Cairn 資料夾複製到 USB 隨身碟，從隨身碟執行。");
+    let answer = menu::prompt("仍要寫入系統磁碟並繼續嗎？(Y/N，預設 N)：");
+    if menu::is_yes(&answer) {
+        println!();
+        true
+    } else {
+        println!("已取消，沒有寫入任何檔案。");
+        false
+    }
 }
 
 fn since_from_hours(hours: u64) -> String {
@@ -129,11 +191,16 @@ fn finish(output_dir: &Path, report_dir: &Path, desc: &str) {
     }
 }
 
-/// 雙擊：直接掃描這台主機最近 7 天。
+/// 雙擊：直接掃描這台主機最近 30 天。
 fn run_live(env: &Env) -> anyhow::Result<()> {
+    if !confirm_output_location(&env.output_base) {
+        return Ok(());
+    }
+    let case_id = menu::optional_field(&menu::prompt("案件編號（選填，直接按 Enter 略過）："));
+    let operator = menu::optional_field(&menu::prompt("操作人員（選填，直接按 Enter 略過）："));
     let output_dir = runner::timestamped_output_dir(&env.output_base);
     std::fs::create_dir_all(&output_dir)?;
-    let desc = "最近 7 天";
+    let desc = "最近 30 天";
     let since = since_from_hours(LIVE_HOURS);
     let cfg = runner::RunConfig {
         cairn_exe: &env.cairn_exe,
@@ -141,6 +208,9 @@ fn run_live(env: &Env) -> anyhow::Result<()> {
         output_dir: &output_dir,
         since: &since,
         profile: None,
+        case_id: case_id.as_deref(),
+        operator: operator.as_deref(),
+        export_evtx: true,
     };
     println!("開始掃描這台主機（{desc}），通常需要幾分鐘，請不要關閉這個視窗。");
     println!("結果會存到：{}\n", output_dir.display());
@@ -170,8 +240,8 @@ fn run_dropped_evtx(env: &Env, dropped: &[PathBuf]) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Look-back window of the double-click scan, in hours (7 days, matches cairn's default).
-const LIVE_HOURS: u64 = 168;
+/// Look-back window of the double-click scan, in hours (30 days): cairn's own default.
+const LIVE_HOURS: u64 = cairn_core::config::DEFAULT_SINCE_HOURS as u64;
 
 /// What a launch should do, from its command-line arguments. Windows passes the paths
 /// of files dropped onto the exe as arguments; a plain double-click passes none.
@@ -243,6 +313,36 @@ mod tests {
                 PathBuf::from(r"C:\more")
             ])
         );
+    }
+
+    #[test]
+    fn volume_of_drive_unc_and_verbatim_paths() {
+        assert_eq!(volume_of(r"c:\Tools\cairn\output"), Some("C:".into()));
+        assert_eq!(volume_of(r"\\?\D:\cairn\output"), Some("D:".into()));
+        assert_eq!(volume_of(r"\\srv\share\cairn"), Some(r"\\SRV\SHARE".into()));
+        assert_eq!(
+            volume_of(r"\\?\UNC\srv\share\x"),
+            Some(r"\\SRV\SHARE".into())
+        );
+        assert_eq!(volume_of("output"), None);
+    }
+
+    #[test]
+    fn system_drive_detection() {
+        assert!(on_system_drive(
+            Path::new(r"C:\Users\a\Desktop\cairn\output"),
+            r"C:\WINDOWS"
+        ));
+        assert!(!on_system_drive(
+            Path::new(r"E:\cairn\output"),
+            r"C:\Windows"
+        ));
+        assert!(!on_system_drive(Path::new("relative"), r"C:\Windows"));
+    }
+
+    #[test]
+    fn live_window_is_thirty_days() {
+        assert_eq!(LIVE_HOURS, 720);
     }
 
     #[test]
