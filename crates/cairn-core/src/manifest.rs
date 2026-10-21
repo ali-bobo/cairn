@@ -60,6 +60,12 @@ pub struct Privileges {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceEntry {
+    /// Canonical `Collector::name()` of the collector that produced this entry (see
+    /// [`crate::collectors`]), stamped by the orchestrator; or `analyzer:<name>` for an
+    /// analyzer failure entry. Lets reports tie a source to a collector without guessing
+    /// from `artifact`. Additive; old manifests default to "".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub collector: String,
     pub artifact: String,
     pub path: String,
     pub method: String, // e.g. api|fs|file_api|com|toolhelp
@@ -132,6 +138,7 @@ mod tests {
                 se_debug: false,
             },
             sources: vec![SourceEntry {
+                collector: String::new(),
                 artifact: "evtx:Security".into(),
                 path: r"C:\evidence\Security.evtx".into(),
                 method: "api".into(),

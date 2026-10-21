@@ -9,7 +9,7 @@
 //! Judging what is normal for each mechanism is NOT done here — that knowledge lives
 //! in `cairn-heur` (analyzers never touch the host; collectors never judge).
 
-use cairn_core::record::{PersistenceRecord, RegValueRecord};
+use cairn_core::record::{Mechanism, PersistenceRecord, RegValueRecord};
 use chrono::{DateTime, Utc};
 
 /// Registry root a catalog entry lives under.
@@ -113,7 +113,7 @@ pub enum Target {
 #[derive(Debug, Clone, Copy)]
 pub struct AsepSpec {
     /// `PersistenceRecord.mechanism`; cairn-heur keys its judgement and MITRE ID on it.
-    pub mechanism: &'static str,
+    pub mechanism: Mechanism,
     pub hive: Hive,
     pub key: &'static str,
     pub select: Select,
@@ -121,7 +121,7 @@ pub struct AsepSpec {
 }
 
 const fn spec(
-    mechanism: &'static str,
+    mechanism: Mechanism,
     hive: Hive,
     key: &'static str,
     select: Select,
@@ -144,14 +144,14 @@ const WINLOGON: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon";
 pub const CATALOG: &[AsepSpec] = &[
     // T1547.001 — per-user Run keys, read from every loaded user hive (see Hive::Hku).
     spec(
-        "run_key",
+        Mechanism::RunKey,
         Hive::Hkcu,
         r"Software\Microsoft\Windows\CurrentVersion\Run",
         Select::AllValues,
         Target::Command,
     ),
     spec(
-        "run_key",
+        Mechanism::RunKey,
         Hive::Hkcu,
         r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
         Select::AllValues,
@@ -159,28 +159,28 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1547.001 — 32-bit Run keys and policy-driven Run keys (missed by run_key reader).
     spec(
-        "run_key",
+        Mechanism::RunKey,
         Hive::Hklm,
         r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Run",
         Select::AllValues,
         Target::Command,
     ),
     spec(
-        "run_key",
+        Mechanism::RunKey,
         Hive::Hklm,
         r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\RunOnce",
         Select::AllValues,
         Target::Command,
     ),
     spec(
-        "explorer_policy_run",
+        Mechanism::ExplorerPolicyRun,
         Hive::Hklm,
         r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
         Select::AllValues,
         Target::Command,
     ),
     spec(
-        "explorer_policy_run",
+        Mechanism::ExplorerPolicyRun,
         Hive::Hkcu,
         r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run",
         Select::AllValues,
@@ -188,7 +188,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1547.001 — BootExecute (native programs run by smss before Windows starts).
     spec(
-        "boot_execute",
+        Mechanism::BootExecute,
         Hive::Hklm,
         r"SYSTEM\CurrentControlSet\Control\Session Manager",
         Select::Value {
@@ -199,7 +199,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1547.002 / T1547.005 / T1556.002 — LSA packages and password filters.
     spec(
-        "lsa_auth_package",
+        Mechanism::LsaAuthPackage,
         Hive::Hklm,
         LSA,
         Select::Value {
@@ -209,7 +209,7 @@ pub const CATALOG: &[AsepSpec] = &[
         Target::Dll,
     ),
     spec(
-        "lsa_security_package",
+        Mechanism::LsaSecurityPackage,
         Hive::Hklm,
         LSA,
         Select::Value {
@@ -219,7 +219,7 @@ pub const CATALOG: &[AsepSpec] = &[
         Target::Dll,
     ),
     spec(
-        "lsa_security_package",
+        Mechanism::LsaSecurityPackage,
         Hive::Hklm,
         r"SYSTEM\CurrentControlSet\Control\Lsa\OSConfig",
         Select::Value {
@@ -229,7 +229,7 @@ pub const CATALOG: &[AsepSpec] = &[
         Target::Dll,
     ),
     spec(
-        "lsa_notification_package",
+        Mechanism::LsaNotificationPackage,
         Hive::Hklm,
         LSA,
         Select::Value {
@@ -240,7 +240,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1547.003 — time provider DLLs.
     spec(
-        "time_provider",
+        Mechanism::TimeProvider,
         Hive::Hklm,
         r"SYSTEM\CurrentControlSet\Services\W32Time\TimeProviders",
         Select::SubkeyValue("DllName"),
@@ -248,14 +248,14 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1547.004 — Winlogon Notify packages and MPNotify.
     spec(
-        "winlogon_notify",
+        Mechanism::WinlogonNotify,
         Hive::Hklm,
         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon\Notify",
         Select::SubkeyValue("DllName"),
         Target::Dll,
     ),
     spec(
-        "winlogon_mpnotify",
+        Mechanism::WinlogonMpnotify,
         Hive::Hklm,
         WINLOGON,
         Select::Value {
@@ -266,7 +266,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1547.010 — port monitors.
     spec(
-        "print_monitor",
+        Mechanism::PrintMonitor,
         Hive::Hklm,
         r"SYSTEM\CurrentControlSet\Control\Print\Monitors",
         Select::SubkeyValue("Driver"),
@@ -274,7 +274,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1547.014 — Active Setup.
     spec(
-        "active_setup",
+        Mechanism::ActiveSetup,
         Hive::Hklm,
         r"SOFTWARE\Microsoft\Active Setup\Installed Components",
         Select::SubkeyValue("StubPath"),
@@ -282,7 +282,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1546.002 — screensaver.
     spec(
-        "screensaver",
+        Mechanism::Screensaver,
         Hive::Hkcu,
         r"Control Panel\Desktop",
         Select::Value {
@@ -293,7 +293,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1546.007 — netsh helper DLLs.
     spec(
-        "netsh_helper",
+        Mechanism::NetshHelper,
         Hive::Hklm,
         r"SOFTWARE\Microsoft\NetSh",
         Select::AllValues,
@@ -301,7 +301,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1546.009 — AppCert DLLs.
     spec(
-        "appcert_dlls",
+        Mechanism::AppcertDlls,
         Hive::Hklm,
         r"SYSTEM\CurrentControlSet\Control\Session Manager\AppCertDlls",
         Select::AllValues,
@@ -309,7 +309,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1546.010 — AppInit DLLs (both bitnesses).
     spec(
-        "appinit_dlls",
+        Mechanism::AppinitDlls,
         Hive::Hklm,
         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows",
         Select::Value {
@@ -319,7 +319,7 @@ pub const CATALOG: &[AsepSpec] = &[
         Target::Dll,
     ),
     spec(
-        "appinit_dlls",
+        Mechanism::AppinitDlls,
         Hive::Hklm,
         r"SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows",
         Select::Value {
@@ -330,7 +330,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1546.012 — SilentProcessExit monitor (IFEO-adjacent).
     spec(
-        "silent_exit_monitor",
+        Mechanism::SilentExitMonitor,
         Hive::Hklm,
         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit",
         Select::SubkeyValue("MonitorProcess"),
@@ -338,7 +338,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1546.015 — per-user COM hijack (HKCU CLSID shadows HKLM).
     spec(
-        "com_hijack",
+        Mechanism::ComHijack,
         Hive::Hkcu,
         r"Software\Classes\CLSID",
         Select::SubkeyChildDefault("InprocServer32"),
@@ -346,7 +346,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1546 — cmd.exe AutoRun.
     spec(
-        "cmd_autorun",
+        Mechanism::CmdAutorun,
         Hive::Hklm,
         r"SOFTWARE\Microsoft\Command Processor",
         Select::Value {
@@ -356,7 +356,7 @@ pub const CATALOG: &[AsepSpec] = &[
         Target::Command,
     ),
     spec(
-        "cmd_autorun",
+        Mechanism::CmdAutorun,
         Hive::Hkcu,
         r"Software\Microsoft\Command Processor",
         Select::Value {
@@ -367,7 +367,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1137.002 — Office Test key.
     spec(
-        "office_test",
+        Mechanism::OfficeTest,
         Hive::Hkcu,
         r"Software\Microsoft\Office test\Special\Perf",
         Select::Value {
@@ -377,7 +377,7 @@ pub const CATALOG: &[AsepSpec] = &[
         Target::Dll,
     ),
     spec(
-        "office_test",
+        Mechanism::OfficeTest,
         Hive::Hklm,
         r"SOFTWARE\Microsoft\Office test\Special\Perf",
         Select::Value {
@@ -388,7 +388,7 @@ pub const CATALOG: &[AsepSpec] = &[
     ),
     // T1037.001 — logon script.
     spec(
-        "logon_script",
+        Mechanism::LogonScript,
         Hive::Hkcu,
         r"Environment",
         Select::Value {
@@ -433,7 +433,7 @@ fn read_spec_at(
             Target::Command => None,
         };
         out.push(PersistenceRecord {
-            mechanism: spec.mechanism.to_string(),
+            mechanism: spec.mechanism,
             location,
             value: Some(value),
             command: Some(data),
@@ -663,7 +663,7 @@ pub fn read_ps_profiles(paths: &[String]) -> Vec<PersistenceRecord> {
             .map(DateTime::<Utc>::from);
         let file = path.rsplit(['\\', '/']).next().unwrap_or(path).to_string();
         out.push(PersistenceRecord {
-            mechanism: "ps_profile".to_string(),
+            mechanism: Mechanism::PsProfile,
             location: path.clone(),
             value: Some(file),
             command: Some(text),
@@ -825,7 +825,7 @@ mod tests {
         );
         let recs: Vec<_> = read_catalog(&reg, r"C:\Windows")
             .into_iter()
-            .filter(|r| r.mechanism == "logon_script")
+            .filter(|r| r.mechanism == Mechanism::LogonScript)
             .collect();
         assert_eq!(recs.len(), 2, "{recs:?}");
         assert!(recs[0]
@@ -885,7 +885,7 @@ mod tests {
         let recs = read_catalog(&reg, r"C:\Windows");
         let pkgs: Vec<_> = recs
             .iter()
-            .filter(|r| r.mechanism == "lsa_security_package")
+            .filter(|r| r.mechanism == Mechanism::LsaSecurityPackage)
             .map(|r| (r.command.clone().unwrap(), r.binary_path.clone().unwrap()))
             .collect();
         assert_eq!(
@@ -912,7 +912,7 @@ mod tests {
         );
         let recs: Vec<_> = read_catalog(&reg, r"C:\Windows")
             .into_iter()
-            .filter(|r| r.mechanism == "appinit_dlls")
+            .filter(|r| r.mechanism == Mechanism::AppinitDlls)
             .collect();
         assert_eq!(recs.len(), 2);
         assert_eq!(
@@ -953,7 +953,7 @@ mod tests {
         );
         let recs: Vec<_> = read_catalog(&reg, r"C:\Windows")
             .into_iter()
-            .filter(|r| r.mechanism == "print_monitor")
+            .filter(|r| r.mechanism == Mechanism::PrintMonitor)
             .collect();
         assert_eq!(recs.len(), 2);
         let evil = recs
@@ -975,7 +975,7 @@ mod tests {
         );
         let recs: Vec<_> = read_catalog(&reg, r"C:\Windows")
             .into_iter()
-            .filter(|r| r.mechanism == "com_hijack")
+            .filter(|r| r.mechanism == Mechanism::ComHijack)
             .collect();
         assert_eq!(recs.len(), 1);
         assert_eq!(
@@ -996,7 +996,7 @@ mod tests {
         );
         let recs = read_catalog(&reg, r"C:\Windows");
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].mechanism, "office_test");
+        assert_eq!(recs[0].mechanism, Mechanism::OfficeTest);
         assert_eq!(recs[0].value.as_deref(), Some("(Default)"));
         assert_eq!(
             recs[0].location,
@@ -1068,17 +1068,19 @@ mod tests {
         ]);
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].mechanism, "ps_profile");
+        assert_eq!(recs[0].mechanism, Mechanism::PsProfile);
         assert!(recs[0].command.as_deref().unwrap().starts_with("IEX"));
     }
 
-    /// Mechanism names in the catalog are the contract with cairn-heur; keep them
-    /// stable and lowercase snake_case.
+    /// Catalog mechanisms are the contract with cairn-heur: a typed, known mechanism
+    /// whose serialized name stays lowercase snake_case.
     #[test]
-    fn catalog_mechanisms_are_snake_case() {
+    fn catalog_mechanisms_are_known_and_snake_case() {
         for s in CATALOG {
+            assert_ne!(s.mechanism, Mechanism::Other);
             assert!(
                 s.mechanism
+                    .as_str()
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c == '_'),
                 "{}",

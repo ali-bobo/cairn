@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use cairn_core::manifest::SourceEntry;
-use cairn_core::record::{PersistenceRecord, Record};
+use cairn_core::record::{Mechanism, PersistenceRecord, Record};
 use cairn_core::traits::{CollectCtx, Collector};
 use cairn_core::Result;
 
@@ -28,7 +28,7 @@ pub struct WmiSubscriptionCollector;
 
 impl Collector for WmiSubscriptionCollector {
     fn name(&self) -> &str {
-        "wmi_subscription"
+        cairn_core::collectors::WMI_SUBSCRIPTION
     }
 
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
@@ -44,7 +44,7 @@ impl Collector for WmiSubscriptionCollector {
                     .as_deref()
                     .and_then(|c| extract_binary_path(&sub.consumer_type, c));
                 PersistenceRecord {
-                    mechanism: "wmi_subscription".to_string(),
+                    mechanism: Mechanism::WmiSubscription,
                     location: format!("{} -> {}", sub.filter_name, sub.consumer_name),
                     value: Some(sub.consumer_name.clone()),
                     command: sub.command,
@@ -71,6 +71,7 @@ impl Collector for WmiSubscriptionCollector {
 
     fn sources(&self) -> Vec<SourceEntry> {
         vec![SourceEntry {
+            collector: String::new(),
             artifact: "wmi_subscription".into(),
             path: r"live:root\subscription".into(),
             method: "com".into(),

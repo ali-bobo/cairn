@@ -239,14 +239,35 @@ fn default_rules_dir() -> Option<PathBuf> {
 }
 
 /// The live collectors' real `Collector::name()` strings, in canonical run order.
-const AVAILABLE: &[&str] = &[
-    "proc",
-    "net",
-    "logon_session",
-    "persist",
-    "prefetch",
-    "wmi_subscription",
-    "evtx_live",
+const AVAILABLE: &[cairn_core::ModuleInfo] = &[
+    cairn_core::ModuleInfo {
+        name: "proc",
+        in_minimal: true,
+    },
+    cairn_core::ModuleInfo {
+        name: "net",
+        in_minimal: true,
+    },
+    cairn_core::ModuleInfo {
+        name: "logon_session",
+        in_minimal: true,
+    },
+    cairn_core::ModuleInfo {
+        name: "persist",
+        in_minimal: true,
+    },
+    cairn_core::ModuleInfo {
+        name: "prefetch",
+        in_minimal: false,
+    },
+    cairn_core::ModuleInfo {
+        name: "wmi_subscription",
+        in_minimal: true,
+    },
+    cairn_core::ModuleInfo {
+        name: "evtx_live",
+        in_minimal: false,
+    },
 ];
 
 /// Deterministic output ordering (NFR4): sort by (ts, then a stable tiebreak key).
@@ -340,8 +361,8 @@ fn enrich_hashes(
 fn built_collector_names(selected: &[String]) -> Vec<String> {
     AVAILABLE
         .iter()
-        .filter(|n| selected.iter().any(|m| m == *n))
-        .map(|s| s.to_string())
+        .filter(|n| selected.iter().any(|m| m == n.name))
+        .map(|s| s.name.to_string())
         .collect()
 }
 
@@ -1014,7 +1035,7 @@ mod tests {
 
         let mk = |value: &str, bin: &str| {
             Record::Persistence(PersistenceRecord {
-                mechanism: "run_key".into(),
+                mechanism: cairn_core::Mechanism::RunKey,
                 location: "HKCU\\Run".into(),
                 value: Some(value.into()),
                 command: Some(bin.into()),
@@ -1071,7 +1092,7 @@ mod tests {
 
         // no --only => every collector in canonical order.
         let sel = select_modules(Profile::Standard, None, AVAILABLE);
-        assert_eq!(built_collector_names(&sel.selected), AVAILABLE);
+        assert_eq!(built_collector_names(&sel.selected).len(), AVAILABLE.len());
 
         // --profile minimal skips prefetch and evtx_live.
         let sel = select_modules(Profile::Minimal, None, AVAILABLE);

@@ -62,10 +62,129 @@ pub struct NetConnRecord {
     pub pid: Option<u32>,
 }
 
+/// Every persistence mechanism cairn collects. Serializes as the snake_case string
+/// the collectors have always written (`"run_key"`, `"ifeo"`, ...), so JSON output is
+/// unchanged; in code it is a closed set analyzers and reports can `match` on instead of
+/// comparing free strings. An unknown string read back from old/foreign JSON becomes
+/// [`Mechanism::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mechanism {
+    RunKey,
+    Service,
+    ScheduledTask,
+    WmiSubscription,
+    Ifeo,
+    Startup,
+    Winlogon,
+    ExplorerPolicyRun,
+    BootExecute,
+    LsaAuthPackage,
+    LsaSecurityPackage,
+    LsaNotificationPackage,
+    TimeProvider,
+    WinlogonNotify,
+    WinlogonMpnotify,
+    PrintMonitor,
+    ActiveSetup,
+    Screensaver,
+    NetshHelper,
+    AppcertDlls,
+    AppinitDlls,
+    SilentExitMonitor,
+    ComHijack,
+    CmdAutorun,
+    OfficeTest,
+    LogonScript,
+    PsProfile,
+    /// A mechanism string this build does not know (deserialization fallback only).
+    #[serde(other)]
+    Other,
+}
+
+impl Mechanism {
+    /// Every known mechanism (excludes [`Mechanism::Other`]), in declaration order.
+    pub const ALL: &'static [Mechanism] = &[
+        Mechanism::RunKey,
+        Mechanism::Service,
+        Mechanism::ScheduledTask,
+        Mechanism::WmiSubscription,
+        Mechanism::Ifeo,
+        Mechanism::Startup,
+        Mechanism::Winlogon,
+        Mechanism::ExplorerPolicyRun,
+        Mechanism::BootExecute,
+        Mechanism::LsaAuthPackage,
+        Mechanism::LsaSecurityPackage,
+        Mechanism::LsaNotificationPackage,
+        Mechanism::TimeProvider,
+        Mechanism::WinlogonNotify,
+        Mechanism::WinlogonMpnotify,
+        Mechanism::PrintMonitor,
+        Mechanism::ActiveSetup,
+        Mechanism::Screensaver,
+        Mechanism::NetshHelper,
+        Mechanism::AppcertDlls,
+        Mechanism::AppinitDlls,
+        Mechanism::SilentExitMonitor,
+        Mechanism::ComHijack,
+        Mechanism::CmdAutorun,
+        Mechanism::OfficeTest,
+        Mechanism::LogonScript,
+        Mechanism::PsProfile,
+    ];
+
+    /// The serialized snake_case name (`"run_key"`, ...). Same string serde writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mechanism::RunKey => "run_key",
+            Mechanism::Service => "service",
+            Mechanism::ScheduledTask => "scheduled_task",
+            Mechanism::WmiSubscription => "wmi_subscription",
+            Mechanism::Ifeo => "ifeo",
+            Mechanism::Startup => "startup",
+            Mechanism::Winlogon => "winlogon",
+            Mechanism::ExplorerPolicyRun => "explorer_policy_run",
+            Mechanism::BootExecute => "boot_execute",
+            Mechanism::LsaAuthPackage => "lsa_auth_package",
+            Mechanism::LsaSecurityPackage => "lsa_security_package",
+            Mechanism::LsaNotificationPackage => "lsa_notification_package",
+            Mechanism::TimeProvider => "time_provider",
+            Mechanism::WinlogonNotify => "winlogon_notify",
+            Mechanism::WinlogonMpnotify => "winlogon_mpnotify",
+            Mechanism::PrintMonitor => "print_monitor",
+            Mechanism::ActiveSetup => "active_setup",
+            Mechanism::Screensaver => "screensaver",
+            Mechanism::NetshHelper => "netsh_helper",
+            Mechanism::AppcertDlls => "appcert_dlls",
+            Mechanism::AppinitDlls => "appinit_dlls",
+            Mechanism::SilentExitMonitor => "silent_exit_monitor",
+            Mechanism::ComHijack => "com_hijack",
+            Mechanism::CmdAutorun => "cmd_autorun",
+            Mechanism::OfficeTest => "office_test",
+            Mechanism::LogonScript => "logon_script",
+            Mechanism::PsProfile => "ps_profile",
+            Mechanism::Other => "other",
+        }
+    }
+
+    /// File-backed mechanisms: the persistence entry is a file (Startup folder item,
+    /// PowerShell profile), not a registry value.
+    pub fn is_file_backed(self) -> bool {
+        matches!(self, Mechanism::Startup | Mechanism::PsProfile)
+    }
+}
+
+impl std::fmt::Display for Mechanism {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistenceRecord {
-    pub mechanism: String, // run_key|service|scheduled_task|wmi_subscription|ifeo|startup|winlogon
-    pub location: String,  // registry key / file path / wmi binding
+    pub mechanism: Mechanism,
+    pub location: String, // registry key / file path / wmi binding
     pub value: Option<String>,
     pub command: Option<String>,
     pub binary_path: Option<String>,
@@ -123,7 +242,7 @@ mod tests {
     #[test]
     fn persistence_record_signer_roundtrips() {
         let mut r = PersistenceRecord {
-            mechanism: "run_key".into(),
+            mechanism: Mechanism::RunKey,
             location: "HKCU\\...\\Run".into(),
             value: Some("X".into()),
             command: Some("C:\\a.exe".into()),
@@ -236,6 +355,22 @@ mod tests {
         });
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"kind\":\"execution\""));
+    }
+
+    #[test]
+    fn mechanism_serializes_as_legacy_snake_case_strings() {
+        for m in Mechanism::ALL {
+            let j = serde_json::to_string(m).unwrap();
+            assert_eq!(j, format!("\"{}\"", m.as_str()), "{m:?}");
+            let back: Mechanism = serde_json::from_str(&j).unwrap();
+            assert_eq!(back, *m);
+        }
+        assert_eq!(
+            serde_json::to_string(&Mechanism::WinlogonMpnotify).unwrap(),
+            "\"winlogon_mpnotify\""
+        );
+        let unknown: Mechanism = serde_json::from_str("\"brand_new_thing\"").unwrap();
+        assert_eq!(unknown, Mechanism::Other);
     }
 
     #[test]

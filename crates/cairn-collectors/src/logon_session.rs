@@ -8,7 +8,7 @@ pub struct LogonSessionCollector;
 
 impl Collector for LogonSessionCollector {
     fn name(&self) -> &str {
-        "logon_session"
+        cairn_core::collectors::LOGON_SESSION
     }
 
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {

@@ -2,7 +2,8 @@
 //! `--only` allow-list, decide which collector modules run. No host, no I/O — the
 //! selection is a deterministic string-set operation, unit-tested on any platform.
 //!
-//! The profile→base-set mapping here is the single place that knowledge lives.
+//! Which modules a profile includes is carried by each [`ModuleInfo`] (from the CLI
+//! collector registry); this module only applies it.
 
 use crate::config::Profile;
 
@@ -26,21 +27,27 @@ fn canonical_only_name(raw: &str) -> String {
     }
 }
 
-/// Collectors `--profile minimal` skips: the file-API prefetch reader and the live
-/// EVTX reader, the two that scan many files. Everything else (process, network,
-/// sessions, persistence, WMI) is the light live set.
-const MINIMAL_SKIPS: &[&str] = &["prefetch", "evtx_live"];
+/// What selection needs to know about one collector module: its canonical name and
+/// whether `--profile minimal` runs it. The CLI's collector registry is the one list of
+/// these (with constructors); this crate only decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleInfo {
+    pub name: &'static str,
+    /// True when the light `minimal` profile runs this module. The heavy file scanners
+    /// (prefetch, live EVTX) are standard-only.
+    pub in_minimal: bool,
+}
 
 /// Modules a profile selects from `available`, BEFORE the `--only` intersection.
-fn profile_base<'a>(profile: Profile, available: &[&'a str]) -> Vec<&'a str> {
-    match profile {
-        Profile::Minimal => available
-            .iter()
-            .copied()
-            .filter(|name| !MINIMAL_SKIPS.contains(name))
-            .collect(),
-        Profile::Standard => available.to_vec(),
-    }
+fn profile_base(profile: Profile, available: &[ModuleInfo]) -> Vec<&'static str> {
+    available
+        .iter()
+        .filter(|m| match profile {
+            Profile::Minimal => m.in_minimal,
+            Profile::Standard => true,
+        })
+        .map(|m| m.name)
+        .collect()
 }
 
 /// Decide which collector modules run.
@@ -54,7 +61,7 @@ fn profile_base<'a>(profile: Profile, available: &[&'a str]) -> Vec<&'a str> {
 pub fn select_modules(
     profile: Profile,
     only: Option<&[String]>,
-    available: &[&str],
+    available: &[ModuleInfo],
 ) -> SelectionOutcome {
     let base = profile_base(profile, available);
 
@@ -77,7 +84,7 @@ pub fn select_modules(
         None => Vec::new(),
         Some(only_list) => {
             let avail_set: std::collections::BTreeSet<String> =
-                available.iter().map(|s| s.to_string()).collect();
+                available.iter().map(|m| m.name.to_string()).collect();
             let mut seen = std::collections::BTreeSet::new();
             only_list
                 .iter()
@@ -106,8 +113,12 @@ pub fn select_modules(
 mod tests {
     use super::*;
 
-    fn avail() -> Vec<&'static str> {
-        vec!["proc", "net", "persist"]
+    fn m(name: &'static str, in_minimal: bool) -> ModuleInfo {
+        ModuleInfo { name, in_minimal }
+    }
+
+    fn avail() -> Vec<ModuleInfo> {
+        vec![m("proc", true), m("net", true), m("persist", true)]
     }
 
     #[test]
@@ -119,7 +130,7 @@ mod tests {
 
     #[test]
     fn minimal_no_only_selects_the_live_light_set() {
-        // The avail() fixture has none of MINIMAL_SKIPS, so minimal and standard return
+        // Every avail() module is in_minimal, so minimal and standard return
         // the same set here. The divergence is tested by minimal_skips_prefetch_and_evtx_live.
         let out = select_modules(Profile::Minimal, None, &avail());
         assert_eq!(out.selected, vec!["proc", "net", "persist"]);
@@ -185,17 +196,31 @@ mod tests {
 
     #[test]
     fn minimal_skips_prefetch_and_evtx_live() {
-        let available = vec!["proc", "net", "persist", "prefetch", "evtx_live"];
+        let available = vec![
+            m("proc", true),
+            m("net", true),
+            m("persist", true),
+            m("prefetch", false),
+            m("evtx_live", false),
+        ];
         let out = select_modules(Profile::Minimal, None, &available);
         assert_eq!(out.selected, vec!["proc", "net", "persist"]);
         let std = select_modules(Profile::Standard, None, &available);
-        assert_eq!(std.selected, available);
+        assert_eq!(
+            std.selected,
+            vec!["proc", "net", "persist", "prefetch", "evtx_live"]
+        );
     }
 
     #[test]
     fn only_prefetch_under_minimal_still_excluded() {
         // --only cannot re-enable a module the profile base excludes (only INTERSECTS base).
-        let available = vec!["proc", "net", "persist", "prefetch"];
+        let available = vec![
+            m("proc", true),
+            m("net", true),
+            m("persist", true),
+            m("prefetch", false),
+        ];
         let only = vec!["prefetch".to_string()];
         let out = select_modules(Profile::Minimal, Some(&only), &available);
         assert!(out.selected.is_empty());

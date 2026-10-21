@@ -10,7 +10,7 @@ pub struct NetCollector;
 
 impl Collector for NetCollector {
     fn name(&self) -> &str {
-        "net"
+        cairn_core::collectors::NET
     }
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
         let tcp = cairn_collectors_win::net::tcp_table()?;
@@ -19,6 +19,7 @@ impl Collector for NetCollector {
     }
     fn sources(&self) -> Vec<SourceEntry> {
         vec![SourceEntry {
+            collector: String::new(),
             artifact: "netconn".into(),
             path: "live:net".into(),
             method: "api".into(),

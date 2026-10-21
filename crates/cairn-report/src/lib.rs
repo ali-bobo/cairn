@@ -789,6 +789,7 @@ mod tests {
         let mut manifest = minimal_manifest();
         manifest.outputs = sink.outputs_so_far();
         manifest.sources = vec![SourceEntry {
+            collector: String::new(),
             artifact: "process".into(),
             path: "live:process".into(),
             method: "api".into(),

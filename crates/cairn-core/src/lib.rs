@@ -11,6 +11,7 @@
 
 #![forbid(unsafe_code)] // raw-volume/WinAPI unsafe lives only in collector crates, behind review.
 
+pub mod collectors;
 pub mod config;
 pub mod finding;
 pub mod manifest;
@@ -22,11 +23,11 @@ pub mod time;
 pub mod traits;
 
 pub use config::{Config, Governance, OutputKind, Profile, Target};
-pub use finding::{Entity, Finding, FindingSource, Severity};
+pub use finding::{Entity, EntityPersistence, Finding, FindingSource, Severity};
 pub use manifest::{GovernanceReport, Manifest, SourceEntry};
 pub use observation::Observation;
-pub use record::Record;
-pub use selection::{select_modules, SelectionOutcome};
+pub use record::{Mechanism, Record};
+pub use selection::{select_modules, ModuleInfo, SelectionOutcome};
 pub use time::filetime_to_utc;
 pub use traits::{Analyzer, CollectCtx, Collector, OutputSink};
 

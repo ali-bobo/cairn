@@ -1336,7 +1336,7 @@ mod tests {
 
     fn persist_record() -> cairn_core::Record {
         cairn_core::Record::Persistence(cairn_core::record::PersistenceRecord {
-            mechanism: "run_key".into(),
+            mechanism: cairn_core::Mechanism::RunKey,
             location: r"HKLM\Run".into(),
             value: Some("x".into()),
             command: Some(r"C:\Program Files\x.exe".into()),
@@ -1364,6 +1364,7 @@ mod tests {
     fn overview_marks_clean_high_and_unchecked_areas() {
         let mut m = minimal_manifest();
         m.sources.push(cairn_core::manifest::SourceEntry {
+            collector: String::new(),
             artifact: "net".into(),
             path: "live:net".into(),
             method: "api".into(),

@@ -58,7 +58,7 @@ impl ProcCollector {
 
 impl Collector for ProcCollector {
     fn name(&self) -> &str {
-        "proc"
+        cairn_core::collectors::PROC
     }
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
         let raw = cairn_collectors_win::proc::enumerate()?;
@@ -79,6 +79,7 @@ impl Collector for ProcCollector {
     }
     fn sources(&self) -> Vec<SourceEntry> {
         vec![SourceEntry {
+            collector: String::new(),
             artifact: "process".into(),
             path: "live:process".into(),
             method: "api".into(),

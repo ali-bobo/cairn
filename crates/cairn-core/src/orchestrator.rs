@@ -120,6 +120,7 @@ pub fn run_live(
                     "collector failed; skipping"
                 );
                 sources.push(SourceEntry {
+                    collector: String::new(),
                     artifact: c.name().to_string(),
                     path: format!("live:{}", c.name()),
                     method: "api".into(),
@@ -203,6 +204,7 @@ mod tests {
         }
         fn sources(&self) -> Vec<SourceEntry> {
             vec![SourceEntry {
+                collector: String::new(),
                 artifact: self.name.into(),
                 path: format!("live:{}", self.name),
                 method: "api".into(),

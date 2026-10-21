@@ -200,7 +200,7 @@ impl PrefetchCollector {
 
 impl Collector for PrefetchCollector {
     fn name(&self) -> &str {
-        "prefetch"
+        cairn_core::collectors::PREFETCH
     }
 
     fn collect(&self, ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
@@ -283,6 +283,7 @@ impl Collector for PrefetchCollector {
             );
         }
         vec![SourceEntry {
+            collector: String::new(),
             artifact: "prefetch".into(),
             path: PREFETCH_DIR.into(),
             method: "file_api".into(),

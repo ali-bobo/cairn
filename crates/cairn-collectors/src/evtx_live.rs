@@ -83,6 +83,7 @@ pub(crate) fn collect_from_dir(
                     "evtx_live: parsed"
                 );
                 source_entries.push(SourceEntry {
+                    collector: String::new(),
                     artifact: format!("evtx_live:{channel}"),
                     path: path.display().to_string(),
                     method: "fs".into(),
@@ -94,6 +95,7 @@ pub(crate) fn collect_from_dir(
             Err(e) => {
                 tracing::warn!(file = %path.display(), error = %e, "evtx_live: parse failed; skipping");
                 source_entries.push(SourceEntry {
+                    collector: String::new(),
                     artifact: format!("evtx_live:{channel}"),
                     path: path.display().to_string(),
                     method: "fs".into(),
@@ -127,7 +129,7 @@ impl EvtxLiveCollector {
 
 impl Collector for EvtxLiveCollector {
     fn name(&self) -> &str {
-        "evtx_live"
+        cairn_core::collectors::EVTX_LIVE
     }
 
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {

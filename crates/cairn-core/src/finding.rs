@@ -31,6 +31,18 @@ pub struct Entity {
     pub netconn: Option<EntityNetConn>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub registry: Option<EntityRegistry>,
+    /// The persistence entry behind a persistence finding: its typed mechanism plus
+    /// where it lives. Lets reports pick mechanism-specific wording from a typed field
+    /// instead of parsing the title. Additive; absent on non-persistence findings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub persistence: Option<EntityPersistence>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntityPersistence {
+    pub mechanism: crate::record::Mechanism,
+    /// Registry key / file path / WMI binding (PersistenceRecord.location).
+    pub location: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +104,12 @@ pub struct Finding {
     pub severity: Severity,
     pub title: String,
     pub source: FindingSource,
+    /// `Analyzer::name()` of the analyzer that produced this finding (e.g.
+    /// "heur_persist", "sigma"). Typed provenance for cross-analyzer correlation and
+    /// report wording; never parse `reason`/`title` for this. Additive: old JSON
+    /// without the key deserializes to "".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub analyzer: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rule_id: Option<String>,
     /// DRL 1.1 REQUIRES surfacing Sigma author. Must be Some when source==Sigma.
@@ -132,6 +150,7 @@ impl Finding {
             severity,
             title: title.into(),
             source,
+            analyzer: String::new(),
             rule_id: None,
             rule_author: None,
             mitre: vec![],
@@ -256,6 +275,34 @@ mod tests {
         assert!(!j2.contains("evidence"));
         let back2: Finding = serde_json::from_str(&j2).unwrap();
         assert!(back2.evidence.is_empty());
+    }
+
+    #[test]
+    fn analyzer_and_persistence_entity_roundtrip_and_default_on_old_json() {
+        let mut f = Finding::new(Severity::High, "x", FindingSource::Heuristic);
+        f.analyzer = "heur_persist".into();
+        f.entity.persistence = Some(EntityPersistence {
+            mechanism: crate::record::Mechanism::Ifeo,
+            location: "HKLM\\IFEO\\sethc.exe".into(),
+        });
+        let j = serde_json::to_string(&f).unwrap();
+        assert!(j.contains(r#""analyzer":"heur_persist""#), "{j}");
+        assert!(j.contains(r#""mechanism":"ifeo""#), "{j}");
+        let back: Finding = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.analyzer, "heur_persist");
+        assert_eq!(
+            back.entity.persistence.map(|p| p.mechanism),
+            Some(crate::record::Mechanism::Ifeo)
+        );
+
+        // Old JSON: neither key present -> defaults, and empty values are not written.
+        let f2 = Finding::new(Severity::Low, "y", FindingSource::Sigma);
+        let j2 = serde_json::to_string(&f2).unwrap();
+        assert!(!j2.contains("analyzer"));
+        assert!(!j2.contains("persistence"));
+        let back2: Finding = serde_json::from_str(&j2).unwrap();
+        assert!(back2.analyzer.is_empty());
+        assert!(back2.entity.persistence.is_none());
     }
 
     #[test]

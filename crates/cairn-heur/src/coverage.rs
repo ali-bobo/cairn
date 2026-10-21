@@ -265,36 +265,8 @@ mod tests {
     /// so the coverage report never under-states what a run can find.
     #[test]
     fn every_persistence_technique_is_listed() {
-        for m in [
-            "run_key",
-            "service",
-            "scheduled_task",
-            "wmi_subscription",
-            "ifeo",
-            "startup",
-            "winlogon",
-            "explorer_policy_run",
-            "boot_execute",
-            "lsa_auth_package",
-            "lsa_security_package",
-            "lsa_notification_package",
-            "time_provider",
-            "winlogon_notify",
-            "winlogon_mpnotify",
-            "print_monitor",
-            "active_setup",
-            "screensaver",
-            "netsh_helper",
-            "appcert_dlls",
-            "appinit_dlls",
-            "silent_exit_monitor",
-            "com_hijack",
-            "cmd_autorun",
-            "office_test",
-            "logon_script",
-            "ps_profile",
-        ] {
-            let t = crate::asep::mechanism_mitre(m);
+        for m in cairn_core::Mechanism::ALL {
+            let t = crate::asep::mechanism_mitre(*m);
             assert!(
                 BUILTIN.iter().any(|c| c.technique == t),
                 "{m} -> {t} missing from coverage table"

