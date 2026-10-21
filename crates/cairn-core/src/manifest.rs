@@ -33,7 +33,7 @@ pub struct RunInfo {
     pub cmdline: String,
     pub operator: String,
     pub case_id: String,
-    /// The active run profile (minimal|standard|verbose) — transparency (FR6).
+    /// The active run profile (minimal|standard) — transparency (FR6).
     /// Additive (S2-L); `#[serde(default)]` keeps pre-S2-L manifests parseable.
     #[serde(default)]
     pub profile: String,
@@ -62,7 +62,7 @@ pub struct Privileges {
 pub struct SourceEntry {
     pub artifact: String,
     pub path: String,
-    pub method: String, // api|raw_ntfs|vss
+    pub method: String, // e.g. api|fs|file_api|com|toolhelp
     pub size: u64,
     pub sha256: String,
     #[serde(default)]
@@ -84,11 +84,9 @@ pub struct Counts {
     pub observations: u64,
 }
 
-/// Resource-governance report (NFR9/NFR10): what the run throttled or truncated.
+/// Resource-governance report (NFR9): how the run was throttled.
 /// Additive; `#[serde(default)]` on the `Manifest` field keeps pre-governance
 /// manifests parseable.
-/// Truncations here are the structured form; the same event is also recorded as a
-/// string in `manifest.sources[].errors` for SRS NFR10 compatibility.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GovernanceReport {
     /// Effective rayon thread count used this run.
@@ -97,21 +95,6 @@ pub struct GovernanceReport {
     /// True if the process priority was successfully lowered (live + not --full-speed).
     #[serde(default)]
     pub low_priority_applied: bool,
-    /// One entry per collector that hit a record cap / circuit breaker.
-    #[serde(default)]
-    pub truncations: Vec<Truncation>,
-}
-
-/// A single circuit-breaker / cap hit, recorded for transparency (NFR10).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Truncation {
-    /// The collector module that was truncated, e.g. `"mft"`.
-    pub collector: String,
-    /// The cap value that fired, in the collector's natural unit (e.g. a record
-    /// count for `max_mft_records`); see `reason` for the unit context.
-    pub cap: u64,
-    /// Human-readable explanation, e.g. `"max_mft_records reached"`.
-    pub reason: String,
 }
 
 #[cfg(test)]
@@ -220,26 +203,16 @@ mod tests {
         let r = GovernanceReport {
             effective_threads: 8,
             low_priority_applied: true,
-            truncations: vec![Truncation {
-                collector: "mft".into(),
-                cap: 1_000_000,
-                reason: "max_mft_records reached".into(),
-            }],
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: GovernanceReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back.effective_threads, 8);
         assert!(back.low_priority_applied);
-        assert_eq!(back.truncations.len(), 1);
-        assert_eq!(back.truncations[0].collector, "mft");
-        assert_eq!(back.truncations[0].cap, 1_000_000);
-        assert_eq!(back.truncations[0].reason, "max_mft_records reached");
 
-        // A GovernanceReport with no truncations omits/defaults the vec.
+        // An empty object (pre-governance) defaults every field.
         let empty: GovernanceReport = serde_json::from_str("{}").unwrap();
         assert_eq!(empty.effective_threads, 0);
         assert!(!empty.low_priority_applied);
-        assert!(empty.truncations.is_empty());
     }
 
     #[test]
@@ -250,7 +223,6 @@ mod tests {
         v.as_object_mut().unwrap().remove("governance");
         let back: Manifest = serde_json::from_value(v).unwrap();
         assert_eq!(back.governance.effective_threads, 0);
-        assert!(back.governance.truncations.is_empty());
     }
 
     #[test]

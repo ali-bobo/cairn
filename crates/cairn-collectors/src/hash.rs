@@ -1,7 +1,7 @@
 //! Streaming, size-capped sha256 of a file (FR14 IOC hashing). PURE: the file open+length probe
 //! is injected, so this is Linux-CI-testable and unsafe-free. Constant memory (one fixed
 //! buffer); a file over the cap is skipped (None) so a pathological huge file cannot stall
-//! triage — the first concrete NFR10 resource-governance guard (raw-NTFS will reuse the shape).
+//! triage (NFR10 resource-governance guard).
 #![allow(dead_code)]
 
 use sha2::{Digest, Sha256};

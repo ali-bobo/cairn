@@ -165,7 +165,7 @@ pub fn is_inbox_service_command(cmd: &str) -> bool {
 }
 
 /// 跨文物比對鍵：有完整路徑（含目錄分隔符）就用正規化後的完整路徑比對；
-/// 只有檔名（來源本身缺路徑資訊，如多數 prefetch 條目、srum 的 "id:<n>" 回退）
+/// 只有檔名（來源本身缺路徑資訊，如多數 prefetch 條目）
 /// 就降級成純檔名比對。降級佐證的信心度低於完整路徑相符，呼叫端在組
 /// finding reason 時必須標註「降級佐證」。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -188,7 +188,7 @@ impl JoinKey {
 }
 
 /// 從一個原始路徑/檔名字串建立 JoinKey：trim + 去引號 + 小寫，再判斷是否含
-/// 目錄分隔符（`\` 或 `/`）。不含分隔符（如純檔名、或 srum 的 "id:42" 回退）
+/// 目錄分隔符（`\` 或 `/`）。不含分隔符（如純檔名）
 /// 一律視為 Name（降級）鍵。
 pub fn join_key(raw: &str) -> JoinKey {
     let normalized = raw.trim().trim_matches('"').to_ascii_lowercase();
@@ -262,8 +262,8 @@ pub fn escalate(sev: Severity) -> Severity {
 /// Index execution + process records for corroboration lookups. Two-layer index:
 /// exact (JoinKey equality — Path==Path or Name==Name with identical string) built
 /// for **all** records; degraded (basename-only) built **only** from records whose
-/// source itself lacks path information (`JoinKey::Name`, e.g. prefetch filenames,
-/// srum's `id:<n>` fallback) — records with a full path (`JoinKey::Path`) are never
+/// source itself lacks path information (`JoinKey::Name`, e.g. prefetch filenames)
+/// — records with a full path (`JoinKey::Path`) are never
 /// inserted into the degraded index. On lookup, exact is tried first regardless of
 /// the query's own key kind; degraded is only consulted on an exact miss. Because
 /// the degraded index only ever holds path-less records, two records that both carry
@@ -388,17 +388,6 @@ mod tests {
             prefetch_side.degraded_key(),
             live_side.degraded_key(),
             "basename-only source must still corroborate via degraded match"
-        );
-    }
-
-    #[test]
-    fn join_key_srum_id_fallback_is_name_only() {
-        // srum's resolve_app_name falls back to "id:<n>" when unmapped — must be
-        // treated as a Name key (no directory component), not misparsed as a path.
-        let k = join_key("id:42");
-        assert!(
-            matches!(k, JoinKey::Name(_)),
-            "id: fallback must be a Name key"
         );
     }
 

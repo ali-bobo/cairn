@@ -17,5 +17,4 @@ pub mod priority;
 pub mod privilege;
 pub mod proc;
 pub mod signature;
-pub mod volume;
 pub mod wmi;

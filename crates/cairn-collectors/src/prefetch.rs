@@ -1,6 +1,6 @@
 //! PrefetchCollector: parse C:\Windows\Prefetch\*.pf (Win10+ MAM-compressed) into
-//! Record::Execution with real run_count + first/last run times. The first non-raw-NTFS
-//! offline collector: std::fs reads (admin only, .pf is not OS-locked), compcol decompresses
+//! Record::Execution with real run_count + first/last run times. An offline-artifact
+//! collector: std::fs reads (admin only, .pf is not OS-locked), compcol decompresses
 //! the MAM (Xpress-Huffman) wrapper, a pure never-panic parser reads the header. Recognised
 //! format versions only (Win10 v30); an unrecognised version ABSTAINS (NFR12).
 
@@ -103,7 +103,7 @@ struct PrefetchInfo {
     run_times: Vec<DateTime<Utc>>,
 }
 
-/// Bounds-checked little-endian u32 reader (mirrors usn.rs/shimcache.rs rd_u32).
+/// Bounds-checked little-endian u32 reader.
 /// Returns None when `off..off+4` is out of bounds — never panics.
 #[inline]
 fn rd_u32(buf: &[u8], off: usize) -> Option<u32> {
@@ -113,7 +113,7 @@ fn rd_u32(buf: &[u8], off: usize) -> Option<u32> {
         .map(u32::from_le_bytes)
 }
 
-/// Bounds-checked little-endian u64 reader (mirrors usn.rs/shimcache.rs rd_u64).
+/// Bounds-checked little-endian u64 reader.
 /// Returns None when `off..off+8` is out of bounds — never panics.
 #[inline]
 fn rd_u64(buf: &[u8], off: usize) -> Option<u64> {

@@ -2,10 +2,7 @@
 //! `--only` allow-list, decide which collector modules run. No host, no I/O — the
 //! selection is a deterministic string-set operation, unit-tested on any platform.
 //!
-//! Why a module of its own: this is the switch raw-NTFS (S2-M+) hangs off. When
-//! heavier collectors are added tagged `standard`/`verbose`-only, `minimal` will
-//! skip them automatically — the profile→base-set mapping here is the single place
-//! that knowledge lives.
+//! The profile→base-set mapping here is the single place that knowledge lives.
 
 use crate::config::Profile;
 
@@ -29,35 +26,20 @@ fn canonical_only_name(raw: &str) -> String {
     }
 }
 
-/// Heavy offline collectors (raw-NTFS modules + prefetch + future srum/userassist)
-/// and conditional collectors like evtx_live (requires --rules; skipped in minimal).
-/// `--profile minimal` skips ALL of these (SRS §19.1). The single place the
-/// profile→heavy-set mapping lives. Not all are raw-NTFS (prefetch uses the file API),
-/// hence the name HEAVY_OFFLINE rather than RAW_NTFS.
-const HEAVY_OFFLINE: &[&str] = &[
-    "mft",
-    "usn",
-    "shimcache",
-    "amcache",
-    "prefetch",
-    "bam",
-    "userassist",
-    "srum",
-    "evtx_live",
-];
+/// Collectors `--profile minimal` skips: the file-API prefetch reader and the live
+/// EVTX reader, the two that scan many files. Everything else (process, network,
+/// sessions, persistence, WMI) is the light live set.
+const MINIMAL_SKIPS: &[&str] = &["prefetch", "evtx_live"];
 
 /// Modules a profile selects from `available`, BEFORE the `--only` intersection.
-/// `minimal` = the light live set (HEAVY_OFFLINE excluded, SRS §19.1). `standard`/`verbose`
-/// currently select everything available. The mechanism is here; profiles diverge as
-/// heavier collectors register into `HEAVY_OFFLINE`.
 fn profile_base<'a>(profile: Profile, available: &[&'a str]) -> Vec<&'a str> {
     match profile {
         Profile::Minimal => available
             .iter()
             .copied()
-            .filter(|name| !HEAVY_OFFLINE.contains(name))
+            .filter(|name| !MINIMAL_SKIPS.contains(name))
             .collect(),
-        Profile::Standard | Profile::Verbose => available.to_vec(),
+        Profile::Standard => available.to_vec(),
     }
 }
 
@@ -137,8 +119,8 @@ mod tests {
 
     #[test]
     fn minimal_no_only_selects_the_live_light_set() {
-        // Today's avail() fixture has no raw-NTFS modules, so minimal and standard return
-        // the same set here. The profile divergence is tested by minimal_excludes_raw_ntfs_collectors.
+        // The avail() fixture has none of MINIMAL_SKIPS, so minimal and standard return
+        // the same set here. The divergence is tested by minimal_skips_prefetch_and_evtx_live.
         let out = select_modules(Profile::Minimal, None, &avail());
         assert_eq!(out.selected, vec!["proc", "net", "persist"]);
     }
@@ -202,165 +184,22 @@ mod tests {
     }
 
     #[test]
-    fn minimal_excludes_raw_ntfs_collectors() {
-        // SRS §19.1: --profile minimal SKIPS raw-NTFS. "mft" is the first raw-NTFS module.
-        let available = vec!["proc", "net", "persist", "mft"];
+    fn minimal_skips_prefetch_and_evtx_live() {
+        let available = vec!["proc", "net", "persist", "prefetch", "evtx_live"];
         let out = select_modules(Profile::Minimal, None, &available);
-        assert_eq!(out.selected, vec!["proc", "net", "persist"]); // no "mft"
-    }
-
-    #[test]
-    fn standard_and_verbose_include_raw_ntfs() {
-        let available = vec!["proc", "net", "persist", "mft"];
+        assert_eq!(out.selected, vec!["proc", "net", "persist"]);
         let std = select_modules(Profile::Standard, None, &available);
-        assert_eq!(std.selected, vec!["proc", "net", "persist", "mft"]);
-        let vb = select_modules(Profile::Verbose, None, &available);
-        assert_eq!(vb.selected, vec!["proc", "net", "persist", "mft"]);
+        assert_eq!(std.selected, available);
     }
 
     #[test]
-    fn only_mft_under_minimal_still_excluded() {
+    fn only_prefetch_under_minimal_still_excluded() {
         // --only cannot re-enable a module the profile base excludes (only INTERSECTS base).
-        let available = vec!["proc", "net", "persist", "mft"];
-        let only = vec!["mft".to_string()];
+        let available = vec!["proc", "net", "persist", "prefetch"];
+        let only = vec!["prefetch".to_string()];
         let out = select_modules(Profile::Minimal, Some(&only), &available);
         assert!(out.selected.is_empty());
-        // "mft" IS available (just not in minimal's base), so it is NOT an unknown_only warning.
+        // "prefetch" IS available (just not in minimal's base), so it is NOT unknown.
         assert!(out.unknown_only.is_empty());
-    }
-
-    #[test]
-    fn minimal_excludes_usn() {
-        let available = vec!["proc", "net", "persist", "mft", "usn"];
-        let out = select_modules(Profile::Minimal, None, &available);
-        assert_eq!(out.selected, vec!["proc", "net", "persist"]); // no mft, no usn
-        let std = select_modules(Profile::Standard, None, &available);
-        assert!(std.selected.contains(&"usn".to_string())); // standard keeps usn (Vec<String>)
-    }
-
-    #[test]
-    fn minimal_excludes_shimcache() {
-        let available = vec!["proc", "net", "persist", "mft", "usn", "shimcache"];
-        let out = select_modules(Profile::Minimal, None, &available);
-        assert_eq!(out.selected, vec!["proc", "net", "persist"]); // no raw-NTFS
-        let std = select_modules(Profile::Standard, None, &available);
-        assert!(std.selected.contains(&"shimcache".to_string())); // standard keeps shimcache
-    }
-
-    #[test]
-    fn minimal_excludes_amcache() {
-        let available = vec![
-            "proc",
-            "net",
-            "persist",
-            "mft",
-            "usn",
-            "shimcache",
-            "amcache",
-        ];
-        let out = select_modules(Profile::Minimal, None, &available);
-        assert_eq!(out.selected, vec!["proc", "net", "persist"]); // no raw-NTFS
-        let std = select_modules(Profile::Standard, None, &available);
-        assert!(std.selected.contains(&"amcache".to_string())); // standard keeps amcache
-    }
-
-    #[test]
-    fn minimal_excludes_prefetch() {
-        let available = vec![
-            "proc",
-            "net",
-            "persist",
-            "mft",
-            "usn",
-            "shimcache",
-            "amcache",
-            "prefetch",
-        ];
-        let out = select_modules(Profile::Minimal, None, &available);
-        assert_eq!(out.selected, vec!["proc", "net", "persist"]);
-        let std = select_modules(Profile::Standard, None, &available);
-        assert!(std.selected.contains(&"prefetch".to_string()));
-    }
-
-    #[test]
-    fn minimal_excludes_bam() {
-        let available = vec![
-            "proc",
-            "net",
-            "persist",
-            "mft",
-            "usn",
-            "shimcache",
-            "amcache",
-            "prefetch",
-            "bam",
-        ];
-        let out = select_modules(Profile::Minimal, None, &available);
-        assert_eq!(out.selected, vec!["proc", "net", "persist"]);
-        let std = select_modules(Profile::Standard, None, &available);
-        assert!(std.selected.contains(&"bam".to_string()));
-    }
-
-    #[test]
-    fn minimal_excludes_userassist() {
-        let available = vec![
-            "proc",
-            "net",
-            "persist",
-            "mft",
-            "usn",
-            "shimcache",
-            "amcache",
-            "prefetch",
-            "bam",
-            "userassist",
-        ];
-        let out = select_modules(Profile::Minimal, None, &available);
-        assert_eq!(out.selected, vec!["proc", "net", "persist"]);
-        let std = select_modules(Profile::Standard, None, &available);
-        assert!(std.selected.contains(&"userassist".to_string()));
-    }
-
-    #[test]
-    fn minimal_excludes_srum() {
-        let available = vec![
-            "proc",
-            "net",
-            "persist",
-            "mft",
-            "usn",
-            "shimcache",
-            "amcache",
-            "prefetch",
-            "bam",
-            "userassist",
-            "srum",
-        ];
-        let out = select_modules(Profile::Minimal, None, &available);
-        assert_eq!(out.selected, vec!["proc", "net", "persist"]);
-        let std = select_modules(Profile::Standard, None, &available);
-        assert!(std.selected.contains(&"srum".to_string()));
-    }
-
-    #[test]
-    fn minimal_excludes_evtx_live() {
-        let available = vec![
-            "proc",
-            "net",
-            "persist",
-            "mft",
-            "usn",
-            "shimcache",
-            "amcache",
-            "prefetch",
-            "bam",
-            "userassist",
-            "srum",
-            "evtx_live",
-        ];
-        let out = select_modules(Profile::Minimal, None, &available);
-        assert_eq!(out.selected, vec!["proc", "net", "persist"]);
-        let std = select_modules(Profile::Standard, None, &available);
-        assert!(std.selected.contains(&"evtx_live".to_string()));
     }
 }

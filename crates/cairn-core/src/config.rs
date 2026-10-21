@@ -17,7 +17,6 @@ pub enum Target {
 pub enum Profile {
     Minimal,
     Standard,
-    Verbose,
 }
 
 impl std::str::FromStr for Profile {
@@ -31,9 +30,8 @@ impl std::str::FromStr for Profile {
         match s.to_ascii_lowercase().as_str() {
             "minimal" => Ok(Profile::Minimal),
             "standard" => Ok(Profile::Standard),
-            "verbose" => Ok(Profile::Verbose),
             other => Err(format!(
-                "unknown profile '{other}'; valid profiles: minimal, standard, verbose"
+                "unknown profile '{other}'; valid profiles: minimal, standard"
             )),
         }
     }
@@ -104,14 +102,6 @@ pub struct Config {
     pub operator: String,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub use_vss: bool,
-    /// Hard cap on $MFT records scanned by the mft collector (NFR10). Default 1_000_000.
-    /// Hitting it records a truncation note in the manifest and stops the scan
-    /// (never OOM / never an unbounded loop on a lied-about volume capacity).
-    pub max_mft_records: u64,
-    /// Hard cap on USN ($J) records the usn collector emits (NFR10). Default 1,000,000.
-    /// Hitting it records a truncation note in the manifest and stops the scan, so a
-    /// huge journal on a long-uptime server cannot exhaust memory. Mirrors max_mft_records.
-    pub max_usn_records: u64,
     /// Time window (minutes) for grouping repeated failed logons (EID 4625) from the
     /// same (TargetUserName, IpAddress) pair before flagging bruteforce (segment 4-C).
     /// Fixed default; no CLI flag.
@@ -126,10 +116,6 @@ pub struct Config {
     /// Distinct TargetUserName count within `password_spraying_window_minutes` from
     /// the same source that triggers a spraying Finding.
     pub password_spraying_threshold: u32,
-    /// Reconstruct full file paths from $MFT parent references (path map, S2-O).
-    /// false → fall back to S2-N bare-filename behaviour (path_complete = None),
-    /// the first optional enhancement to drop under a future minimal profile.
-    pub resolve_mft_paths: bool,
     /// Resource governance (NFR9): thread cap + priority posture.
     pub governance: Governance,
 }
@@ -148,13 +134,10 @@ impl Default for Config {
             operator: String::new(),
             since: None,
             use_vss: false,
-            max_mft_records: 1_000_000,
-            max_usn_records: 1_000_000,
             logon_bruteforce_window_minutes: 5,
             logon_bruteforce_threshold: 5,
             password_spraying_window_minutes: 1,
             password_spraying_threshold: 10,
-            resolve_mft_paths: true,
             governance: Governance::default(),
         }
     }
@@ -175,15 +158,6 @@ impl Config {
     pub fn with_rules_plain(mut self, plain: bool) -> Self {
         self.rules_plain = plain;
         self
-    }
-
-    /// Apply profile-implied light-mode overrides. Call once after CLI parsing,
-    /// before the run. Currently: `minimal` disables full-path reconstruction
-    /// (path map is the first enhancement dropped in light mode). Idempotent.
-    pub fn normalize_for_profile(&mut self) {
-        if self.profile == Profile::Minimal {
-            self.resolve_mft_paths = false;
-        }
     }
 }
 
@@ -228,35 +202,6 @@ mod tests {
     }
 
     #[test]
-    fn normalize_for_profile_minimal_disables_path_resolution() {
-        let mut cfg = Config {
-            profile: Profile::Minimal,
-            ..Config::default()
-        };
-        assert!(cfg.resolve_mft_paths, "default starts true");
-        cfg.normalize_for_profile();
-        assert!(!cfg.resolve_mft_paths, "minimal must force false");
-        // idempotent
-        cfg.normalize_for_profile();
-        assert!(!cfg.resolve_mft_paths);
-    }
-
-    #[test]
-    fn normalize_for_profile_standard_and_verbose_leave_path_resolution() {
-        for p in [Profile::Standard, Profile::Verbose] {
-            let mut cfg = Config {
-                profile: p,
-                resolve_mft_paths: true,
-                ..Config::default()
-            };
-            cfg.normalize_for_profile();
-            assert!(cfg.resolve_mft_paths, "{p:?} must not disable resolution");
-        }
-    }
-
-    /// `cairn evtx <files> --rules <dir>` maps to a Config whose target is the file
-    /// list, rules_dir is set, and output stays off-target by default (golden rule 4).
-    #[test]
     fn for_evtx_maps_files_rules_and_default_output() {
         let files = vec![PathBuf::from("Security.evtx"), PathBuf::from("System.evtx")];
         let cfg = Config::for_evtx(files.clone(), Some(PathBuf::from("./rules")));
@@ -296,7 +241,7 @@ mod tests {
     fn profile_from_str_parses_known_values_case_insensitively() {
         assert_eq!("minimal".parse::<Profile>().unwrap(), Profile::Minimal);
         assert_eq!("standard".parse::<Profile>().unwrap(), Profile::Standard);
-        assert_eq!("verbose".parse::<Profile>().unwrap(), Profile::Verbose);
+        assert!("verbose".parse::<Profile>().is_err(), "verbose was removed");
         // case-insensitive: an analyst typing --profile MINIMAL still works.
         assert_eq!("MINIMAL".parse::<Profile>().unwrap(), Profile::Minimal);
         assert_eq!("Standard".parse::<Profile>().unwrap(), Profile::Standard);
@@ -311,26 +256,8 @@ mod tests {
             "error should echo the bad value: {err}"
         );
         assert!(
-            err.contains("minimal") && err.contains("standard") && err.contains("verbose"),
+            err.contains("minimal") && err.contains("standard"),
             "error should list valid profiles: {err}"
         );
-    }
-
-    #[test]
-    fn max_mft_records_defaults_to_one_million() {
-        let cfg = Config::default();
-        assert_eq!(cfg.max_mft_records, 1_000_000);
-    }
-
-    #[test]
-    fn max_usn_records_defaults_to_one_million() {
-        let cfg = Config::default();
-        assert_eq!(cfg.max_usn_records, 1_000_000);
-    }
-
-    #[test]
-    fn resolve_mft_paths_defaults_to_true() {
-        let cfg = Config::default();
-        assert!(cfg.resolve_mft_paths);
     }
 }

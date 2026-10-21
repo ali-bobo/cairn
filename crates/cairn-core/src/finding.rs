@@ -70,8 +70,8 @@ pub struct EntityRegistry {
 /// in `detail`. Additive to the finding schema (old JSON deserializes to an empty vec).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvidenceItem {
-    /// Source artifact: "run_key" | "service" | "prefetch" | "shimcache" | "amcache"
-    /// | "bam" | "userassist" | "process" | "evtx:Security" | "mft" | ...
+    /// Source artifact: "run_key" | "service" | "prefetch" | "process"
+    /// | "evtx:Security" | ...
     pub artifact: String,
     /// Full path as seen by that source (None when the source has no path).
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -325,7 +325,7 @@ fn execution_evidence(entries: &[&ExecutionRecord]) -> Vec<EvidenceItem> {
                     .unwrap_or_else(|| "unknown".into()),
             );
             if e.source == "prefetch" {
-                detail.push_str("（prefetch 僅記錄檔名，完整路徑見 shimcache/amcache 條目）");
+                detail.push_str("（prefetch 僅記錄檔名）");
             }
             EvidenceItem {
                 artifact: e.source.clone(),

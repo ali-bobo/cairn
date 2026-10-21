@@ -125,14 +125,6 @@ struct RunArgs {
     operator: Option<String>,
     #[arg(long)]
     use_vss: bool,
-    /// Hard cap on $MFT records the mft collector scans (NFR10). Default 1,000,000.
-    /// Keep this default in sync with `cairn_core::config::Config::default().max_mft_records`.
-    #[arg(long, default_value_t = 1_000_000)]
-    max_mft_records: u64,
-    /// Hard cap on USN ($J) records the usn collector emits (NFR10). Default 1,000,000.
-    /// Keep in sync with `cairn_core::config::Config::default().max_usn_records`.
-    #[arg(long, default_value_t = 1_000_000)]
-    max_usn_records: u64,
     /// Cap the rayon worker pool (NFR9). Default: min(cores, 8). 0 = use default.
     #[arg(long)]
     max_threads: Option<usize>,
@@ -271,6 +263,17 @@ fn default_rules_dir() -> Option<PathBuf> {
         .find(|d| d.is_dir())
 }
 
+/// The live collectors' real `Collector::name()` strings, in canonical run order.
+const AVAILABLE: &[&str] = &[
+    "proc",
+    "net",
+    "logon_session",
+    "persist",
+    "prefetch",
+    "wmi_subscription",
+    "evtx_live",
+];
+
 fn is_live_target(target: &str) -> bool {
     target.eq_ignore_ascii_case("live")
 }
@@ -357,67 +360,18 @@ fn enrich_hashes(
     }
 }
 
-/// Harvest record-cap truncation notes from collector provenance into manifest
-/// Truncation entries. Collectors surface a cap via a `sources()` error string of the
-/// form "truncated: max_<X>_records reached (cap=N)"; this parses the cap and attributes
-/// it to the SourceEntry's artifact name. The authoritative source is the collector's own
-/// sources() — no separate truncation channel is invented (governance design).
-fn collect_truncations(
-    sources: &[cairn_core::manifest::SourceEntry],
-) -> Vec<cairn_core::manifest::Truncation> {
-    let mut out = Vec::new();
-    for entry in sources {
-        for err in &entry.errors {
-            if let Some(rest) = err.strip_prefix("truncated: ") {
-                if let Some(cap) = parse_cap(rest) {
-                    out.push(cairn_core::manifest::Truncation {
-                        collector: entry.artifact.clone(),
-                        cap,
-                        reason: err.clone(),
-                    });
-                }
-            }
-        }
-    }
-    out
-}
-
-/// Extract N from a string containing "(cap=N)". Returns None if absent or unparsable.
-fn parse_cap(s: &str) -> Option<u64> {
-    let start = s.find("(cap=")? + "(cap=".len();
-    let tail = &s[start..];
-    let end = tail.find(')')?;
-    tail[..end].parse::<u64>().ok()
-}
-
 /// The collector names that the run arm's construction `if` blocks would build for
 /// this selection, in canonical order. Pure mirror of those blocks, so the
 /// selection→collectors mapping is unit-testable without a live Windows host.
-/// MUST stay in sync with the twelve unconditional `if ... push(...)` blocks in `main` that
-/// construct proc/net/logon_session/persist/mft/usn/shimcache/amcache/prefetch/bam/userassist/
-/// wmi_subscription collectors (search: "S2-L: construct only").
-/// NOTE: `evtx_live` and `srum` are NOT included — they are conditionally constructed
-/// (evtx_live requires sigma_analyzer, srum has its own stub path).
+/// MUST stay in sync with the `if ... push(...)` blocks in `main` (search:
+/// "S2-L: construct only"). `evtx_live` is included: it is always built when selected.
 #[cfg(test)]
 fn built_collector_names(selected: &[String]) -> Vec<String> {
-    [
-        "proc",
-        "net",
-        "logon_session",
-        "persist",
-        "mft",
-        "usn",
-        "shimcache",
-        "amcache",
-        "prefetch",
-        "bam",
-        "userassist",
-        "wmi_subscription",
-    ]
-    .iter()
-    .filter(|n| selected.iter().any(|m| m == *n))
-    .map(|s| s.to_string())
-    .collect()
+    AVAILABLE
+        .iter()
+        .filter(|n| selected.iter().any(|m| m == *n))
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Dump collected Records as JSONL so a live run produces usable data even before
@@ -811,24 +765,8 @@ fn main() -> anyhow::Result<()> {
                 "unknown".into()
             });
 
-            // S2-L: decide which collectors run. AVAILABLE = the live collectors' real
-            // Collector::name() strings. Pure decision; logged for transparency (FR6).
-            const AVAILABLE: &[&str] = &[
-                "proc",
-                "net",
-                "logon_session",
-                "persist",
-                "mft",
-                "usn",
-                "shimcache",
-                "amcache",
-                "prefetch",
-                "bam",
-                "userassist",
-                "srum",
-                "wmi_subscription",
-                "evtx_live",
-            ];
+            // S2-L: decide which collectors run (AVAILABLE = the live collectors' real
+            // Collector::name() strings). Pure decision; logged for transparency (FR6).
             let selection = cairn_core::select_modules(profile, only.as_deref(), AVAILABLE);
             for name in &selection.unknown_only {
                 tracing::warn!(
@@ -852,8 +790,6 @@ fn main() -> anyhow::Result<()> {
             };
 
             let mut cfg = Config {
-                max_mft_records: args.max_mft_records,
-                max_usn_records: args.max_usn_records,
                 profile,
                 output: output_kind,
                 ..Config::default()
@@ -871,7 +807,6 @@ fn main() -> anyhow::Result<()> {
             let is_live = matches!(cfg.target, cairn_core::Target::Live);
             cfg.governance.max_threads = args.max_threads;
             cfg.governance.low_priority = is_live && !args.full_speed;
-            cfg.normalize_for_profile();
 
             // Default look-back for live EVTX (DEFAULT_SINCE_DAYS); overridable with
             // --since (ISO8601 UTC).
@@ -949,37 +884,10 @@ fn main() -> anyhow::Result<()> {
                     cairn_collectors::persist::PersistCollector::default(),
                 ));
             }
-            if selection.selected.iter().any(|m| m == "mft") {
-                collectors.push(Box::new(cairn_collectors::mft::MftCollector::default()));
-            }
-            if selection.selected.iter().any(|m| m == "usn") {
-                collectors.push(Box::new(cairn_collectors::usn::UsnCollector::default()));
-            }
-            if selection.selected.iter().any(|m| m == "shimcache") {
-                collectors.push(Box::new(
-                    cairn_collectors::shimcache::ShimCollector::default(),
-                ));
-            }
-            if selection.selected.iter().any(|m| m == "amcache") {
-                collectors.push(Box::new(
-                    cairn_collectors::amcache::AmcacheCollector::default(),
-                ));
-            }
             if selection.selected.iter().any(|m| m == "prefetch") {
                 collectors.push(Box::new(
                     cairn_collectors::prefetch::PrefetchCollector::default(),
                 ));
-            }
-            if selection.selected.iter().any(|m| m == "bam") {
-                collectors.push(Box::new(cairn_collectors::bam::BamCollector::default()));
-            }
-            if selection.selected.iter().any(|m| m == "userassist") {
-                collectors.push(Box::new(
-                    cairn_collectors::userassist::UserAssistCollector::default(),
-                ));
-            }
-            if selection.selected.iter().any(|m| m == "srum") {
-                collectors.push(Box::new(cairn_collectors::srum::SrumCollector::default()));
             }
             if selection.selected.iter().any(|m| m == "wmi_subscription") {
                 collectors.push(Box::new(
@@ -1050,7 +958,6 @@ fn main() -> anyhow::Result<()> {
             let governance_report = cairn_core::manifest::GovernanceReport {
                 effective_threads,
                 low_priority_applied,
-                truncations: collect_truncations(&outcome.sources),
             };
 
             let by_sev = cairn_report::Summary::from_findings(
@@ -1244,126 +1151,22 @@ mod tests {
     #[test]
     fn selected_collector_names_follow_selection() {
         use cairn_core::{select_modules, Profile};
-        const AVAILABLE: &[&str] = &[
-            "proc",
-            "net",
-            "logon_session",
-            "persist",
-            "mft",
-            "usn",
-            "shimcache",
-            "amcache",
-            "prefetch",
-            "bam",
-            "userassist",
-            "srum",
-            "wmi_subscription",
-            "evtx_live",
-        ];
 
         // --only persist => only persist constructed.
         let only = vec!["persist".to_string()];
         let sel = select_modules(Profile::Standard, Some(&only), AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert_eq!(built, vec!["persist".to_string()]);
+        assert_eq!(built_collector_names(&sel.selected), vec!["persist"]);
 
-        // no --only => unconditional collectors in canonical order (minimal skips raw-NTFS;
-        // evtx_live and srum are not in built_collector_names as they are conditional).
+        // no --only => every collector in canonical order.
         let sel = select_modules(Profile::Standard, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert_eq!(
-            built,
-            vec![
-                "proc",
-                "net",
-                "logon_session",
-                "persist",
-                "mft",
-                "usn",
-                "shimcache",
-                "amcache",
-                "prefetch",
-                "bam",
-                "userassist",
-                "wmi_subscription"
-            ]
-        );
+        assert_eq!(built_collector_names(&sel.selected), AVAILABLE);
 
-        // --profile minimal must NOT select mft (raw-NTFS); standard must.
+        // --profile minimal skips prefetch and evtx_live.
         let sel = select_modules(Profile::Minimal, None, AVAILABLE);
         let built = built_collector_names(&sel.selected);
-        assert!(
-            !built.contains(&"mft".to_string()),
-            "minimal skips raw-NTFS mft"
-        );
-
-        let sel = select_modules(Profile::Standard, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(built.contains(&"mft".to_string()), "standard includes mft");
-
-        // raw-NTFS collectors: standard includes usn, minimal skips it.
-        let sel = select_modules(Profile::Standard, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(built.contains(&"usn".to_string()), "standard includes usn");
-        let sel = select_modules(Profile::Minimal, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(!built.contains(&"usn".to_string()), "minimal skips usn");
-        // raw-NTFS collectors: standard includes shimcache, minimal skips it.
-        let sel = select_modules(Profile::Standard, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(
-            built.contains(&"shimcache".to_string()),
-            "standard includes shimcache"
-        );
-        let sel = select_modules(Profile::Minimal, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(
-            !built.contains(&"shimcache".to_string()),
-            "minimal skips shimcache"
-        );
-        // raw-NTFS collectors: standard includes amcache, minimal skips it.
-        let sel = select_modules(Profile::Standard, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(
-            built.contains(&"amcache".to_string()),
-            "standard includes amcache"
-        );
-        let sel = select_modules(Profile::Minimal, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(
-            !built.contains(&"amcache".to_string()),
-            "minimal skips amcache"
-        );
-        let sel = select_modules(Profile::Standard, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(
-            built.contains(&"prefetch".to_string()),
-            "standard includes prefetch"
-        );
-        let sel = select_modules(Profile::Minimal, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(
-            !built.contains(&"prefetch".to_string()),
-            "minimal skips prefetch"
-        );
-        let sel = select_modules(Profile::Standard, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(built.contains(&"bam".to_string()), "standard includes bam");
-        let sel = select_modules(Profile::Minimal, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(!built.contains(&"bam".to_string()), "minimal skips bam");
-        let sel = select_modules(Profile::Standard, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(
-            built.contains(&"userassist".to_string()),
-            "standard includes userassist"
-        );
-        let sel = select_modules(Profile::Minimal, None, AVAILABLE);
-        let built = built_collector_names(&sel.selected);
-        assert!(
-            !built.contains(&"userassist".to_string()),
-            "minimal skips userassist"
-        );
+        assert!(!built.contains(&"prefetch".to_string()));
+        assert!(!built.contains(&"evtx_live".to_string()));
+        assert!(built.contains(&"proc".to_string()));
     }
 
     #[test]
@@ -1588,51 +1391,6 @@ mod tests {
     }
 
     #[test]
-    fn max_mft_records_flag_defaults_to_one_million() {
-        // clap default must match Config's default so an unspecified flag is a no-op.
-        use clap::Parser;
-        let args = RunArgs::parse_from(["cairn", "--target", "live", "--output", "out"]);
-        assert_eq!(args.max_mft_records, 1_000_000);
-    }
-
-    #[test]
-    fn max_mft_records_flag_parses_override() {
-        use clap::Parser;
-        let args = RunArgs::parse_from([
-            "cairn",
-            "--target",
-            "live",
-            "--output",
-            "out",
-            "--max-mft-records",
-            "42",
-        ]);
-        assert_eq!(args.max_mft_records, 42);
-    }
-
-    #[test]
-    fn max_usn_records_flag_defaults_to_one_million() {
-        use clap::Parser;
-        let args = RunArgs::parse_from(["cairn", "--target", "live", "--output", "out"]);
-        assert_eq!(args.max_usn_records, 1_000_000);
-    }
-
-    #[test]
-    fn max_usn_records_flag_parses_override() {
-        use clap::Parser;
-        let args = RunArgs::parse_from([
-            "cairn",
-            "--target",
-            "live",
-            "--output",
-            "out",
-            "--max-usn-records",
-            "42",
-        ]);
-        assert_eq!(args.max_usn_records, 42);
-    }
-
-    #[test]
     fn governance_report_assembles_threads_and_priority() {
         use cairn_core::manifest::GovernanceReport;
         use cairn_core::resolve_max_threads;
@@ -1643,7 +1401,6 @@ mod tests {
         let report = GovernanceReport {
             effective_threads: effective,
             low_priority_applied: true,
-            truncations: vec![],
         };
         assert_eq!(report.effective_threads, 3);
         assert!(report.low_priority_applied);
@@ -1683,72 +1440,6 @@ mod tests {
         ]);
         assert!(args_fs.full_speed, "--full-speed present => true");
         assert_eq!(args_fs.max_threads, None, "max_threads absent => None");
-    }
-
-    #[test]
-    fn live_config_enables_mft_path_resolution_by_default() {
-        // The live Config is built with `..Config::default()`; path resolution must be
-        // on by default so the mft collector reconstructs full paths (S2-O).
-        let cfg = Config::default();
-        assert!(
-            cfg.resolve_mft_paths,
-            "path resolution must default on for the live run"
-        );
-    }
-
-    #[test]
-    fn collect_truncations_extracts_mft_and_usn() {
-        use cairn_core::manifest::SourceEntry;
-        let sources = vec![
-            SourceEntry {
-                artifact: "mft".into(),
-                path: r"\\.\C:".into(),
-                method: "raw_ntfs".into(),
-                size: 0,
-                sha256: String::new(),
-                errors: vec!["truncated: max_mft_records reached (cap=1000000)".into()],
-            },
-            SourceEntry {
-                artifact: "usn".into(),
-                path: r"\\.\C:".into(),
-                method: "raw_ntfs_usn".into(),
-                size: 0,
-                sha256: String::new(),
-                errors: vec!["truncated: max_usn_records reached (cap=42)".into()],
-            },
-        ];
-        let t = collect_truncations(&sources);
-        assert_eq!(t.len(), 2);
-        assert!(t.iter().any(|x| x.collector == "mft" && x.cap == 1_000_000));
-        assert!(t.iter().any(|x| x.collector == "usn" && x.cap == 42));
-    }
-
-    #[test]
-    fn collect_truncations_empty_when_no_caps() {
-        use cairn_core::manifest::SourceEntry;
-        let sources = vec![SourceEntry {
-            artifact: "mft".into(),
-            path: r"\\.\C:".into(),
-            method: "raw_ntfs".into(),
-            size: 0,
-            sha256: String::new(),
-            errors: vec![],
-        }];
-        assert!(collect_truncations(&sources).is_empty());
-    }
-
-    #[test]
-    fn collect_truncations_ignores_unrelated_errors() {
-        use cairn_core::manifest::SourceEntry;
-        let sources = vec![SourceEntry {
-            artifact: "proc".into(),
-            path: "live".into(),
-            method: "toolhelp".into(),
-            size: 0,
-            sha256: String::new(),
-            errors: vec!["some unrelated warning".into()],
-        }];
-        assert!(collect_truncations(&sources).is_empty());
     }
 
     /// Integration: SigmaAnalyzer wired into run_live receives Record::Event and produces findings.

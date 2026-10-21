@@ -7,8 +7,6 @@ license.workspace = true
 [dependencies]
 cairn-core = { path = "../cairn-core" }
 cairn-collectors-win = { path = "../cairn-collectors-win" }
-ntfs = "=0.4.0"
-notatin = { workspace = true }
 tracing.workspace = true
 evtx.workspace = true
 chrono.workspace = true
@@ -17,9 +15,6 @@ thiserror.workspace = true
 quick-xml = { version = "0.41.0", default-features = false }
 sha2.workspace = true
 compcol = { workspace = true }
-srum-core   = { version = "0.1.0", default-features = false }
-srum-parser.workspace = true
-tempfile.workspace    = true
 
 [target.'cfg(windows)'.dependencies]
 winreg.workspace = true
