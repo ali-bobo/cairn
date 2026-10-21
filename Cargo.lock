@@ -411,6 +411,7 @@ dependencies = [
  "chrono",
  "serde_json",
  "tempfile",
+ "winresource",
  "zip",
 ]
 

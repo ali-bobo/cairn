@@ -104,9 +104,10 @@ checksums) with `.\scripts\package.ps1` → `dist\cairn-forensics\`.
 
 ## Quick start
 
-**Interactive (recommended for first-time use):** double-click
-`cairn-launcher.exe` in the packaged distribution for a guided, menu-driven
-run — no command-line flags to learn.
+**One click (recommended):** double-click `cairn-launcher.exe` in the packaged
+distribution. It asks for elevation through a normal UAC prompt, scans the last
+7 days of this host, zips the results and opens `report.html` in the browser.
+Drop `.evtx` files or a folder onto it to analyze exported logs instead.
 
 **Command line:**
 

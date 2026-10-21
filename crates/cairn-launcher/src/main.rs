@@ -66,56 +66,6 @@ fn since_from_hours(hours: u64) -> String {
     dt.format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
-fn run_scan_flow(env: &Env, hours: u64, desc: &str, profile: Option<&str>) -> anyhow::Result<()> {
-    let output_dir = runner::timestamped_output_dir(&env.output_base);
-    std::fs::create_dir_all(&output_dir)?;
-
-    let since = since_from_hours(hours);
-    let cfg = runner::RunConfig {
-        cairn_exe: &env.cairn_exe,
-        rules_dir: env.rules_dir.as_deref(),
-        output_dir: &output_dir,
-        since: &since,
-        profile,
-    };
-
-    println!("\n執行掃描中，請稍候...");
-    println!(
-        "（掃描範圍：{}，輸出目錄：{}）\n",
-        desc,
-        output_dir.display()
-    );
-
-    runner::run_scan(&cfg)?;
-
-    match summary::load_summary(&output_dir, desc) {
-        Ok(s) => {
-            menu::print_summary(&s);
-            match package::zip_output(&output_dir) {
-                Ok(zip_path) => {
-                    println!("║  報告已壓縮：{:<28}║", "");
-                    println!("║  {:<40}║", zip_path.display().to_string());
-                    println!("╚══════════════════════════════════════════╝");
-                    menu::wait_enter("\n按 Enter 開啟報告資料夾...");
-                    package::open_folder(&env.output_base);
-                }
-                Err(e) => {
-                    eprintln!("壓縮失敗（{e}），報告目錄：{}", output_dir.display());
-                    menu::wait_enter("\n按 Enter 繼續...");
-                }
-            }
-        }
-        Err(e) => {
-            eprintln!(
-                "無法讀取掃描結果（{e}），報告目錄：{}",
-                output_dir.display()
-            );
-            menu::wait_enter("\n按 Enter 繼續...");
-        }
-    }
-    Ok(())
-}
-
 /// 展開輸入路徑成 .evtx 檔案清單：檔案直接回傳單一項；目錄則列舉其下（非遞迴）
 /// 所有 .evtx 副檔名檔案。不存在或無 .evtx 檔的目錄回傳空清單。
 fn expand_evtx_input(input: &Path) -> Vec<PathBuf> {
@@ -147,31 +97,68 @@ fn expand_evtx_input(input: &Path) -> Vec<PathBuf> {
     }
 }
 
-fn run_evtx_flow(env: &Env) -> anyhow::Result<()> {
-    let Some(raw) = menu::read_path_input("請輸入 .evtx 檔案或目錄路徑：") else {
-        println!("\n未輸入路徑，取消。");
-        menu::wait_enter("按 Enter 繼續...");
-        return Ok(());
-    };
-    let input_path = PathBuf::from(&raw);
-    if !input_path.exists() {
-        eprintln!("\n路徑不存在：{raw}");
-        menu::wait_enter("按 Enter 繼續...");
-        return Ok(());
+/// 開始掃描前印出的標題：主機、規則版本，以及這次會做什麼。
+fn print_banner(host: &str, ver: &str, rules_loaded: bool) {
+    println!("Cairn 威脅鑑識工具");
+    println!("主機名稱：{host}");
+    if rules_loaded {
+        println!("規則版本：{}", menu::truncate_rules_ver(ver));
+    } else {
+        println!("⚠️  找不到規則目錄 rules\\sigma\\，只執行內建偵測（不跑 Sigma 規則）");
     }
-    let files = expand_evtx_input(&input_path);
-    if files.is_empty() {
-        eprintln!("\n找不到任何 .evtx 檔案：{raw}");
-        menu::wait_enter("按 Enter 繼續...");
-        return Ok(());
-    }
+    println!();
+}
 
+/// 掃描結束後：印摘要、壓縮、用預設瀏覽器打開 report.html。
+fn finish(output_dir: &Path, report_dir: &Path, desc: &str) {
+    match summary::load_summary(report_dir, desc) {
+        Ok(s) => menu::print_summary(&s),
+        Err(e) => eprintln!(
+            "無法讀取掃描結果（{e}），報告目錄：{}",
+            report_dir.display()
+        ),
+    }
+    match package::zip_output(report_dir) {
+        Ok(zip_path) => println!("\n要交給資安人員的壓縮檔：{}", zip_path.display()),
+        Err(e) => eprintln!("\n壓縮失敗（{e}），報告目錄：{}", output_dir.display()),
+    }
+    let report = report_dir.join("report.html");
+    if report.exists() {
+        println!("正在用瀏覽器開啟報告：{}", report.display());
+        package::open_path(&report);
+    }
+}
+
+/// 雙擊：直接掃描這台主機最近 7 天。
+fn run_live(env: &Env) -> anyhow::Result<()> {
     let output_dir = runner::timestamped_output_dir(&env.output_base);
     std::fs::create_dir_all(&output_dir)?;
+    let desc = "最近 7 天";
+    let since = since_from_hours(LIVE_HOURS);
+    let cfg = runner::RunConfig {
+        cairn_exe: &env.cairn_exe,
+        rules_dir: env.rules_dir.as_deref(),
+        output_dir: &output_dir,
+        since: &since,
+        profile: None,
+    };
+    println!("開始掃描這台主機（{desc}），通常需要幾分鐘，請不要關閉這個視窗。");
+    println!("結果會存到：{}\n", output_dir.display());
+    runner::run_scan(&cfg)?;
+    finish(&output_dir, &output_dir, desc);
+    Ok(())
+}
 
-    println!("\n分析 {} 個 EVTX 檔案中，請稍候...", files.len());
-    println!("（輸出目錄：{}）\n", output_dir.display());
-
+/// 把 .evtx 檔或資料夾拖到程式上：分析這些事件記錄，不掃描這台主機。
+fn run_dropped_evtx(env: &Env, dropped: &[PathBuf]) -> anyhow::Result<()> {
+    let files: Vec<PathBuf> = dropped.iter().flat_map(|p| expand_evtx_input(p)).collect();
+    if files.is_empty() {
+        anyhow::bail!("拖進來的檔案裡沒有 .evtx 事件記錄檔");
+    }
+    let output_dir = runner::timestamped_output_dir(&env.output_base);
+    std::fs::create_dir_all(&output_dir)?;
+    println!("分析 {} 個事件記錄檔，請稍候...", files.len());
+    println!("結果會存到：{}\n", output_dir.display());
     let cfg = runner::EvtxConfig {
         cairn_exe: &env.cairn_exe,
         files: &files,
@@ -179,16 +166,32 @@ fn run_evtx_flow(env: &Env) -> anyhow::Result<()> {
         output_dir: &output_dir,
     };
     let report_dir = runner::run_evtx(&cfg)?;
-
-    match summary::load_summary(&report_dir, "離線 EVTX 分析") {
-        Ok(s) => menu::print_summary(&s),
-        Err(e) => eprintln!(
-            "無法讀取分析結果（{e}），報告目錄：{}",
-            report_dir.display()
-        ),
-    }
-    menu::wait_enter("\n按 Enter 繼續...");
+    finish(&output_dir, &report_dir, "離線事件記錄分析");
     Ok(())
+}
+
+/// Look-back window of the double-click scan, in hours (7 days, matches cairn's default).
+const LIVE_HOURS: u64 = 168;
+
+/// What a launch should do, from its command-line arguments. Windows passes the paths
+/// of files dropped onto the exe as arguments; a plain double-click passes none.
+#[derive(Debug, PartialEq)]
+enum Mode {
+    Live,
+    Evtx(Vec<PathBuf>),
+}
+
+fn mode_from_args(args: &[String]) -> Mode {
+    let paths: Vec<PathBuf> = args
+        .iter()
+        .filter_map(|a| menu::clean_path_input(a))
+        .map(PathBuf::from)
+        .collect();
+    if paths.is_empty() {
+        Mode::Live
+    } else {
+        Mode::Evtx(paths)
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -201,67 +204,46 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
-    if env.rules_dir.is_none() {
-        eprintln!("⚠️  找不到規則目錄 rules\\sigma\\，Sigma 偵測將無法執行（僅啟發式偵測）\n");
-    }
-
     let host = hostname();
     let ver = rules_ver(env.rules_dir.as_deref());
-    let rules_loaded = env.rules_dir.is_some();
+    print_banner(&host, &ver, env.rules_dir.is_some());
 
-    loop {
-        menu::clear_screen();
-        menu::print_main_menu(&host, &ver, rules_loaded);
-
-        match menu::read_choice() {
-            '1' => {
-                if let Err(e) = run_scan_flow(&env, 168, "最近 7 天", None) {
-                    eprintln!("\n掃描發生錯誤：{e}");
-                    menu::wait_enter("按 Enter 繼續...");
-                }
-            }
-            '2' => {
-                let (hours, desc) = menu::print_time_menu();
-                if let Err(e) = run_scan_flow(&env, hours, desc, None) {
-                    eprintln!("\n掃描發生錯誤：{e}");
-                    menu::wait_enter("按 Enter 繼續...");
-                }
-            }
-            '3' => loop {
-                menu::clear_screen();
-                menu::print_engineer_menu();
-                match menu::read_choice() {
-                    '1' => {
-                        let (profile_value, profile_desc) = menu::print_profile_menu();
-                        let desc = format!("最近 7 天（{profile_desc} profile）");
-                        if let Err(e) = run_scan_flow(&env, 168, &desc, Some(profile_value)) {
-                            eprintln!("\n掃描發生錯誤：{e}");
-                            menu::wait_enter("按 Enter 繼續...");
-                        }
-                    }
-                    '2' => {
-                        if let Err(e) = run_evtx_flow(&env) {
-                            eprintln!("\nEVTX 分析發生錯誤：{e}");
-                            menu::wait_enter("按 Enter 繼續...");
-                        }
-                    }
-                    'B' => break,
-                    _ => {}
-                }
-            },
-            'Q' => {
-                println!("\n離開 Cairn 鑑識工具。");
-                break;
-            }
-            _ => {}
-        }
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let result = match mode_from_args(&args) {
+        Mode::Live => run_live(&env),
+        Mode::Evtx(paths) => run_dropped_evtx(&env, &paths),
+    };
+    if let Err(e) = result {
+        eprintln!("\n掃描發生錯誤：{e}");
     }
+    menu::wait_enter("\n按 Enter 關閉視窗...");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_arguments_means_live_scan() {
+        assert_eq!(mode_from_args(&[]), Mode::Live);
+        assert_eq!(mode_from_args(&["  ".to_string()]), Mode::Live);
+    }
+
+    #[test]
+    fn dropped_paths_mean_evtx_analysis() {
+        let m = mode_from_args(&[
+            r#""C:\logs\Security.evtx""#.to_string(),
+            r"C:\more".to_string(),
+        ]);
+        assert_eq!(
+            m,
+            Mode::Evtx(vec![
+                PathBuf::from(r"C:\logs\Security.evtx"),
+                PathBuf::from(r"C:\more")
+            ])
+        );
+    }
 
     #[test]
     fn since_from_hours_produces_valid_rfc3339() {

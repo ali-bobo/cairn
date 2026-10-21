@@ -19,3 +19,6 @@ anyhow.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true

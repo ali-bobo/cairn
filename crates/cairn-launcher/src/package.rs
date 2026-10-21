@@ -40,9 +40,9 @@ pub fn zip_output(output_dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(zip_path)
 }
 
-/// Windows 上用 explorer.exe 開啟資料夾。
-/// 非 Windows 環境下靜默跳過（單元測試環境）。
-pub fn open_folder(path: &Path) {
+/// Windows 上用 explorer.exe 開啟資料夾，或以預設程式開啟檔案（report.html →
+/// 預設瀏覽器）。非 Windows 環境下靜默跳過（單元測試環境）。
+pub fn open_path(path: &Path) {
     #[cfg(target_os = "windows")]
     {
         let _ = std::process::Command::new("explorer.exe").arg(path).spawn();
