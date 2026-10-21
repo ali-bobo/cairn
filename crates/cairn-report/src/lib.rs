@@ -187,7 +187,10 @@ fn timeline_row(f: &Finding) -> [String; 13] {
         f.rule_author.clone().unwrap_or_default(),
         f.mitre.join(";"),
         f.details.clone(),
-        f.reason.clone().unwrap_or_default(),
+        f.reason
+            .clone()
+            .or_else(|| client_text::sigma_reason(f))
+            .unwrap_or_default(),
         entity_summary(f),
         f.details_client.clone().unwrap_or_default(),
     ]
@@ -643,6 +646,20 @@ mod tests {
         assert!(
             row.contains("service autostart persistence"),
             "reason not in row: {row}"
+        );
+    }
+
+    /// A Sigma finding without a reason gets the rule/author/level/record explanation
+    /// in the Reason column.
+    #[test]
+    fn timeline_csv_sigma_reason_fallback() {
+        let csv = timeline_csv(&[finding(1_700_000_000, "Susp PS", 42)]);
+        let row = csv.lines().nth(1).unwrap();
+        assert!(
+            row.contains(
+                "sigma rule 'Susp PS' by Author A (level high) matched Security EID 4688 record 42"
+            ),
+            "{row}"
         );
     }
 

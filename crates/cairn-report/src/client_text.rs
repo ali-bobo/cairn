@@ -217,6 +217,63 @@ fn clickfix_client_text(f: &Finding) -> String {
     )
 }
 
+/// The Sigma level a finding was raised at (its severity, lowercase: "high", ...).
+fn level(f: &Finding) -> &'static str {
+    match f.severity {
+        Severity::Critical => "critical",
+        Severity::High => "high",
+        Severity::Medium => "medium",
+        Severity::Low => "low",
+        Severity::Info => "informational",
+    }
+}
+
+/// The matched event as "Security EID 4688 record 42" (whatever parts are known).
+fn matched_event(f: &Finding) -> String {
+    let mut parts = vec![f
+        .artifact
+        .strip_prefix("evtx:")
+        .unwrap_or(&f.artifact)
+        .to_string()];
+    if let Some(eid) = f.event_id {
+        parts.push(format!("EID {eid}"));
+    }
+    parts.push(format!(
+        "record {}",
+        f.evidence_ref.as_deref().unwrap_or("?")
+    ));
+    parts.join(" ")
+}
+
+/// zh-TW "why" line for a Sigma finding: rule title, rule author (DRL 1.1 requires
+/// surfacing it), level, and the matched event record. `None` for heuristics, which
+/// carry their own `reason`. The Sigma engine itself sets no reason; this is the
+/// report-side explanation built from the finding's typed fields.
+pub fn sigma_rule_line(f: &Finding) -> Option<String> {
+    (f.source == FindingSource::Sigma).then(|| {
+        format!(
+            "Sigma 規則「{}」（作者：{}；等級：{}；比對事件：{}）",
+            f.title,
+            f.rule_author.as_deref().unwrap_or("未標示"),
+            level(f),
+            matched_event(f)
+        )
+    })
+}
+
+/// English equivalent for the timeline's Reason column when the finding has none.
+pub fn sigma_reason(f: &Finding) -> Option<String> {
+    (f.source == FindingSource::Sigma).then(|| {
+        format!(
+            "sigma rule '{}' by {} (level {}) matched {}",
+            f.title,
+            f.rule_author.as_deref().unwrap_or("unknown author"),
+            level(f),
+            matched_event(f)
+        )
+    })
+}
+
 /// Fill `details_client` for a Medium+ finding. `now` is the run's reference time
 /// (manifest `run.started_utc`).
 pub fn fill_details_client(f: &mut Finding, now: DateTime<Utc>) {
@@ -244,16 +301,17 @@ pub fn fill_details_client(f: &mut Finding, now: DateTime<Utc>) {
         },
         FindingSource::Sigma => {
             let title = f.title.clone();
+            let basis = sigma_rule_line(f).unwrap_or_default();
             match f.severity {
                 Severity::Critical | Severity::High => format!(
                     "主機 {} 上偵測到與「{}」相關的可疑活動，\
-                     此類活動具有較高風險，建議盡速進行調查。",
-                    host, title
+                     此類活動具有較高風險，建議盡速進行調查。偵測依據：{}。",
+                    host, title, basis
                 ),
                 _ => format!(
                     "主機 {} 上偵測到與「{}」相關的活動，\
-                     建議分析師評估是否為授權操作。",
-                    host, title
+                     建議分析師評估是否為授權操作。偵測依據：{}。",
+                    host, title, basis
                 ),
             }
         }
@@ -379,6 +437,32 @@ mod tests {
             text.contains("Mimikatz Credential Dumping"),
             "title missing: {text}"
         );
+    }
+
+    /// Sigma client text names the rule, its DRL author, the level and the record.
+    #[test]
+    fn sigma_text_carries_title_author_level_and_record() {
+        let mut f = make_sigma(Severity::High, "Mimikatz Credential Dumping");
+        f.rule_author = Some("Florian Roth".into());
+        f.artifact = "evtx:Security".into();
+        f.event_id = Some(4688);
+        f.evidence_ref = Some("4242".into());
+        fill_details_client(&mut f, run_time());
+        let text = f.details_client.clone().unwrap();
+        for want in [
+            "Florian Roth",
+            "等級：high",
+            "Security EID 4688 record 4242",
+        ] {
+            assert!(text.contains(want), "{want} missing: {text}");
+        }
+        let line = sigma_rule_line(&f).unwrap();
+        assert!(line.contains("Mimikatz Credential Dumping"));
+        let reason = sigma_reason(&f).unwrap();
+        assert!(reason.contains("by Florian Roth") && reason.contains("record 4242"));
+        // Heuristics carry their own reason.
+        let h = make_heuristic(Severity::High, analyzers::PARENTCHILD);
+        assert!(sigma_rule_line(&h).is_none() && sigma_reason(&h).is_none());
     }
 
     #[test]
