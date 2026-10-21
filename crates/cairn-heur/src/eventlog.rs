@@ -11,7 +11,8 @@
 //! | 4698 | Security | scheduled task created (needs "Other Object Access" audit) | T1053.005 |
 //! | 5001 | Defender | real-time protection turned off | T1562.001 |
 //! | 5007 | Defender | configuration changed (exclusion added) | T1562.001 |
-//! | 1116 | Defender | malware detected | — |
+//! | 1116 | Defender | malware detected (PUA/adware Low–Medium, else High) | — |
+//! | 1117 / 1118 / 1119 | Defender | action taken / action failed (High) | — |
 //!
 //! Pure logic over EventRecords; touches no host state.
 #![forbid(unsafe_code)]
@@ -270,45 +271,171 @@ fn defender_exclusion(ev: &EventRecord) -> Option<Finding> {
     ))
 }
 
-/// One finding per (threat, path): Defender logs a 1116 for every re-detection.
-fn defender_detections(events: &[&EventRecord]) -> Vec<Finding> {
-    let mut by_threat: BTreeMap<(String, String), Vec<&EventRecord>> = BTreeMap::new();
-    for ev in events {
-        let threat = field_or_dash(ev, "Threat Name");
-        let path = field_or_dash(ev, "Path");
-        by_threat.entry((threat, path)).or_default().push(ev);
+/// Defender threat-name prefixes and category names of potentially unwanted software:
+/// unwanted, not malicious.
+const PUA_THREAT_PREFIXES: &[&str] = &["pua:", "adware:", "softwarebundler:", "puadlmgr"];
+const PUA_CATEGORIES: &[&str] = &["potentially unwanted", "adware", "software bundler"];
+
+/// True if this detection is PUA / adware rather than malware.
+fn is_pua(threat: &str, category: &str) -> bool {
+    let t = threat.to_ascii_lowercase();
+    let c = category.to_ascii_lowercase();
+    PUA_THREAT_PREFIXES.iter().any(|p| t.starts_with(p))
+        || PUA_CATEGORIES.iter().any(|p| c.contains(p))
+}
+
+/// What Defender did about one threat, from its 1117 / 1118 / 1119 events.
+#[derive(Debug, Default)]
+struct DefenderOutcome {
+    /// 1117: actions that succeeded ("Quarantine", "Remove", ...).
+    done: Vec<String>,
+    /// 1118 / 1119: actions that failed, with the error text.
+    failed: Vec<String>,
+}
+
+impl DefenderOutcome {
+    fn add(&mut self, ev: &EventRecord) {
+        let action = field_or_dash(ev, "Action Name");
+        match ev.event_id {
+            1117 => {
+                if !self.done.contains(&action) {
+                    self.done.push(action);
+                }
+            }
+            _ => {
+                let err = field(&ev.data, "Error Description")
+                    .filter(|e| !e.is_empty() && e != "-")
+                    .map(|e| format!(" ({e})"))
+                    .unwrap_or_default();
+                let critical = if ev.event_id == 1119 { "critical " } else { "" };
+                self.failed.push(format!(
+                    "{action} {critical}failed (EID {}){err}",
+                    ev.event_id
+                ));
+            }
+        }
     }
-    by_threat
+
+    /// English summary for details / reason.
+    fn summary(&self) -> String {
+        match (self.done.is_empty(), self.failed.is_empty()) {
+            (true, true) => "no action recorded (no 1117/1118/1119)".to_string(),
+            (false, true) => format!("action taken: {}", self.done.join(", ")),
+            (true, false) => format!("action FAILED: {}", self.failed.join("; ")),
+            (false, false) => format!(
+                "action taken: {}; action FAILED: {}",
+                self.done.join(", "),
+                self.failed.join("; ")
+            ),
+        }
+    }
+
+    /// zh-TW sentence for the client.
+    fn client(&self) -> String {
+        if !self.failed.is_empty() {
+            "Defender 嘗試處理但失敗，威脅可能仍在主機上，請立即處理。".to_string()
+        } else if !self.done.is_empty() {
+            format!(
+                "Defender 已處理（{}），但仍請找出它是怎麼進來的。",
+                self.done.join("、")
+            )
+        } else {
+            "記錄中看不到 Defender 的處理結果，偵測到不代表已清除，請確認處理狀態。".to_string()
+        }
+    }
+}
+
+/// One threat group: the 1116 detections and 1117-1119 outcomes of one (threat, path).
+#[derive(Default)]
+struct ThreatGroup<'a> {
+    detections: Vec<&'a EventRecord>,
+    outcome_events: Vec<&'a EventRecord>,
+    outcome: DefenderOutcome,
+}
+
+/// One finding per (threat, path): Defender logs a 1116 for every re-detection, and
+/// the 1117 (action taken) / 1118-1119 (action failed) events for the same threat
+/// are attached to it. Severity: failed action -> High; PUA/adware -> Low when an
+/// action succeeded, else Medium; any other detection -> High.
+fn defender_detections(events: &[&EventRecord]) -> Vec<Finding> {
+    let mut groups: BTreeMap<(String, String), ThreatGroup> = BTreeMap::new();
+    let (detections, outcomes): (Vec<&EventRecord>, Vec<&EventRecord>) =
+        events.iter().partition(|e| e.event_id == 1116);
+    for ev in detections {
+        let key = (field_or_dash(ev, "Threat Name"), field_or_dash(ev, "Path"));
+        groups.entry(key).or_default().detections.push(ev);
+    }
+    for ev in outcomes {
+        let threat = field_or_dash(ev, "Threat Name");
+        let exact = (threat.clone(), field_or_dash(ev, "Path"));
+        // Same threat and path; else the same threat at any path (the action events
+        // sometimes list the path differently); else a group of its own.
+        let key = if groups.contains_key(&exact) {
+            exact
+        } else {
+            groups
+                .keys()
+                .find(|(t, _)| *t == threat)
+                .cloned()
+                .unwrap_or(exact)
+        };
+        let g = groups.entry(key).or_default();
+        g.outcome.add(ev);
+        g.outcome_events.push(ev);
+    }
+    groups
         .into_iter()
-        .map(|((threat, path), evs)| {
-            let first = evs[0];
-            let last = evs[evs.len() - 1];
+        .map(|((threat, path), g)| {
+            let all: Vec<&EventRecord> = {
+                let mut v: Vec<&EventRecord> =
+                    g.detections.iter().chain(&g.outcome_events).copied().collect();
+                v.sort_by_key(|e| (e.ts, e.record_id));
+                v
+            };
+            let first = all[0];
+            let last = all[all.len() - 1];
+            let rep = g.detections.last().copied().unwrap_or(last);
+            let category = field_or_dash(rep, "Category Name");
+            let pua = is_pua(&threat, &category);
+            let failed = !g.outcome.failed.is_empty();
+            let handled = !g.outcome.done.is_empty();
+            let (severity, why) = if failed {
+                (Severity::High, "Defender could not remove or quarantine it")
+            } else if pua && handled {
+                (Severity::Low, "potentially unwanted software (PUA/adware), and Defender acted on it")
+            } else if pua {
+                (Severity::Medium, "potentially unwanted software (PUA/adware), no successful action recorded")
+            } else {
+                (Severity::High, "Microsoft Defender identified this file as malware")
+            };
+            let summary = g.outcome.summary();
+            let kind = if pua { "可能不需要的軟體" } else { "惡意程式" };
             let mut f = finding(
-                last,
-                Severity::High,
-                format!("Defender 偵測到惡意程式：{threat}"),
+                rep,
+                severity,
+                format!("Defender 偵測到{kind}：{threat}"),
                 &[],
                 format!(
-                    "Defender EID 1116 x{}: {threat} at {path} (severity {})",
-                    evs.len(),
-                    field_or_dash(last, "Severity Name")
+                    "Defender EID 1116 x{}: {threat} at {path} (category {category}, severity {}); {summary}",
+                    g.detections.len(),
+                    field_or_dash(rep, "Severity Name")
                 ),
-                "Microsoft Defender identified this file as malware".to_string(),
+                format!("{why}; {summary}"),
                 format!(
-                    "Microsoft Defender 在這台主機偵測到惡意程式 {threat}（位置：{path}），\
-                     共 {} 次，最早在 {}。偵測到不代表已清除，請確認 Defender 的處理結果，\
-                     並找出它是怎麼進來的。",
-                    evs.len(),
-                    first.ts.format("%Y-%m-%d %H:%M UTC")
+                    "Microsoft Defender 在這台主機偵測到{kind} {threat}（位置：{path}），\
+                     共 {} 次，最早在 {}。{}",
+                    g.detections.len(),
+                    first.ts.format("%Y-%m-%d %H:%M UTC"),
+                    g.outcome.client()
                 ),
             );
-            f.evidence = evs
+            f.evidence = all
                 .iter()
                 .map(|e| EvidenceItem {
                     artifact: format!("evtx:{}", e.channel),
                     path: Some(path.clone()),
                     ts: Some(e.ts),
-                    detail: format!("EID 1116 record {}", e.record_id),
+                    detail: format!("EID {} record {}", e.event_id, e.record_id),
                 })
                 .collect();
             f
@@ -340,7 +467,7 @@ impl Analyzer for EventLogHeuristic {
                 ("Security", 4698) => out.push(task_created(ev)),
                 (DEFENDER_CHANNEL, 5001) => out.push(defender_rtp_off(ev)),
                 (DEFENDER_CHANNEL, 5007) => out.extend(defender_exclusion(ev)),
-                (DEFENDER_CHANNEL, 1116) => detections.push(ev),
+                (DEFENDER_CHANNEL, 1116..=1119) => detections.push(ev),
                 _ => {}
             }
         }
@@ -501,6 +628,72 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].evidence.len(), 2);
         assert!(f[0].details.contains("x2"));
+    }
+
+    #[test]
+    fn defender_severity_by_category_and_outcome() {
+        let pua = json!({"Threat Name": "PUA:Win32/Presenoker", "Path": "file:_C:\\a.exe", "Category Name": "Potentially Unwanted Software"});
+        // PUA, no action recorded -> Medium
+        let f = run(&[ev(DEFENDER_CHANNEL, 1116, pua.clone())]);
+        assert_eq!(f[0].severity, Severity::Medium);
+        assert!(f[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("no action recorded"));
+        // PUA quarantined -> Low, outcome attached
+        let mut done = pua.clone();
+        done["Action Name"] = json!("Quarantine");
+        let f = run(&[
+            ev(DEFENDER_CHANNEL, 1116, pua.clone()),
+            ev(DEFENDER_CHANNEL, 1117, done),
+        ]);
+        assert_eq!(f.len(), 1, "1117 joins the 1116 group");
+        assert_eq!(f[0].severity, Severity::Low);
+        assert!(
+            f[0].details.contains("action taken: Quarantine"),
+            "{}",
+            f[0].details
+        );
+        assert_eq!(f[0].evidence.len(), 2);
+        // adware by category
+        let adw = json!({"Threat Name": "BrowserModifier:Win32/X", "Path": "p", "Category Name": "Adware"});
+        assert_eq!(
+            run(&[ev(DEFENDER_CHANNEL, 1116, adw)])[0].severity,
+            Severity::Medium
+        );
+        // trojan -> High even when quarantined
+        let tro = json!({"Threat Name": "Trojan:Win32/X", "Path": "p", "Category Name": "Trojan", "Action Name": "Quarantine"});
+        let f = run(&[
+            ev(DEFENDER_CHANNEL, 1116, tro.clone()),
+            ev(DEFENDER_CHANNEL, 1117, tro),
+        ]);
+        assert_eq!(f[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn defender_failed_action_is_high_and_joins_by_threat() {
+        let det = json!({"Threat Name": "PUA:Win32/X", "Path": "file:_C:\\a.exe", "Category Name": "Potentially Unwanted Software"});
+        // the 1118 lists the path differently: joined by threat name
+        let fail = json!({"Threat Name": "PUA:Win32/X", "Path": "file:_C:\\a.exe; process:_pid:4", "Action Name": "Remove", "Error Description": "Access is denied."});
+        let f = run(&[
+            ev(DEFENDER_CHANNEL, 1116, det),
+            ev(DEFENDER_CHANNEL, 1118, fail),
+        ]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::High);
+        let reason = f[0].reason.as_deref().unwrap();
+        assert!(
+            reason.contains("FAILED") && reason.contains("Access is denied"),
+            "{reason}"
+        );
+        assert!(f[0].details_client.as_deref().unwrap().contains("失敗"));
+        // a 1119 with no 1116 still reports
+        let crit =
+            json!({"Threat Name": "Trojan:Win32/Y", "Path": "p", "Action Name": "Quarantine"});
+        let f = run(&[ev(DEFENDER_CHANNEL, 1119, crit)]);
+        assert_eq!(f[0].severity, Severity::High);
+        assert!(f[0].details.contains("critical failed"));
     }
 
     #[test]
