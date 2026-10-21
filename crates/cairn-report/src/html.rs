@@ -2,6 +2,7 @@
 //! No external dependencies; CSS is inlined.
 #![allow(clippy::too_many_lines)]
 
+use cairn_core::collectors;
 use cairn_core::{
     finding::{Finding, Severity},
     manifest::Manifest,
@@ -342,7 +343,8 @@ struct Area {
     artifacts: fn(&str) -> bool,
     /// Live records this area inspected.
     records: fn(&cairn_core::Record) -> bool,
-    /// Collector names whose failure means the area was not checked.
+    /// Canonical collector names (`cairn_core::collectors`, matched against
+    /// `SourceEntry.collector`) whose failure means the area was not checked.
     modules: &'static [&'static str],
     /// Shown in offline EVTX mode too (event-log areas only).
     offline: bool,
@@ -361,42 +363,42 @@ const AREAS: &[Area] = &[
         name: "持久化（開機或登入時自動執行的程式）",
         artifacts: |a| a == "persistence" || a == "run_key",
         records: |r| matches!(r, cairn_core::Record::Persistence(_)),
-        modules: &["persistence", "persist", "wmi_subscription"],
+        modules: &[collectors::PERSIST, collectors::WMI_SUBSCRIPTION],
         offline: false,
     },
     Area {
         name: "正在執行的程式",
         artifacts: |a| a == "process",
         records: |r| matches!(r, cairn_core::Record::Process(_)),
-        modules: &["process", "proc"],
+        modules: &[collectors::PROC],
         offline: false,
     },
     Area {
         name: "網路連線",
         artifacts: |a| a.starts_with("netconn"),
         records: |r| matches!(r, cairn_core::Record::NetConn(_)),
-        modules: &["netconn", "net"],
+        modules: &[collectors::NET],
         offline: false,
     },
     Area {
         name: "「執行」對話框貼上的指令（ClickFix）",
         artifacts: |a| a == "run_mru",
         records: is_run_mru,
-        modules: &["persistence", "persist"],
+        modules: &[collectors::PERSIST],
         offline: false,
     },
     Area {
         name: "帳號建立、群組變更、密碼猜測",
         artifacts: |a| a == "account" || a == "logon_bruteforce",
         records: |r| is_event_on(r, "Security"),
-        modules: &["evtx_live"],
+        modules: &[collectors::EVTX_LIVE],
         offline: true,
     },
     Area {
         name: "事件記錄（清除記錄、新服務、新排程、Defender、Sigma 規則）",
         artifacts: |a| a.starts_with("evtx:"),
         records: |r| matches!(r, cairn_core::Record::Event(_)),
-        modules: &["evtx_live"],
+        modules: &[collectors::EVTX_LIVE],
         offline: true,
     },
 ];
@@ -427,7 +429,7 @@ fn overview_panel(
         let failed = manifest
             .sources
             .iter()
-            .find(|s| !s.errors.is_empty() && area.modules.contains(&s.artifact.as_str()));
+            .find(|s| !s.errors.is_empty() && area.modules.contains(&s.collector.as_str()));
         let inspected = if offline {
             manifest.counts.records as usize
         } else {
@@ -1364,8 +1366,8 @@ mod tests {
     fn overview_marks_clean_high_and_unchecked_areas() {
         let mut m = minimal_manifest();
         m.sources.push(cairn_core::manifest::SourceEntry {
-            collector: String::new(),
-            artifact: "net".into(),
+            collector: cairn_core::collectors::NET.into(),
+            artifact: "netconn".into(),
             path: "live:net".into(),
             method: "api".into(),
             size: 0,
