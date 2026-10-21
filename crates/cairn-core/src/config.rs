@@ -36,45 +36,12 @@ impl std::str::FromStr for Profile {
 }
 
 /// Resource-governance knobs (NFR9). Grouped so the resource posture is one object.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Governance {
-    /// rayon global pool ceiling. None = default min(cores, MAX_THREADS_CEILING)
-    /// (NFR9: not all cores). Some(n>0) = explicit `--max-threads N` (clamped to
-    /// real cores by `resolve_max_threads`). Some(0) is treated as None.
-    pub max_threads: Option<usize>,
     /// Whether to lower CPU + IO priority (NFR9). `Governance::default()` is false;
     /// the CLI sets this true for a live target unless `--full-speed`. Offline
     /// analysis stays false.
     pub low_priority: bool,
-}
-
-#[allow(clippy::derivable_impls)]
-impl Default for Governance {
-    fn default() -> Self {
-        // Default serves the offline/evtx path: uncapped (resolver picks the
-        // ceiling) and normal priority. The live run path flips low_priority true.
-        Governance {
-            max_threads: None,
-            low_priority: false,
-        }
-    }
-}
-
-/// NFR9 "sane ceiling, not all cores": the default rayon pool size is capped here
-/// even on a many-core box, leaving headroom for the production workload.
-pub const MAX_THREADS_CEILING: usize = 8;
-
-/// Effective rayon thread count. Pure; no global state, so it is unit-testable.
-///
-/// - None / Some(0) → min(available, MAX_THREADS_CEILING)
-/// - Some(n>0)      → min(n, available)  (never exceed real cores)
-/// - Always returns >= 1 (a 0 `available` is clamped up so rayon gets a valid count).
-pub fn resolve_max_threads(requested: Option<usize>, available: usize) -> usize {
-    let avail = available.max(1);
-    match requested {
-        None | Some(0) => avail.min(MAX_THREADS_CEILING),
-        Some(n) => n.min(avail),
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,7 +76,7 @@ pub struct Config {
     /// Distinct TargetUserName count within `password_spraying_window_minutes` from
     /// the same source that triggers a spraying Finding.
     pub password_spraying_threshold: u32,
-    /// Resource governance (NFR9): thread cap + priority posture.
+    /// Resource governance (NFR9): priority posture.
     pub governance: Governance,
 }
 
@@ -150,39 +117,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn governance_defaults_are_uncapped_and_normal_priority() {
+    fn governance_defaults_to_normal_priority() {
         let cfg = Config::default();
-        assert_eq!(cfg.governance.max_threads, None);
         assert!(!cfg.governance.low_priority);
-    }
-
-    #[test]
-    fn resolve_max_threads_none_uses_min_cores_ceiling() {
-        // None → min(available, 8). available=4 → 4; available=32 → 8 (ceiling).
-        assert_eq!(resolve_max_threads(None, 4), 4);
-        assert_eq!(resolve_max_threads(None, 32), 8);
-        assert_eq!(resolve_max_threads(None, 8), 8);
-    }
-
-    #[test]
-    fn resolve_max_threads_zero_is_treated_as_default() {
-        // Some(0) is meaningless; fall back to the None default.
-        assert_eq!(resolve_max_threads(Some(0), 16), 8);
-    }
-
-    #[test]
-    fn resolve_max_threads_explicit_never_exceeds_available() {
-        assert_eq!(resolve_max_threads(Some(2), 16), 2);
-        assert_eq!(resolve_max_threads(Some(1000), 16), 16); // clamped to cores
-        assert_eq!(resolve_max_threads(Some(4), 4), 4);
-    }
-
-    #[test]
-    fn resolve_max_threads_never_returns_zero() {
-        // available could be reported as 0 in pathological cases; result must be >= 1.
-        assert!(resolve_max_threads(None, 0) >= 1);
-        assert!(resolve_max_threads(Some(0), 0) >= 1);
-        assert!(resolve_max_threads(Some(1), 0) >= 1); // Some(n) arm, pathological available=0
     }
 
     #[test]

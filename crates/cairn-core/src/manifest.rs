@@ -89,9 +89,6 @@ pub struct Counts {
 /// manifests parseable.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GovernanceReport {
-    /// Effective rayon thread count used this run.
-    #[serde(default)]
-    pub effective_threads: usize,
     /// True if the process priority was successfully lowered (live + not --full-speed).
     #[serde(default)]
     pub low_priority_applied: bool,
@@ -201,17 +198,14 @@ mod tests {
     #[test]
     fn governance_report_round_trips_and_old_json_defaults() {
         let r = GovernanceReport {
-            effective_threads: 8,
             low_priority_applied: true,
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: GovernanceReport = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.effective_threads, 8);
         assert!(back.low_priority_applied);
 
         // An empty object (pre-governance) defaults every field.
         let empty: GovernanceReport = serde_json::from_str("{}").unwrap();
-        assert_eq!(empty.effective_threads, 0);
         assert!(!empty.low_priority_applied);
     }
 
@@ -222,7 +216,7 @@ mod tests {
         let mut v: serde_json::Value = serde_json::to_value(&m).unwrap();
         v.as_object_mut().unwrap().remove("governance");
         let back: Manifest = serde_json::from_value(v).unwrap();
-        assert_eq!(back.governance.effective_threads, 0);
+        assert!(!back.governance.low_priority_applied);
     }
 
     #[test]

@@ -104,9 +104,6 @@ struct RunArgs {
     case_id: Option<String>,
     #[arg(long)]
     operator: Option<String>,
-    /// Cap the rayon worker pool (NFR9). Default: min(cores, 8). 0 = use default.
-    #[arg(long)]
-    max_threads: Option<usize>,
     /// Do NOT lower process priority on a live run (opt out of below-normal).
     #[arg(long)]
     full_speed: bool,
@@ -758,7 +755,6 @@ fn main() -> anyhow::Result<()> {
             // Always true in this handler (`run` only triages the live host); kept to
             // document intent.
             let is_live = matches!(cfg.target, cairn_core::Target::Live);
-            cfg.governance.max_threads = args.max_threads;
             cfg.governance.low_priority = is_live && !args.full_speed;
 
             // Default look-back for live EVTX (DEFAULT_SINCE_DAYS); overridable with
@@ -769,16 +765,6 @@ fn main() -> anyhow::Result<()> {
                     .map_err(|e| anyhow::anyhow!("--since parse error: {e}"))?,
                 None => default_since(chrono::Utc::now()),
             });
-
-            let available = std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1);
-            let effective_threads =
-                cairn_core::resolve_max_threads(cfg.governance.max_threads, available);
-            // build_global is a process one-shot; a second call (e.g. in tests) errors — ignore it.
-            let _ = rayon::ThreadPoolBuilder::new()
-                .num_threads(effective_threads)
-                .build_global();
 
             let low_priority_applied = if cfg.governance.low_priority {
                 match cairn_collectors_win::priority::lower_priority() {
@@ -908,7 +894,6 @@ fn main() -> anyhow::Result<()> {
             );
 
             let governance_report = cairn_core::manifest::GovernanceReport {
-                effective_threads,
                 low_priority_applied,
             };
 
@@ -1308,43 +1293,11 @@ mod tests {
         assert!(!ok, "modified ruleset must fail verify");
     }
 
+    /// Clap-parse assertion: --full-speed wires correctly into RunArgs.
     #[test]
-    fn governance_report_assembles_threads_and_priority() {
-        use cairn_core::manifest::GovernanceReport;
-        use cairn_core::resolve_max_threads;
-        // Pure assembly logic mirrored: effective_threads from resolver, priority flag
-        // from (is_live && !full_speed). This guards the wiring contract without
-        // touching the global pool.
-        let effective = resolve_max_threads(Some(3), 16);
-        let report = GovernanceReport {
-            effective_threads: effective,
-            low_priority_applied: true,
-        };
-        assert_eq!(report.effective_threads, 3);
-        assert!(report.low_priority_applied);
-    }
-
-    /// Clap-parse assertion: --max-threads and --full-speed flags wire correctly into RunArgs.
-    /// Guards that the flag names and their RunArgs field types match the handler's expectations
-    /// (a rename or type mismatch would break this test immediately).
-    #[test]
-    fn run_args_max_threads_and_full_speed_parse_correctly() {
+    fn run_args_full_speed_parses_correctly() {
         use clap::Parser;
-        // --max-threads 3 must parse and set max_threads = Some(3); full_speed defaults false.
-        let args = RunArgs::parse_from([
-            "cairn",
-            "--target",
-            "live",
-            "--output",
-            "out",
-            "--max-threads",
-            "3",
-        ]);
-        assert_eq!(
-            args.max_threads,
-            Some(3),
-            "--max-threads 3 must parse to Some(3)"
-        );
+        let args = RunArgs::parse_from(["cairn", "--target", "live", "--output", "out"]);
         assert!(!args.full_speed, "--full-speed absent => false");
 
         // --full-speed must parse and set full_speed = true.
@@ -1357,7 +1310,6 @@ mod tests {
             "--full-speed",
         ]);
         assert!(args_fs.full_speed, "--full-speed present => true");
-        assert_eq!(args_fs.max_threads, None, "max_threads absent => None");
     }
 
     /// Integration: SigmaAnalyzer wired into run_live receives Record::Event and produces findings.
