@@ -194,6 +194,7 @@ impl PrefetchCollector {
             sha1: None,
             user_sid: None,
             execution_confirmed: Some(true),
+            full_path: None,
         })
     }
 }

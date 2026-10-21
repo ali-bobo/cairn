@@ -62,6 +62,7 @@ impl Collector for WmiSubscriptionCollector {
                     signed: None,
                     signer: None,
                     last_write: None,
+                    service_start: None,
                 }
             })
             .collect();

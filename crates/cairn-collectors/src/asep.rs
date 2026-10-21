@@ -442,6 +442,7 @@ fn read_spec_at(
             signed: None,
             signer: None,
             last_write: lw,
+            service_start: None,
         });
     };
     match spec.select {
@@ -604,6 +605,7 @@ pub fn read_run_mru(reg: &dyn RegRead) -> Vec<RegValueRecord> {
                 value: name,
                 data: cmd,
                 last_write: lw,
+                mru_rank: None,
             });
         }
     }
@@ -672,6 +674,7 @@ pub fn read_ps_profiles(paths: &[String]) -> Vec<PersistenceRecord> {
             signed: None,
             signer: None,
             last_write,
+            service_start: None,
         });
     }
     out

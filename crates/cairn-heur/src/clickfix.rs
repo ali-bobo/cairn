@@ -121,6 +121,7 @@ mod tests {
             value: "a".into(),
             data: data.into(),
             last_write: None,
+            mru_rank: None,
         })
     }
 
@@ -177,6 +178,7 @@ mod tests {
             value: "x".into(),
             data: "powershell -enc AAAA".into(),
             last_write: None,
+            mru_rank: None,
         });
         assert!(ClickFixHeuristic.analyze(&[rec], &[]).unwrap().is_empty());
     }

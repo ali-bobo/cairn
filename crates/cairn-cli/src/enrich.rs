@@ -95,6 +95,7 @@ mod tests {
                 signed: None,
                 signer: None,
                 last_write: None,
+                service_start: None,
             })
         };
         let mut records = vec![mk("Evil", "C:\\evil.exe"), mk("Benign", "C:\\benign.exe")];
