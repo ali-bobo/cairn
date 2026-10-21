@@ -15,6 +15,7 @@ pub mod lnk;
 pub mod logon_session;
 pub mod net;
 pub mod persist;
+pub mod posture;
 pub mod prefetch;
 pub mod proc;
 pub mod wmi_subscription;
