@@ -609,7 +609,9 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
 ///     `.expect()` internally and would panic on a malformed timestamp.
 #[cfg(windows)]
 mod win {
-    use super::{extract_binary_path, make_record, normalize_service_path, PersistenceRecord};
+    use super::{
+        extract_binary_path, make_record, normalize_service_path, Mechanism, PersistenceRecord,
+    };
     use chrono::{DateTime, TimeZone, Utc};
     use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
