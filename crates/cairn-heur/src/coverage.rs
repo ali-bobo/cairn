@@ -78,8 +78,8 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1053.005",
         "Scheduled Task",
-        "task XML under System32\\Tasks; Security 4698 task created",
-        "heur_persist, heur_eventlog",
+        "task XML under System32\\Tasks; Security 4698 task created; hidden TaskCache\\Tree tasks (SD value deleted or no task file: Tarrask)",
+        "heur_persist, heur_eventlog, heur_defense",
     ),
     c(
         "T1059",
@@ -190,6 +190,12 @@ pub const BUILTIN: &[Coverage] = &[
         "heur_persist",
     ),
     c(
+        "T1219",
+        "Remote Access Tools",
+        "RMM / remote-access tools (AnyDesk, ScreenConnect, TeamViewer, Atera, ngrok, ...) from processes, services and install folders",
+        "heur_rmm",
+    ),
+    c(
         "T1505.003",
         "Web Shell",
         "w3wp/sqlservr/httpd/nginx/Tomcat spawning cmd, PowerShell or whoami",
@@ -234,8 +240,8 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1546.008",
         "Accessibility Features",
-        "IFEO Debugger on sethc/utilman/osk/magnify/narrator",
-        "heur_persist",
+        "IFEO Debugger on sethc/utilman/osk/magnify/narrator; System32 accessibility binaries whose OriginalFilename is cmd/PowerShell/explorer or that are unsigned",
+        "heur_persist, heur_defense",
     ),
     c(
         "T1546.009",
@@ -318,8 +324,8 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1562.001",
         "Disable or Modify Tools",
-        "Defender 5001 real-time protection off, 5007 exclusion added",
-        "heur_eventlog",
+        "Defender 5001 real-time protection off, 5007 exclusion added; Defender exclusions (paths, extensions, processes, IPs), Defender disabled by policy, Tamper Protection off",
+        "heur_eventlog, heur_defense",
     ),
     c(
         "T1569.002",

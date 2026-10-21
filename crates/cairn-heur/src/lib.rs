@@ -7,11 +7,13 @@ pub mod account;
 pub mod asep;
 pub mod clickfix;
 pub mod coverage;
+pub mod defense;
 pub mod eventlog;
 pub mod logon_bruteforce;
 pub mod netconn;
 pub mod parentchild;
 pub mod persist;
+pub mod rmm;
 pub mod score;
 pub mod sigma;
 pub mod trust;
@@ -19,11 +21,13 @@ pub mod trust;
 // Public API: the analyzers wired into the CLI live run (and reusable elsewhere).
 pub use account::AccountHeuristic;
 pub use clickfix::ClickFixHeuristic;
+pub use defense::DefenseHeuristic;
 pub use eventlog::EventLogHeuristic;
 pub use logon_bruteforce::LogonBruteforceHeuristic;
 pub use netconn::NetConnHeuristic;
 pub use parentchild::ParentChildHeuristic;
 pub use persist::PersistHeuristic;
+pub use rmm::RmmHeuristic;
 pub use sigma::SigmaAnalyzer;
 
 /// Stamp `Finding.analyzer` on every finding an analyzer returns (typed provenance;
