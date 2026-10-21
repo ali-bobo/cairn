@@ -69,7 +69,7 @@ pub const COLLECTORS: &[CollectorEntry] = &[
     },
     CollectorEntry {
         info: light(names::NET),
-        build: |_| Box::new(cairn_collectors::net::NetCollector),
+        build: |_| Box::new(cairn_collectors::net::NetCollector::default()),
     },
     CollectorEntry {
         info: light(names::LOGON_SESSION),
