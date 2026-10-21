@@ -24,21 +24,90 @@ pub enum EvtxError {
 /// record must not abort the file (threat-model untrusted-input #1). Opening a
 /// missing/unreadable file is an error the caller records and continues past.
 pub fn parse_evtx(path: &Path) -> Result<Vec<EventRecord>, EvtxError> {
+    let mut out = Vec::new();
+    stream_evtx(path, None, |ev| out.push(ev))?;
+    Ok(out)
+}
+
+/// Per-file counts from [`stream_evtx`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StreamStats {
+    /// Records handed to the sink.
+    pub kept: u64,
+    /// Records skipped because their header timestamp is before `since` (never rendered).
+    pub skipped_old: u64,
+    /// Records (or chunks) that failed to parse and were skipped.
+    pub failed: u64,
+}
+
+/// Stream one .evtx file, handing each normalized record to `sink`.
+///
+/// The `since` filter runs on the record HEADER timestamp, before the record's BinXML
+/// is rendered to JSON, so an old record costs no JSON/map allocation at all. Memory is
+/// bounded per record (plus the `evtx` crate's per-chunk batch), not per file: records
+/// are converted one at a time and given to `sink` immediately. A record that fails to
+/// parse is counted and skipped (threat-model untrusted-input #1).
+pub fn stream_evtx(
+    path: &Path,
+    since: Option<DateTime<Utc>>,
+    mut sink: impl FnMut(EventRecord),
+) -> Result<StreamStats, EvtxError> {
     let mut parser = evtx::EvtxParser::from_path(path).map_err(|source| EvtxError::Open {
         path: path.display().to_string(),
         source: Box::new(source),
     })?;
-
-    let mut out = Vec::new();
-    for record in parser.records_json_value() {
-        // Skip records that fail to parse rather than aborting the whole file.
-        let Ok(rec) = record else { continue };
-        let ts = jiff_to_utc(rec.timestamp);
-        if let Some(ev) = normalize(&rec.data, rec.event_record_id, ts) {
-            out.push(ev);
+    let mut stats = StreamStats::default();
+    let iter = parser.serialized_records(move |record| {
+        let record = record?;
+        let ts = jiff_to_utc(record.timestamp);
+        if since.is_some_and(|s| ts < s) {
+            return Ok(None); // old: skip before rendering
+        }
+        let id = record.event_record_id;
+        let json = record.into_json_value()?;
+        Ok(Some(normalize(&json.data, id, ts)))
+    });
+    for item in iter {
+        match item {
+            Ok(None) => stats.skipped_old += 1,
+            Ok(Some(Some(ev))) => {
+                stats.kept += 1;
+                sink(ev);
+            }
+            Ok(Some(None)) | Err(_) => stats.failed += 1,
         }
     }
-    Ok(out)
+    Ok(stats)
+}
+
+/// Streaming sha256 of a reader with a fixed 64 KiB buffer: `(lowercase hex, bytes read)`.
+/// Used for EVTX source hashes; constant memory whatever the file size.
+pub fn sha256_reader<R: std::io::Read>(mut r: R) -> std::io::Result<(String, u64)> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = match r.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        h.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect(),
+        total,
+    ))
+}
+
+/// [`sha256_reader`] over a file opened read-only. On a LIVE log the file keeps
+/// growing: the hash and byte count describe exactly the bytes read by this pass at
+/// collection time, not the file as it is later.
+pub fn sha256_file(path: &Path) -> std::io::Result<(String, u64)> {
+    sha256_reader(std::fs::File::open(path)?)
 }
 
 /// Convert the `evtx`/`jiff` timestamp to `chrono::DateTime<Utc>` (golden rule 7:
@@ -162,6 +231,54 @@ mod tests {
 
         assert_eq!(ours, theirs, "parsed {ours}, evtx crate had {theirs}");
         assert!(ours > 0);
+    }
+
+    /// The since filter skips old records before rendering and keeps the rest; the
+    /// split always adds up to the unfiltered count.
+    #[test]
+    fn stream_since_filter_partitions_records() {
+        let path = fixture("sysmon_compiledhtml.evtx");
+        if !path.exists() {
+            eprintln!("skipping: fixture missing: {path:?}");
+            return;
+        }
+        let all = parse_evtx(&path).unwrap();
+        let mut ts: Vec<_> = all.iter().map(|e| e.ts).collect();
+        ts.sort();
+        let cut = ts[ts.len() / 2];
+        let mut kept = Vec::new();
+        let stats = stream_evtx(&path, Some(cut), |e| kept.push(e)).unwrap();
+        assert!(kept.iter().all(|e| e.ts >= cut));
+        assert_eq!(stats.kept as usize, kept.len());
+        assert_eq!(
+            kept.len(),
+            all.iter().filter(|e| e.ts >= cut).count(),
+            "filter must keep exactly the records at/after since"
+        );
+        assert_eq!((stats.kept + stats.skipped_old) as usize, all.len());
+        // a since in the far future keeps nothing
+        let future = chrono::Utc::now() + chrono::Duration::days(3650);
+        let s = stream_evtx(&path, Some(future), |_| panic!("nothing expected")).unwrap();
+        assert_eq!(s.kept, 0);
+    }
+
+    #[test]
+    fn sha256_reader_known_vectors_and_length() {
+        let (h, n) = sha256_reader(std::io::Cursor::new(b"abc".to_vec())).unwrap();
+        assert_eq!(
+            h,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(n, 3);
+        let big = vec![7u8; 64 * 1024 * 2 + 5];
+        let (h2, n2) = sha256_reader(std::io::Cursor::new(big.clone())).unwrap();
+        use sha2::{Digest, Sha256};
+        let want: String = Sha256::digest(&big)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!((h2, n2), (want, big.len() as u64));
+        assert!(sha256_file(&fixture("does_not_exist.evtx")).is_err());
     }
 
     /// A missing file returns Err, never panics (graceful degrade, golden rule 8).
