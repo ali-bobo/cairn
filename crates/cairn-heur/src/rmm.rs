@@ -337,7 +337,7 @@ fn by_service(name: &str) -> Option<&'static RmmTool> {
 }
 
 /// A routable public address (IPv4 via the shared check; IPv6 global unicast).
-fn is_public_ip(addr: &str) -> bool {
+pub(crate) fn is_public_ip(addr: &str) -> bool {
     match addr.trim_matches(['[', ']']).parse::<IpAddr>() {
         Ok(IpAddr::V4(_)) => is_public_ipv4(addr),
         Ok(IpAddr::V6(v6)) => match v6.to_ipv4_mapped() {

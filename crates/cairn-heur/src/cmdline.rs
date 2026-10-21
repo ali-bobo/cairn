@@ -16,6 +16,18 @@ pub(crate) fn event_str(data: &Map<String, Value>, key: &str) -> Option<String> 
     }
 }
 
+/// Like [`event_str`], but also looks one object level down: `UserData` payloads
+/// (`EventXML`, `Operation_ESStoConsumerBinding`, ...) are flattened by the EVTX
+/// collector as one nested object, so their fields sit one level below `data`.
+pub(crate) fn event_field(data: &Map<String, Value>, key: &str) -> Option<String> {
+    if let Some(v) = event_str(data, key) {
+        return Some(v);
+    }
+    data.values()
+        .filter_map(Value::as_object)
+        .find_map(|o| event_str(o, key))
+}
+
 /// One command line and where it was seen.
 #[derive(Debug, Clone)]
 pub(crate) struct CommandLine<'a> {
