@@ -201,6 +201,11 @@ pub struct RegValueRecord {
     pub value: String,
     pub data: String,
     pub last_write: Option<DateTime<Utc>>,
+    /// Position in the key's most-recently-used order (RunMRU / TypedPaths), 0 = most
+    /// recent. The key's LastWrite time dates only the rank-0 entry. None = unknown /
+    /// not an MRU list. Additive field: absent in older JSONL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mru_rank: Option<u32>,
 }
 
 /// Evidence-of-execution (currently Prefetch).

