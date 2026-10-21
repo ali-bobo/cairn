@@ -47,13 +47,13 @@ split)+Velociraptor offline-collector(packaging), fused in one process.
    manifest, continue. Never abort the whole run for one collector.
 
 ## Workspace map
-- `crates/cairn-core`  — typed contracts: Record, Finding (+ EvidenceItem), Manifest, traits, Config, orchestrator. Depend-on-only crate; no host or external-forensic deps.
+- `crates/cairn-core`  — typed contracts: Record (persistence `Mechanism` enum), Finding (+ EvidenceItem; `analyzer` = producing analyzer's name), Observation, Manifest (`SourceEntry.collector`), traits, Config, selection, orchestrator (panic-guarded collector/analyzer runs; `run_analyzers` shared by live and evtx), canonical `collectors::*` / `analyzers::*` name constants. Depend-on-only crate; no host or external-forensic deps.
 - `crates/cairn-collectors` — artifact->Record collectors (evtx file + live; proc/net/logon_session; persist + asep incl. per-user HKU; WMI subscriptions; scheduled tasks; prefetch). `#![forbid(unsafe_code)]`.
 - `crates/cairn-collectors-win` — Windows unsafe FFI ONLY (proc/net/host/privilege/logon/signature/WMI/priority). The single `#![allow(unsafe_code)]` crate; `cfg(windows)`, empty shell elsewhere.
 - `crates/cairn-sigma` — SigmaMatcher trait + sigma-rust engine + LogsourceMap + ruleset aggregate hash (ADR-0003).
-- `crates/cairn-heur`  — heuristic analyzers (parentchild/netconn/account/logon_bruteforce/eventlog/clickfix/persist/asep) + score.rs cross-artifact corroboration + trust.rs path-trust knowledge + coverage table.
-- `crates/cairn-report`— timeline(csv)/findings(jsonl)/observations(jsonl)/manifest/report.html, sha256, output sinks (Dir/Zip/DryRun), verify, client_text (zh-TW).
-- `crates/cairn-cli`   — `cairn` binary, clap CLI (SRS §6). Subcommands: run / evtx / coverage / verify.
+- `crates/cairn-heur`  — heuristic analyzers (parentchild/netconn/account/logon_bruteforce/eventlog/clickfix/persist/asep) + score.rs scoring/cross-artifact corroboration + trust.rs, the single home of shared detection knowledge (drop-zone dirs, launcher table, exe-name tokenizer, encoded-command/base64 checks, script markers) + coverage table. Analyzers set `Finding.analyzer` and correlate on it, never on reason/title text.
+- `crates/cairn-report`— timeline(csv)/findings(jsonl)/observations(jsonl)/manifest/report.html, sha256, output sinks (Dir/Zip/DryRun), verify, client_text (zh-TW client wording, chosen from `Finding.analyzer` + typed mechanism).
+- `crates/cairn-cli`   — `cairn` binary, clap CLI (SRS §6). Subcommands: run / evtx / coverage / verify. Modules: cli (args), registry (THE collector table + analyzer set for live/evtx — add a collector or analyzer there, nowhere else), run, evtx, coverage, verify, enrich, output.
 - `crates/cairn-launcher` — interactive CLI launcher for end users; double-click entry point that wraps cairn.exe.
 - `rules/`             — bundled Sigma (DRL 1.1, plain YAML under `rules/sigma/`) + config maps. Bundle manifest: `rules/ruleset.toml` (a test keeps it in sync with `rules/sigma/`).
 - `docs/`              — REMAINING-WORK (backlog), COVERAGE, threat-model, SOC-runbook, ADRs.
@@ -84,8 +84,12 @@ scoped `cargo test` gate before moving on.
   only in the cli bin.
 - Serialize with serde; keep schema strings from `cairn_core::schema`.
 - Determinism: sort output by (ts, record_id). Reproducible builds in CI.
-- Prefer streaming iteration over loading whole artifacts (EVTX, MFT).
-- Parallelism via `rayon`; collectors are independent, analyzers fan-in.
+- Prefer streaming iteration over loading whole artifacts (EVTX).
+- Collectors run sequentially and independently; analyzers fan in over the
+  accumulated records in `depends_on()` order.
+- No stringly-typed coupling: match on typed fields (`Mechanism`,
+  `Finding.analyzer`, `SourceEntry.collector`) and the name constants in
+  `cairn_core::{collectors, analyzers}`, never on titles or reason text.
 
 ## Skills to lean on (Claude Code)
 There is no project-specific "skill" to install — for Claude Code the equivalent
@@ -116,7 +120,9 @@ finishing-a-branch → post-merge). Split responsibility:
 ## Testing collectors and analyzers
 - Prefer synthetic integration tests that exercise the pipeline through `run_live`
   with a fake collector (pattern: `sigma_analyzer_findings_appear_in_live_outcome`,
-  `logon_bruteforce_heuristic_fires_in_live_outcome` in cairn-cli).
+  `logon_bruteforce_heuristic_fires_in_live_outcome` in cairn-cli `run.rs`).
+- Report wording tests feed findings produced by the real analyzers (see
+  cairn-report `client_text.rs`), not hand-built titles.
 - Real-machine e2e as elevated admin remains the final acceptance bar for the live
   collectors.
 

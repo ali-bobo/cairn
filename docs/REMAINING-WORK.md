@@ -34,6 +34,22 @@ manifest + verify、coverage、launcher。
 
 ---
 
+## Phase 1 核心契約（2026-10-21）✅ 完成
+
+- `Mechanism` enum 取代 `PersistenceRecord.mechanism` 字串（JSON 值不變）；`Finding.analyzer`、
+  `Entity.persistence`、`SourceEntry.collector` 為新增欄位（舊 JSON 以預設值讀入）。
+  `PERSIST_SOURCE_MARKER` 已移除：netconn 以 `f.analyzer == "heur_persist"` 判斷來源。
+- orchestrator 以 `catch_unwind` 包住每個 collector / analyzer；panic 記為
+  `panicked: <msg>` 寫入 manifest sources，run 繼續（golden rule 8）。
+- `cairn-cli` 拆成 cli/registry/run/evtx/coverage/verify/enrich/output；collector 與
+  analyzer 各只有一份註冊表（live 與 evtx 共用）。
+- 偵測知識集中在 `cairn-heur/src/trust.rs`（drop zone、launcher 表、exe 名稱、
+  encoded/base64、script markers）。
+- 殘留：`heur_eventlog` 仍自帶 `details_client`（需要 Finding 沒有結構化保存的事件欄位）；
+  analyzer 的 finding 標題、gate label 與 persist `details` 片段仍為 zh-TW，尚未移到 report 層。
+
+---
+
 ## 目前位置（2026-07-08，段 0 完成後二次更新）
 
 - **S1–S4 全部完成**；post-S4 補強已 merge 至 main：heuristic-gate-redesign（`068983e`）、

@@ -1,13 +1,20 @@
 //! cairn-core: shared contracts for the Cairn live-forensics triage engine.
 //!
 //! This crate defines the *typed bus* every other crate speaks:
-//!   - [`Record`]   : normalized output of a Collector (raw artifact -> typed row)
-//!   - [`Finding`]  : normalized output of an Analyzer (Sigma or heuristic)
-//!   - [`Manifest`] : integrity + chain-of-custody record of a run
-//!   - traits       : Collector, Analyzer, OutputSink (see `traits`)
+//!   - [`Record`]    : normalized output of a Collector (raw artifact -> typed row);
+//!     persistence entries carry a typed [`Mechanism`]
+//!   - [`Finding`]   : normalized output of an Analyzer (Sigma or heuristic), stamped
+//!     with the producing analyzer's name (`Finding.analyzer`)
+//!   - [`Observation`]: inventory that did not clear an analyzer's gate
+//!   - [`Manifest`]  : integrity + chain-of-custody record of a run
+//!   - traits        : Collector, Analyzer, OutputSink, FileVerifier (see `traits`)
+//!   - [`collectors`] / [`analyzers`]: the canonical collector / analyzer names
+//!   - [`orchestrator`]: runs collectors then dependency-ordered analyzers; a failing
+//!     or panicking collector/analyzer is recorded in the manifest and skipped
+//!   - [`selection`] : pure profile / `--only` collector selection
 //!
 //! Design rule: Collectors NEVER analyze; Analyzers NEVER touch the host.
-//! See ../../docs (SRS §3-§5) for the authoritative spec.
+//! Authoritative spec: cairn-SRS.md at the repo root (§3-§5).
 
 #![forbid(unsafe_code)] // raw-volume/WinAPI unsafe lives only in collector crates, behind review.
 

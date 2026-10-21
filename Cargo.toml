@@ -1,4 +1,6 @@
-# Cairn workspace. Every crate under crates/ is a member; see CLAUDE.md for the map.
+# Cairn workspace: the eight crates under crates/ (core contracts, collectors, the
+# Windows FFI shell, Sigma engine, heuristics, report, the `cairn` CLI and the end-user
+# launcher). See CLAUDE.md for the workspace map.
 [workspace]
 resolver = "2"
 members = [
