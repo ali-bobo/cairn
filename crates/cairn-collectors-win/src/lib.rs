@@ -6,6 +6,7 @@
 //! "unsupported platform" error or empty data so the whole workspace still builds.
 #![allow(unsafe_code)] // EXPECTED: this is the isolated FFI boundary (NFR3, CLAUDE.md).
 
+pub mod auditpol;
 #[cfg(windows)]
 mod cmdline_reader;
 pub mod evtx_export;
