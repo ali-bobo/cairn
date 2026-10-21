@@ -78,8 +78,10 @@ enum Cmd {
 
 #[derive(Parser)]
 struct RunArgs {
-    /// "live" or a directory of artifacts.
-    #[arg(long)]
+    /// What to triage. Only "live" (this host) is supported, and it is the default;
+    /// the flag is kept so existing `--target live` invocations still parse. For EVTX
+    /// files use `cairn evtx`.
+    #[arg(long, default_value = "live", value_parser = ["live"], ignore_case = true)]
     target: String,
     #[arg(long)]
     output: PathBuf,
@@ -87,9 +89,6 @@ struct RunArgs {
     zip: bool,
     #[arg(long)]
     dry_run: bool,
-    /// enable Administrator-only collectors (only effective if priv present).
-    #[arg(long)]
-    admin_features: bool,
     #[arg(long)]
     rules: Option<PathBuf>,
     #[arg(long, default_value = "standard")]
@@ -105,8 +104,6 @@ struct RunArgs {
     case_id: Option<String>,
     #[arg(long)]
     operator: Option<String>,
-    #[arg(long)]
-    use_vss: bool,
     /// Cap the rayon worker pool (NFR9). Default: min(cores, 8). 0 = use default.
     #[arg(long)]
     max_threads: Option<usize>,
@@ -254,10 +251,6 @@ const AVAILABLE: &[&str] = &[
     "wmi_subscription",
     "evtx_live",
 ];
-
-fn is_live_target(target: &str) -> bool {
-    target.eq_ignore_ascii_case("live")
-}
 
 /// Deterministic output ordering (NFR4): sort by (ts, then a stable tiebreak key).
 /// Heuristic findings have no record_id, so the tiebreak is (title, then entity pid for
@@ -646,15 +639,6 @@ fn main() -> anyhow::Result<()> {
 
             let started_utc = chrono::Utc::now();
 
-            if !is_live_target(&args.target) {
-                // Offline-artifact orchestration is the raw-NTFS sub-segment; be honest.
-                eprintln!(
-                    "cairn run --target <dir> is not implemented yet (raw-NTFS sub-segment); \
-                     use --target live, or `cairn evtx` for EVTX files."
-                );
-                std::process::exit(2);
-            }
-
             // S2-L: parse --profile into the typed enum FIRST; an invalid value is a
             // clean CLI error (exit non-zero) before we create any output or start a
             // run — not a silent Standard fallback.
@@ -771,8 +755,8 @@ fn main() -> anyhow::Result<()> {
             cfg.operator = args.operator.clone().unwrap_or_default();
 
             // ── Resource governance (NFR9/NFR10) ──────────────────────────────────────
-            // Always true in this handler (a non-live --target exits earlier); kept to
-            // document intent and to make low_priority target-aware if more targets are added.
+            // Always true in this handler (`run` only triages the live host); kept to
+            // document intent.
             let is_live = matches!(cfg.target, cairn_core::Target::Live);
             cfg.governance.max_threads = args.max_threads;
             cfg.governance.low_priority = is_live && !args.full_speed;
@@ -1201,10 +1185,14 @@ mod tests {
     }
 
     #[test]
-    fn run_target_live_is_recognized() {
-        assert!(is_live_target("live"));
-        assert!(is_live_target("LIVE"));
-        assert!(!is_live_target("C:\\evidence"));
+    fn run_target_defaults_to_live_and_rejects_dirs() {
+        let args = RunArgs::try_parse_from(["cairn", "--output", "out"]).unwrap();
+        assert_eq!(args.target, "live");
+        assert!(RunArgs::try_parse_from(["cairn", "--target", "LIVE", "--output", "o"]).is_ok());
+        assert!(
+            RunArgs::try_parse_from(["cairn", "--target", "C:\\evidence", "--output", "o"])
+                .is_err()
+        );
     }
 
     #[test]

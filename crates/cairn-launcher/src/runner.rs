@@ -12,7 +12,7 @@ pub struct RunConfig<'a> {
     pub output_dir: &'a Path,
     /// --since 的 UTC datetime（RFC3339 格式，如 "2026-06-27T14:30:00Z"）
     pub since: &'a str,
-    /// --profile 的值（"minimal"/"standard"/"verbose"）。None 時不帶旗標，
+    /// --profile 的值（"minimal"/"standard"）。None 時不帶旗標，
     /// cairn.exe 自身預設 "standard"（見 cairn-cli RunArgs::profile default_value）。
     pub profile: Option<&'a str>,
 }
@@ -127,11 +127,11 @@ mod tests {
             rules_dir: None,
             output_dir: &output,
             since: "2026-06-27T14:30:00Z",
-            profile: Some("verbose"),
+            profile: Some("minimal"),
         };
         let args = build_args(&cfg);
         assert!(args.contains(&"--profile".to_string()));
-        assert!(args.contains(&"verbose".to_string()));
+        assert!(args.contains(&"minimal".to_string()));
     }
 
     #[test]

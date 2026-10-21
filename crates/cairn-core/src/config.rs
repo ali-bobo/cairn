@@ -4,8 +4,6 @@ use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Target {
-    /// Analyze artifacts already on disk (EVTX dir/files, mounted image).
-    Dir(PathBuf),
     /// Analyze an explicit list of files (the `cairn evtx <files...>` entry, SRS §6).
     Files(Vec<PathBuf>),
     /// Collect from the live running host.
@@ -94,11 +92,9 @@ pub struct Config {
     pub rules_dir: Option<PathBuf>,
     /// module allow-list (e.g. ["evtx","process","persist"]); empty == default set.
     pub only: Vec<String>,
-    pub admin_features: bool,
     pub case_id: String,
     pub operator: String,
     pub since: Option<chrono::DateTime<chrono::Utc>>,
-    pub use_vss: bool,
     /// Time window (minutes) for grouping repeated failed logons (EID 4625) from the
     /// same (TargetUserName, IpAddress) pair before flagging bruteforce (segment 4-C).
     /// Fixed default; no CLI flag.
@@ -125,11 +121,9 @@ impl Default for Config {
             profile: Profile::Standard,
             rules_dir: None,
             only: vec![],
-            admin_features: false,
             case_id: String::new(),
             operator: String::new(),
             since: None,
-            use_vss: false,
             logon_bruteforce_window_minutes: 5,
             logon_bruteforce_threshold: 5,
             password_spraying_window_minutes: 1,
@@ -201,8 +195,6 @@ mod tests {
             other => panic!("expected Target::Files, got {other:?}"),
         }
         assert_eq!(cfg.rules_dir, Some(PathBuf::from("./rules")));
-        // Stage-1 evtx run is file analysis, not live; no admin features.
-        assert!(!cfg.admin_features);
         // Output defaults off-target (a dir), never DryRun unless asked.
         assert!(matches!(cfg.output, OutputKind::Dir(_)));
     }
