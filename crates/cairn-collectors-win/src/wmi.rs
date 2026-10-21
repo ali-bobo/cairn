@@ -180,7 +180,7 @@ pub fn enumerate_subscriptions() -> Result<Vec<RawWmiSubscription>> {
 }
 
 #[cfg(windows)]
-mod win {
+pub(crate) mod win {
     use super::RawWmiSubscription;
     use super::{join_subscriptions, wmi_error, RawBinding, RawConsumer, RawFilter};
     use cairn_core::Result;
@@ -202,7 +202,7 @@ mod win {
     /// RAII guard: calls CoUninitialize on drop. Constructed ONLY after a CoInitializeEx
     /// call that succeeded (S_OK or S_FALSE), so every guard matches exactly one
     /// successful initialize on this thread and COM is never left initialized by us.
-    struct ComGuard;
+    pub(crate) struct ComGuard;
     impl Drop for ComGuard {
         fn drop(&mut self) {
             // SAFETY: one CoUninitialize per successful CoInitializeEx on the same thread
@@ -216,7 +216,7 @@ mod win {
     /// Initializes COM on this thread (COINIT_MULTITHREADED) and installs process-wide
     /// default security. Ok(None) when the thread already has an incompatible apartment
     /// (RPC_E_CHANGED_MODE): COM is usable but the initialize is not ours to undo.
-    fn init_com() -> Result<Option<ComGuard>> {
+    pub(crate) fn init_com() -> Result<Option<ComGuard>> {
         // SAFETY: pvreserved must be None per the API contract. S_FALSE (already
         // initialized in this mode) is success and still owes a CoUninitialize.
         let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -263,7 +263,7 @@ mod win {
     }
 
     /// Runs one WQL query and collects every returned object. Err names the step.
-    fn query_all(services: &IWbemServices, wql: &str) -> Result<Vec<IWbemClassObject>> {
+    pub(crate) fn query_all(services: &IWbemServices, wql: &str) -> Result<Vec<IWbemClassObject>> {
         let wql_b = BSTR::from(wql);
         let lang = BSTR::from("WQL");
         let flags = WBEM_FLAG_RETURN_IMMEDIATELY | WBEM_FLAG_FORWARD_ONLY;
