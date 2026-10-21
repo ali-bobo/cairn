@@ -10,3 +10,5 @@ pub const LOGON_BRUTEFORCE: &str = "heur_logon_bruteforce";
 pub const NETCONN: &str = "heur_netconn";
 pub const PARENTCHILD: &str = "heur_parentchild";
 pub const PERSIST: &str = "heur_persist";
+pub const RMM: &str = "heur_rmm";
+pub const DEFENSE: &str = "heur_defense";
