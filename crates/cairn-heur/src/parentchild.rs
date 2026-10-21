@@ -1,7 +1,10 @@
 //! heur_parentchild (FR10, SRS §10): anomalous parent->child, encoded PowerShell,
 //! suspicious exec path, unsigned + integrity weighting, built-in LOLBAS-flavored list.
-use crate::score::{is_suspicious_path, severity_for, Score};
-use crate::trust::is_masquerade;
+use crate::score::{severity_for, Score};
+use crate::trust::{
+    exe_name, has_base64_token, has_encoded_flag, is_interpreter, is_masquerade, is_powershell,
+    is_user_writable_path, launcher_kind, LauncherKind,
+};
 use cairn_core::finding::EntityProcess;
 use cairn_core::record::{ProcessRecord, Record};
 use cairn_core::traits::Analyzer;
@@ -10,37 +13,15 @@ use std::collections::HashMap;
 
 // --- Named rule tables (config-loader seam; see spec) -------------------------
 
-// NOTE: these tables match on the lowercased file NAME only. A renamed binary evades
-// them; hash/signer-based enrichment is a future signal (the is_suspicious_path signal
-// gives partial path-based coverage in the meantime).
+// NOTE: matching is on the normalized exe NAME only (crate::trust::exe_name). A renamed
+// binary evades it; the user-writable-path amplifier gives partial path-based coverage.
+// Which binaries are shells / script hosts / LOLBins is crate::trust::LAUNCHERS — the
+// one table shared with persist, event-log and ClickFix.
 /// Parent images whose spawning of a shell is anomalous (Office apps).
-pub(crate) const OFFICE_PARENTS: &[&str] =
-    &["winword.exe", "excel.exe", "powerpnt.exe", "outlook.exe"];
-/// Script-host parents.
-pub(crate) const SCRIPT_PARENTS: &[&str] = &["wscript.exe", "cscript.exe", "mshta.exe"];
-/// Shell/child images that are suspicious when spawned by the above.
-pub(crate) const SHELL_CHILDREN: &[&str] = &[
-    "cmd.exe",
-    "powershell.exe",
-    "pwsh.exe",
-    "wscript.exe",
-    "cscript.exe",
-    "mshta.exe",
-];
-/// PowerShell binaries (for the `-e ` disambiguation).
-pub(crate) const PS_BINARIES: &[&str] = &["powershell.exe", "pwsh.exe"];
-/// Built-in LOLBAS-flavored watchlist (NOT the full external dataset; see spec scope).
-pub(crate) const LOLBAS_WATCH: &[&str] = &[
-    "rundll32.exe",
-    "regsvr32.exe",
-    "mshta.exe",
-    "certutil.exe",
-    "bitsadmin.exe",
-    "cscript.exe",
-    "wscript.exe",
-];
+pub(crate) const OFFICE_PARENTS: &[&str] = &["winword", "excel", "powerpnt", "outlook"];
 
-/// Lowercased file name (last path segment) of an image path.
+/// Lowercased file name (last path segment, `.exe` kept) of an image path, for
+/// reason text.
 pub(crate) fn file_name(image: &str) -> String {
     image
         .rsplit(['\\', '/'])
@@ -49,37 +30,20 @@ pub(crate) fn file_name(image: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// True if cmdline shows an encoded-command flag with a base64-looking token.
-/// `-e ` only counts when the image is a PowerShell binary (avoids unrelated -e flags).
-pub(crate) fn has_encoded_powershell(image_name: &str, cmdline: &str) -> bool {
-    let lc = cmdline.to_ascii_lowercase();
-    // `-enc` already subsumes `-encodedcommand` (substring); `-e ` is the short form,
-    // gated to PowerShell binaries so unrelated `-e ` flags on other tools don't match.
-    let flag = lc.contains("-enc") || (lc.contains("-e ") && PS_BINARIES.contains(&image_name));
-    flag && has_base64_token(cmdline)
-}
-
-/// A run of >= 16 chars from the base64 alphabet.
-pub(crate) fn has_base64_token(s: &str) -> bool {
-    let mut run = 0usize;
-    for c in s.chars() {
-        if c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=' {
-            run += 1;
-            if run >= 16 {
-                return true;
-            }
-        } else {
-            run = 0;
-        }
-    }
-    false
+/// True if cmdline carries a PowerShell encoded-command flag AND a real base64
+/// payload token. `-e` only counts for a PowerShell binary (unrelated tools use `-e`).
+pub(crate) fn has_encoded_powershell(exe: &str, cmdline: &str) -> bool {
+    has_encoded_flag(cmdline, is_powershell(exe)) && has_base64_token(cmdline)
 }
 
 /// Score one process against its (optional) parent. Returns a Score (may be empty).
 pub(crate) fn score_process(p: &ProcessRecord, parent: Option<&ProcessRecord>) -> Score {
     let mut s = Score::default();
     let child_name = file_name(&p.image);
+    let child_exe = exe_name(&p.image);
+    let child_kind = launcher_kind(&child_exe);
     let parent_name = parent.map(|pp| file_name(&pp.image));
+    let parent_exe = parent.map(|pp| exe_name(&pp.image));
 
     // S3 masquerade (spec §4.2): a protected system name outside C:\Windows is
     // dispositive on its own — no clean machine has an AppData svchost.exe.
@@ -90,8 +54,8 @@ pub(crate) fn score_process(p: &ProcessRecord, parent: Option<&ProcessRecord>) -
             &["T1036.005"],
         );
     }
-    if let Some(pn) = &parent_name {
-        if OFFICE_PARENTS.contains(&pn.as_str()) && SHELL_CHILDREN.contains(&child_name.as_str()) {
+    if let (Some(pn), Some(pexe)) = (&parent_name, &parent_exe) {
+        if OFFICE_PARENTS.contains(&pexe.as_str()) && is_interpreter(&child_exe) {
             s.add(
                 50,
                 format!("Office app {pn} spawned shell {child_name}"),
@@ -101,8 +65,8 @@ pub(crate) fn score_process(p: &ProcessRecord, parent: Option<&ProcessRecord>) -
         // Intentionally only the real shells (not other script hosts): a script host
         // launching cmd/powershell is the suspicious pattern; wscript<->cscript chains
         // are commonly benign.
-        if SCRIPT_PARENTS.contains(&pn.as_str())
-            && ["cmd.exe", "powershell.exe", "pwsh.exe"].contains(&child_name.as_str())
+        if launcher_kind(pexe) == Some(LauncherKind::ScriptHost)
+            && child_kind == Some(LauncherKind::Shell)
         {
             s.add(
                 30,
@@ -111,10 +75,14 @@ pub(crate) fn score_process(p: &ProcessRecord, parent: Option<&ProcessRecord>) -
             );
         }
     }
-    if has_encoded_powershell(&child_name, &p.cmdline) {
+    if has_encoded_powershell(&child_exe, &p.cmdline) {
         s.add(40, "encoded PowerShell command", &["T1059.001"]);
     }
-    if LOLBAS_WATCH.contains(&child_name.as_str()) && lolbas_suspicious(&p.cmdline) {
+    if matches!(
+        child_kind,
+        Some(LauncherKind::ScriptHost | LauncherKind::ProxyExec)
+    ) && lolbas_suspicious(&p.cmdline)
+    {
         s.add(
             30,
             format!("LOLBAS {child_name} with suspicious arguments"),
@@ -125,7 +93,7 @@ pub(crate) fn score_process(p: &ProcessRecord, parent: Option<&ProcessRecord>) -
     // per-user app (chrome-native-host in \AppData\) — zero information. It adds
     // weight only when a behavioral combo already fired.
     let combo_fired = !s.reasons.is_empty();
-    if combo_fired && is_suspicious_path(&p.image) {
+    if combo_fired && is_user_writable_path(&p.image) {
         s.add(
             25,
             format!("executes from a suspicious path: {}", p.image),
@@ -241,6 +209,26 @@ mod tests {
             user: None,
             start_time: None,
         }
+    }
+
+    /// Regression: the old base64 check (any 16+ alphanumeric run) fired on the
+    /// `WindowsPowerShell` directory name, so every LOLBin-style check saw "base64" in a
+    /// plain PowerShell path. A real token is now required.
+    #[test]
+    fn windows_powershell_path_is_not_base64() {
+        let cmd = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -File x.ps1";
+        assert!(!has_base64_token(cmd));
+        assert!(!lolbas_suspicious(cmd));
+        assert!(!has_encoded_powershell("powershell", cmd));
+        let p = proc(
+            10,
+            1,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            cmd,
+        );
+        let explorer = proc(1, 0, r"C:\Windows\explorer.exe", "");
+        let s = score_process(&p, Some(&explorer));
+        assert_eq!(s.weight, 0, "{:?}", s.reasons);
     }
 
     /// Office -> encoded PowerShell scores high+ and tags T1059.001.

@@ -1,8 +1,7 @@
 //! heur_netconn (FR11, SRS §10): bare public-IP remote, rare remote port, owning-proc
 //! in temp, unsigned owner, suspicious high-port listener. Pure scoring + Analyzer impl.
-use crate::score::{
-    is_public_ipv4, is_rare_port, is_suspicious_path, join_key, severity_for, Score,
-};
+use crate::score::{is_public_ipv4, is_rare_port, join_key, severity_for, Score};
+use crate::trust::is_user_writable_path;
 use cairn_core::finding::{EntityNetConn, EntityProcess};
 use cairn_core::record::{NetConnRecord, ProcessRecord, Record};
 use cairn_core::traits::Analyzer;
@@ -47,7 +46,7 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
         // C2 最常見的偽裝手法正是用常見埠（443/80）混在正常流量裡——不能因為埠
         // 是常見埠就假設這是正常流量。MITRE T1036 (Masquerading)，比照
         // parentchild.rs 對同性質訊號的標籤。
-        if is_suspicious_path(&o.image) && o.signed == Some(false) {
+        if is_user_writable_path(&o.image) && o.signed == Some(false) {
             s.add(
                 50,
                 format!(
@@ -57,7 +56,7 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
                 &["T1036"],
             );
             owner_path_suspicious = true;
-        } else if is_suspicious_path(&o.image) {
+        } else if is_user_writable_path(&o.image) {
             s.add(
                 30,
                 format!("owning process runs from a suspicious path: {}", o.image),

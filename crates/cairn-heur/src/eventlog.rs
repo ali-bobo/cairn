@@ -24,8 +24,10 @@ use cairn_core::traits::Analyzer;
 use cairn_core::{Finding, Result};
 use serde_json::{Map, Value};
 
-use crate::asep::suspicious_script_markers;
-use crate::trust::{is_system_or_program_files, is_user_writable_path};
+use crate::trust::{
+    is_system_or_program_files, is_user_writable_path, launchers_in, script_marker_labels,
+    MICROSOFT_PROGRAMDATA,
+};
 
 /// Defender's operational channel.
 pub const DEFENDER_CHANNEL: &str = "Microsoft-Windows-Windows Defender/Operational";
@@ -57,37 +59,19 @@ fn field_or_dash(ev: &EventRecord, key: &str) -> String {
     field(&ev.data, key).unwrap_or_else(|| "-".to_string())
 }
 
-/// Interpreters and proxy binaries that a legitimate service or task rarely launches
-/// directly; attackers use them to run a payload without dropping an exe.
-const LAUNCHERS: &[&str] = &[
-    "cmd.exe",
-    "cmd /",
-    "powershell",
-    "pwsh",
-    "mshta",
-    "rundll32",
-    "regsvr32",
-    "wscript",
-    "cscript",
-    "certutil",
-    "bitsadmin",
-];
-
-/// ProgramData folders where Microsoft itself installs services (Defender platform
-/// updates register their drivers and services from here on every update).
-const MICROSOFT_PROGRAMDATA: &[&str] = &[r"\programdata\microsoft\windows defender\platform\"];
-
 /// Why a service ImagePath / task command looks like a payload, if it does.
 fn command_red_flags(cmd: &str) -> Vec<String> {
     let lower = cmd.to_ascii_lowercase();
     let mut flags: Vec<String> = Vec::new();
-    if is_user_writable_path(&lower) && !MICROSOFT_PROGRAMDATA.iter().any(|p| lower.contains(p)) {
+    if is_user_writable_path(&lower) {
         flags.push("runs from a user-writable folder".to_string());
     }
-    if let Some(l) = LAUNCHERS.iter().find(|l| lower.contains(*l)) {
-        flags.push(format!("launches {}", l.trim_end_matches(" /")));
+    // Interpreters and proxy binaries a legitimate service or task rarely launches
+    // directly; attackers use them to run a payload without dropping an exe.
+    if let Some(l) = launchers_in(cmd).first() {
+        flags.push(format!("launches {l}"));
     }
-    let markers = suspicious_script_markers(cmd);
+    let markers = script_marker_labels(cmd);
     if !markers.is_empty() {
         flags.push(format!("contains {}", markers.join(", ")));
     }
@@ -185,9 +169,7 @@ fn service_installed(ev: &EventRecord) -> Finding {
     let (severity, reason) = if !flags.is_empty() {
         (Severity::High, flags.join("; "))
     } else if is_system_or_program_files(&normalize_image(&image))
-        || MICROSOFT_PROGRAMDATA
-            .iter()
-            .any(|p| image.to_ascii_lowercase().contains(p))
+        || image.to_ascii_lowercase().contains(MICROSOFT_PROGRAMDATA)
     {
         (
             Severity::Low,

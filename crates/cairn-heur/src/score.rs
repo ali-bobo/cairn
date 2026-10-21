@@ -3,16 +3,6 @@
 use cairn_core::Severity;
 use std::net::Ipv4Addr;
 
-/// Directories whose presence in an image path is a suspicious-execution signal.
-/// Matched case-insensitively as a substring of the path.
-pub const SUSPICIOUS_DIRS: &[&str] = &[
-    r"\temp\",
-    r"\appdata\",
-    r"\programdata\",
-    r"\downloads\",
-    r"\public\", // matches C:\Users\Public (world-readable shared dir) too
-];
-
 /// The canonical install subpath for modern signed per-user apps (Notion, Warp, VS Code, …).
 /// Matched case-insensitively as a substring. Only THIS AppData subpath earns suspicious-path
 /// suppression; Temp/Roaming/other AppData subpaths stay suspicious (droppers favor them).
@@ -37,12 +27,6 @@ pub const WINLOGON_SHELL_DEFAULT: &str = "explorer.exe";
 /// suppression. Fail-loud is intentional.
 pub const WINLOGON_USERINIT_DEFAULTS: &[&str] =
     &[r"c:\windows\system32\userinit.exe", "userinit.exe"];
-
-/// True if `path` (any case) contains one of the suspicious directory segments.
-pub fn is_suspicious_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    SUSPICIOUS_DIRS.iter().any(|d| lower.contains(d))
-}
 
 /// True if `path` (any case) is under the trusted per-user app install directory
 /// (`\AppData\Local\Programs\`). Used only in combination with `signed==Some(true)`.
@@ -389,15 +373,6 @@ mod tests {
             live_side.degraded_key(),
             "basename-only source must still corroborate via degraded match"
         );
-    }
-
-    #[test]
-    fn suspicious_path_matches_each_dir_case_insensitively() {
-        assert!(is_suspicious_path(r"C:\Users\a\AppData\Local\Temp\x.exe"));
-        assert!(is_suspicious_path(r"c:\users\a\downloads\y.exe"));
-        assert!(is_suspicious_path(r"C:\ProgramData\z.exe"));
-        // a normal system path is not suspicious
-        assert!(!is_suspicious_path(r"C:\Windows\System32\cmd.exe"));
     }
 
     #[test]

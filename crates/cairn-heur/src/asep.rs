@@ -12,7 +12,9 @@
 //! Mechanisms not listed here (Active Setup, COM hijack, screensaver, Winlogon
 //! Notify, WOW64 Run keys) rely on persist.rs's generic path/signature signals.
 use crate::persist::GateHit;
-use crate::trust::{is_masquerade, is_under_windows_tree, is_user_writable_path};
+use crate::trust::{
+    is_masquerade, is_under_windows_tree, is_user_writable_path, script_marker_labels,
+};
 use cairn_core::record::{Mechanism, PersistenceRecord};
 use cairn_core::Severity;
 
@@ -187,32 +189,6 @@ fn untrusted_target(p: &PersistenceRecord) -> bool {
     p.signed == Some(false) || is_user_writable_path(path) || is_masquerade(path)
 }
 
-/// Download / encoded-payload markers in a script body (PowerShell profiles).
-pub(crate) fn suspicious_script_markers(text: &str) -> Vec<&'static str> {
-    const MARKERS: &[(&str, &str)] = &[
-        ("downloadstring", "DownloadString"),
-        ("downloadfile", "DownloadFile"),
-        ("invoke-webrequest", "Invoke-WebRequest"),
-        ("iwr ", "iwr"),
-        ("invoke-expression", "Invoke-Expression"),
-        ("iex ", "iex"),
-        ("iex(", "iex"),
-        ("frombase64string", "FromBase64String"),
-        (" -enc", "-EncodedCommand"),
-        ("start-bitstransfer", "Start-BitsTransfer"),
-        ("http://", "http URL"),
-        ("https://", "https URL"),
-    ];
-    let lower = text.to_ascii_lowercase();
-    let mut found: Vec<&'static str> = MARKERS
-        .iter()
-        .filter(|(needle, _)| lower.contains(needle))
-        .map(|(_, label)| *label)
-        .collect();
-    found.dedup();
-    found
-}
-
 /// Mechanism-specific gate signal for the extended catalog, IFEO accessibility
 /// backdoors and PowerShell profiles. None = no mechanism-specific signal (the generic
 /// path/signature signals in persist.rs still apply).
@@ -243,7 +219,7 @@ pub(crate) fn asep_signal(p: &PersistenceRecord) -> Option<GateHit> {
     }
 
     if m == Mechanism::PsProfile {
-        let markers = suspicious_script_markers(p.command.as_deref().unwrap_or(""));
+        let markers = script_marker_labels(p.command.as_deref().unwrap_or(""));
         if markers.is_empty() {
             return None;
         }

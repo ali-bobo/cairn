@@ -13,26 +13,7 @@ use cairn_core::record::{Record, RegValueRecord};
 use cairn_core::traits::Analyzer;
 use cairn_core::{Finding, Result};
 
-use crate::asep::suspicious_script_markers;
-
-/// Binaries ClickFix lures paste into the Run dialog to fetch and run a payload.
-const LAUNCHERS: &[&str] = &[
-    "powershell",
-    "pwsh",
-    "mshta",
-    "cmd",
-    "conhost",
-    "rundll32",
-    "regsvr32",
-    "msiexec",
-    "wscript",
-    "cscript",
-    "certutil",
-    "bitsadmin",
-    "curl",
-    "wget",
-    "finger",
-];
+use crate::trust::{has_arguments, invoked_exe, launcher_kind, script_marker_labels};
 
 /// Extra markers seen in paste-and-run payloads beyond the shared script markers.
 const PAYLOAD_MARKERS: &[(&str, &str)] = &[
@@ -49,23 +30,16 @@ fn is_run_mru(r: &RegValueRecord) -> bool {
     r.key.to_ascii_lowercase().ends_with(r"\explorer\runmru")
 }
 
-/// The launcher this entry starts, when it is called with arguments.
-fn launcher(cmd: &str) -> Option<&'static str> {
-    let lower = cmd.trim().trim_start_matches('"').to_ascii_lowercase();
-    let first = lower.split_whitespace().next()?;
-    let exe = first.rsplit(['\\', '/']).next().unwrap_or(first);
-    let exe = exe.trim_end_matches(".exe").trim_end_matches('"');
-    let has_args = lower.split_whitespace().nth(1).is_some();
-    LAUNCHERS
-        .iter()
-        .find(|l| exe == **l)
-        .copied()
-        .filter(|_| has_args)
+/// The launcher this entry starts (any kind in crate::trust::LAUNCHERS), when it is
+/// called with arguments.
+fn launcher(cmd: &str) -> Option<String> {
+    let exe = invoked_exe(cmd)?;
+    (launcher_kind(&exe).is_some() && has_arguments(cmd)).then_some(exe)
 }
 
 fn payload_markers(cmd: &str) -> Vec<&'static str> {
     let lower = cmd.to_ascii_lowercase();
-    let mut out = suspicious_script_markers(cmd);
+    let mut out = script_marker_labels(cmd);
     for (needle, label) in PAYLOAD_MARKERS {
         if lower.contains(needle) && !out.contains(label) {
             out.push(label);

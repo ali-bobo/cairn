@@ -3,7 +3,8 @@
 //! is inventory surfaced via `observe()` as an Observation (spec §6).
 use crate::score::{build_cross_index, escalate, join_key};
 use crate::trust::{
-    is_masquerade, is_system_or_program_files, is_user_writable_path, winlogon_value_is_default,
+    exe_name, invoked_exe, is_interpreter, is_masquerade, is_system_or_program_files,
+    is_user_writable_path, script_markers, winlogon_value_is_default, MarkerKind,
 };
 use cairn_core::finding::{EntityFile, EntityProcess, EntityRegistry, EvidenceItem};
 use cairn_core::observation::Observation;
@@ -34,41 +35,20 @@ pub(crate) struct GateHit {
 /// The interpreter must be the invoked binary itself (basename of binary_path, or the
 /// command's first token) — a substring match would flag "PowerShell Studio\app.exe".
 fn script_persistence_signal(p: &PersistenceRecord) -> Option<GateHit> {
-    const INTERPRETERS: &[&str] = &[
-        "powershell.exe",
-        "pwsh.exe",
-        "wscript.exe",
-        "cscript.exe",
-        "mshta.exe",
-        "cmd.exe",
-        "powershell",
-        "pwsh",
-        "wscript",
-        "cscript",
-        "mshta",
-        "cmd",
-    ];
     let cmd = p.command.as_deref()?;
     let invoked = p
         .binary_path
         .as_deref()
-        .map(|bp| short_name_persist(bp).to_ascii_lowercase())
-        .or_else(|| {
-            cmd.trim()
-                .trim_matches('"')
-                .split_whitespace()
-                .next()
-                .map(|t| short_name_persist(t).to_ascii_lowercase())
-        })?;
-    if !INTERPRETERS.contains(&invoked.as_str()) {
+        .map(exe_name)
+        .or_else(|| invoked_exe(cmd))?;
+    if !is_interpreter(&invoked) {
         return None;
     }
     let lower = cmd.to_ascii_lowercase();
-    let encoded = lower.contains(" -enc")
-        || lower.contains(" -encodedcommand")
-        || lower.contains("frombase64string");
-    let remote = lower.contains("http://") || lower.contains("https://");
-    if encoded || remote {
+    let payload = script_markers(cmd)
+        .iter()
+        .any(|m| matches!(m.kind, MarkerKind::Encoded | MarkerKind::Remote));
+    if payload {
         return Some(GateHit {
             severity: Severity::High,
             label: "腳本直譯器持久化（編碼/遠端內容）",
@@ -818,6 +798,23 @@ mod tests {
             None,
         );
         assert!(evaluate_gate(&pf, now).is_empty());
+    }
+
+    /// The drop-zone list is the shared trust::USER_WRITABLE_DIRS, which (unlike the
+    /// old persist-only list) includes all of AppData\Local: an explicitly unsigned
+    /// binary there is the same S2 hit as one in Roaming.
+    #[test]
+    fn gate_s2_covers_appdata_local_vendor_dirs() {
+        let now = Utc::now();
+        let p = full_rec(
+            Mechanism::RunKey,
+            Some("Upd"),
+            Some(r"C:\Users\a\AppData\Local\Updater\upd.exe"),
+            Some(r"C:\Users\a\AppData\Local\Updater\upd.exe"),
+            Some(false),
+            None,
+        );
+        assert!(evaluate_gate(&p, now).iter().any(|h| h.mitre == "T1036"));
     }
 
     /// The Startup folder IS the persistence location, not a suspicious drop zone —
