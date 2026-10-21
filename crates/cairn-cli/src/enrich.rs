@@ -64,15 +64,7 @@ pub fn enrich_hashes(
 
 /// The real hasher: streaming SHA-256, capped at DEFAULT_MAX_HASH_BYTES.
 pub fn hash_on_disk(path: &str) -> Option<String> {
-    cairn_collectors::hash::hash_file_capped(
-        path,
-        cairn_collectors::hash::DEFAULT_MAX_HASH_BYTES,
-        |p| {
-            let len = std::fs::metadata(p).ok()?.len();
-            let file = std::fs::File::open(p).ok()?;
-            Some((len, file))
-        },
-    )
+    cairn_collectors::hash::hash_file_capped(path)
 }
 
 #[cfg(test)]
@@ -95,6 +87,8 @@ mod tests {
                 signed: None,
                 signer: None,
                 last_write: None,
+                bound: None,
+                signer_source: None,
             })
         };
         let mut records = vec![mk("Evil", "C:\\evil.exe"), mk("Benign", "C:\\benign.exe")];

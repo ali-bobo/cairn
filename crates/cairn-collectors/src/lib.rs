@@ -16,3 +16,5 @@ pub mod persist;
 pub mod prefetch;
 pub mod proc;
 pub mod wmi_subscription;
+
+pub use hash::hash_file_capped;

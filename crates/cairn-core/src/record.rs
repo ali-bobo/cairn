@@ -49,6 +49,20 @@ pub struct ProcessRecord {
     pub integrity: Option<String>,
     pub user: Option<String>,
     pub start_time: Option<DateTime<Utc>>,
+    /// Where `signer` came from (embedded Authenticode vs. a system catalog). Additive;
+    /// absent in old JSON and omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_source: Option<SignerSource>,
+}
+
+/// Where a file's signer name was read from. `Embedded` = the PE's own Authenticode
+/// PKCS#7; `Catalog` = the signer of the system catalog (.cat) that lists the file's hash
+/// (most in-box System32 binaries are catalog-signed and carry no embedded signature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignerSource {
+    Embedded,
+    Catalog,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -192,6 +206,14 @@ pub struct PersistenceRecord {
     pub signed: Option<bool>,
     pub signer: Option<String>,
     pub last_write: Option<DateTime<Utc>>,
+    /// Where `signer` came from (see [`SignerSource`]). Additive; omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_source: Option<SignerSource>,
+    /// WMI subscriptions only: `Some(true)` for a filter/consumer joined by a
+    /// `__FilterToConsumerBinding`, `Some(false)` for an orphaned (unbound) filter or
+    /// consumer. `None` for every other mechanism. Additive; omitted when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -231,6 +253,14 @@ pub struct LogonSessionRecord {
     /// "unknown" is conservatively treated as "not active" rather than assumed true.
     #[serde(default)]
     pub state_active: bool,
+    /// WTS connection state label (`active`, `disconnected`, `idle`, ...) when the
+    /// session maps to a WTS session. Additive; omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_state: Option<String>,
+    /// LSA `LogonServer`: the server that authenticated the logon (e.g. a DC name).
+    /// Additive; omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logon_server: Option<String>,
 }
 
 #[cfg(test)]
@@ -251,6 +281,8 @@ mod tests {
             signed: Some(true),
             signer: Some("Docker Inc".into()),
             last_write: None,
+            bound: None,
+            signer_source: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         assert!(j.contains(r#""signer":"Docker Inc""#));
@@ -275,6 +307,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         let back: ProcessRecord = serde_json::from_str(&j).unwrap();
@@ -294,6 +327,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         let back: ProcessRecord = serde_json::from_str(&j).unwrap();
@@ -382,6 +416,8 @@ mod tests {
             source: Some("10.0.0.5".into()),
             session_id: Some(2),
             state_active: true,
+            logon_server: None,
+            session_state: None,
         });
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"kind\":\"logon_session\""));
@@ -407,6 +443,8 @@ mod tests {
             source: None,
             session_id: Some(3),
             state_active: true,
+            logon_server: None,
+            session_state: None,
         });
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains(r#""state_active":true"#));
@@ -415,5 +453,40 @@ mod tests {
             Record::LogonSession(back_rec) => assert!(back_rec.state_active),
             other => panic!("expected LogonSession, got {other:?}"),
         }
+    }
+
+    /// Phase 2A additive fields: omitted when None, absent keys default to None, and
+    /// SignerSource serializes as a snake_case string.
+    #[test]
+    fn phase2a_additive_fields_are_optional_and_roundtrip() {
+        let old_proc = r#"{"pid":1,"ppid":0,"image":"a","cmdline":"","signed":null,"signer":null,"binary_sha256":null,"integrity":null,"user":null,"start_time":null}"#;
+        let p: ProcessRecord = serde_json::from_str(old_proc).unwrap();
+        assert_eq!(p.signer_source, None);
+        let j = serde_json::to_string(&p).unwrap();
+        assert!(!j.contains("signer_source"), "None must be omitted: {j}");
+
+        let mut p2 = p.clone();
+        p2.signer_source = Some(SignerSource::Catalog);
+        let j2 = serde_json::to_string(&p2).unwrap();
+        assert!(j2.contains(r#""signer_source":"catalog""#), "{j2}");
+        let back: ProcessRecord = serde_json::from_str(&j2).unwrap();
+        assert_eq!(back.signer_source, Some(SignerSource::Catalog));
+
+        let old_persist = r#"{"mechanism":"wmi_subscription","location":"x","value":null,"command":null,"binary_path":null,"binary_sha256":null,"signed":null,"signer":null,"last_write":null}"#;
+        let mut r: PersistenceRecord = serde_json::from_str(old_persist).unwrap();
+        assert_eq!(r.bound, None);
+        assert_eq!(r.signer_source, None);
+        assert!(!serde_json::to_string(&r).unwrap().contains("bound"));
+        r.bound = Some(false);
+        r.signer_source = Some(SignerSource::Embedded);
+        let j3 = serde_json::to_string(&r).unwrap();
+        assert!(j3.contains(r#""bound":false"#) && j3.contains(r#""signer_source":"embedded""#));
+
+        let old_logon = r#"{"user":"D\\a","logon_type":"Interactive","logon_time":null,"source":null,"session_id":1}"#;
+        let l: LogonSessionRecord = serde_json::from_str(old_logon).unwrap();
+        assert_eq!(l.session_state, None);
+        assert_eq!(l.logon_server, None);
+        let j4 = serde_json::to_string(&l).unwrap();
+        assert!(!j4.contains("session_state") && !j4.contains("logon_server"));
     }
 }

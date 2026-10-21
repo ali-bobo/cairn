@@ -22,13 +22,28 @@ pub fn is_absolute_path(image: &str) -> bool {
     drive || unc
 }
 
-/// Fill `signed` for records whose image is an absolute path, via the verifier. A
-/// file-name-only image is left None. Pure wiring (no OS code).
+/// Fill `signed` / `signer` / `signer_source` for records whose image is an absolute path,
+/// via the verifier. A file-name-only image is left None. Pure wiring (no OS code).
 fn apply_signatures(records: &mut [ProcessRecord], verifier: &dyn FileVerifier) {
     for r in records.iter_mut() {
         if is_absolute_path(&r.image) {
             r.signed = verifier.verify(&r.image);
             r.signer = verifier.signer(&r.image);
+            r.signer_source = r
+                .signer
+                .as_ref()
+                .and_then(|_| verifier.signer_source(&r.image));
+        }
+    }
+}
+
+/// Fill `binary_sha256` for records whose image is an absolute path, via `hasher`
+/// (the real one is [`crate::hash::hash_file_capped`]: 256 MiB cap, cached per path). A
+/// file-name-only image is never hashed (no CWD resolution). Pure wiring.
+fn apply_hashes(records: &mut [ProcessRecord], hasher: fn(&str) -> Option<String>) {
+    for r in records.iter_mut() {
+        if is_absolute_path(&r.image) {
+            r.binary_sha256 = hasher(&r.image);
         }
     }
 }
@@ -36,6 +51,7 @@ fn apply_signatures(records: &mut [ProcessRecord], verifier: &dyn FileVerifier) 
 /// Collector that enumerates live processes (SRS §4 proc_collector).
 pub struct ProcCollector {
     verifier: Box<dyn FileVerifier + Send + Sync>,
+    hasher: fn(&str) -> Option<String>,
 }
 
 impl Default for ProcCollector {
@@ -45,14 +61,26 @@ impl Default for ProcCollector {
             Box::new(cairn_collectors_win::signature::WinSigVerifier);
         #[cfg(not(windows))]
         let verifier: Box<dyn FileVerifier + Send + Sync> = Box::new(NoopVerifier);
-        Self { verifier }
+        Self {
+            verifier,
+            hasher: crate::hash::hash_file_capped,
+        }
     }
 }
 
 impl ProcCollector {
-    /// Construct with a specific verifier (tests inject a fake).
+    /// Construct with a specific verifier (tests inject a fake). Uses the real hasher.
     pub fn with_verifier(verifier: Box<dyn FileVerifier + Send + Sync>) -> Self {
-        Self { verifier }
+        Self {
+            verifier,
+            hasher: crate::hash::hash_file_capped,
+        }
+    }
+
+    /// Replace the image hasher (tests inject a fake).
+    pub fn with_hasher(mut self, hasher: fn(&str) -> Option<String>) -> Self {
+        self.hasher = hasher;
+        self
     }
 }
 
@@ -75,6 +103,7 @@ impl Collector for ProcCollector {
             })
             .collect();
         apply_signatures(&mut proc_recs, self.verifier.as_ref());
+        apply_hashes(&mut proc_recs, self.hasher);
         Ok(proc_recs.into_iter().map(Record::Process).collect())
     }
     fn sources(&self) -> Vec<SourceEntry> {
@@ -106,6 +135,7 @@ pub fn build_process_records(raw: &[RawProc]) -> Vec<Record> {
                 integrity: r.integrity_raw.map(integrity_label),
                 user: r.user.clone(),
                 start_time: r.start_time,
+                signer_source: None,
             })
         })
         .collect()
@@ -143,6 +173,9 @@ mod tests {
                 None
             }
         }
+        fn signer_source(&self, _path: &str) -> Option<cairn_core::record::SignerSource> {
+            Some(cairn_core::record::SignerSource::Catalog)
+        }
     }
 
     /// is_absolute_path: drive-letter and UNC are absolute; a bare name is not.
@@ -173,6 +206,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         };
         let mut recs = vec![
             mk(1, r"C:\evil\b.exe"),    // absolute, known false
@@ -187,11 +221,48 @@ mod tests {
         assert_eq!(recs[3].signed, None);
         // signer is filled only for the absolute path the fake knows; file-name-only is never queried.
         assert_eq!(recs[1].signer.as_deref(), Some("Proc Vendor"));
+        assert_eq!(
+            recs[1].signer_source,
+            Some(cairn_core::record::SignerSource::Catalog)
+        );
+        assert_eq!(recs[0].signer_source, None, "no signer -> no source");
         assert_eq!(recs[0].signer, None);
         assert_eq!(
             recs[3].signer, None,
             "file-name-only image: signer not queried"
         );
+    }
+
+    fn fake_hash(path: &str) -> Option<String> {
+        Some(format!("sha-of-{path}"))
+    }
+
+    /// apply_hashes fills binary_sha256 only for absolute images.
+    #[test]
+    fn apply_hashes_fills_only_absolute_images() {
+        let mut recs: Vec<ProcessRecord> =
+            build_process_records(&[raw(1, 0, r"C:\x\a.exe"), raw(2, 0, "a.exe")])
+                .into_iter()
+                .filter_map(|r| match r {
+                    Record::Process(p) => Some(p),
+                    _ => None,
+                })
+                .collect();
+        apply_hashes(&mut recs, fake_hash);
+        assert_eq!(recs[0].binary_sha256.as_deref(), Some(r"sha-of-C:\x\a.exe"));
+        assert_eq!(recs[1].binary_sha256, None);
+    }
+
+    /// The token user read by the FFI layer is carried through to the record.
+    #[test]
+    fn user_is_carried_through() {
+        let mut r = raw(5, 1, r"C:\x\a.exe");
+        r.user = Some(r"CORP\alice".into());
+        let recs = build_process_records(&[r]);
+        let Record::Process(p) = &recs[0] else {
+            panic!()
+        };
+        assert_eq!(p.user.as_deref(), Some(r"CORP\alice"));
     }
 
     fn raw(pid: u32, ppid: u32, image: &str) -> RawProc {
@@ -241,7 +312,7 @@ mod tests {
     /// platform stub returns empty) and never panics; its name() is "proc".
     #[test]
     fn proc_collector_collects_without_panicking() {
-        let collector = ProcCollector::default();
+        let collector = ProcCollector::default().with_hasher(fake_hash);
         assert_eq!(collector.name(), "proc");
         let cfg = Config::default();
         let ctx = CollectCtx {

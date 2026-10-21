@@ -2,6 +2,7 @@
 //! PersistenceRecord entries with mechanism="wmi_subscription".
 #![forbid(unsafe_code)]
 
+use cairn_collectors_win::wmi::RawWmiSubscription;
 use cairn_core::manifest::SourceEntry;
 use cairn_core::record::{Mechanism, PersistenceRecord, Record};
 use cairn_core::traits::{CollectCtx, Collector};
@@ -24,6 +25,56 @@ fn extract_binary_path(consumer_type: &str, command: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// `location` for one entry: `filter -> consumer` for a bound pair, otherwise which half
+/// exists, marked unbound.
+fn location_of(sub: &RawWmiSubscription) -> String {
+    match (
+        sub.bound,
+        sub.filter_name.is_empty(),
+        sub.consumer_name.is_empty(),
+    ) {
+        (true, _, _) => format!("{} -> {}", sub.filter_name, sub.consumer_name),
+        (false, false, _) => format!("filter:{} (unbound)", sub.filter_name),
+        (false, true, _) => format!("consumer:{} (unbound)", sub.consumer_name),
+    }
+}
+
+/// Map raw WMI entries to Persistence records (mechanism wmi_subscription). Pure.
+/// `bound` is carried into `PersistenceRecord.bound`; an unbound filter has no command;
+/// its `value` is the filter name, otherwise the consumer name.
+pub fn build_wmi_records(raw: Vec<RawWmiSubscription>) -> Vec<Record> {
+    raw.into_iter()
+        .map(|sub| {
+            let binary_path = sub
+                .command
+                .as_deref()
+                .and_then(|c| extract_binary_path(&sub.consumer_type, c));
+            let location = location_of(&sub);
+            let value = if sub.consumer_name.is_empty() {
+                sub.filter_name.clone()
+            } else {
+                sub.consumer_name.clone()
+            };
+            Record::Persistence(PersistenceRecord {
+                mechanism: Mechanism::WmiSubscription,
+                location,
+                value: Some(value),
+                command: sub.command,
+                binary_path,
+                // Signature verification is left None here (not backfilled): the
+                // persist collector's signing helpers are scoped to its own batch.
+                // Tracked as a known gap.
+                binary_sha256: None,
+                signed: None,
+                signer: None,
+                last_write: None,
+                bound: Some(sub.bound),
+                signer_source: None,
+            })
+        })
+        .collect()
+}
+
 pub struct WmiSubscriptionCollector;
 
 impl Collector for WmiSubscriptionCollector {
@@ -33,40 +84,10 @@ impl Collector for WmiSubscriptionCollector {
 
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
         // enumerate_subscriptions() is cross-platform on its own (empty vec on
-        // non-Windows) — no cfg needed at this call site.
+        // non-Windows) and returns Err (step + HRESULT) on any COM failure, which the
+        // orchestrator records in the manifest.
         let raw = cairn_collectors_win::wmi::enumerate_subscriptions()?;
-
-        let records: Vec<PersistenceRecord> = raw
-            .into_iter()
-            .map(|sub| {
-                let binary_path = sub
-                    .command
-                    .as_deref()
-                    .and_then(|c| extract_binary_path(&sub.consumer_type, c));
-                PersistenceRecord {
-                    mechanism: Mechanism::WmiSubscription,
-                    location: format!("{} -> {}", sub.filter_name, sub.consumer_name),
-                    value: Some(sub.consumer_name.clone()),
-                    command: sub.command,
-                    binary_path,
-                    // Signature verification is left None here (not backfilled) because
-                    // persist.rs's `apply_signatures`/`resolve_relative_binary_paths` are
-                    // module-private helpers scoped to PersistCollector's own record batch
-                    // (see crates/cairn-collectors/src/persist.rs:782,815) — reusing them
-                    // would require either making them pub(crate) and threading a second
-                    // FileVerifier instance through this independent collector, or merging
-                    // WMI records into PersistCollector's batch (rejected by the plan: WMI's
-                    // unsafe COM lifecycle warrants its own collector, see plan Task 1).
-                    // Deferred rather than solved here; tracked as a known gap.
-                    binary_sha256: None,
-                    signed: None,
-                    signer: None,
-                    last_write: None,
-                }
-            })
-            .collect();
-
-        Ok(records.into_iter().map(Record::Persistence).collect())
+        Ok(build_wmi_records(raw))
     }
 
     fn sources(&self) -> Vec<SourceEntry> {
@@ -109,5 +130,49 @@ mod tests {
     fn empty_command_line_yields_no_binary_path() {
         let path = extract_binary_path("CommandLineEventConsumer", "");
         assert_eq!(path, None);
+    }
+
+    fn sub(f: &str, c: &str, ctype: &str, cmd: Option<&str>, bound: bool) -> RawWmiSubscription {
+        RawWmiSubscription {
+            filter_name: f.into(),
+            filter_query: String::new(),
+            consumer_name: c.into(),
+            consumer_type: ctype.into(),
+            command: cmd.map(Into::into),
+            bound,
+        }
+    }
+
+    #[test]
+    fn maps_bound_and_unbound_entries() {
+        let recs = build_wmi_records(vec![
+            sub(
+                "F",
+                "C",
+                "CommandLineEventConsumer",
+                Some(r"C:\x.exe /q"),
+                true,
+            ),
+            sub("Orphan", "", "", None, false),
+            sub("", "Lone", "ActiveScriptEventConsumer", Some("x"), false),
+        ]);
+        let p: Vec<&PersistenceRecord> = recs
+            .iter()
+            .map(|r| match r {
+                Record::Persistence(p) => p,
+                _ => panic!("persistence"),
+            })
+            .collect();
+        assert_eq!(p[0].location, "F -> C");
+        assert_eq!(p[0].bound, Some(true));
+        assert_eq!(p[0].binary_path.as_deref(), Some(r"C:\x.exe"));
+        assert_eq!(p[1].location, "filter:Orphan (unbound)");
+        assert_eq!(p[1].bound, Some(false));
+        assert_eq!(p[1].value.as_deref(), Some("Orphan"));
+        assert_eq!(p[1].command, None);
+        assert_eq!(p[2].location, "consumer:Lone (unbound)");
+        assert_eq!(p[2].bound, Some(false));
+        assert_eq!(p[2].binary_path, None);
+        assert!(p.iter().all(|r| r.mechanism == Mechanism::WmiSubscription));
     }
 }
