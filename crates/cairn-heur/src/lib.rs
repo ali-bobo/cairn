@@ -7,6 +7,7 @@ pub mod account;
 pub mod asep;
 pub mod byovd;
 pub mod coverage;
+pub mod eventlog;
 pub mod live_exec;
 pub mod logon_bruteforce;
 pub mod netconn;
@@ -21,6 +22,7 @@ pub mod trust;
 // Public API: the analyzers wired into the CLI live run (and reusable elsewhere).
 pub use account::AccountHeuristic;
 pub use byovd::ByovdHeuristic;
+pub use eventlog::EventLogHeuristic;
 pub use live_exec::LiveExecHeuristic;
 pub use logon_bruteforce::LogonBruteforceHeuristic;
 pub use netconn::NetConnHeuristic;

@@ -183,7 +183,7 @@ fn untrusted_target(p: &PersistenceRecord) -> bool {
 }
 
 /// Download / encoded-payload markers in a script body (PowerShell profiles).
-fn suspicious_script_markers(text: &str) -> Vec<&'static str> {
+pub(crate) fn suspicious_script_markers(text: &str) -> Vec<&'static str> {
     const MARKERS: &[(&str, &str)] = &[
         ("downloadstring", "DownloadString"),
         ("downloadfile", "DownloadFile"),

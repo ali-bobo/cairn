@@ -54,8 +54,8 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1053.005",
         "Scheduled Task",
-        "task XML under System32\\Tasks",
-        "heur_persist",
+        "task XML under System32\\Tasks; Security 4698 task created",
+        "heur_persist, heur_eventlog",
     ),
     c(
         "T1059",
@@ -68,6 +68,12 @@ pub const BUILTIN: &[Coverage] = &[
         "PowerShell",
         "encoded / download-cradle PowerShell command lines",
         "heur_parentchild",
+    ),
+    c(
+        "T1070.001",
+        "Clear Windows Event Logs",
+        "Security 1102 / System 104 log cleared",
+        "heur_eventlog",
     ),
     c(
         "T1098.007",
@@ -114,8 +120,8 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1543.003",
         "Windows Service",
-        "auto-start services' ImagePath + signature",
-        "heur_persist",
+        "auto-start services' ImagePath + signature; System 7045 service installed",
+        "heur_persist, heur_eventlog",
     ),
     c(
         "T1546",
@@ -224,6 +230,12 @@ pub const BUILTIN: &[Coverage] = &[
         "Password Filter DLL",
         "LSA Notification Packages non-stock entries",
         "heur_persist",
+    ),
+    c(
+        "T1562.001",
+        "Disable or Modify Tools",
+        "Defender 5001 real-time protection off, 5007 exclusion added",
+        "heur_eventlog",
     ),
 ];
 

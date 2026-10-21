@@ -153,6 +153,11 @@ pub fn fill_details_client(f: &mut Finding) {
     if !is_medium_or_above(f.severity) {
         return;
     }
+    // An analyzer that wrote its own event-specific text knows more than the generic
+    // per-artifact templates below; keep it.
+    if f.source == FindingSource::Heuristic && f.details_client.is_some() {
+        return;
+    }
     let host = f.host.clone();
     let text = match f.source {
         FindingSource::Heuristic => match f.artifact.as_str() {
@@ -230,6 +235,14 @@ mod tests {
         let mut f = Finding::new(severity, title, FindingSource::Sigma);
         f.host = "WS01".into();
         f
+    }
+
+    #[test]
+    fn heuristic_supplied_text_is_kept() {
+        let mut f = make_heuristic(Severity::High, "evtx:Security");
+        f.details_client = Some("自訂說明".into());
+        fill_details_client(&mut f);
+        assert_eq!(f.details_client.as_deref(), Some("自訂說明"));
     }
 
     #[test]

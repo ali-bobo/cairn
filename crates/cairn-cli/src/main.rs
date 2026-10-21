@@ -184,6 +184,33 @@ fn default_since(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chrono:
     now - chrono::Duration::days(DEFAULT_SINCE_DAYS)
 }
 
+/// Channels the live EVTX collector reads: whatever the loaded Sigma rules reference,
+/// plus the channels the built-in event-log heuristics need, so account, brute-force
+/// and log-clearing detections still run when no rules are loaded.
+fn live_evtx_channels(sigma: Option<&[String]>) -> Vec<String> {
+    let mut out: Vec<String> = sigma.map(<[String]>::to_vec).unwrap_or_default();
+    for ch in cairn_heur::eventlog::CHANNELS {
+        if !out.iter().any(|c| c.eq_ignore_ascii_case(ch)) {
+            out.push((*ch).to_string());
+        }
+    }
+    out
+}
+
+/// Heuristics that read only EVTX events; shared by the offline `cairn evtx` path.
+fn event_analyzers(cfg: &Config) -> Vec<Box<dyn cairn_core::traits::Analyzer>> {
+    vec![
+        Box::new(cairn_heur::AccountHeuristic),
+        Box::new(cairn_heur::EventLogHeuristic),
+        Box::new(cairn_heur::LogonBruteforceHeuristic::new(
+            chrono::Duration::minutes(cfg.logon_bruteforce_window_minutes),
+            cfg.logon_bruteforce_threshold,
+            chrono::Duration::minutes(cfg.password_spraying_window_minutes),
+            cfg.password_spraying_threshold,
+        )),
+    ]
+}
+
 /// `cairn coverage` text: one line per built-in technique (with the Sigma rule count
 /// when rules are loaded), then the techniques only Sigma covers. Pure for testing.
 fn coverage_report(sigma: Option<&std::collections::BTreeMap<String, usize>>) -> String {
@@ -660,6 +687,20 @@ fn main() -> anyhow::Result<()> {
             } else {
                 tracing::warn!("no --rules and no bundled rules/sigma beside the binary or in the current directory; skipping Sigma (parse-only run)");
             }
+            // Built-in event-log heuristics (account changes, brute force, log clearing,
+            // service/task installs, Defender) run with or without Sigma rules.
+            let event_records: Vec<cairn_core::Record> = records
+                .iter()
+                .cloned()
+                .map(cairn_core::Record::Event)
+                .collect();
+            for a in event_analyzers(&cfg) {
+                match a.analyze(&event_records, &findings) {
+                    Ok(mut fs) => findings.append(&mut fs),
+                    Err(e) => tracing::warn!(analyzer = a.name(), error = %e, "analyzer failed"),
+                }
+            }
+            sort_findings(&mut findings);
             tracing::info!(findings = findings.len(), "analysis complete");
 
             // T7: write timeline.csv + findings.jsonl, then the manifest. The data
@@ -970,15 +1011,13 @@ fn main() -> anyhow::Result<()> {
                 ));
             }
             if selection.selected.iter().any(|m| m == "evtx_live") {
-                if let Some(ref sa) = sigma_analyzer {
-                    let channels = sa.channels().to_vec();
-                    let since = cfg
-                        .since
-                        .unwrap_or_else(|| default_since(chrono::Utc::now()));
-                    collectors.push(Box::new(
-                        cairn_collectors::evtx_live::EvtxLiveCollector::new(channels, since),
-                    ));
-                }
+                let channels = live_evtx_channels(sigma_analyzer.as_ref().map(|sa| sa.channels()));
+                let since = cfg
+                    .since
+                    .unwrap_or_else(|| default_since(chrono::Utc::now()));
+                collectors.push(Box::new(
+                    cairn_collectors::evtx_live::EvtxLiveCollector::new(channels, since),
+                ));
             }
             // BYOVD driver hash list: --driver-list override, else the bundled list.
             // Read failure falls back to bundled (graceful, golden rule 8).
@@ -1008,6 +1047,7 @@ fn main() -> anyhow::Result<()> {
                     chrono::Duration::hours(cfg.timestomp_threshold_hours),
                 )),
                 Box::new(cairn_heur::AccountHeuristic),
+                Box::new(cairn_heur::EventLogHeuristic),
                 Box::new(cairn_heur::LogonBruteforceHeuristic::new(
                     chrono::Duration::minutes(cfg.logon_bruteforce_window_minutes),
                     cfg.logon_bruteforce_threshold,
@@ -1393,6 +1433,30 @@ mod tests {
         sort_findings(&mut v);
         assert_eq!(v[0].title, "a-title");
         assert_eq!(v[1].title, "b-title");
+    }
+
+    #[test]
+    fn live_evtx_channels_always_include_builtin_channels() {
+        let none = live_evtx_channels(None);
+        for ch in cairn_heur::eventlog::CHANNELS {
+            assert!(none.iter().any(|c| c == ch), "{ch} missing without Sigma");
+        }
+        let sigma = vec![
+            "security".to_string(),
+            "Microsoft-Windows-PowerShell/Operational".to_string(),
+        ];
+        let merged = live_evtx_channels(Some(&sigma));
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|c| c.eq_ignore_ascii_case("Security"))
+                .count(),
+            1,
+            "{merged:?}"
+        );
+        assert!(merged
+            .iter()
+            .any(|c| c == "Microsoft-Windows-PowerShell/Operational"));
     }
 
     #[test]
