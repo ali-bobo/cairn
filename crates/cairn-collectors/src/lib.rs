@@ -6,6 +6,7 @@
 #![forbid(unsafe_code)]
 
 pub mod asep;
+pub mod dropscan;
 pub mod evtx;
 pub mod evtx_live;
 pub mod hash;
