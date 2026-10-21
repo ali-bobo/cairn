@@ -106,6 +106,12 @@ pub const BUILTIN: &[Coverage] = &[
         "heur_persist",
     ),
     c(
+        "T1204.004",
+        "Malicious Copy and Paste (ClickFix)",
+        "Run dialog (Win+R) history RunMRU of every loaded user",
+        "heur_clickfix",
+    ),
+    c(
         "T1218",
         "System Binary Proxy Execution",
         "LOLBins (rundll32, certutil, ...) run with suspicious arguments",

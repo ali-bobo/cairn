@@ -491,16 +491,59 @@ fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
     win::read_scheduled_tasks()
 }
 
-/// Startup folders: per-user (%APPDATA%) and All Users (%PROGRAMDATA%) Startup dirs.
-/// Reads the real process env; delegates to the testable core. Read-only.
+/// Startup folders: All Users (%PROGRAMDATA%), the current user (%APPDATA%) and every
+/// other user profile's roaming Startup dir. Reads the real process env; delegates to
+/// the testable core. Read-only.
 fn read_startup_folders() -> Vec<PersistenceRecord> {
+    read_startup_dirs(&startup_dirs(
+        |var| std::env::var(var).ok(),
+        &user_profile_dirs(),
+    ))
+}
+
+/// Startup directories to scan, without duplicates (case-insensitive).
+fn startup_dirs(env: impl Fn(&str) -> Option<String>, homes: &[String]) -> Vec<String> {
     let rel = r"Microsoft\Windows\Start Menu\Programs\Startup";
-    let dirs: Vec<String> = ["APPDATA", "PROGRAMDATA"]
+    let mut dirs: Vec<String> = ["PROGRAMDATA", "APPDATA"]
         .iter()
-        .filter_map(|var| std::env::var(var).ok())
+        .filter_map(|var| env(var))
         .map(|base| format!(r"{base}\{rel}"))
         .collect();
-    read_startup_dirs(&dirs)
+    for home in homes {
+        let d = format!(r"{home}\AppData\Roaming\{rel}");
+        if !dirs.iter().any(|x| x.eq_ignore_ascii_case(&d)) {
+            dirs.push(d);
+        }
+    }
+    dirs
+}
+
+/// Profile folders that hold real users: the subfolders of the folder containing
+/// %USERPROFILE% (normally `C:\Users`), minus the shared/template ones.
+fn user_profile_dirs() -> Vec<String> {
+    let Some(root) = std::env::var("USERPROFILE")
+        .ok()
+        .and_then(|p| std::path::Path::new(&p).parent().map(|r| r.to_path_buf()))
+    else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+            !matches!(
+                n.as_str(),
+                "public" | "default" | "default user" | "all users"
+            )
+        })
+        .map(|e| e.path().display().to_string())
+        .collect();
+    out.sort();
+    out
 }
 
 /// Pure core: scan the given Startup directories for files, each -> a `startup`
@@ -568,7 +611,7 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
 mod win {
     use super::{extract_binary_path, make_record, normalize_service_path, PersistenceRecord};
     use chrono::{DateTime, TimeZone, Utc};
-    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
 
     /// Best-effort last-write of a key as UTC; None if unavailable or out of range.
@@ -587,10 +630,11 @@ mod win {
         .single()
     }
 
-    /// Run + RunOnce under both HKLM and HKCU.
+    /// Run + RunOnce under HKLM.
     pub fn read_run_keys() -> Vec<PersistenceRecord> {
         let mut out = Vec::new();
-        let bases = [(HKEY_LOCAL_MACHINE, "HKLM"), (HKEY_CURRENT_USER, "HKCU")];
+        // HKCU Run/RunOnce are read per loaded user hive by the asep catalog.
+        let bases = [(HKEY_LOCAL_MACHINE, "HKLM")];
         let subs = [
             r"Software\Microsoft\Windows\CurrentVersion\Run",
             r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
@@ -779,7 +823,7 @@ fn read_extended_aseps() -> Vec<PersistenceRecord> {
         ));
     }
     out.extend(crate::asep::read_ps_profiles(
-        &crate::asep::ps_profile_paths(|name| std::env::var(name).ok()),
+        &crate::asep::ps_profile_paths(|name| std::env::var(name).ok(), &user_profile_dirs()),
     ));
     fill_command_binary_paths(&mut out, |p| std::path::Path::new(p).exists());
     out
@@ -898,7 +942,19 @@ impl Collector for PersistCollector {
         records.extend(read_extended_aseps());
         resolve_relative_binary_paths(&mut records);
         apply_signatures(&mut records, self.verifier.as_ref());
-        Ok(records.into_iter().map(Record::Persistence).collect())
+        let out: Vec<Record> = records.into_iter().map(Record::Persistence).collect();
+        // Run-dialog history rides along with the registry sweep: not persistence, but
+        // the direct trace of a ClickFix paste-and-run (judged by cairn-heur::clickfix).
+        #[cfg(windows)]
+        let out: Vec<Record> = out
+            .into_iter()
+            .chain(
+                crate::asep::read_run_mru(&crate::asep::WinReg)
+                    .into_iter()
+                    .map(Record::RegValue),
+            )
+            .collect();
+        Ok(out)
     }
 
     fn sources(&self) -> Vec<SourceEntry> {
@@ -1673,5 +1729,21 @@ mod tests {
         assert_eq!(recs[1].binary_path.as_deref(), Some(r"\\srv\share\x.exe"));
         assert_eq!(recs[2].binary_path.as_deref(), Some("ghost.exe")); // stays; verifier -> None
         assert_eq!(recs[3].binary_path, None);
+    }
+
+    #[test]
+    fn startup_dirs_cover_every_profile_without_duplicates() {
+        let env = |v: &str| match v {
+            "PROGRAMDATA" => Some(r"C:\ProgramData".to_string()),
+            "APPDATA" => Some(r"C:\Users\admin\AppData\Roaming".to_string()),
+            _ => None,
+        };
+        let homes = vec![
+            r"C:\Users\admin".to_string(),
+            r"C:\Users\victim".to_string(),
+        ];
+        let dirs = startup_dirs(env, &homes);
+        assert_eq!(dirs.len(), 3, "{dirs:?}");
+        assert!(dirs[2].starts_with(r"C:\Users\victim\AppData\Roaming\"));
     }
 }

@@ -1048,6 +1048,7 @@ fn main() -> anyhow::Result<()> {
                 )),
                 Box::new(cairn_heur::AccountHeuristic),
                 Box::new(cairn_heur::EventLogHeuristic),
+                Box::new(cairn_heur::ClickFixHeuristic),
                 Box::new(cairn_heur::LogonBruteforceHeuristic::new(
                     chrono::Duration::minutes(cfg.logon_bruteforce_window_minutes),
                     cfg.logon_bruteforce_threshold,
