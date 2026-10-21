@@ -34,6 +34,24 @@ const fn c(
 /// what `asep::mechanism_mitre` emits for that mechanism (checked by a test).
 pub const BUILTIN: &[Coverage] = &[
     c(
+        "T1021.001",
+        "Remote Desktop Protocol",
+        "inbound RDP (local port 3389) connection from a public IP",
+        "heur_netconn",
+    ),
+    c(
+        "T1021.002",
+        "SMB/Windows Admin Shares",
+        "inbound SMB (local port 445) from a public IP; loopback ADMIN$ output of wmiexec/smbexec",
+        "heur_netconn, heur_parentchild",
+    ),
+    c(
+        "T1021.004",
+        "SSH",
+        "inbound SSH (local port 22) connection from a public IP",
+        "heur_netconn",
+    ),
+    c(
         "T1036",
         "Masquerading",
         "unsigned binaries in user-writable paths behind persistence or network connections",
@@ -42,7 +60,7 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1036.005",
         "Match Legitimate Name or Location",
-        "system binary names outside C:\\Windows",
+        "system binary names outside their canonical directory (also inside C:\\Windows)",
         "heur_persist, heur_parentchild",
     ),
     c(
@@ -50,6 +68,12 @@ pub const BUILTIN: &[Coverage] = &[
         "Logon Script (Windows)",
         "HKCU\\Environment UserInitMprLogonScript",
         "heur_persist",
+    ),
+    c(
+        "T1047",
+        "Windows Management Instrumentation",
+        "wmiprvse.exe spawning cmd/PowerShell (wmiexec output to ADMIN$ escalates)",
+        "heur_parentchild",
     ),
     c(
         "T1053.005",
@@ -70,28 +94,52 @@ pub const BUILTIN: &[Coverage] = &[
         "heur_parentchild",
     ),
     c(
+        "T1059.003",
+        "Windows Command Shell",
+        "persistence running cmd.exe on a user-writable or remote script",
+        "heur_persist",
+    ),
+    c(
+        "T1059.005",
+        "Visual Basic",
+        "persistence running wscript/cscript on a user-writable or remote script",
+        "heur_persist",
+    ),
+    c(
         "T1070.001",
         "Clear Windows Event Logs",
         "Security 1102 / System 104 log cleared",
         "heur_eventlog",
     ),
     c(
+        "T1098",
+        "Account Manipulation",
+        "Security 4722 account enabled, 4724 password reset by another account, 4738 risky UAC flag turned on",
+        "heur_account",
+    ),
+    c(
         "T1098.007",
         "Additional Local or Domain Groups",
-        "Security 4728/4732 member added to group",
+        "Security 4728/4732/4756 member added to group (High for admin/RDP/backup groups)",
         "heur_account",
     ),
     c(
         "T1110.001",
         "Password Guessing",
-        "Security 4625 bursts against one account",
+        "Security 4625/4771/4776 guessing failures against one account",
         "heur_logon_bruteforce",
     ),
     c(
         "T1110.003",
         "Password Spraying",
-        "Security 4625 across many accounts from one source",
+        "Security 4625/4771/4776 failures across many accounts from one source",
         "heur_logon_bruteforce",
+    ),
+    c(
+        "T1133",
+        "External Remote Services",
+        "inbound RDP/SMB/SSH session from a public IP",
+        "heur_netconn",
     ),
     c(
         "T1136.001",
@@ -108,13 +156,43 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1204.004",
         "Malicious Copy and Paste (ClickFix)",
-        "Run dialog (Win+R) history RunMRU of every loaded user",
-        "heur_clickfix",
+        "Run dialog RunMRU and Explorer address bar TypedPaths of every loaded user; explorer.exe -> mshta.exe",
+        "heur_clickfix, heur_parentchild",
     ),
     c(
         "T1218",
         "System Binary Proxy Execution",
         "LOLBins (rundll32, certutil, ...) run with suspicious arguments",
+        "heur_parentchild",
+    ),
+    c(
+        "T1218.005",
+        "Mshta",
+        "persistence running mshta on remote/user-writable content; explorer.exe -> mshta.exe",
+        "heur_persist, heur_parentchild",
+    ),
+    c(
+        "T1218.007",
+        "Msiexec",
+        "persistence running msiexec on a URL or user-writable package",
+        "heur_persist",
+    ),
+    c(
+        "T1218.010",
+        "Regsvr32",
+        "persistence running regsvr32 on a URL/scriptlet or user-writable DLL",
+        "heur_persist",
+    ),
+    c(
+        "T1218.011",
+        "Rundll32",
+        "persistence running rundll32 on a user-writable or remote DLL",
+        "heur_persist",
+    ),
+    c(
+        "T1505.003",
+        "Web Shell",
+        "w3wp/sqlservr/httpd/nginx/Tomcat spawning cmd, PowerShell or whoami",
         "heur_parentchild",
     ),
     c(
@@ -242,6 +320,12 @@ pub const BUILTIN: &[Coverage] = &[
         "Disable or Modify Tools",
         "Defender 5001 real-time protection off, 5007 exclusion added",
         "heur_eventlog",
+    ),
+    c(
+        "T1569.002",
+        "Service Execution",
+        "services.exe -> cmd.exe writing to \\\\127.0.0.1\\ADMIN$, PSEXESVC (PsExec / Impacket)",
+        "heur_parentchild",
     ),
 ];
 
