@@ -1,15 +1,15 @@
 # Cairn bundled Sigma rule subset (FR19 / ADR-0003).
-# `cairn update-rules` fetches these from SigmaHQ at the pinned commit.
-# All paths are relative to the SigmaHQ `rules/` directory.
+# The manifest of what ships in rules/sigma/: each `path` is relative to the SigmaHQ
+# `rules/` directory at the pinned commit, and the rule is stored verbatim at
+# rules/sigma/<path>. A cairn-sigma test checks this list matches rules/sigma/ exactly.
 # All listed rules MUST carry an `author:` field (DRL 1.1).
 # Verified: paths confirmed to exist at pin + author field present.
 # Updated: 2026-07-11 — expanded from 50 to 80 rules (segment 2: PowerShell 4104
 # script block, authentication/logon abuse, System 7045 service installs, and
-# additional process_creation coverage — see docs/dev-history/specs/
-# 2026-07-11-sigma-ruleset-expansion-design.md).
+# additional process_creation coverage).
 # Scope: no-Sysmon environments (Security.evtx + System.evtx + PowerShell
 # Operational/classic + process_creation via EID 4688). Sysmon rules deliberately
-# excluded — see design doc for rationale.
+# excluded.
 # Prerequisites for full process_creation coverage:
 #   1. Audit Process Creation + command line: GPO or reg key ProcessCreationIncludeCmdLine_Enabled=1
 #   2. PowerShell Script Block Logging: reg key EnableScriptBlockLogging=1

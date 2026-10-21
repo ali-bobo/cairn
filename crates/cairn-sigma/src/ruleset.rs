@@ -235,4 +235,26 @@ mod tests {
         let ver = ruleset_version(&dir, true).unwrap();
         assert_eq!(ver, format!("unpinned+{agg}"));
     }
+
+    /// rules/ruleset.toml lists exactly the rules bundled under rules/sigma/ (same
+    /// relative paths, no extras, none missing). It is the bundle's manifest.
+    #[test]
+    fn ruleset_toml_matches_bundled_rules() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../rules");
+        let toml = std::fs::read_to_string(root.join("ruleset.toml")).unwrap();
+        let mut listed: Vec<String> = toml
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("path = "))
+            .map(|v| v.trim().trim_matches('"').to_string())
+            .collect();
+        listed.sort();
+        let mut bundled: Vec<String> = collect_rule_files(&root.join("sigma"))
+            .unwrap()
+            .into_iter()
+            .map(|(rel, _)| rel)
+            .collect();
+        bundled.sort();
+        assert_eq!(listed, bundled);
+        assert_eq!(listed.len(), 80, "bundled rule count");
+    }
 }

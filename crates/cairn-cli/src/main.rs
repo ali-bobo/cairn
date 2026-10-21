@@ -61,11 +61,6 @@ enum Cmd {
         #[arg(long)]
         rules_plain: bool,
     },
-    /// Fetch + pin the Sigma ruleset (S4).
-    UpdateRules {
-        #[arg(long)]
-        pin: Option<String>,
-    },
     /// Print which ATT&CK techniques this build can detect: built-in heuristics plus
     /// the Sigma rules' technique tags. Use it to know what a clean result does NOT
     /// rule out.
@@ -1035,27 +1030,6 @@ fn main() -> anyhow::Result<()> {
                 .with_target(false)
                 .init();
             match other {
-                Cmd::UpdateRules { pin } => {
-                    #[cfg(feature = "updater")]
-                    {
-                        let rules_dir = std::env::current_dir()
-                            .map_err(|e| anyhow::anyhow!("cwd: {e}"))?
-                            .join("rules")
-                            .join("sigma");
-                        let ruleset_toml = std::env::current_dir()
-                            .map_err(|e| anyhow::anyhow!("cwd: {e}"))?
-                            .join("rules")
-                            .join("ruleset.toml");
-                        cairn_updater::run(pin.as_deref(), &rules_dir, &ruleset_toml)?;
-                    }
-                    #[cfg(not(feature = "updater"))]
-                    {
-                        let _ = pin;
-                        anyhow::bail!(
-                            "this cairn build was compiled without network support (updater feature disabled)"
-                        );
-                    }
-                }
                 Cmd::Coverage { rules, rules_plain } => {
                     let sigma = match rules.or_else(default_rules_dir) {
                         Some(dir) => {
