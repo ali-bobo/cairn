@@ -261,6 +261,31 @@ pub fn sigma_rule_line(f: &Finding) -> Option<String> {
     })
 }
 
+/// zh-TW name of a logging setting a Sigma rule needs, phrased as what to turn on.
+pub fn logging_requirement_text(r: cairn_core::observation::LoggingRequirement) -> &'static str {
+    use cairn_core::observation::LoggingRequirement as R;
+    match r {
+        R::ProcessCreationAudit => "稽核「行程建立」（4688，預設關閉）",
+        R::CommandLineIn4688 => "在行程建立事件中包含命令列（預設關閉）",
+        R::ScriptBlockLogging => "PowerShell 指令碼區塊記錄（4104，預設關閉）",
+        R::ModuleLogging => "PowerShell 模組記錄（4103，預設關閉）",
+        R::Sysmon => "安裝 Sysmon（規則用到只有 Sysmon 才記錄的欄位或事件）",
+        R::LogonAudit => "稽核「登入」（預設開啟）",
+        R::UserAccountManagementAudit => "稽核「使用者帳戶管理」（預設開啟）",
+        R::SecurityGroupManagementAudit => "稽核「安全性群組管理」（預設開啟）",
+        R::OtherObjectAccessAudit => "稽核「其他物件存取事件」（排程工作，預設關閉）",
+        R::SecuritySystemExtensionAudit => "稽核「安全性系統延伸」（4697 服務安裝，預設關閉）",
+        R::FileShareAudit => "稽核「檔案共用」（5140，預設關閉）",
+        R::DetailedFileShareAudit => "稽核「詳細檔案共用」（5145，預設關閉）",
+        R::ObjectAccessSacl => "物件存取稽核加上目標的 SACL（4656/4663，預設關閉）",
+        R::NtlmAudit => "NTLM 稽核記錄（預設關閉）",
+        R::DomainController => "只有網域控制站才會產生的事件",
+        R::TaskSchedulerLog => "工作排程器操作記錄（用戶端預設停用）",
+        R::OtherAuditPolicy => "對應的安全性稽核原則（cairn 無法判斷是哪一項）",
+        R::UnmappedLogsource => "cairn 不認得這條規則的記錄來源",
+    }
+}
+
 /// English equivalent for the timeline's Reason column when the finding has none.
 pub fn sigma_reason(f: &Finding) -> Option<String> {
     (f.source == FindingSource::Sigma).then(|| {

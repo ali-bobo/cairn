@@ -437,7 +437,7 @@ cairn verify old_run/manifest.json --rules rules/sigma
 | 限制 | 說明 |
 |------|------|
 | **僅 Windows x64**（live collector） | arm64 計畫中；Linux/macOS 只能跑 `cairn evtx` |
-| **規則集固定**（80 條） | 規則更新需手動替換 `rules/sigma/` 並同步 `rules/ruleset.toml` |
+| **規則集固定**（86 條） | 規則更新需手動替換 `rules/sigma/` 並同步 `rules/ruleset.toml` |
 | **Binary 目前未 Authenticode 簽章** | 簽章工作列為 legitimacy layer，正式給客戶前必須完成；目前以 hash 識別 |
 | **不讀 raw 磁碟** | 不解析 $MFT、USN、Amcache、Shimcache、BAM、UserAssist、SRUM |
 | **Velociraptor 封裝**（FR20 延伸） | 尚未實作 |

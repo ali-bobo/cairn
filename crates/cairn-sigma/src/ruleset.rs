@@ -219,6 +219,6 @@ mod tests {
             .collect();
         bundled.sort();
         assert_eq!(listed, bundled);
-        assert_eq!(listed.len(), 80, "bundled rule count");
+        assert_eq!(listed.len(), 86, "bundled rule count");
     }
 }

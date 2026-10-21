@@ -1,6 +1,6 @@
 # Sigma 規則清冊
 
-> 涵蓋 `rules/ruleset.toml` 全部規則（既有 50 條 + 段 2 新增 30 條 = 80 條）。
+> 涵蓋 `rules/ruleset.toml` 全部規則（既有 50 條 + 段 2 新增 30 條 + 階段 3G 新增 6 條 = 86 條）。
 > 「是否確認會 fire」欄位如實記錄——沒有測試覆蓋的規則明確標示，不倒填假驗證。
 > **既有 50 條規則的驗證現況**：`crates/cairn-sigma/tests/parity.rs` 目前只有 3 個
 > 針對既有規則的專屬 firing 測試（`hh_chm_execution_fires`、`msxsl_execution_fires`、
@@ -93,10 +93,39 @@
 | windows/process_creation/proc_creation_win_cdb_arbitrary_command_execution.yml | Potential Binary Proxy Execution Via Cdb.EXE | 利用 cdb.exe（Windows 除錯工具）以 debugger script 參數執行未授權指令的代理執行手法 | 需啟用 Process Creation 稽核 + 命令列記錄 | parity.rs::cdb_arbitrary_command_fires | 是 |
 | windows/process_creation/proc_creation_win_adplus_memory_dump.yml | Potential Adplus.EXE Abuse | 濫用 AdPlus.exe（Windows SDK 工具）擷取行程記憶體內容或執行未授權指令（與既有 procdump/comsvcs dump 規則互補、非重複工具） | 需啟用 Process Creation 稽核 + 命令列記錄 | parity.rs::adplus_memory_dump_fires | 是 |
 | windows/process_creation/proc_creation_win_certreq_download.yml | Suspicious CertReq Command to Download | 濫用 certreq.exe 透過網路下載檔案（與既有 certutil download 規則互補、屬不同 LOLBAS 工具） | 需啟用 Process Creation 稽核 + 命令列記錄 | parity.rs::certreq_download_fires | 是 |
+| windows/process_creation/proc_creation_win_susp_shadow_copies_deletion.yml | Shadow Copies Deletion Using Operating Systems Utilities | vssadmin/wmic/PowerShell/diskshadow 刪除陰影複製、wbadmin 刪除備份目錄、vssadmin 縮小陰影儲存區（勒索前兆 T1490） | 需啟用 Process Creation 稽核 + 命令列記錄 | parity.rs::shadow_copy_deletion_fires_on_4688_with_matched_fields（4688 形狀） | 是 |
+| windows/process_creation/proc_creation_win_powershell_shadowcopy_deletion.yml | Deletion of Volume Shadow Copies via WMI with PowerShell | 命令列以 Get-WmiObject/Get-CimInstance 取得 Win32_ShadowCopy 再刪除（T1490） | 需啟用 Process Creation 稽核 + 命令列記錄 | parity.rs::powershell_wmi_shadow_copy_deletion_fires_on_4688_and_4104 | 是 |
+| windows/powershell/powershell_script/posh_ps_susp_win32_shadowcopy_deletion.yml | Deletion of Volume Shadow Copies via WMI with PowerShell - PS Script | 同上，從 PowerShell 指令碼區塊（4104）看到 | 需啟用 PowerShell Script Block Logging（4104） | parity.rs::powershell_wmi_shadow_copy_deletion_fires_on_4688_and_4104 | 是 |
+| windows/process_creation/proc_creation_win_susp_eventlog_clear.yml | Suspicious Eventlog Clearing or Configuration Change Activity | wevtutil cl/sl、Clear-EventLog、ClearEventLog 等清除或縮小事件記錄（T1070.001；heur_eventlog 看的是清除後的 1102/104，這條看的是下指令的行程） | 需啟用 Process Creation 稽核 + 命令列記錄 | parity.rs::wevtutil_clear_log_fires_on_4688 | 是 |
+| windows/process_creation/proc_creation_win_powershell_defender_exclusion.yml | Powershell Defender Exclusion | Add-/Set-MpPreference 加入 Defender 排除路徑、副檔名、行程或 IP | 需啟用 Process Creation 稽核 + 命令列記錄 | parity.rs::defender_exclusion_and_tamper_fire | 是 |
+| windows/powershell/powershell_script/posh_ps_tamper_windows_defender_set_mp.yml | Tamper Windows Defender - ScriptBlockLogging | Set-MpPreference 關閉即時保護、行為監控等，或把威脅預設動作設為 Allow | 需啟用 PowerShell Script Block Logging（4104） | parity.rs::defender_exclusion_and_tamper_fire | 是 |
+
+## 每次執行的可行性檢查（階段 3G）
+
+上表的「資料前提」現在每次執行都會實際檢查。Sigma analyzer 為每條規則輸出一筆
+`sigma_rule` observation（`observations.jsonl`），report.html 的「Sigma 規則這次能不能跑」
+區塊列出能觸發／不可能觸發／無法確認的條數，以及缺少哪些記錄設定。判斷方式
+（`crates/cairn-sigma/src/viability.rs`）：
+
+- **靜態**：logsource 對到哪些頻道與事件 ID、各自需要哪個稽核設定。`process_creation`
+  規則會對 4688 實際有的欄位做條件式推演：每個分支都需要 `OriginalFileName`、
+  `Hashes`、`ParentCommandLine` 等欄位的規則只能靠 Sysmon 觸發；每個分支都需要
+  `CommandLine` 的規則另外需要「在行程建立事件中包含命令列」。
+- **主機**：用這次收集到的事件推斷。看到某條規則的事件就代表該設定有開；Security 有
+  事件卻沒有任何 4688 代表行程建立稽核沒開；有 4688 但都沒有命令列代表命令列記錄沒開；
+  沒有任何 Sysmon 事件代表沒有 Sysmon。預設開啟的稽核（登入、帳戶管理、群組管理）在
+  讀得到 Security 時視為開啟。其他預設關閉、又沒看到事件的設定標為「無法確認」。
+- 目前唯一的 Sysmon-only 規則是 Renamed Whoami Execution（只比對 `OriginalFileName`）。
+  需要 NTLM 稽核、物件 SACL、詳細檔案共用稽核或網域控制站的規則也保留，這些規則
+  在一般工作站上會被標成不可能觸發或無法確認，而不是默默不命中。
+
+同一條規則在同一台主機命中超過 3 次時，合併成一筆 finding：`details` 寫命中次數與
+起訖時間，`evidence` 逐筆列出前 20 筆命中的 record 與比對到的欄位值。每筆 Sigma finding
+的 `details` 都會帶「matched fields: 欄位=值」。
 
 ## 統計摘要
 
-- 規則總數：80 條（既有 50 條 + 段 2 新增 30 條）。
+- 規則總數：86 條（既有 50 條 + 段 2 新增 30 條 + 階段 3G 新增 6 條）。
 - **既有 50 條規則測試覆蓋現況**：3 條有專屬 firing 測試（`hh_chm_execution_fires`、
   `msxsl_execution_fires`、`mshta_suspicious_extension_fires`），**47 條無現存測試**，
   狀態不明——僅通過載入時的 DRL 1.1 author 檢查與 YAML 語法解析，detection 邏輯

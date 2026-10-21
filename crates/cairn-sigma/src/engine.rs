@@ -5,8 +5,10 @@
 //! tags (from `tags`). The engine stays behind the `SigmaMatcher` trait so it can be
 //! swapped (e.g. for tau-engine) per ADR-0001's fallback.
 
+use crate::viability::{self, HostLogging, RuleProfile};
 use crate::{LogsourceMap, SigmaMatcher};
 use cairn_core::finding::{Finding, FindingSource, Severity};
+use cairn_core::observation::SigmaRuleStatus;
 use cairn_core::record::EventRecord;
 use cairn_core::{CairnError, Result};
 use sigma_rust::Rule;
@@ -18,6 +20,8 @@ use std::path::Path;
 #[derive(Default)]
 pub struct Engine {
     rules: Vec<Rule>,
+    /// Viability profile per rule, index-aligned with `rules`.
+    profiles: Vec<RuleProfile>,
     channels: Vec<String>,
     logsource: LogsourceMap,
     ruleset_ver: String,
@@ -28,17 +32,21 @@ impl Engine {
     /// after decoding). A rule that fails to parse is a hard error — bundled rules are
     /// trusted/pinned (ADR-0003), so a parse failure is a packaging bug, not input.
     pub fn from_rules(rules: &[&str]) -> Result<Self> {
+        let logsource = LogsourceMap::windows_builtin();
         let mut parsed = Vec::with_capacity(rules.len());
+        let mut profiles = Vec::with_capacity(rules.len());
         for (i, yaml) in rules.iter().enumerate() {
             let rule = sigma_rust::rule_from_yaml(yaml)
                 .map_err(|e| CairnError::Other(format!("sigma rule #{i} parse error: {e}")))?;
+            let profile = viability::profile_rule(yaml, &logsource)
+                .map_err(|e| CairnError::Other(format!("sigma rule #{i} profile error: {e}")))?;
             parsed.push(rule);
+            profiles.push(profile);
         }
-        Ok(Self::from_parsed(parsed))
+        Ok(Self::from_parsed(parsed, profiles, logsource))
     }
 
-    fn from_parsed(rules: Vec<Rule>) -> Self {
-        let logsource = LogsourceMap::windows_builtin();
+    fn from_parsed(rules: Vec<Rule>, profiles: Vec<RuleProfile>, logsource: LogsourceMap) -> Self {
         // Distinct EVTX channel names the rules' logsources resolve to (e.g.
         // `service: security` -> "Security", `category: process_creation` -> "Security"
         // + Sysmon). These are real channel names, so EvtxLiveCollector can map them to
@@ -62,10 +70,24 @@ impl Engine {
         channels.dedup();
         Engine {
             rules,
+            profiles,
             channels,
             logsource,
             ruleset_ver: String::new(),
         }
+    }
+
+    /// Static viability profile of every loaded rule, in load order.
+    pub fn profiles(&self) -> &[RuleProfile] {
+        &self.profiles
+    }
+
+    /// Each loaded rule's viability on a host with the given logging, in load order.
+    pub fn rule_statuses(&self, host: &HostLogging) -> Vec<(&RuleProfile, SigmaRuleStatus)> {
+        self.profiles
+            .iter()
+            .map(|p| (p, viability::assess(p, host)))
+            .collect()
     }
 
     /// Number of loaded rules tagged with each ATT&CK technique, keyed by the
@@ -124,8 +146,29 @@ impl Engine {
     /// applied first: e.g. a Security 4688 carries `NewProcessName`, so `Image` is added
     /// with the same value, letting process_creation rules written against Sysmon
     /// field names match it. An alias never overwrites a field the event already has.
-    fn to_sigma_event(&self, ev: &EventRecord) -> Result<sigma_rust::Event> {
+    fn to_sigma_event(
+        &self,
+        ev: &EventRecord,
+    ) -> Result<(
+        sigma_rust::Event,
+        serde_json::Map<String, serde_json::Value>,
+    )> {
         let mut data = ev.data.clone();
+        // The flattened System section keeps `Provider` as an object and `EventID` as an
+        // object when it has qualifiers; Sigma rules match `Provider_Name` and a numeric
+        // `EventID`, so give them the normalized values the EventRecord already holds.
+        if !data.contains_key("Provider_Name") && !ev.provider.is_empty() {
+            data.insert(
+                "Provider_Name".into(),
+                serde_json::Value::String(ev.provider.clone()),
+            );
+        }
+        if !data
+            .get("EventID")
+            .is_some_and(serde_json::Value::is_number)
+        {
+            data.insert("EventID".into(), serde_json::Value::from(ev.event_id));
+        }
         for entry in self
             .logsource
             .entries
@@ -141,12 +184,18 @@ impl Engine {
                 }
             }
         }
-        let json = serde_json::Value::Object(data).to_string();
-        sigma_rust::event_from_json(&json)
-            .map_err(|e| CairnError::Other(format!("event to sigma: {e}")))
+        let json = serde_json::Value::Object(data.clone()).to_string();
+        let event = sigma_rust::event_from_json(&json)
+            .map_err(|e| CairnError::Other(format!("event to sigma: {e}")))?;
+        Ok((event, data))
     }
 
-    fn finding_from(rule: &Rule, ev: &EventRecord) -> Finding {
+    fn finding_from(
+        rule: &Rule,
+        profile: &RuleProfile,
+        ev: &EventRecord,
+        data: &serde_json::Map<String, serde_json::Value>,
+    ) -> Finding {
         let mut f = Finding::new(
             level_to_severity(&rule.level),
             &rule.title,
@@ -160,7 +209,45 @@ impl Engine {
         f.artifact = format!("evtx:{}", ev.channel);
         f.event_id = Some(ev.event_id);
         f.evidence_ref = Some(ev.record_id.to_string());
+        f.details = matched_fields(profile, data);
         f
+    }
+}
+
+/// Longest field value quoted in a finding's matched-fields line.
+const MATCHED_VALUE_MAX: usize = 200;
+
+/// `matched fields: CommandLine=...; Image=...` — the values of the fields the rule's
+/// detection references, as this event carried them (after field aliasing). Empty when
+/// the event has none of them (a keyword rule).
+pub(crate) fn matched_fields(
+    profile: &RuleProfile,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let parts: Vec<String> = profile
+        .fields
+        .iter()
+        .filter(|f| !viability::UNINTERESTING_FIELDS.contains(&f.as_str()))
+        .filter_map(|f| {
+            let v = data.get(f)?;
+            let text = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => return None,
+                other => other.to_string(),
+            };
+            let text = if text.chars().count() > MATCHED_VALUE_MAX {
+                let cut: String = text.chars().take(MATCHED_VALUE_MAX).collect();
+                format!("{cut}...")
+            } else {
+                text
+            };
+            Some(format!("{f}={text}"))
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("matched fields: {}", parts.join("; "))
     }
 }
 
@@ -230,14 +317,15 @@ impl SigmaMatcher for Engine {
     }
 
     fn match_event(&self, ev: &EventRecord) -> Result<Vec<Finding>> {
-        let sigma_ev = self.to_sigma_event(ev)?;
+        let (sigma_ev, data) = self.to_sigma_event(ev)?;
         let findings = self
             .rules
             .iter()
+            .zip(&self.profiles)
             // Gate first (cheap channel/EID check) so a rule only matches events of the
             // type its logsource denotes; then run the full content match.
-            .filter(|rule| self.event_passes_logsource(rule, ev) && rule.is_match(&sigma_ev))
-            .map(|rule| Self::finding_from(rule, ev))
+            .filter(|(rule, _)| self.event_passes_logsource(rule, ev) && rule.is_match(&sigma_ev))
+            .map(|(rule, profile)| Self::finding_from(rule, profile, ev, &data))
             .collect();
         Ok(findings)
     }

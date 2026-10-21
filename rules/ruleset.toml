@@ -7,6 +7,9 @@
 # Updated: 2026-07-11 — expanded from 50 to 80 rules (segment 2: PowerShell 4104
 # script block, authentication/logon abuse, System 7045 service installs, and
 # additional process_creation coverage).
+# Updated: 2026-10-21 — 86 rules (phase 3G: shadow-copy deletion, event-log clearing
+# and Defender tampering via 4688/4104). Each run reports per rule whether the host's
+# logging lets it fire (sigma_rule observations).
 # Scope: no-Sysmon environments (Security.evtx + System.evtx + PowerShell
 # Operational/classic + process_creation via EID 4688). Sysmon rules deliberately
 # excluded.
@@ -329,3 +332,26 @@ path = "windows/process_creation/proc_creation_win_adplus_memory_dump.yml"
 
 [[rules]]
 path = "windows/process_creation/proc_creation_win_certreq_download.yml"
+
+# ============================================================
+# Phase 3G: ransomware precursors and defense impairment (same pin)
+# All run on Security 4688 (process creation + command line) or 4104.
+# ============================================================
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_susp_shadow_copies_deletion.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_powershell_shadowcopy_deletion.yml"
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_susp_win32_shadowcopy_deletion.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_susp_eventlog_clear.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_powershell_defender_exclusion.yml"
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_tamper_windows_defender_set_mp.yml"

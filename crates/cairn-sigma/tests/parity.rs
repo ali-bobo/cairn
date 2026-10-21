@@ -947,3 +947,164 @@ fn certutil_download_fires_on_real_shaped_4688() {
         findings.iter().map(|f| &f.title).collect::<Vec<_>>()
     );
 }
+
+/// A real-shaped Security 4688 (no Sysmon): image in `NewProcessName`, parent in
+/// `ParentProcessName`, command line present (command-line auditing on).
+fn security_4688(image: &str, cmdline: &str) -> EventRecord {
+    security_event(
+        4688,
+        json!({
+            "NewProcessName": image,
+            "ParentProcessName": r"C:\Windows\System32\cmd.exe",
+            "CommandLine": cmdline,
+        }),
+    )
+}
+
+fn fires(engine: &Engine, ev: &EventRecord, rule_id: &str) -> cairn_core::Finding {
+    let hits = engine.match_event(ev).unwrap();
+    let hit = hits
+        .iter()
+        .find(|f| f.rule_id.as_deref() == Some(rule_id))
+        .unwrap_or_else(|| {
+            panic!(
+                "rule {rule_id} should fire, got {:?}",
+                hits.iter().map(|f| &f.title).collect::<Vec<_>>()
+            )
+        })
+        .clone();
+    assert!(
+        hit.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+        "DRL 1.1: author must be present"
+    );
+    hit
+}
+
+/// Phase 3G: vssadmin shadow-copy deletion fires on a plain 4688 and the finding
+/// carries the fields it matched on.
+#[test]
+fn shadow_copy_deletion_fires_on_4688_with_matched_fields() {
+    let engine = load_bundled();
+    let ev = security_4688(
+        r"C:\Windows\System32\vssadmin.exe",
+        "vssadmin.exe delete shadows /all /quiet",
+    );
+    let hit = fires(&engine, &ev, "c947b146-0abc-4c87-9c64-b17e9d7274a2");
+    assert!(
+        hit.details
+            .contains("CommandLine=vssadmin.exe delete shadows /all /quiet"),
+        "{}",
+        hit.details
+    );
+    assert!(
+        hit.details
+            .contains(r"Image=C:\Windows\System32\vssadmin.exe"),
+        "{}",
+        hit.details
+    );
+}
+
+#[test]
+fn powershell_wmi_shadow_copy_deletion_fires_on_4688_and_4104() {
+    let engine = load_bundled();
+    let code = "Get-WmiObject Win32_ShadowCopy | ForEach-Object {$_.Delete();}";
+    let ev = security_4688(
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        &format!("powershell.exe -c \"{code}\""),
+    );
+    fires(&engine, &ev, "21ff4ca9-f13a-41ad-b828-0077b2af2e40");
+    let ev = ps_script(json!({ "ScriptBlockText": code }));
+    fires(&engine, &ev, "c1337eb8-921a-4b59-855b-4ba188ddcc42");
+}
+
+#[test]
+fn wevtutil_clear_log_fires_on_4688() {
+    let engine = load_bundled();
+    let ev = security_4688(
+        r"C:\Windows\System32\wevtutil.exe",
+        "wevtutil.exe cl Security",
+    );
+    fires(&engine, &ev, "cc36992a-4671-4f21-a91d-6c2b72a2edf5");
+}
+
+#[test]
+fn defender_exclusion_and_tamper_fire() {
+    let engine = load_bundled();
+    let ev = security_4688(
+        r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+        r"powershell.exe Add-MpPreference -ExclusionPath C:\Users\Public",
+    );
+    fires(&engine, &ev, "17769c90-230e-488b-a463-e05c08e9d48f");
+    let ev = ps_script(json!({
+        "ScriptBlockText": "Set-MpPreference -DisableRealtimeMonitoring $true"
+    }));
+    fires(&engine, &ev, "14c71865-6cd3-44ae-adaa-1db923fae5f2");
+}
+
+/// System-channel rules match `Provider_Name`, which the flattened EVTX System section
+/// only holds as an object: the engine fills it from the EventRecord's provider.
+#[test]
+fn provider_name_rule_fires_on_real_shaped_7045() {
+    let engine = load_bundled();
+    let ev = EventRecord {
+        ts: Utc::now(),
+        channel: "System".into(),
+        event_id: 7045,
+        provider: "Service Control Manager".into(),
+        computer: "WS01".into(),
+        record_id: 9,
+        data: json!({
+            // Real 7045s carry the qualified form, not a bare number.
+            "EventID": {"#text": "7045", "#attributes": {"Qualifiers": "16384"}},
+            "Provider": {"#attributes": {"Name": "Service Control Manager"}},
+            "ServiceName": "updsvc",
+            "ImagePath": r"C:\Users\Public\updsvc.exe",
+        })
+        .as_object()
+        .cloned()
+        .unwrap(),
+    };
+    let hits = engine.match_event(&ev).unwrap();
+    assert!(
+        hits.iter()
+            .any(|f| f.title == "Uncommon Service Installation Image Path"),
+        "got {:?}",
+        hits.iter().map(|f| &f.title).collect::<Vec<_>>()
+    );
+}
+
+/// Every bundled rule has a viability profile, and only the one documented rule is
+/// Sysmon-only (it keys on OriginalFileName, which 4688 never carries). Kept bundled:
+/// it fires wherever Sysmon is installed, and the run reports it as not runnable
+/// elsewhere.
+#[test]
+fn bundled_rules_viability_profiles() {
+    let engine = load_bundled();
+    assert_eq!(
+        engine.profiles().len(),
+        engine.rule_statuses(&Default::default()).len()
+    );
+    let sysmon_only: Vec<&str> = engine
+        .profiles()
+        .iter()
+        .filter(|p| p.sysmon_only())
+        .map(|p| p.title.as_str())
+        .collect();
+    assert_eq!(sysmon_only, vec!["Renamed Whoami Execution"]);
+    // Each process_creation rule that can run on 4688 says whether it needs the
+    // command line: msxsl matches on Image alone.
+    let msxsl = engine
+        .profiles()
+        .iter()
+        .find(|p| p.title == "Msxsl.EXE Execution")
+        .unwrap();
+    let security = msxsl
+        .alternatives
+        .iter()
+        .find(|a| a.channel == "Security")
+        .unwrap();
+    assert_eq!(
+        security.requirements.iter().copied().collect::<Vec<_>>(),
+        vec![cairn_core::observation::LoggingRequirement::ProcessCreationAudit]
+    );
+}

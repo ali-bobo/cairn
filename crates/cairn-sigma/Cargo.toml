@@ -12,3 +12,4 @@ thiserror.workspace = true
 chrono.workspace = true
 sha2.workspace = true # ADR-0003 ruleset aggregate hash
 sigma-rust.workspace = true # Sigma 2.0 engine (ADR-0001)
+serde_norway.workspace = true # detection-section introspection for rule viability
