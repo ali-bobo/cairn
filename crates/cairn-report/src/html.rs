@@ -887,6 +887,9 @@ mod tests {
                 os_build: String::new(),
                 timezone: "UTC".into(),
                 wall_clock_utc_skew: "unknown".into(),
+                utc_offset_seconds: None,
+                reference_time_utc: None,
+                skew_seconds: None,
             },
             privileges: Privileges {
                 admin: true,

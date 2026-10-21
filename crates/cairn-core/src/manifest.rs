@@ -48,7 +48,35 @@ pub struct HostInfo {
     pub hostname: String,
     pub os_build: String,
     pub timezone: String,
+    /// Host clock vs true UTC. Without a reference this is [`SKEW_NOT_MEASURED`]: a
+    /// user-space tool with no network time source cannot measure it. With an
+    /// operator-supplied reference time it is `"+Ns"` / `"-Ns"` (host ahead / behind).
     pub wall_clock_utc_skew: String,
+    /// Host UTC offset in seconds at run start (e.g. 28800 for UTC+08:00). Additive;
+    /// absent on old manifests and on offline runs (the analysed host is not this one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utc_offset_seconds: Option<i32>,
+    /// The operator-supplied true UTC time at run start (`--reference-time`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_time_utc: Option<DateTime<Utc>>,
+    /// `run.started_utc - reference_time_utc` in whole seconds: positive means the
+    /// host clock is ahead. Present only when `reference_time_utc` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skew_seconds: Option<i64>,
+}
+
+/// `wall_clock_utc_skew` when no reference time was supplied.
+pub const SKEW_NOT_MEASURED: &str = "not measured (no network time source)";
+
+/// Host-clock skew in whole seconds against an operator reference: positive means the
+/// host clock is ahead of the reference.
+pub fn skew_seconds(host_utc: DateTime<Utc>, reference_utc: DateTime<Utc>) -> i64 {
+    (host_utc - reference_utc).num_seconds()
+}
+
+/// The `wall_clock_utc_skew` string for a measured skew, e.g. `"+12s"` / `"-3s"`.
+pub fn format_skew(seconds: i64) -> String {
+    format!("{seconds:+}s")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,8 +105,13 @@ pub struct SourceEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputEntry {
+    /// Path relative to the output root (the manifest's directory, or the zip root),
+    /// `/`-separated, e.g. `timeline.csv` or `evidence/evtx/Security.evtx`.
     pub file: String,
     pub sha256: String,
+    /// Byte length of the file. Additive; old manifests default to 0 (unknown).
+    #[serde(default)]
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -131,6 +164,9 @@ mod tests {
                 os_build: "Windows 11 26200".into(),
                 timezone: "Asia/Taipei".into(),
                 wall_clock_utc_skew: "+0s".into(),
+                utc_offset_seconds: Some(28800),
+                reference_time_utc: None,
+                skew_seconds: None,
             },
             privileges: Privileges {
                 admin: false,
@@ -149,6 +185,7 @@ mod tests {
             outputs: vec![OutputEntry {
                 file: "timeline.csv".into(),
                 sha256: "f".repeat(64),
+                size: 42,
             }],
             counts: Counts {
                 records: 5000,
@@ -224,6 +261,31 @@ mod tests {
         v.as_object_mut().unwrap().remove("governance");
         let back: Manifest = serde_json::from_value(v).unwrap();
         assert!(!back.governance.low_priority_applied);
+    }
+
+    /// Old manifests (no output `size`, no host offset/reference/skew) still parse.
+    #[test]
+    fn old_output_and_host_json_defaults_new_fields() {
+        let o: OutputEntry = serde_json::from_str(r#"{"file":"a","sha256":"b"}"#).unwrap();
+        assert_eq!(o.size, 0);
+        let h: HostInfo = serde_json::from_str(
+            r#"{"hostname":"h","os_build":"","timezone":"UTC","wall_clock_utc_skew":"unknown"}"#,
+        )
+        .unwrap();
+        assert!(h.utc_offset_seconds.is_none());
+        assert!(h.reference_time_utc.is_none() && h.skew_seconds.is_none());
+    }
+
+    /// Skew is host minus reference: a host 90s fast reports +90s.
+    #[test]
+    fn skew_is_host_minus_reference() {
+        let reference = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+        let host = reference + chrono::Duration::seconds(90);
+        assert_eq!(skew_seconds(host, reference), 90);
+        assert_eq!(skew_seconds(reference, host), -90);
+        assert_eq!(format_skew(90), "+90s");
+        assert_eq!(format_skew(-3), "-3s");
+        assert_eq!(format_skew(0), "+0s");
     }
 
     #[test]

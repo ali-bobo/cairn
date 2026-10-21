@@ -64,10 +64,23 @@ pub struct RunArgs {
     /// comma-separated module allow-list, e.g. process,persist,evtx_live
     #[arg(long)]
     pub only: Option<String>,
-    /// Only analyze live EVTX events at or after this RFC3339 UTC time.
-    /// Default: 7 days before the run.
+    /// Only analyze (and export) live EVTX events at or after this RFC3339 UTC time.
+    /// Default: 30 days before the run.
     #[arg(long)]
     pub since: Option<String>,
+    /// Export the live EVTX channels (the --since window) to evidence/evtx/*.evtx in
+    /// the OUTPUT location for re-parsing off-host. On by default; skipped under
+    /// --dry-run and when the evtx_live module is not selected.
+    #[arg(long, overrides_with = "no_export_evtx")]
+    pub export_evtx: bool,
+    /// Do not export EVTX channels (see --export-evtx).
+    #[arg(long, overrides_with = "export_evtx")]
+    pub no_export_evtx: bool,
+    /// The true UTC time (RFC3339) at the moment you start the run, read from a
+    /// trusted clock (phone / NTP). Recorded in the manifest with the host clock skew
+    /// in seconds. Without it the skew is recorded as not measured.
+    #[arg(long)]
+    pub reference_time: Option<String>,
     #[arg(long)]
     pub case_id: Option<String>,
     #[arg(long)]
@@ -78,6 +91,24 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
+    /// EVTX export is on unless `--no-export-evtx` was the last word.
+    pub fn export_evtx_enabled(&self) -> bool {
+        !self.no_export_evtx
+    }
+
+    /// `--reference-time` parsed as UTC. A malformed value is a CLI error, raised
+    /// before any output is created.
+    pub fn reference_time(&self) -> anyhow::Result<Option<chrono::DateTime<chrono::Utc>>> {
+        self.reference_time
+            .as_deref()
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s)
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|e| anyhow::anyhow!("--reference-time parse error: {e}"))
+            })
+            .transpose()
+    }
+
     /// `--only` as a list (comma-separated, trimmed, empties dropped). None = no
     /// restriction.
     pub fn only_list(&self) -> Option<Vec<String>> {
@@ -153,6 +184,39 @@ mod tests {
         );
         let none = RunArgs::parse_from(["cairn", "--output", "o"]);
         assert_eq!(none.only_list(), None);
+    }
+
+    #[test]
+    fn export_evtx_defaults_on_and_last_flag_wins() {
+        let on = RunArgs::parse_from(["cairn", "--output", "o"]);
+        assert!(on.export_evtx_enabled());
+        let off = RunArgs::parse_from(["cairn", "--output", "o", "--no-export-evtx"]);
+        assert!(!off.export_evtx_enabled());
+        let back_on = RunArgs::parse_from([
+            "cairn",
+            "--output",
+            "o",
+            "--no-export-evtx",
+            "--export-evtx",
+        ]);
+        assert!(back_on.export_evtx_enabled());
+    }
+
+    #[test]
+    fn reference_time_parses_rfc3339_with_offset_and_rejects_garbage() {
+        let a = RunArgs::parse_from([
+            "cairn",
+            "--output",
+            "o",
+            "--reference-time",
+            "2026-10-21T10:00:00+08:00",
+        ]);
+        let t = a.reference_time().unwrap().unwrap();
+        assert_eq!(t.to_rfc3339(), "2026-10-21T02:00:00+00:00");
+        let none = RunArgs::parse_from(["cairn", "--output", "o"]);
+        assert!(none.reference_time().unwrap().is_none());
+        let bad = RunArgs::parse_from(["cairn", "--output", "o", "--reference-time", "now"]);
+        assert!(bad.reference_time().is_err());
     }
 
     #[test]

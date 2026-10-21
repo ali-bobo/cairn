@@ -1,11 +1,12 @@
 //! `cairn run`: live triage of this host. Probe privileges, select and build the
-//! collectors from the registry, run them and the analyzers through the orchestrator,
-//! enrich, then write timeline/findings/observations/report/records/manifest.
+//! collectors from the registry, run them, hash persistence targets, run the analyzers,
+//! then write timeline/findings/observations/records/report/EVTX evidence/manifest.
 use crate::cli::RunArgs;
 use crate::output::{self, BUILD_SHA};
 use crate::registry::{self, BuildCtx, Mode};
 use cairn_core::manifest::{GovernanceReport, HostInfo, Manifest};
-use cairn_core::orchestrator::{run_live, RunOutcome};
+use cairn_core::orchestrator::{run_analyzers, run_live, RunOutcome};
+use cairn_core::traits::{Analyzer, Collector};
 use cairn_core::{Config, OutputKind, Profile, SelectionOutcome};
 use cairn_report::client_text;
 use std::path::{Path, PathBuf};
@@ -103,6 +104,51 @@ fn finalize_outcome(outcome: &mut RunOutcome) {
     });
 }
 
+/// Clock facts for the manifest (golden rule 7). The UTC offset is always measurable.
+/// Skew against true time is not measurable from user space without a network time
+/// source, so it is recorded as such unless the operator supplied `--reference-time`
+/// (the true UTC at run start), in which case it is `started_utc - reference` seconds.
+fn host_clock(
+    started_utc: chrono::DateTime<chrono::Utc>,
+    utc_offset_seconds: i32,
+    reference_time: Option<chrono::DateTime<chrono::Utc>>,
+) -> HostInfo {
+    use cairn_core::manifest::{format_skew, skew_seconds, SKEW_NOT_MEASURED};
+    let skew = reference_time.map(|r| skew_seconds(started_utc, r));
+    HostInfo {
+        hostname: String::new(),
+        os_build: String::new(),
+        timezone: String::new(),
+        wall_clock_utc_skew: skew.map_or_else(|| SKEW_NOT_MEASURED.to_string(), format_skew),
+        utc_offset_seconds: Some(utc_offset_seconds),
+        reference_time_utc: reference_time,
+        skew_seconds: skew,
+    }
+}
+
+/// Run the collectors, hash every persistence target, THEN run the analyzers — so the
+/// analyzers (and the findings they emit) see `binary_sha256` — and finally hash the
+/// process images behind findings that still lack one. Collector/analyzer failures are
+/// recorded in `sources` exactly as `run_live` records them.
+fn collect_then_analyze(
+    cfg: &Config,
+    privileges: cairn_core::manifest::Privileges,
+    hostname: String,
+    collectors: &[Box<dyn Collector>],
+    analyzers: &[Box<dyn Analyzer>],
+    hash_fn: impl Fn(&str) -> Option<String> + Copy,
+) -> RunOutcome {
+    let mut outcome = run_live(cfg, privileges, hostname, collectors, &[]);
+    crate::enrich::enrich_persistence_hashes(&mut outcome.records, hash_fn);
+    let analysis = run_analyzers(&outcome.records, analyzers);
+    outcome.findings = analysis.findings;
+    outcome.observations = analysis.observations;
+    outcome.sources.extend(analysis.errors);
+    finalize_outcome(&mut outcome);
+    crate::enrich::enrich_process_hashes(&mut outcome.records, &outcome.findings, hash_fn);
+    outcome
+}
+
 /// The live run's manifest: the shared skeleton plus live host/privilege/source facts.
 fn live_manifest(
     cfg: &Config,
@@ -110,6 +156,7 @@ fn live_manifest(
     selection: &SelectionOutcome,
     started_utc: chrono::DateTime<chrono::Utc>,
     low_priority_applied: bool,
+    reference_time: Option<chrono::DateTime<chrono::Utc>>,
 ) -> Manifest {
     let mut m = output::base_manifest(
         cfg,
@@ -124,7 +171,11 @@ fn live_manifest(
         hostname: outcome.hostname.clone(),
         os_build: cairn_collectors::host_info::os_build(),
         timezone: cairn_collectors::host_info::timezone(),
-        wall_clock_utc_skew: "unknown".into(),
+        ..host_clock(
+            started_utc,
+            chrono::Local::now().offset().local_minus_utc(),
+            reference_time,
+        )
     };
     m.privileges = outcome.privileges.clone();
     m.sources = outcome.sources.clone();
@@ -134,26 +185,41 @@ fn live_manifest(
     m
 }
 
-/// Write every output through the sink. manifest.outputs stays empty for live runs:
-/// DirSink logs per-file sha256 at finalize; the zip sink is integrity-checked at the
-/// archive level.
-fn write_outputs(cfg: &Config, outcome: &RunOutcome, manifest: Manifest) -> anyhow::Result<()> {
+/// Write every output through the sink — dir and zip alike — then embed every data
+/// output's SHA-256 + size into `manifest.outputs` before writing the manifest itself
+/// (chain of custody; `cairn verify` re-hashes each one). EVTX evidence is exported
+/// first so a failed channel is in the manifest (and report) sources. Under `--dry-run`
+/// the sink discards everything and nothing touches the disk.
+fn write_outputs(
+    cfg: &Config,
+    outcome: &RunOutcome,
+    mut manifest: Manifest,
+    export: Option<&crate::export::ExportPlan>,
+) -> anyhow::Result<()> {
+    use cairn_core::traits::OutputSink;
     let mut sink = output::build_sink(&cfg.output);
+    if let Some(plan) = export.filter(|_| !sink.is_dry_run()) {
+        let failures = crate::export::export_into(
+            &mut sink,
+            plan,
+            cairn_collectors_win::evtx_export::export_channel,
+        );
+        manifest.sources.extend(failures);
+    }
     sink.write_timeline_csv(&outcome.findings)?;
     sink.write_findings_jsonl(&outcome.findings)?;
     sink.write_observations(&outcome.observations)?;
+    sink.write_records_jsonl(&outcome.records)?;
     sink.write_html_report(
         &outcome.findings,
         &outcome.observations,
         &outcome.records,
         &manifest,
     )?;
-    if let OutputKind::Dir(ref d) = cfg.output {
-        output::write_records_jsonl(d, &outcome.records)?;
-    }
+    manifest.outputs = sink.outputs_so_far();
     sink.write_manifest(&manifest)?;
     for o in sink.finalize()? {
-        tracing::info!(file = %o.file, sha256 = %o.sha256, "wrote output");
+        tracing::info!(file = %o.file, sha256 = %o.sha256, size = o.size, "wrote output");
     }
     Ok(())
 }
@@ -168,6 +234,7 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
         .parse()
         .map_err(|e: String| anyhow::anyhow!(e))?;
     let cfg = build_config(args, profile)?;
+    let reference_time = args.reference_time()?;
 
     // --dry-run (FR16 / golden rule 4): write NOTHING — no output dir, no run.log; logs
     // go to stderr and only a summary is printed.
@@ -208,13 +275,21 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
         sigma_channels: sigma.as_ref().map(|s| s.channels()),
     };
     let collectors = registry::build_collectors(&selection.selected, &ctx);
+    let export_plan = crate::export::plan(
+        args.export_evtx_enabled() && !args.dry_run,
+        &selection.selected,
+        registry::live_evtx_channels(ctx.sigma_channels),
+        cfg.since
+            .unwrap_or_else(|| registry::default_since(chrono::Utc::now())),
+    );
     let analyzers = registry::analyzers(&cfg, Mode::Live, sigma);
 
-    let mut outcome = run_live(&cfg, privileges, hostname, &collectors, &analyzers);
-    finalize_outcome(&mut outcome);
-    crate::enrich::enrich_hashes(
-        &mut outcome.records,
-        &outcome.findings,
+    let mut outcome = collect_then_analyze(
+        &cfg,
+        privileges,
+        hostname,
+        &collectors,
+        &analyzers,
         crate::enrich::hash_on_disk,
     );
     tracing::info!(
@@ -229,11 +304,12 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
         &selection,
         started_utc,
         low_priority_applied,
+        reference_time,
     );
     for f in &mut outcome.findings {
         client_text::fill_details_client(f, manifest.run.started_utc);
     }
-    write_outputs(&cfg, &outcome, manifest)?;
+    write_outputs(&cfg, &outcome, manifest, export_plan.as_ref())?;
     if args.dry_run {
         println!(
             "dry-run: {} records, {} findings — no files written (would have gone to {})",
@@ -288,8 +364,97 @@ mod tests {
         assert!(!cfg.governance.low_priority, "--full-speed opts out");
         let since = cfg.since.unwrap();
         let age = Utc::now() - since;
-        assert!(age >= chrono::Duration::days(7) && age < chrono::Duration::days(8));
+        assert!(age >= chrono::Duration::days(30) && age < chrono::Duration::days(31));
         assert!(build_config(&args(&["--since", "nope"]), Profile::Standard).is_err());
+    }
+
+    /// Without a reference the skew is explicitly "not measured"; with one it is
+    /// host-minus-reference seconds, and the offset is always recorded.
+    #[test]
+    fn host_clock_records_offset_and_optional_skew() {
+        let start = Utc::now();
+        let h = host_clock(start, 28800, None);
+        assert_eq!(
+            h.wall_clock_utc_skew,
+            cairn_core::manifest::SKEW_NOT_MEASURED
+        );
+        assert_eq!(h.utc_offset_seconds, Some(28800));
+        assert!(h.skew_seconds.is_none());
+        let h = host_clock(start, 0, Some(start - chrono::Duration::seconds(42)));
+        assert_eq!(h.skew_seconds, Some(42));
+        assert_eq!(h.wall_clock_utc_skew, "+42s");
+        assert_eq!(
+            h.reference_time_utc,
+            Some(start - chrono::Duration::seconds(42))
+        );
+    }
+
+    /// Persistence targets are hashed BEFORE the analyzers run: an analyzer sees
+    /// `binary_sha256` on the record.
+    #[test]
+    fn analyzers_see_persistence_hashes() {
+        use cairn_core::record::PersistenceRecord;
+        struct Persist;
+        impl Collector for Persist {
+            fn name(&self) -> &str {
+                "fake_persist"
+            }
+            fn collect(&self, _: &CollectCtx<'_>) -> cairn_core::Result<Vec<Record>> {
+                Ok(vec![Record::Persistence(PersistenceRecord {
+                    mechanism: cairn_core::Mechanism::RunKey,
+                    location: "HKCU\\Run".into(),
+                    value: Some("x".into()),
+                    command: Some(r"C:\x.exe".into()),
+                    binary_path: Some(r"C:\x.exe".into()),
+                    binary_sha256: None,
+                    signed: None,
+                    signer: None,
+                    last_write: None,
+                })])
+            }
+        }
+        struct SeesHash;
+        impl Analyzer for SeesHash {
+            fn name(&self) -> &str {
+                "sees_hash"
+            }
+            fn analyze(
+                &self,
+                records: &[Record],
+                _: &[cairn_core::Finding],
+            ) -> cairn_core::Result<Vec<cairn_core::Finding>> {
+                Ok(records
+                    .iter()
+                    .filter_map(|r| match r {
+                        Record::Persistence(p) => p.binary_sha256.clone(),
+                        _ => None,
+                    })
+                    .map(|h| {
+                        cairn_core::Finding::new(
+                            cairn_core::Severity::Low,
+                            h,
+                            cairn_core::FindingSource::Heuristic,
+                        )
+                    })
+                    .collect())
+            }
+        }
+        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(Persist)];
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![Box::new(SeesHash)];
+        let outcome = collect_then_analyze(
+            &Config::default(),
+            privs(),
+            "T".into(),
+            &collectors,
+            &analyzers,
+            |_| Some("abc123".into()),
+        );
+        assert_eq!(outcome.findings.len(), 1);
+        assert_eq!(outcome.findings[0].title, "abc123");
+        assert_eq!(
+            outcome.findings[0].host, "T",
+            "finalize_outcome still applied"
+        );
     }
 
     fn privs() -> Privileges {
@@ -377,6 +542,112 @@ author: test-integration
             Some("test-integration"),
             "finding must carry DRL 1.1 rule_author"
         );
+    }
+
+    fn outcome_with_one_record() -> RunOutcome {
+        RunOutcome {
+            records: vec![Record::Event(event(4688, 7, &[("Image", "x.exe")]))],
+            findings: vec![{
+                let mut f = cairn_core::Finding::new(
+                    cairn_core::Severity::High,
+                    "t",
+                    cairn_core::FindingSource::Sigma,
+                );
+                f.rule_author = Some("A".into());
+                f
+            }],
+            observations: vec![],
+            sources: vec![],
+            privileges: privs(),
+            hostname: "TEST".into(),
+        }
+    }
+
+    fn manifest_for(cfg: &Config, outcome: &RunOutcome) -> Manifest {
+        let selection = SelectionOutcome {
+            selected: vec!["proc".into()],
+            unknown_only: vec![],
+        };
+        live_manifest(cfg, outcome, &selection, Utc::now(), false, None)
+    }
+
+    /// A live dir run lists every written data file in manifest.outputs (with size),
+    /// records.jsonl included; verify passes, and tampering ONE output makes it fail.
+    #[test]
+    fn live_dir_outputs_are_listed_and_tamper_fails_verify() {
+        let dir = std::env::temp_dir().join("cairn_live_dir_outputs");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            output: OutputKind::Dir(dir.clone()),
+            ..Config::default()
+        };
+        let outcome = outcome_with_one_record();
+        write_outputs(&cfg, &outcome, manifest_for(&cfg, &outcome), None).unwrap();
+
+        let m = cairn_report::read_manifest(&dir.join("manifest.json")).unwrap();
+        let names: Vec<&str> = m.outputs.iter().map(|o| o.file.as_str()).collect();
+        for want in [
+            "timeline.csv",
+            "findings.jsonl",
+            "observations.jsonl",
+            "records.jsonl",
+            "report.html",
+        ] {
+            assert!(names.contains(&want), "{want} missing from {names:?}");
+        }
+        assert!(m
+            .outputs
+            .iter()
+            .all(|o| o.size > 0 || o.file == "observations.jsonl"));
+        assert!(crate::verify::run_verify(&dir.join("manifest.json"), None).unwrap());
+
+        let p = dir.join("records.jsonl");
+        let mut c = std::fs::read(&p).unwrap();
+        c[0] ^= 0x20;
+        std::fs::write(&p, &c).unwrap();
+        assert!(
+            !crate::verify::run_verify(&dir.join("manifest.json"), None).unwrap(),
+            "tampered records.jsonl must fail verify"
+        );
+    }
+
+    /// A live zip run carries records.jsonl + report.html as members, lists the member
+    /// hashes in the inner manifest, writes a `<zip>.sha256` sidecar, and verifies.
+    #[test]
+    fn live_zip_lists_members_writes_sidecar_and_verifies() {
+        let dir = std::env::temp_dir().join("cairn_live_zip_outputs");
+        let _ = std::fs::remove_dir_all(&dir);
+        let zip = dir.join("c.zip");
+        let cfg = Config {
+            output: OutputKind::Zip(zip.clone()),
+            ..Config::default()
+        };
+        let outcome = outcome_with_one_record();
+        write_outputs(&cfg, &outcome, manifest_for(&cfg, &outcome), None).unwrap();
+        assert!(dir.join("c.zip.sha256").is_file(), "sidecar written");
+        let (m, report) = cairn_report::verify_zip(&zip).unwrap();
+        assert!(m.outputs.iter().any(|o| o.file == "records.jsonl"));
+        assert!(m.outputs.iter().any(|o| o.file == "report.html"));
+        assert!(report.ok(), "{:?}", report.failures());
+        assert!(crate::verify::run_verify(&zip, None).unwrap());
+    }
+
+    /// --dry-run writes nothing at all, even with EVTX export requested.
+    #[test]
+    fn dry_run_write_outputs_touches_nothing() {
+        let dir = std::env::temp_dir().join("cairn_live_dry_run_outputs");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config {
+            output: OutputKind::DryRun,
+            ..Config::default()
+        };
+        let outcome = outcome_with_one_record();
+        let plan = crate::export::ExportPlan {
+            channels: vec!["Security".into()],
+            since: Utc::now(),
+        };
+        write_outputs(&cfg, &outcome, manifest_for(&cfg, &outcome), Some(&plan)).unwrap();
+        assert!(!dir.exists());
     }
 
     /// Integration: the registry's brute-force heuristic detects the pattern end to end

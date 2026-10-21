@@ -4,9 +4,8 @@ use cairn_core::finding::Finding;
 use cairn_core::manifest::{
     Counts, GovernanceReport, HostInfo, Manifest, Privileges, RunInfo, ToolInfo,
 };
-use cairn_core::traits::OutputSink;
 use cairn_core::{Config, OutputKind};
-use cairn_report::{DirSink, DryRunSink, ZipSink};
+use cairn_report::Sink;
 use cairn_sigma::{engine::Engine, SigmaMatcher};
 use std::path::{Path, PathBuf};
 use tracing_subscriber::EnvFilter;
@@ -117,27 +116,9 @@ fn finding_tiebreak(f: &Finding) -> u32 {
     }
 }
 
-/// Dump collected Records as JSONL (the internal bus type; versioned by
-/// schema::RECORD) so a live run's raw data is reviewable and replayable.
-pub fn write_records_jsonl(
-    dir: &Path,
-    records: &[cairn_core::record::Record],
-) -> anyhow::Result<()> {
-    use std::io::Write;
-    let mut f = std::fs::File::create(dir.join("records.jsonl"))?;
-    for r in records {
-        writeln!(f, "{}", serde_json::to_string(r)?)?;
-    }
-    Ok(())
-}
-
-/// Construct the correct OutputSink variant from the resolved OutputKind (FR15/FR16).
-pub fn build_sink(output: &OutputKind) -> Box<dyn OutputSink + Send> {
-    match output {
-        OutputKind::Dir(p) => Box::new(DirSink::new(p)),
-        OutputKind::Zip(p) => Box::new(ZipSink::new(p)),
-        OutputKind::DryRun => Box::new(DryRunSink),
-    }
+/// Construct the output sink for the resolved OutputKind (FR15/FR16).
+pub fn build_sink(output: &OutputKind) -> Sink {
+    Sink::new(output)
 }
 
 /// The manifest's `sigma_ruleset_ver` for this run (ADR-0003): `"<pin>+<aggregate>"`
@@ -185,7 +166,10 @@ pub fn base_manifest(
             hostname: hostname.to_string(),
             os_build: String::new(),
             timezone: "UTC".into(),
-            wall_clock_utc_skew: "unknown".into(),
+            wall_clock_utc_skew: cairn_core::manifest::SKEW_NOT_MEASURED.into(),
+            utc_offset_seconds: None,
+            reference_time_utc: None,
+            skew_seconds: None,
         },
         privileges: Privileges {
             admin: false,
