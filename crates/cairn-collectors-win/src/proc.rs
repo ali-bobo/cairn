@@ -17,6 +17,18 @@ pub struct RawProc {
     pub start_time: Option<DateTime<Utc>>,
 }
 
+/// `DOMAIN\user` from a LookupAccountSid result; a bare name when the domain is empty;
+/// None when the name is empty. Pure.
+pub fn format_account(domain: &str, name: &str) -> Option<String> {
+    let d = domain.trim_end_matches('\0');
+    let n = name.trim_end_matches('\0');
+    match (d.is_empty(), n.is_empty()) {
+        (_, true) => None,
+        (true, false) => Some(n.to_string()),
+        (false, false) => Some(format!("{d}\\{n}")),
+    }
+}
+
 /// Non-Windows: empty (the live proc path is Windows-only).
 #[cfg(not(windows))]
 pub fn enumerate() -> Result<Vec<RawProc>> {
@@ -34,11 +46,13 @@ pub fn enumerate() -> Result<Vec<RawProc>> {
 mod win {
     use super::RawProc;
     use cairn_core::{CairnError, Result};
+    use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::FILETIME;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
-        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TokenIntegrityLevel,
-        TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, LookupAccountSidW,
+        TokenIntegrityLevel, TokenUser, SID_NAME_USE, TOKEN_INFORMATION_CLASS,
+        TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
     };
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
@@ -118,43 +132,107 @@ mod win {
         }
     }
 
-    /// Best-effort token integrity RID for an already-open process handle. Returns
-    /// None on any failure — never panics. Read-only: TOKEN_QUERY cannot modify
-    /// the target.
+    /// Open the process token for TOKEN_QUERY (read-only: cannot modify the target).
+    /// None on any failure, typically access denied for protected/other-user processes
+    /// when not elevated; the caller then leaves integrity/user None (skip quietly).
     ///
     /// Caller contract: `handle` MUST have been opened with at least
     /// PROCESS_QUERY_LIMITED_INFORMATION.
-    fn read_integrity(handle: HANDLE) -> Option<u32> {
+    fn open_token(handle: HANDLE) -> Option<TokenHandle> {
         let mut token = HANDLE::default();
         // SAFETY: handle valid (caller contract); token is an out-param written
-        // only on success.
+        // only on success, and wrapped in the guard immediately.
         unsafe { OpenProcessToken(handle, TOKEN_QUERY, &mut token) }.ok()?;
-        let token_guard = TokenHandle(token);
+        Some(TokenHandle(token))
+    }
 
-        // Two-stage size probe: first call with a null buffer to learn the required
-        // size, which GetTokenInformation always reports via the out-param even
-        // though the probe call itself returns an error.
+    /// Read a variable-length token information class into an owned byte buffer
+    /// (two-stage size probe). None on any failure.
+    fn token_info(token: &TokenHandle, class: TOKEN_INFORMATION_CLASS) -> Option<Vec<u8>> {
         let mut len: u32 = 0;
         // SAFETY: null buffer + 0 size is the documented probe form; return value
-        // intentionally ignored (probe always "fails" with the required size in `len`).
+        // intentionally ignored (probe "fails" with the required size in `len`).
         unsafe {
-            let _ = GetTokenInformation(token_guard.0, TokenIntegrityLevel, None, 0, &mut len);
+            let _ = GetTokenInformation(token.0, class, None, 0, &mut len);
         }
         if len == 0 {
             return None;
         }
         let mut buf = vec![0u8; len as usize];
-        // SAFETY: buf sized to the probed `len`; token_guard.0 valid; out len re-passed.
+        // SAFETY: buf sized to the probed `len`; token.0 valid; out len re-passed.
         unsafe {
             GetTokenInformation(
-                token_guard.0,
-                TokenIntegrityLevel,
+                token.0,
+                class,
                 Some(buf.as_mut_ptr() as *mut core::ffi::c_void),
                 len,
                 &mut len,
             )
         }
         .ok()?;
+        buf.truncate(len as usize);
+        Some(buf)
+    }
+
+    /// Best-effort `DOMAIN\user` owning the process token: GetTokenInformation(TokenUser)
+    /// then LookupAccountSidW on the local system. None on any failure (access denied,
+    /// unmappable SID). Read-only.
+    fn read_user(token: &TokenHandle) -> Option<String> {
+        let buf = token_info(token, TokenUser)?;
+        if buf.len() < std::mem::size_of::<TOKEN_USER>() {
+            return None;
+        }
+        // SAFETY: buf holds at least size_of::<TOKEN_USER>() bytes written by the API;
+        // read_unaligned because Vec<u8> is only 1-byte aligned.
+        let tu: TOKEN_USER = unsafe { std::ptr::read_unaligned(buf.as_ptr() as *const TOKEN_USER) };
+        let sid = tu.User.Sid;
+        if sid.0.is_null() {
+            return None;
+        }
+        let mut name = vec![0u16; 256];
+        let mut domain = vec![0u16; 256];
+        for _ in 0..2 {
+            let mut name_len = name.len() as u32;
+            let mut dom_len = domain.len() as u32;
+            let mut use_ = SID_NAME_USE::default();
+            // SAFETY: sid points into `buf`, which is alive for this whole function;
+            // name/domain are live buffers whose capacities (in u16 chars) are passed in
+            // name_len/dom_len; on success the API writes the lengths excluding the NUL,
+            // on ERROR_INSUFFICIENT_BUFFER it writes the required sizes and we retry once.
+            let r = unsafe {
+                LookupAccountSidW(
+                    PCWSTR::null(),
+                    sid,
+                    Some(PWSTR(name.as_mut_ptr())),
+                    &mut name_len,
+                    Some(PWSTR(domain.as_mut_ptr())),
+                    &mut dom_len,
+                    &mut use_,
+                )
+            };
+            match r {
+                Ok(()) => {
+                    let n = String::from_utf16_lossy(&name[..(name_len as usize).min(name.len())]);
+                    let d =
+                        String::from_utf16_lossy(&domain[..(dom_len as usize).min(domain.len())]);
+                    return super::format_account(&d, &n);
+                }
+                Err(_) => {
+                    if (name_len as usize) <= name.len() && (dom_len as usize) <= domain.len() {
+                        return None; // a real failure, not a size problem
+                    }
+                    name = vec![0u16; (name_len as usize).max(name.len())];
+                    domain = vec![0u16; (dom_len as usize).max(domain.len())];
+                }
+            }
+        }
+        None
+    }
+
+    /// Best-effort token integrity RID. Returns None on any failure — never panics.
+    fn read_integrity(token_guard: &TokenHandle) -> Option<u32> {
+        let buf = token_info(token_guard, TokenIntegrityLevel)?;
+        let len = buf.len() as u32;
 
         // Defensive: TOKEN_MANDATORY_LABEL must fit in the returned buffer before we
         // read it out. Normal Windows semantics guarantee len >= size_of::<TOKEN_MANDATORY_LABEL>()
@@ -250,16 +328,18 @@ mod win {
             // SAFETY: OpenProcess returns an owned handle or Err; wrapped immediately.
             let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok();
 
-            let (image, cmdline, integrity_raw, start_time) = match handle {
+            let (image, cmdline, integrity_raw, user, start_time) = match handle {
                 Some(h) => {
                     let guard = ProcHandle(h);
                     let image = full_image_path(guard.0).unwrap_or_else(|| file_name.clone());
                     let cmdline = crate::cmdline_reader::read_cmdline(guard.0);
-                    let integrity_raw = read_integrity(guard.0);
+                    let token = open_token(guard.0);
+                    let integrity_raw = token.as_ref().and_then(read_integrity);
+                    let user = token.as_ref().and_then(read_user);
                     let start_time = read_start_time(guard.0);
-                    (image, cmdline, integrity_raw, start_time)
+                    (image, cmdline, integrity_raw, user, start_time)
                 }
-                None => (file_name.clone(), None, None, None),
+                None => (file_name.clone(), None, None, None, None),
             };
 
             out.push(RawProc {
@@ -269,7 +349,7 @@ mod win {
                 cmdline,
                 integrity_raw,
                 signed: None,
-                user: None,
+                user,
                 start_time,
             });
             // SAFETY: snap.0 valid; entry reused per the Toolhelp iteration contract.
@@ -278,6 +358,25 @@ mod win {
             }
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod pure_tests {
+    use super::format_account;
+
+    #[test]
+    fn formats_domain_and_user() {
+        assert_eq!(
+            format_account("NT AUTHORITY", "SYSTEM").as_deref(),
+            Some(r"NT AUTHORITY\SYSTEM")
+        );
+        assert_eq!(format_account("", "alice").as_deref(), Some("alice"));
+        assert_eq!(format_account("CORP", ""), None);
+        assert_eq!(
+            format_account("CORP\0", "bob\0").as_deref(),
+            Some(r"CORP\bob")
+        );
     }
 }
 
@@ -339,6 +438,19 @@ mod tests {
             st <= chrono::Utc::now(),
             "start_time must not be in the future"
         );
+    }
+
+    /// Our own process's token user should resolve to DOMAIN\name.
+    #[test]
+    fn current_process_user_resolves() {
+        let me = std::process::id();
+        let procs = enumerate().expect("enumerate");
+        let mine = procs.iter().find(|p| p.pid == me).expect("self in list");
+        let user = mine
+            .user
+            .as_deref()
+            .expect("expected a token user for our own process");
+        assert!(!user.is_empty());
     }
 
     /// Our own process's cmdline should be readable via ProcessCommandLineInformation,
