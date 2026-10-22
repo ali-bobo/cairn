@@ -398,11 +398,22 @@ fn accessibility_finding(a: &AccessibilityBinary, now: DateTime<Utc>) -> Option<
         "{} OriginalFilename={:?} signed={:?} signer={:?}",
         a.path, a.original_filename, a.signed, a.signer
     );
-    f.details_client = Some(format!(
-        "Windows 的協助工具程式 {} 被換成別的程式。攻擊者用這招在登入畫面按快速鍵（例如連按 Shift）\
-         就能不用密碼取得最高權限的命令列；請從乾淨的系統還原這個檔案，並檢查是否有遠端登入紀錄。",
-        a.name
-    ));
+    f.details_client = Some(if severity == Severity::High {
+        format!(
+            "Windows 的協助工具程式 {} 被換成別的程式。攻擊者用這招在登入畫面按快速鍵（例如連按 Shift）\
+             就能不用密碼取得最高權限的命令列；請從乾淨的系統還原這個檔案，並檢查是否有遠端登入紀錄。",
+            a.name
+        )
+    } else {
+        // Signed (or signature unknown) and not a shell: a vendor accessibility tool or
+        // an OEM build can carry another internal name. Worth a check, not a verdict.
+        format!(
+            "Windows 的協助工具程式 {} 的內部檔名與 Windows 內建版本不同。這可能是廠商或第三方的\
+             協助工具取代了它，也可能是被換成別的程式（攻擊者可藉此在登入畫面不用密碼取得最高權限）；\
+             請確認這個檔案的來源與簽章是否為已知軟體。",
+            a.name
+        )
+    });
     f.entity.file = Some(EntityFile {
         path: a.path.clone(),
         sha256: a.sha256.clone(),
@@ -757,6 +768,23 @@ mod tests {
             acc_sev("osk.exe", Some("other.exe"), Some(true)),
             Some(Severity::Low)
         );
+        // Only the High case tells the client the binary was replaced as an attack.
+        for (orig, signed, replaced) in [
+            (Some("cmd.exe"), Some(true), true),
+            (Some("evil.exe"), None, false),
+            (Some("other.exe"), Some(true), false),
+        ] {
+            let f = run(PostureRecord {
+                accessibility_binaries: vec![acc("osk.exe", orig, signed)],
+                ..PostureRecord::default()
+            });
+            let text = f[0].details_client.as_deref().unwrap();
+            assert_eq!(
+                text.contains("被換成別的程式。"),
+                replaced,
+                "{orig:?}: {text}"
+            );
+        }
         // In-box: no finding (including names that differ from the file name).
         assert_eq!(acc_sev("sethc.exe", Some("sethc.exe"), Some(true)), None);
         assert_eq!(
