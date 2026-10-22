@@ -8,11 +8,25 @@
 //! | 1102 | Security | audit log cleared | T1070.001 |
 //! | 104 | System | event log cleared | T1070.001 |
 //! | 7045 | System | service installed | T1543.003 |
+//! | 7040 | System | Windows Event Log service set to disabled | T1562.002 |
 //! | 4698 | Security | scheduled task created (needs "Other Object Access" audit) | T1053.005 |
 //! | 5001 | Defender | real-time protection turned off | T1562.001 |
 //! | 5007 | Defender | configuration changed (exclusion added) | T1562.001 |
 //! | 1116 | Defender | malware detected (PUA/adware Low–Medium, else High) | — |
 //! | 1117 / 1118 / 1119 | Defender | action taken / action failed (High) | — |
+//!
+//! Field names, checked against real logs (EVTX-ATTACK-SAMPLES, DeepBlueCLI samples;
+//! see `tests/fixtures/README.md`):
+//! - 1102 / 104: UserData `LogFileCleared` { `SubjectUserName`, `SubjectDomainName`,
+//!   104 also `Channel` (the cleared log) and `BackupPath` }, one level below `data`.
+//! - 7045: EventData `ServiceName`, `ImagePath`, `ServiceType`, `StartType`,
+//!   `AccountName`. Its System `EventID` carries `Qualifiers` (the collector reads it).
+//! - 7040: `param1` display name, `param2` old / `param3` new start type (localized
+//!   text), `param4` service key name.
+//! - 4698: `TaskName`, `TaskContent` (the task XML), `SubjectUserName`.
+//! - Defender 5001 / 5007 / 1116-1119 (`New Value`, `Threat Name`, `Action Name`,
+//!   `Error Description`, ...) are NOT yet checked against a real log: no public
+//!   sample was found.
 //!
 //! Pure logic over EventRecords; touches no host state.
 #![forbid(unsafe_code)]
@@ -26,8 +40,8 @@ use cairn_core::{Finding, Result};
 use serde_json::{Map, Value};
 
 use crate::trust::{
-    is_system_or_program_files, is_user_writable_path, launchers_in, script_marker_labels,
-    MICROSOFT_PROGRAMDATA,
+    is_system_or_program_files, is_user_writable_path, is_windows_root_exe, launchers_in,
+    script_marker_labels, MICROSOFT_PROGRAMDATA,
 };
 
 /// Defender's operational channel.
@@ -169,6 +183,16 @@ fn service_installed(ev: &EventRecord) -> Finding {
     let flags = command_red_flags(&image);
     let (severity, reason) = if !flags.is_empty() {
         (Severity::High, flags.join("; "))
+    } else if is_windows_root_exe(&image) {
+        // Checked before the Windows-tree trust tier: the root of C:\Windows is the
+        // ADMIN$ share, where PsExec-style tools drop their service binary.
+        (
+            Severity::Medium,
+            "binary sits directly in the Windows folder (the ADMIN$ share root), where \
+             PsExec-style remote execution drops its service exe; stock services run from \
+             System32 or a vendor folder"
+                .to_string(),
+        )
     } else if is_system_or_program_files(&normalize_image(&image))
         || image.to_ascii_lowercase().contains(MICROSOFT_PROGRAMDATA)
     {
@@ -195,6 +219,44 @@ fn service_installed(ev: &EventRecord) -> Finding {
             ev.ts.format("%Y-%m-%d %H:%M UTC")
         ),
     )
+}
+
+/// 7040 start-type text meaning "disabled" (English, zh-TW); `param3` is localized.
+const START_TYPE_DISABLED: &[&str] = &["disabled", "已停用"];
+
+/// System 7040 turning the Windows Event Log service (`param4` key name `EventLog`)
+/// to disabled: T1562.002. Real shape (DeepBlueCLI `disablestop-eventlog.evtx`):
+/// `param1` display name, `param2` old start type, `param3` new start type, `param4`
+/// service key name.
+fn eventlog_service_disabled(ev: &EventRecord) -> Option<Finding> {
+    let key = field_or_dash(ev, "param4");
+    let new_type = field_or_dash(ev, "param3");
+    if !key.trim().eq_ignore_ascii_case("eventlog")
+        || !START_TYPE_DISABLED
+            .iter()
+            .any(|d| new_type.trim().eq_ignore_ascii_case(d))
+    {
+        return None;
+    }
+    let old_type = field_or_dash(ev, "param2");
+    Some(finding(
+        ev,
+        Severity::High,
+        "事件記錄服務被停用".to_string(),
+        &["T1562.002"],
+        format!(
+            "EID 7040: {} ({key}) start type changed from {old_type} to {new_type}",
+            field_or_dash(ev, "param1")
+        ),
+        "the Windows Event Log service was set to disabled: once it stops, nothing more is \
+         logged, which attackers do to work unseen"
+            .to_string(),
+        format!(
+            "{} Windows 事件記錄服務被設定為停用。服務停止後系統就不再留下任何紀錄，\
+             這是攻擊者隱藏行蹤的手法；除非是已知的維護作業，請立即恢復並調查。",
+            ev.ts.format("%Y-%m-%d %H:%M UTC")
+        ),
+    ))
 }
 
 fn task_created(ev: &EventRecord) -> Finding {
@@ -464,6 +526,7 @@ impl Analyzer for EventLogHeuristic {
             match (ev.channel.as_str(), ev.event_id) {
                 ("Security", 1102) | ("System", 104) => out.push(log_cleared(ev)),
                 ("System", 7045) => out.push(service_installed(ev)),
+                ("System", 7040) => out.extend(eventlog_service_disabled(ev)),
                 ("Security", 4698) => out.push(task_created(ev)),
                 (DEFENDER_CHANNEL, 5001) => out.push(defender_rtp_off(ev)),
                 (DEFENDER_CHANNEL, 5007) => out.extend(defender_exclusion(ev)),
@@ -573,6 +636,50 @@ mod tests {
             json!({"ServiceName": "WinDefend", "ImagePath": image}),
         )]);
         assert_eq!(f[0].severity, Severity::Low);
+    }
+
+    /// Real Metasploit psexec 7045 (DeepBlueCLI metasploit-psexec-native-target-system):
+    /// a random exe directly in %SYSTEMROOT% is not "the trusted Windows tree".
+    #[test]
+    fn service_exe_directly_in_the_windows_folder_is_medium() {
+        for image in [r"%SYSTEMROOT%\duKhLYUX.exe", r"C:\Windows\PSEXESVC.exe"] {
+            let f = run(&[ev(
+                "System",
+                7045,
+                json!({"ServiceName": "KgXItsbKgTJzdzwl", "ImagePath": image}),
+            )]);
+            assert_eq!(f[0].severity, Severity::Medium, "{image}");
+            assert!(f[0].reason.as_deref().unwrap().contains("ADMIN$"));
+        }
+        // A subfolder of the Windows tree keeps the Low trust tier.
+        let f = run(&[ev(
+            "System",
+            7045,
+            json!({"ServiceName": "n", "ImagePath": r"C:\Windows\Microsoft.NET\Framework\v4.0.30319\SMSvcHost.exe"}),
+        )]);
+        assert_eq!(f[0].severity, Severity::Low);
+    }
+
+    /// Real 7040 shape (DeepBlueCLI disablestop-eventlog.evtx).
+    #[test]
+    fn eventlog_service_disabled_is_high() {
+        let ev7040 = |old: &str, new: &str, key: &str| {
+            ev(
+                "System",
+                7040,
+                json!({"param1": "Windows Event Log", "param2": old, "param3": new, "param4": key}),
+            )
+        };
+        let f = run(&[ev7040("auto start", "disabled", "EventLog")]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::High);
+        assert_eq!(f[0].mitre, vec!["T1562.002"]);
+        // Re-enabling it, or another service, is not this detection.
+        assert!(run(&[
+            ev7040("disabled", "auto start", "EventLog"),
+            ev7040("auto start", "disabled", "BITS"),
+        ])
+        .is_empty());
     }
 
     #[test]

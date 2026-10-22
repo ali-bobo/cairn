@@ -23,6 +23,13 @@
 //!   524 and 7040-disabled each raise one Medium finding; the 7036 state changes and
 //!   the 8193 / 8194 / 12289 errors stay silent, because VSS stops after every idle
 //!   period and its writer errors are common on healthy hosts.
+//!
+//! The 7036 / 7040 shapes are checked against real System logs (DeepBlueCLI samples,
+//! `tests/fixtures/README.md`): 7040 `param1` display name, `param2` old and `param3`
+//! new start type (localized text), `param4` service key name; 7036 `param1` display
+//! name, `param2` state, `Binary` = UTF-16LE hex of `<key name>/<state code>`. No public
+//! sample with a VSS 7036 / 7040, Application 524 or VSS 8193 / 8194 / 12289 was found,
+//! so those event IDs themselves are not yet checked against a real log.
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;
