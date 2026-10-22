@@ -227,6 +227,8 @@ fn write_outputs(
             &mut sink,
             plan,
             cairn_collectors_win::evtx_export::export_channel,
+            (cfg.collector_timeout_secs > 0)
+                .then(|| std::time::Duration::from_secs(cfg.collector_timeout_secs)),
         );
         manifest.sources.extend(failures);
     }

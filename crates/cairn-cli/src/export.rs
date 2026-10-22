@@ -59,15 +59,60 @@ fn failure(channel: &str, error: String) -> SourceEntry {
     }
 }
 
+/// Run one export with a time budget. EvtExportLog on a huge or wedged channel can run
+/// for a very long time; past `budget` the export is abandoned exactly like a timed-out
+/// collector: the worker thread cannot be killed, so it is left detached (never
+/// joined) and whatever it later writes is never registered with the sink, hence never
+/// listed in the manifest (`cairn verify` would report a left-behind partial file as
+/// unexpected). The worker owns all its data; nothing it holds blocks shutdown, and the
+/// process exiting ends it. `None` (or a failed thread spawn) runs inline.
+fn export_bounded<E>(
+    exporter: E,
+    channel: &str,
+    query: &str,
+    target: &Path,
+    budget: Option<std::time::Duration>,
+) -> cairn_core::Result<()>
+where
+    E: Fn(&str, &str, &Path) -> cairn_core::Result<()> + Send + Copy + 'static,
+{
+    let Some(budget) = budget else {
+        return exporter(channel, query, target);
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (c, q, t) = (channel.to_string(), query.to_string(), target.to_path_buf());
+    let spawned = std::thread::Builder::new()
+        .name(format!("cairn-export-{channel}"))
+        .spawn(move || {
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exporter(&c, &q, &t)))
+                .unwrap_or_else(|_| Err(cairn_core::CairnError::Other("exporter panicked".into())));
+            let _ = tx.send(r); // receiver gone after a timeout: result discarded
+        });
+    if spawned.is_err() {
+        return exporter(channel, query, target);
+    }
+    match rx.recv_timeout(budget) {
+        Ok(r) => r,
+        Err(_) => Err(cairn_core::CairnError::Other(format!(
+            "timed out after {}s; export abandoned and its file not listed",
+            budget.as_secs()
+        ))),
+    }
+}
+
 /// Export every planned channel through `exporter(channel, xpath, target)` into the
 /// sink's evidence location and register each file with the sink. Returns one manifest
-/// source entry per failed channel. A dry-run sink has no evidence location, so this
-/// does nothing at all.
-pub fn export_into(
+/// source entry per failed (or timed-out, see [`export_bounded`]) channel. A dry-run
+/// sink has no evidence location, so this does nothing at all.
+pub fn export_into<E>(
     sink: &mut Sink,
     plan: &ExportPlan,
-    exporter: impl Fn(&str, &str, &Path) -> cairn_core::Result<()>,
-) -> Vec<SourceEntry> {
+    exporter: E,
+    budget: Option<std::time::Duration>,
+) -> Vec<SourceEntry>
+where
+    E: Fn(&str, &str, &Path) -> cairn_core::Result<()> + Send + Copy + 'static,
+{
     let query = cairn_collectors_win::evtx_export::since_xpath(plan.since);
     let mut failures = Vec::new();
     for channel in &plan.channels {
@@ -81,7 +126,7 @@ pub fn export_into(
             .map_err(cairn_core::CairnError::from)
             .and_then(|()| {
                 let target = std::path::absolute(&target).unwrap_or(target.clone());
-                exporter(channel, &query, &target)?;
+                export_bounded(exporter, channel, &query, &target, budget)?;
                 sink.add_evidence_file(&name, &target)
             });
         match result {
@@ -133,6 +178,7 @@ mod tests {
                     Err(cairn_core::CairnError::Other("channel not found".into()))
                 }
             },
+            None,
         );
         assert!(dir
             .join("evidence")
@@ -152,9 +198,51 @@ mod tests {
     #[test]
     fn dry_run_never_calls_the_exporter() {
         let mut sink = Sink::new(&OutputKind::DryRun);
-        let fails = export_into(&mut sink, &plan_for(&["Security"]), |_, _, _| {
-            panic!("exporter must not run under --dry-run")
-        });
+        let fails = export_into(
+            &mut sink,
+            &plan_for(&["Security"]),
+            |_, _, _| panic!("exporter must not run under --dry-run"),
+            Some(std::time::Duration::from_secs(1)),
+        );
         assert!(fails.is_empty());
+    }
+
+    /// A wedged export is abandoned at its budget: recorded as a timed-out failure,
+    /// its file never listed; the next channel still exports. A panicking exporter is
+    /// a failure too, not a crash.
+    #[test]
+    fn stuck_export_is_abandoned_at_its_budget() {
+        let dir = std::env::temp_dir().join("cairn_cli_export_stuck");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = Sink::new(&OutputKind::Dir(dir.clone()));
+        let start = std::time::Instant::now();
+        let fails = export_into(
+            &mut sink,
+            &plan_for(&["Stuck", "Boom", "Security"]),
+            |ch, _, target| match ch {
+                "Stuck" => {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                    std::fs::write(target, b"late").map_err(Into::into)
+                }
+                "Boom" => panic!("parser bug"),
+                _ => std::fs::write(target, b"ElfFile\0").map_err(Into::into),
+            },
+            Some(std::time::Duration::from_millis(200)),
+        );
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        let outs: Vec<String> = sink.outputs_so_far().into_iter().map(|o| o.file).collect();
+        assert_eq!(outs, vec!["evidence/evtx/Security.evtx".to_string()]);
+        assert_eq!(fails.len(), 2);
+        assert!(fails[0].artifact.ends_with("Stuck"));
+        assert!(
+            fails[0].errors[0].contains("timed out"),
+            "{:?}",
+            fails[0].errors
+        );
+        assert!(
+            fails[1].errors[0].contains("panicked"),
+            "{:?}",
+            fails[1].errors
+        );
     }
 }
