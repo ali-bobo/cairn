@@ -152,11 +152,27 @@ pub struct AnalysisOutcome {
     pub errors: Vec<SourceEntry>,
 }
 
+/// Remove from `earlier` every heuristic finding that one of `new` merged and lists in
+/// its `supersedes`. A Sigma finding stays whatever a heuristic claims: the rule hit
+/// and its author attribution (DRL 1.1) are never folded away.
+fn drop_superseded(earlier: &mut Vec<Finding>, new: &[Finding]) {
+    let gone: std::collections::HashSet<uuid::Uuid> = new
+        .iter()
+        .flat_map(|f| f.supersedes.iter().copied())
+        .collect();
+    if gone.is_empty() {
+        return;
+    }
+    earlier.retain(|f| f.source == crate::finding::FindingSource::Sigma || !gone.contains(&f.id));
+}
+
 /// Fan analyzers in over `records` (SRS §3), in `depends_on()` order. Each analyzer
 /// sees the records plus every earlier analyzer's findings. A failing or panicking
 /// analyzer is logged, recorded in `errors`, and skipped. Shared by the live run and
 /// the offline `cairn evtx` path so both behave the same. Findings whose analyzer left
-/// `Finding.analyzer` empty are stamped with its `name()`.
+/// `Finding.analyzer` empty are stamped with its `name()`. Earlier heuristic findings
+/// that a new finding lists in `Finding.supersedes` (it merged them: same evidence,
+/// see `cairn_heur::dedup`) are dropped; Sigma findings never are.
 pub fn run_analyzers(records: &[Record], analyzers: &[Box<dyn Analyzer>]) -> AnalysisOutcome {
     let order = topo_sort(analyzers);
     let mut out = AnalysisOutcome::default();
@@ -171,6 +187,7 @@ pub fn run_analyzers(records: &[Record], analyzers: &[Box<dyn Analyzer>]) -> Ana
                         f.analyzer = a.name().to_string();
                     }
                 }
+                drop_superseded(&mut out.findings, &fs);
                 out.findings.append(&mut fs);
             }
             Err(e) => {
@@ -866,6 +883,35 @@ mod tests {
             Collected::Finished(Err(e)) => assert!(e.starts_with("panicked:"), "{e}"),
             _ => panic!("expected a caught panic"),
         }
+    }
+
+    /// A later finding that merged earlier ones drops the heuristic ones it lists in
+    /// `supersedes`; a Sigma finding it lists stays (DRL attribution), and the merged
+    /// finding itself is kept.
+    #[test]
+    fn superseded_heuristic_findings_are_dropped_sigma_never() {
+        let heur = a_finding();
+        let sigma = Finding::new(Severity::Medium, "rule", FindingSource::Sigma);
+        let other = a_finding();
+        let mut merged = a_finding();
+        merged.supersedes = vec![heur.id, sigma.id];
+        let (heur_id, sigma_id, other_id, merged_id) = (heur.id, sigma.id, other.id, merged.id);
+        let analyzers = vec![
+            FakeAnalyzer::ok("first", vec![heur, sigma, other]),
+            FakeAnalyzer::ok("second", vec![merged]),
+        ];
+        let out = run_analyzers(&[proc_rec()], &analyzers);
+        let ids: Vec<uuid::Uuid> = out.findings.iter().map(|f| f.id).collect();
+        assert!(
+            !ids.contains(&heur_id),
+            "superseded heuristic must be dropped"
+        );
+        assert!(ids.contains(&sigma_id), "a Sigma finding is never dropped");
+        assert!(ids.contains(&other_id) && ids.contains(&merged_id));
+        assert_eq!(ids.len(), 3);
+        // Never serialized: the finding schema is unchanged.
+        let json = serde_json::to_string(&out.findings[2]).unwrap();
+        assert!(!json.contains("supersedes"), "{json}");
     }
 
     #[test]
