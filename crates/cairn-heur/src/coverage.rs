@@ -54,7 +54,7 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1021",
         "Remote Services",
-        "Security 4648 logon with another account's credentials to another host",
+        "Security 4648 logon with another account's credentials to another host (TargetServerName, or IpAddress when the server is logged as this computer)",
         "heur_lateral",
     ),
     c(
@@ -150,14 +150,14 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1110.001",
         "Password Guessing",
-        "Security 4625/4771/4776 guessing failures against one account",
+        "Security 4625/4768/4771/4776 guessing failures against one account",
         "heur_logon_bruteforce",
     ),
     c(
         "T1110.003",
         "Password Spraying",
-        "Security 4625/4771/4776 failures across many accounts from one source",
-        "heur_logon_bruteforce",
+        "Security 4625/4768/4771/4776 failures across many accounts from one source; 4648 explicit credentials of 5+ accounts against one server",
+        "heur_logon_bruteforce, heur_lateral",
     ),
     c(
         "T1133",
@@ -240,7 +240,7 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1543.003",
         "Windows Service",
-        "auto-start services' ImagePath + signature; System 7045 service installed",
+        "auto-start services' ImagePath + signature; System 7045 service installed (exe directly in the Windows folder: Medium)",
         "heur_persist, heur_eventlog",
     ),
     c(
@@ -370,9 +370,15 @@ pub const BUILTIN: &[Coverage] = &[
         "heur_eventlog, heur_defense",
     ),
     c(
+        "T1562.002",
+        "Disable Windows Event Logging",
+        "System 7040 Windows Event Log service set to disabled",
+        "heur_eventlog",
+    ),
+    c(
         "T1569.002",
         "Service Execution",
-        "services.exe -> cmd.exe writing to \\\\127.0.0.1\\ADMIN$, PSEXESVC (PsExec / Impacket); 7045 remote-exec services tied to the preceding remote logon",
+        "services.exe -> cmd.exe writing to \\\\127.0.0.1\\ADMIN$, PSEXESVC (PsExec / Impacket); 7045 remote-exec services (PSEXESVC, ADMIN$ / cmd /c / Windows-root exe) tied to the preceding remote logon",
         "heur_parentchild, heur_lateral",
     ),
 ];
