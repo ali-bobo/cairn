@@ -383,7 +383,7 @@ fn service_installed(ev: &EventRecord) -> Option<Finding> {
 }
 
 /// Observation category of a 7045 install kept as inventory (see [`assess_service`]).
-pub const OBS_SERVICE_INSTALL: &str = "service_install";
+pub const OBS_SERVICE_INSTALL: &str = cairn_core::observation::CATEGORY_SERVICE_INSTALL;
 
 /// The inventory side of [`service_installed`]: a 7045 with no red flag from an
 /// admin-only folder.

@@ -60,7 +60,7 @@ const EXPECTED_ORIGINAL_NAMES: &[(&str, &[&str])] = &[
 ];
 
 /// Observation category for logging / visibility gaps.
-pub const OBS_CATEGORY: &str = "logging_posture";
+pub const OBS_CATEGORY: &str = cairn_core::observation::CATEGORY_LOGGING_POSTURE;
 
 /// Defender, TaskCache and accessibility-binary checks over the posture snapshot.
 pub struct DefenseHeuristic;

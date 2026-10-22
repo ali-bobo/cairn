@@ -855,7 +855,7 @@ pub fn html_report(
                 .collect();
             groups.push_str(&format!(
                 "<h3>{} ({})</h3><table><tr><th>項目</th><th>路徑</th><th>詳細</th></tr>{}</table>",
-                esc(cat),
+                esc(&crate::client_text::observation_category_label(cat)),
                 items.len(),
                 rows
             ));
