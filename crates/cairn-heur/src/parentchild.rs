@@ -353,8 +353,9 @@ impl Analyzer for ParentChildHeuristic {
     fn analyze(&self, records: &[Record], _prior_findings: &[Finding]) -> Result<Vec<Finding>> {
         // Index processes by pid for parent lookup. Known limitation: if a snapshot
         // contains two processes with the same pid (OS pid reuse), the last one wins;
-        // a live triage snapshot almost never reuses pids, so this only affects parent
-        // attribution accuracy, never correctness/panics.
+        // a live triage snapshot almost never reuses pids. The more common reuse case
+        // (the real parent exited and a newer process took its pid) is rejected by
+        // `is_plausible_parent` using start times.
         let by_pid: HashMap<u32, &ProcessRecord> = records
             .iter()
             .filter_map(|r| match r {
@@ -370,7 +371,10 @@ impl Analyzer for ParentChildHeuristic {
             if p.pid == own_pid {
                 continue; // never flag the forensic tool itself
             }
-            let parent = by_pid.get(&p.ppid).copied();
+            let parent = by_pid
+                .get(&p.ppid)
+                .copied()
+                .filter(|parent| is_plausible_parent(parent, p));
             let verdict = evaluate(p, parent);
             let score = &verdict.score;
             let Some(severity) = severity_for(score.weight) else {
@@ -410,6 +414,21 @@ impl Analyzer for ParentChildHeuristic {
 }
 
 /// A short title for a flagged process.
+/// The process now holding `child.ppid` can only be the parent if it started no later
+/// than the child. Windows reuses PIDs: when the real parent has exited, an unrelated
+/// newer process (often WINWORD.EXE or a browser) may hold that PID, and pairing it
+/// with an old child fabricates an "Office spawned a shell" chain. With either start
+/// time unknown the pairing is kept, as before.
+fn is_plausible_parent(parent: &ProcessRecord, child: &ProcessRecord) -> bool {
+    if parent.pid == child.pid {
+        return false;
+    }
+    match (parent.start_time, child.start_time) {
+        (Some(ps), Some(cs)) => ps <= cs,
+        _ => true,
+    }
+}
+
 fn suspicious_title(p: &ProcessRecord) -> String {
     let name = file_name(&p.image);
     format!("Suspicious process: {name}")
@@ -775,6 +794,25 @@ mod tests {
         let f = &findings[0];
         assert_eq!(f.severity, cairn_core::Severity::Critical);
         assert!(f.mitre.contains(&"T1036.005".to_string()));
+    }
+
+    #[test]
+    fn reused_parent_pid_started_after_the_child_is_ignored() {
+        let t0: chrono::DateTime<chrono::Utc> = "2026-10-20T08:00:00Z".parse().unwrap();
+        let mut child = proc(
+            200,
+            100,
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            "powershell.exe -NoProfile -File C:\\scripts\\inventory.ps1",
+        );
+        child.start_time = Some(t0);
+        // PID 100 was the logon script host, long gone; Word now holds the PID.
+        let mut word = proc(100, 4, r"C:\Program Files\Microsoft Office\WINWORD.EXE", "");
+        word.start_time = Some(t0 + chrono::Duration::hours(3));
+        assert!(analyze_pair(word.clone(), child.clone()).is_empty());
+        // The genuine pairing (Word started first) still fires.
+        word.start_time = Some(t0 - chrono::Duration::minutes(1));
+        assert!(!analyze_pair(word, child).is_empty());
     }
 
     fn analyze_pair(parent: ProcessRecord, child: ProcessRecord) -> Vec<Finding> {
