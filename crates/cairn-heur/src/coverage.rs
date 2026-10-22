@@ -36,7 +36,7 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1003.001",
         "OS Credential Dumping: LSASS Memory",
-        "minidumps in drop zones, WER LocalDumps for lsass.exe, comsvcs MiniDump / ProcDump / Mimikatz command lines",
+        "minidumps in drop zones, WER LocalDumps for lsass.exe, comsvcs MiniDump / ProcDump / Mimikatz command lines (live, 4688, Sysmon 1)",
         "heur_cred_dump",
     ),
     c(
@@ -66,7 +66,7 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1021.002",
         "SMB/Windows Admin Shares",
-        "inbound SMB (local port 445) from a public IP; loopback ADMIN$ output of wmiexec/smbexec; remote ADMIN$/C$ access (5140/5145)",
+        "inbound SMB (local port 445) from a public IP; Impacket wmiexec / dcomexec / smbexec output redirected to \\\\127.0.0.1\\ADMIN$\\__ or C$\\__output under any parent (live, 4688, Sysmon 1); remote ADMIN$/C$ access (5140/5145)",
         "heur_netconn, heur_parentchild, heur_lateral",
     ),
     c(
@@ -80,6 +80,12 @@ pub const BUILTIN: &[Coverage] = &[
         "Masquerading",
         "unsigned binaries in user-writable paths behind persistence or network connections",
         "heur_persist, heur_netconn",
+    ),
+    c(
+        "T1036.003",
+        "Rename System Utilities",
+        "Sysmon 1 OriginalFileName of a shell / script host / LOLBin under another file name",
+        "heur_parentchild",
     ),
     c(
         "T1036.005",
@@ -96,7 +102,7 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1047",
         "Windows Management Instrumentation",
-        "wmiprvse.exe spawning cmd/PowerShell (wmiexec output to ADMIN$ escalates); WMI-Activity 5860 temporary consumers (not local system agents), 5857 providers loaded from user-writable paths",
+        "wmiprvse.exe spawning cmd/PowerShell (wmiexec output to ADMIN$ escalates) or another program outside Program Files / SCCM (not WerFault, wmiadap, msiexec /i), in live processes, 4688 (parent by pid on Windows 7) and Sysmon 1; WMI-Activity 5860 temporary consumers (not local system agents), 5857 providers loaded from user-writable paths",
         "heur_parentchild, heur_lateral",
     ),
     c(
@@ -108,13 +114,13 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1059",
         "Command and Scripting Interpreter",
-        "Office apps / script hosts spawning shells; persistence launching interpreters",
+        "Office apps (Word, Excel, PowerPoint, Outlook, OneNote, Access, Publisher, Visio) / script hosts spawning shells (live, 4688, Sysmon 1); persistence launching interpreters",
         "heur_persist, heur_parentchild",
     ),
     c(
         "T1059.001",
         "PowerShell",
-        "encoded / download-cradle PowerShell command lines",
+        "encoded / download-cradle PowerShell command lines; services.exe starting PowerShell (psexec_psh stagers)",
         "heur_parentchild",
     ),
     c(
@@ -228,7 +234,7 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1505.003",
         "Web Shell",
-        "w3wp/sqlservr/httpd/nginx/Tomcat spawning cmd, PowerShell or whoami",
+        "w3wp/sqlservr/httpd/nginx/Tomcat spawning cmd, PowerShell or whoami (live, 4688, Sysmon 1)",
         "heur_parentchild",
     ),
     c(
@@ -378,7 +384,7 @@ pub const BUILTIN: &[Coverage] = &[
     c(
         "T1569.002",
         "Service Execution",
-        "services.exe -> cmd.exe writing to \\\\127.0.0.1\\ADMIN$, PSEXESVC (PsExec / Impacket); 7045 remote-exec services (PSEXESVC, ADMIN$ / cmd /c / Windows-root exe) tied to the preceding remote logon",
+        "services.exe -> cmd.exe writing to \\\\127.0.0.1\\ADMIN$, PSEXESVC (PsExec / Impacket), services.exe -> PowerShell (live, 4688, Sysmon 1); 7045 remote-exec services (PSEXESVC, ADMIN$ / cmd /c / Windows-root exe) tied to the preceding remote logon",
         "heur_parentchild, heur_lateral",
     ),
 ];
@@ -417,6 +423,28 @@ mod tests {
             assert!(
                 row.is_some_and(|c| c.analyzer.contains("heur_lateral")),
                 "{t} missing or not attributed to heur_lateral"
+            );
+        }
+    }
+
+    /// The techniques heur_parentchild tags from live processes and event-log process
+    /// starts are each listed with heur_parentchild as an analyzer.
+    #[test]
+    fn parentchild_techniques_are_listed() {
+        for t in [
+            "T1021.002",
+            "T1036.003",
+            "T1036.005",
+            "T1047",
+            "T1059",
+            "T1059.001",
+            "T1505.003",
+            "T1569.002",
+        ] {
+            let row = BUILTIN.iter().find(|c| c.technique == t);
+            assert!(
+                row.is_some_and(|c| c.analyzer.contains("heur_parentchild")),
+                "{t} missing or not attributed to heur_parentchild"
             );
         }
     }
