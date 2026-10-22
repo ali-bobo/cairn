@@ -240,8 +240,9 @@ impl Collector for EvtxLiveCollector {
         let reg = crate::asep::WinReg;
         #[cfg(not(windows))]
         let reg = NoReg;
+        // The channel's File value is registry data: never follow it to a share/device.
         let files = resolve_channel_files(&self.channels, &reg, &system_root, &lookup, |p| {
-            Path::new(p).is_file()
+            !cairn_core::paths::must_not_probe(p) && Path::new(p).is_file()
         });
         let mut entries = Vec::new();
         let records = collect_files(&files, self.since, &mut entries);

@@ -239,14 +239,20 @@ mod win {
         CMSG_SIGNER_CERT_INFO_PARAM, HCERTSTORE, PKCS_7_ASN_ENCODING, X509_ASN_ENCODING,
     };
     use windows::Win32::Security::WinTrust::{
-        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
-        WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE, WTD_STATEACTION_VERIFY,
-        WTD_UI_NONE,
+        WinVerifyTrust, WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA,
+        WINTRUST_DATA_PROVIDER_FLAGS, WINTRUST_FILE_INFO, WTD_CACHE_ONLY_URL_RETRIEVAL,
+        WTD_CHOICE_FILE, WTD_REVOCATION_CHECK_NONE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
+        WTD_STATEACTION_VERIFY, WTD_UI_NONE,
     };
     use windows::Win32::Security::WinTrust::{WINTRUST_CATALOG_INFO, WTD_CHOICE_CATALOG};
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING,
     };
+
+    /// Provider flags for every WinVerifyTrust call: cached URL retrieval only and no
+    /// revocation check, so verification never reaches the network.
+    const NO_NETWORK_PROV_FLAGS: WINTRUST_DATA_PROVIDER_FLAGS =
+        WINTRUST_DATA_PROVIDER_FLAGS(WTD_CACHE_ONLY_URL_RETRIEVAL.0 | WTD_REVOCATION_CHECK_NONE.0);
 
     /// Encode a path to a NUL-terminated wide string (UTF-16).
     fn wide_nul(path: &str) -> Vec<u16> {
@@ -256,9 +262,15 @@ mod win {
             .collect()
     }
 
-    /// Existing, non-empty path as a NUL-terminated wide string; None otherwise.
+    /// Existing, non-empty, LOCAL path as a NUL-terminated wide string; None otherwise.
+    /// A remote (UNC / network-share) path is never opened: probing it would make an
+    /// SMB connection, which can stall for minutes and would send this host's
+    /// credentials to whatever server a hostile persistence entry names.
     fn checkable(path: &str) -> Option<Vec<u16>> {
-        if path.is_empty() || !std::path::Path::new(path).exists() {
+        if path.is_empty()
+            || cairn_core::paths::is_remote_path(path)
+            || !std::path::Path::new(path).exists()
+        {
             return None;
         }
         Some(wide_nul(path))
@@ -318,6 +330,9 @@ mod win {
             cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
             dwUIChoice: WTD_UI_NONE,
             fdwRevocationChecks: WTD_REVOKE_NONE,
+            // Never go to the network (AIA / CRL fetch): no outbound traffic from a
+            // triage tool, and no multi-minute stall on a host with dead DNS.
+            dwProvFlags: NO_NETWORK_PROV_FLAGS,
             dwUnionChoice: WTD_CHOICE_FILE,
             dwStateAction: WTD_STATEACTION_VERIFY,
             ..Default::default()
@@ -506,6 +521,9 @@ mod win {
             cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
             dwUIChoice: WTD_UI_NONE,
             fdwRevocationChecks: WTD_REVOKE_NONE,
+            // Never go to the network (AIA / CRL fetch): no outbound traffic from a
+            // triage tool, and no multi-minute stall on a host with dead DNS.
+            dwProvFlags: NO_NETWORK_PROV_FLAGS,
             dwUnionChoice: WTD_CHOICE_CATALOG,
             dwStateAction: WTD_STATEACTION_VERIFY,
             ..Default::default()

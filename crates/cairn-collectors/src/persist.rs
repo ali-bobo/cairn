@@ -539,7 +539,7 @@ fn make_record(
     last_write: Option<DateTime<Utc>>,
 ) -> PersistenceRecord {
     make_record_with_exists(mechanism, location, value, command, last_write, |p| {
-        std::path::Path::new(p).exists()
+        crate::local_path_exists(p)
     })
 }
 
@@ -959,7 +959,7 @@ mod win {
                     &file_name,
                     last_write,
                     |name| std::env::var(name).ok(),
-                    |p| std::path::Path::new(p).exists(),
+                    crate::local_path_exists,
                 ));
             }
         }
@@ -984,7 +984,7 @@ fn read_extended_aseps() -> Vec<PersistenceRecord> {
     out.extend(crate::asep::read_ps_profiles(
         &crate::asep::ps_profile_paths(|name| std::env::var(name).ok(), &user_profile_dirs()),
     ));
-    fill_command_binary_paths(&mut out, |p| std::path::Path::new(p).exists());
+    fill_command_binary_paths(&mut out, crate::local_path_exists);
     out
 }
 
@@ -1045,7 +1045,7 @@ fn resolve_relative_binary_paths_with(
 /// Process-env wrapper: %SystemRoot% with the conventional fallback.
 fn resolve_relative_binary_paths(records: &mut [PersistenceRecord]) {
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    resolve_relative_binary_paths_with(records, &sysroot, |p| std::path::Path::new(p).exists());
+    resolve_relative_binary_paths_with(records, &sysroot, crate::local_path_exists);
 }
 
 /// Fill each record's `signed` from the verifier, for records that have a binary_path.

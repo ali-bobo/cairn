@@ -25,6 +25,7 @@ pub mod finding;
 pub mod manifest;
 pub mod observation;
 pub mod orchestrator;
+pub mod paths;
 pub mod record;
 pub mod selection;
 pub mod time;
