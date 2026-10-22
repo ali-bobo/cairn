@@ -45,7 +45,7 @@ fn relabel(e: cairn_core::CairnError) -> cairn_core::CairnError {
 
 #[cfg(windows)]
 mod win {
-    use crate::wmi::win::{init_com, query_all};
+    use crate::wmi::win::{init_com, query_all, CONNECT_FLAGS};
     use crate::wmi::wmi_error;
     use cairn_core::Result;
     use windows::core::{BSTR, GUID};
@@ -67,9 +67,18 @@ mod win {
         let empty = BSTR::new();
         // SAFETY: locator is a valid IWbemLocator; empty BSTRs are the documented
         // "use defaults" for user/password/locale/authority; None for pctx.
-        let services: IWbemServices =
-            unsafe { locator.ConnectServer(&namespace, &empty, &empty, &empty, 0, &empty, None) }
-                .map_err(|e| wmi_error(r"ConnectServer(root\cimv2)", e.code().0))?;
+        let services: IWbemServices = unsafe {
+            locator.ConnectServer(
+                &namespace,
+                &empty,
+                &empty,
+                &empty,
+                CONNECT_FLAGS,
+                &empty,
+                None,
+            )
+        }
+        .map_err(|e| wmi_error(r"ConnectServer(root\cimv2)", e.code().0))?;
 
         let objects = query_all(&services, "SELECT ID FROM Win32_ShadowCopy")?;
         Ok(u32::try_from(objects.len()).unwrap_or(u32::MAX))

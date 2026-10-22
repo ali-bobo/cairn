@@ -226,6 +226,7 @@ name = "cairn-launcher"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "cairn-collectors-win",
  "cairn-core",
  "cairn-sigma",
  "chrono",

@@ -510,7 +510,11 @@ pub fn original_filename(bytes: &[u8]) -> Option<String> {
             .map_while(|i| u16_at(bytes, start + 2 * i))
             .take_while(|u| *u != 0)
             .collect();
-        let s = String::from_utf16(&units).ok()?;
+        // A malformed (lone-surrogate) candidate is skipped, not fatal: a decoy string
+        // placed before the real version resource must not hide it.
+        let Ok(s) = String::from_utf16(&units) else {
+            continue;
+        };
         let s = s.trim();
         if !s.is_empty() {
             return Some(s.to_string());
@@ -834,6 +838,41 @@ mod tests {
         let mut cut = version_string("sethc.exe");
         cut.truncate(cut.len() - 20);
         assert_eq!(original_filename(&cut), None);
+    }
+
+    /// A decoy OriginalFilename with invalid UTF-16 does not hide the real one, and
+    /// random / mutated / truncated version blobs never panic.
+    #[test]
+    fn original_filename_survives_decoys_and_fuzz() {
+        let mut decoy = version_string("x");
+        // Overwrite the value's first code unit with a lone high surrogate.
+        let n = decoy.len();
+        decoy[n - 4..n - 2].copy_from_slice(&0xD800u16.to_le_bytes());
+        let mut bytes = b"MZ".to_vec();
+        bytes.extend(&decoy);
+        bytes.extend(version_string("sethc.exe"));
+        assert_eq!(original_filename(&bytes).as_deref(), Some("sethc.exe"));
+
+        let mut rng = cairn_core::fuzz::Rng::new(0x0F11E);
+        let seed = {
+            let mut b = b"MZ....".to_vec();
+            b.extend(version_string("cmd.exe"));
+            b
+        };
+        let key = utf16z("OriginalFilename");
+        for i in 0..3000 {
+            let input = match i % 3 {
+                0 => rng.mutate(&seed),
+                1 => rng.bytes(300),
+                _ => {
+                    let mut v = rng.bytes(8);
+                    v.extend_from_slice(&key);
+                    v.extend(rng.bytes(12));
+                    v
+                }
+            };
+            let _ = original_filename(&input);
+        }
     }
 
     #[test]

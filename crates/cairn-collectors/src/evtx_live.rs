@@ -145,6 +145,77 @@ pub(crate) fn resolve_channel_files(
     out
 }
 
+/// Most in-window events kept per channel (NFR10). A busy domain controller's
+/// enlarged Security log can hold millions of events in 30 days; each normalized event
+/// costs about a kilobyte or more, so an uncapped read could exhaust memory and lose the
+/// whole run. Past the cap the OLDEST are dropped (the newest are kept) and the cap is
+/// recorded in the manifest; the exported evidence/evtx copy still has everything.
+pub const MAX_EVENTS_PER_CHANNEL: usize = 500_000;
+
+/// How one capped stream ended.
+#[derive(Debug)]
+pub(crate) enum StreamOutcome {
+    Done {
+        stats: crate::evtx::StreamStats,
+        /// Events dropped (oldest first) because of the cap.
+        dropped: u64,
+    },
+    Failed(String),
+    /// The parser panicked mid-file (a malformed or hostile log). The events read
+    /// before the panic are returned; the other files still get read.
+    Panicked {
+        msg: String,
+        kept: usize,
+    },
+}
+
+/// Run `stream` over `path`, keeping at most `cap` events (the newest), and contain a
+/// parser panic to this one file. `stream` is injected so the cap and the panic
+/// containment are testable without crafting an EVTX file.
+pub(crate) fn stream_capped<F>(
+    path: &Path,
+    since: DateTime<Utc>,
+    cap: usize,
+    stream: F,
+) -> (Vec<cairn_core::record::EventRecord>, StreamOutcome)
+where
+    F: FnOnce(
+        &Path,
+        DateTime<Utc>,
+        &mut dyn FnMut(cairn_core::record::EventRecord),
+    ) -> std::result::Result<crate::evtx::StreamStats, String>,
+{
+    let mut ring = std::collections::VecDeque::new();
+    let mut dropped = 0u64;
+    let result = {
+        let mut sink = |ev| {
+            ring.push_back(ev);
+            if ring.len() > cap {
+                ring.pop_front();
+                dropped += 1;
+            }
+        };
+        // AssertUnwindSafe: on a panic only `ring` / `dropped` are observed afterwards,
+        // and every element in `ring` is a complete record pushed before the panic.
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            stream(path, since, &mut sink)
+        }))
+    };
+    let outcome = match result {
+        Ok(Ok(stats)) => StreamOutcome::Done { stats, dropped },
+        Ok(Err(e)) => StreamOutcome::Failed(e),
+        Err(p) => StreamOutcome::Panicked {
+            msg: p
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".into()),
+            kept: ring.len(),
+        },
+    };
+    (ring.into(), outcome)
+}
+
 /// Stream every resolved file, keeping events at or after `since`; one SourceEntry
 /// per file (with sha256 + byte count of the hash pass, or the error).
 pub(crate) fn collect_files(
@@ -165,21 +236,38 @@ pub(crate) fn collect_files(
                 )
             }
         };
-        match crate::evtx::stream_evtx(path, Some(since), |ev| records.push(Record::Event(ev))) {
-            Ok(stats) => {
+        let (kept, outcome) = stream_capped(path, since, MAX_EVENTS_PER_CHANNEL, |p, s, sink| {
+            crate::evtx::stream_evtx(p, Some(s), sink).map_err(|e| e.to_string())
+        });
+        match outcome {
+            StreamOutcome::Done { stats, dropped } => {
                 tracing::info!(
                     channel = %channel,
                     events = stats.kept,
                     skipped_old = stats.skipped_old,
                     failed = stats.failed,
+                    dropped,
                     "evtx_live: parsed"
                 );
+                if dropped > 0 {
+                    errors.push(format!(
+                        "capped: {} events in the window, only the newest {} kept",
+                        stats.kept, MAX_EVENTS_PER_CHANNEL
+                    ));
+                }
             }
-            Err(e) => {
+            StreamOutcome::Failed(e) => {
                 tracing::warn!(file = %path.display(), error = %e, "evtx_live: parse failed; skipping");
-                errors.push(e.to_string());
+                errors.push(e);
+            }
+            StreamOutcome::Panicked { msg, kept } => {
+                tracing::error!(file = %path.display(), error = %msg, "evtx_live: parser panicked");
+                errors.push(format!(
+                    "parser panicked after {kept} events ({msg}); the events read before it are kept"
+                ));
             }
         }
+        records.extend(kept.into_iter().map(Record::Event));
         source_entries.push(SourceEntry {
             collector: String::new(),
             artifact: format!("evtx_live:{channel}"),
@@ -240,8 +328,9 @@ impl Collector for EvtxLiveCollector {
         let reg = crate::asep::WinReg;
         #[cfg(not(windows))]
         let reg = NoReg;
+        // The channel's File value is registry data: never follow it to a share/device.
         let files = resolve_channel_files(&self.channels, &reg, &system_root, &lookup, |p| {
-            Path::new(p).is_file()
+            !cairn_core::paths::must_not_probe(p) && Path::new(p).is_file()
         });
         let mut entries = Vec::new();
         let records = collect_files(&files, self.since, &mut entries);
@@ -263,6 +352,95 @@ mod tests {
     use cairn_core::traits::CollectCtx;
     use chrono::TimeZone;
     use std::collections::HashMap;
+
+    fn ev(id: u64) -> cairn_core::record::EventRecord {
+        cairn_core::record::EventRecord {
+            ts: chrono::DateTime::UNIX_EPOCH,
+            channel: "Security".into(),
+            event_id: 4624,
+            provider: String::new(),
+            computer: String::new(),
+            record_id: id,
+            data: serde_json::Map::new(),
+        }
+    }
+
+    /// Past the cap the oldest events are dropped and the count of drops is reported.
+    #[test]
+    fn stream_capped_keeps_the_newest() {
+        let (kept, out) = stream_capped(
+            Path::new("x"),
+            chrono::DateTime::UNIX_EPOCH,
+            3,
+            |_, _, sink| {
+                for i in 1..=10 {
+                    sink(ev(i));
+                }
+                Ok(crate::evtx::StreamStats {
+                    kept: 10,
+                    ..Default::default()
+                })
+            },
+        );
+        let ids: Vec<u64> = kept.iter().map(|e| e.record_id).collect();
+        assert_eq!(ids, vec![8, 9, 10]);
+        assert!(
+            matches!(out, StreamOutcome::Done { dropped: 7, .. }),
+            "{out:?}"
+        );
+    }
+
+    /// A parser panic is contained to its file: the events before it survive.
+    #[test]
+    fn stream_capped_contains_a_parser_panic() {
+        let (kept, out) = stream_capped(
+            Path::new("x"),
+            chrono::DateTime::UNIX_EPOCH,
+            100,
+            |_, _, sink| {
+                sink(ev(1));
+                sink(ev(2));
+                panic!("corrupt chunk");
+            },
+        );
+        assert_eq!(kept.len(), 2);
+        match out {
+            StreamOutcome::Panicked { msg, kept } => {
+                assert_eq!(msg, "corrupt chunk");
+                assert_eq!(kept, 2);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A garbage .evtx (random bytes after a valid-looking magic) is an error or a
+    /// skipped file, never a panic that escapes `stream_capped`.
+    #[test]
+    fn garbage_evtx_files_never_escape() {
+        let dir = std::env::temp_dir().join(format!("cairn_evtx_garbage_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("x.evtx");
+        let mut rng = cairn_core::fuzz::Rng::new(0xE7);
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/sysmon_compiledhtml.evtx");
+        let seed = std::fs::read(&fixture).unwrap_or_else(|_| b"ElfFile\0".to_vec());
+        for i in 0..40 {
+            let body = if i % 2 == 0 {
+                rng.mutate(&seed)
+            } else {
+                let mut b = b"ElfFile\0".to_vec();
+                b.extend(rng.bytes(5000));
+                b
+            };
+            std::fs::write(&p, &body).unwrap();
+            let files = vec![("Security".to_string(), p.clone())];
+            let mut sources = Vec::new();
+            let _ = collect_files(&files, chrono::DateTime::UNIX_EPOCH, &mut sources);
+            assert_eq!(sources.len(), 1);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// HKLM-only fake: lowercased key -> File value.
     #[derive(Default)]

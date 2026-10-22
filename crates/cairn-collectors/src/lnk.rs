@@ -151,8 +151,12 @@ pub fn parse_lnk(b: &[u8]) -> Option<LnkInfo> {
     let read_string = |pos: &mut usize| -> Option<String> {
         let count = rd_u16(b, *pos)? as usize;
         let len = if unicode { count * 2 } else { count };
-        let raw = b.get(*pos + 2..*pos + 2 + len)?;
-        *pos += 2 + len;
+        // Checked: `pos` grows by attacker-chosen u32 sizes (saturating), so plain
+        // `+` could overflow on a 32-bit target.
+        let start = pos.checked_add(2)?;
+        let end = start.checked_add(len)?;
+        let raw = b.get(start..end)?;
+        *pos = end;
         Some(if unicode {
             let units: Vec<u16> = raw
                 .chunks_exact(2)
@@ -191,12 +195,14 @@ pub fn parse_lnk(b: &[u8]) -> Option<LnkInfo> {
         if size < 8 || guard > 64 {
             break; // TerminalBlock (size < 4) or nonsense
         }
-        if rd_u32(b, pos + 4) == Some(ENV_BLOCK_SIG) {
+        let at = |off: usize, len: usize| {
+            let start = pos.checked_add(off)?;
+            b.get(start..start.checked_add(len)?)
+        };
+        if pos.checked_add(4).and_then(|o| rd_u32(b, o)) == Some(ENV_BLOCK_SIG) {
             // TargetAnsi: 260 bytes at +8; TargetUnicode: 520 bytes at +268.
-            let uni = b
-                .get(pos + 268..pos + 268 + 520)
-                .and_then(|s| cstr_utf16(s, 0));
-            let ansi = b.get(pos + 8..pos + 8 + 260).and_then(|s| cstr_ansi(s, 0));
+            let uni = at(268, 520).and_then(|s| cstr_utf16(s, 0));
+            let ansi = at(8, 260).and_then(|s| cstr_ansi(s, 0));
             info.env_target = non_empty(uni).or_else(|| non_empty(ansi));
         }
         pos = pos.saturating_add(size as usize);
@@ -379,6 +385,28 @@ pub(crate) mod tests {
         b.extend(string_data(args, true));
         b.extend_from_slice(&0u32.to_le_bytes()); // TerminalBlock
         b
+    }
+
+    /// Mutated, truncated and random shortcuts (huge sizes and offsets in every
+    /// field) never panic; neither does resolving a hostile relative path.
+    #[test]
+    fn fuzzed_lnk_never_panics() {
+        let mut rng = cairn_core::fuzz::Rng::new(0x1A4C);
+        let seed = sample_lnk(r"C:\Users\Public\evil.exe", "-enc AAAA");
+        let mut hdr_only = header(0xFFFF_FFFF);
+        hdr_only.extend(rng.bytes(64));
+        for i in 0..5000 {
+            let input = match i % 3 {
+                0 => rng.mutate(&seed),
+                1 => rng.mutate(&hdr_only),
+                _ => rng.bytes(200),
+            };
+            if let Some(info) = parse_lnk(&input) {
+                let _ = info.target(r"C:\Users\x\Startup");
+            }
+            let rel = rng.text(10, &["..", "\\", "C:", "\\\\"]);
+            let _ = resolve_relative(&rng.text(4, &["\\\\", "C:\\"]), &rel);
+        }
     }
 
     #[test]

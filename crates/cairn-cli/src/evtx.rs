@@ -4,7 +4,7 @@
 use crate::output::{self, BUILD_SHA};
 use crate::registry::{self, Mode};
 use cairn_core::traits::OutputSink;
-use cairn_core::{Config, OutputKind, Target};
+use cairn_core::{Config, OutputKind, SourceEntry, Target};
 use cairn_report::{client_text, DirSink};
 use std::path::PathBuf;
 
@@ -36,9 +36,25 @@ fn output_dir(cfg: &Config) -> PathBuf {
     }
 }
 
+/// Manifest entry for an input file that could not be read completely (graceful
+/// degrade is recorded, not only logged). No sha256: the entry records the failure,
+/// it does not vouch for the file's bytes.
+fn input_failure_entry(path: &std::path::Path, errors: Vec<String>) -> SourceEntry {
+    SourceEntry {
+        collector: "evtx".into(),
+        artifact: "evtx".into(),
+        path: path.display().to_string(),
+        method: "file".into(),
+        size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        sha256: String::new(),
+        errors,
+    }
+}
+
 /// Parse every input file and run the event-only analyzer set (plus Sigma) over the
 /// records: `(records, hostname, analysis)`, findings stamped with the host and sorted.
-/// A file that fails to parse is logged and skipped, never fatal (golden rule 8).
+/// A file that fails to parse is logged, recorded first in `analysis.errors` (it becomes
+/// a manifest source) and skipped, never fatal (golden rule 8).
 pub(crate) fn analyze(
     cfg: &Config,
 ) -> (
@@ -51,15 +67,14 @@ pub(crate) fn analyze(
         _ => &[],
     };
     let mut events = Vec::new();
+    let mut input_errors = Vec::new();
     for path in files {
-        match cairn_collectors::evtx::parse_evtx(path) {
-            Ok(recs) => {
-                tracing::info!(file = %path.display(), records = recs.len(), "parsed evtx");
-                events.extend(recs);
-            }
-            Err(e) => {
-                tracing::warn!(file = %path.display(), error = %e, "skipped (parse failed)");
-            }
+        let (recs, errors) = cairn_collectors::evtx::parse_evtx_contained(path);
+        tracing::info!(file = %path.display(), records = recs.len(), "parsed evtx");
+        events.extend(recs);
+        if !errors.is_empty() {
+            tracing::warn!(file = %path.display(), errors = ?errors, "evtx input incomplete");
+            input_errors.push(input_failure_entry(path, errors));
         }
     }
     tracing::info!(records = events.len(), "evtx parse complete");
@@ -73,6 +88,8 @@ pub(crate) fn analyze(
     // Built-in event-log heuristics run with or without Sigma rules.
     let analyzers = registry::analyzers(cfg, Mode::Evtx, output::load_sigma(cfg));
     let mut analysis = cairn_core::orchestrator::run_analyzers(&records, &analyzers);
+    input_errors.append(&mut analysis.errors);
+    analysis.errors = input_errors;
     for f in &mut analysis.findings {
         f.host = hostname.clone();
     }
@@ -144,6 +161,19 @@ mod tests {
         assert!(line.contains("2 file(s)"), "{line}");
         assert!(line.contains("rules=./rules"), "{line}");
         assert!(line.contains("output="), "{line}");
+    }
+
+    /// An unreadable input is recorded for the manifest with its reason, no hash.
+    #[test]
+    fn unreadable_input_becomes_a_manifest_source_with_errors() {
+        let p = PathBuf::from("/definitely/missing/Security.evtx");
+        let (evs, errs) = cairn_collectors::evtx::parse_evtx_contained(&p);
+        assert!(evs.is_empty());
+        let e = input_failure_entry(&p, errs);
+        assert_eq!(e.collector, "evtx");
+        assert!(e.path.ends_with("Security.evtx"));
+        assert!(!e.errors.is_empty());
+        assert!(e.sha256.is_empty(), "verify must not try to re-hash it");
     }
 
     #[test]

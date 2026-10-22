@@ -35,6 +35,29 @@ fn output_kind(args: &RunArgs) -> OutputKind {
     }
 }
 
+/// A warning when `output` (as given, resolved against the current directory) is on
+/// the same volume as `system_root` (%SystemRoot%): evidence would then be written
+/// onto the disk under investigation, overwriting free space that may still hold
+/// deleted artifacts (golden rule 4: output defaults off-target). None when the
+/// output is elsewhere or the system root is unknown (not Windows).
+fn system_drive_warning(output: &Path, system_root: Option<&str>) -> Option<String> {
+    let system_root = system_root?;
+    // Only a relative path is resolved (on Windows it then gains the current drive).
+    let resolved = match cairn_core::paths::volume_of(&output.display().to_string()) {
+        Some(_) => output.to_path_buf(),
+        None => std::path::absolute(output).unwrap_or_else(|_| output.to_path_buf()),
+    };
+    cairn_core::paths::on_system_drive(&resolved, system_root).then(|| {
+        format!(
+            "output {} is on the system drive {}: evidence is being written to the disk \
+             under investigation and may overwrite deleted-file remnants; prefer an \
+             external or network destination",
+            resolved.display(),
+            cairn_core::paths::volume_of(system_root).unwrap_or_default()
+        )
+    })
+}
+
 /// The run Config from the CLI flags. No --rules: use the bundled rules next to the
 /// binary (or under the current directory) so a plain `cairn run` still runs Sigma.
 fn build_config(args: &RunArgs, profile: Profile) -> anyhow::Result<Config> {
@@ -45,6 +68,7 @@ fn build_config(args: &RunArgs, profile: Profile) -> anyhow::Result<Config> {
     };
     cfg.rules_dir = args.rules.clone().or_else(output::default_rules_dir);
     cfg.case_id = args.case_id.clone().unwrap_or_default();
+    cfg.collector_timeout_secs = args.collector_timeout;
     cfg.operator = args.operator.clone().unwrap_or_default();
     // Resource governance (NFR9/NFR10): `run` only triages the live host.
     cfg.governance.low_priority =
@@ -134,7 +158,7 @@ fn collect_then_analyze(
     cfg: &Config,
     privileges: cairn_core::manifest::Privileges,
     hostname: String,
-    collectors: &[Box<dyn Collector>],
+    collectors: Vec<Box<dyn Collector>>,
     analyzers: &[Box<dyn Analyzer>],
     hash_fn: impl Fn(&str) -> Option<String> + Copy,
 ) -> RunOutcome {
@@ -203,6 +227,8 @@ fn write_outputs(
             &mut sink,
             plan,
             cairn_collectors_win::evtx_export::export_channel,
+            (cfg.collector_timeout_secs > 0)
+                .then(|| std::time::Duration::from_secs(cfg.collector_timeout_secs)),
         );
         manifest.sources.extend(failures);
     }
@@ -252,6 +278,13 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
         env!("CARGO_PKG_VERSION"),
         BUILD_SHA
     );
+    if !args.dry_run {
+        let system_root = std::env::var("SystemRoot").ok();
+        if let Some(w) = system_drive_warning(&args.output, system_root.as_deref()) {
+            tracing::warn!("{w}");
+            eprintln!("warning: {w}");
+        }
+    }
     let privileges = cairn_collectors_win::privilege::probe();
     tracing::info!(
         admin = privileges.admin,
@@ -288,7 +321,7 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
         &cfg,
         privileges,
         hostname,
-        &collectors,
+        collectors,
         &analyzers,
         crate::enrich::hash_on_disk,
     );
@@ -366,6 +399,29 @@ mod tests {
         let age = Utc::now() - since;
         assert!(age >= chrono::Duration::days(30) && age < chrono::Duration::days(31));
         assert!(build_config(&args(&["--since", "nope"]), Profile::Standard).is_err());
+        assert_eq!(
+            cfg.collector_timeout_secs,
+            cairn_core::config::DEFAULT_COLLECTOR_TIMEOUT_SECS,
+            "every live run has a per-collector budget by default"
+        );
+        let a = args(&["--collector-timeout", "0"]);
+        assert_eq!(
+            build_config(&a, Profile::Standard)
+                .unwrap()
+                .collector_timeout_secs,
+            0
+        );
+    }
+
+    /// The system-drive warning fires only for a path on %SystemRoot%'s volume, and
+    /// never off Windows (no SystemRoot).
+    #[test]
+    fn system_drive_warning_only_for_the_system_volume() {
+        let w = system_drive_warning(Path::new(r"c:\cases\out"), Some(r"C:\Windows"));
+        assert!(w.is_some_and(|w| w.contains("C:")));
+        assert!(system_drive_warning(Path::new(r"E:\out"), Some(r"C:\Windows")).is_none());
+        assert!(system_drive_warning(Path::new(r"\\srv\cases\out"), Some(r"C:\Windows")).is_none());
+        assert!(system_drive_warning(Path::new(r"C:\out"), None).is_none());
     }
 
     /// Without a reference the skew is explicitly "not measured"; with one it is
@@ -448,7 +504,7 @@ mod tests {
             &Config::default(),
             privs(),
             "T".into(),
-            &collectors,
+            collectors,
             &analyzers,
             |_| Some("abc123".into()),
         );
@@ -531,7 +587,7 @@ author: test-integration
             Some(cairn_heur::SigmaAnalyzer::new(engine)),
         );
         let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedEvents(vec![ev]))];
-        let outcome = run_live(&cfg, privs(), "TEST".into(), &collectors, &analyzers);
+        let outcome = run_live(&cfg, privs(), "TEST".into(), collectors, &analyzers);
 
         assert_eq!(outcome.records.len(), 1, "event record must be collected");
         let sigma: Vec<_> = outcome
@@ -647,22 +703,127 @@ author: test-integration
         assert!(crate::verify::run_verify(&zip, None).unwrap());
     }
 
-    /// --dry-run writes nothing at all, even with EVTX export requested.
+    /// --dry-run writes nothing at all: the whole live pipeline (config from the real
+    /// CLI flags, fake collectors, the registry's analyzers, manifest, every output
+    /// writer, EVTX export requested) leaves the would-be output's parent untouched.
     #[test]
-    fn dry_run_write_outputs_touches_nothing() {
-        let dir = std::env::temp_dir().join("cairn_live_dry_run_outputs");
-        let _ = std::fs::remove_dir_all(&dir);
-        let cfg = Config {
-            output: OutputKind::DryRun,
-            ..Config::default()
-        };
-        let outcome = outcome_with_one_record();
+    fn dry_run_pipeline_creates_no_file() {
+        let parent = std::env::temp_dir().join("cairn_live_dry_run_pipeline");
+        let _ = std::fs::remove_dir_all(&parent);
+        std::fs::create_dir_all(&parent).unwrap();
+        let out = parent.join("out");
+        let a = RunArgs::parse_from([
+            "cairn",
+            "--output",
+            out.to_str().unwrap(),
+            "--dry-run",
+            "--export-evtx",
+        ]);
+        let cfg = build_config(&a, Profile::Standard).unwrap();
+        assert!(matches!(cfg.output, OutputKind::DryRun));
+        let analyzers = registry::analyzers(&cfg, Mode::Live, None);
+        let collectors: Vec<Box<dyn Collector>> =
+            vec![Box::new(FixedRecords(determinism_records()))];
+        let outcome =
+            collect_then_analyze(&cfg, privs(), "TEST".into(), collectors, &analyzers, |_| {
+                None
+            });
+        assert!(!outcome.findings.is_empty(), "the pipeline did real work");
         let plan = crate::export::ExportPlan {
             channels: vec!["Security".into()],
             since: Utc::now(),
         };
         write_outputs(&cfg, &outcome, manifest_for(&cfg, &outcome), Some(&plan)).unwrap();
-        assert!(!dir.exists());
+        let left: Vec<_> = std::fs::read_dir(&parent).unwrap().flatten().collect();
+        assert!(left.is_empty(), "dry-run wrote {left:?}");
+    }
+
+    /// Records with many findings sharing one timestamp, so output order depends on
+    /// the tiebreaks, not on arrival order.
+    fn determinism_records() -> Vec<Record> {
+        let ts = chrono::DateTime::parse_from_rfc3339("2026-01-02T03:04:05Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mut out = Vec::new();
+        for (i, ip) in ["192.0.2.10", "192.0.2.11", "198.51.100.7"]
+            .iter()
+            .enumerate()
+        {
+            for j in 0..6u64 {
+                out.push(Record::Event(EventRecord {
+                    ts,
+                    ..event(
+                        4625,
+                        (i as u64) * 100 + j,
+                        &[("TargetUserName", &format!("user{i}")), ("IpAddress", ip)],
+                    )
+                }));
+            }
+        }
+        for rid in 0..4u64 {
+            out.push(Record::Event(EventRecord {
+                ts,
+                ..event(
+                    5145,
+                    1000 + rid,
+                    &[
+                        ("ShareName", r"\\*\ADMIN$"),
+                        ("IpAddress", &format!("10.1.2.{rid}")),
+                    ],
+                )
+            }));
+        }
+        out
+    }
+
+    /// NFR4: the same input gives byte-identical timeline.csv and findings.jsonl on
+    /// every run, apart from the per-run metadata (finding id, detected_at).
+    #[test]
+    fn same_input_gives_identical_outputs() {
+        let started = chrono::DateTime::parse_from_rfc3339("2026-01-03T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let run_once = |name: &str| {
+            let dir = std::env::temp_dir().join(name);
+            let _ = std::fs::remove_dir_all(&dir);
+            let cfg = Config {
+                output: OutputKind::Dir(dir.clone()),
+                ..Config::default()
+            };
+            let analyzers = registry::analyzers(&cfg, Mode::Live, None);
+            let collectors: Vec<Box<dyn Collector>> =
+                vec![Box::new(FixedRecords(determinism_records()))];
+            let mut outcome =
+                collect_then_analyze(&cfg, privs(), "TEST".into(), collectors, &analyzers, |_| {
+                    None
+                });
+            for f in &mut outcome.findings {
+                client_text::fill_details_client(f, started);
+            }
+            write_outputs(&cfg, &outcome, manifest_for(&cfg, &outcome), None).unwrap();
+            let timeline = std::fs::read(dir.join("timeline.csv")).unwrap();
+            let findings: Vec<String> = std::fs::read_to_string(dir.join("findings.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|l| {
+                    let mut v: serde_json::Value = serde_json::from_str(l).unwrap();
+                    let o = v.as_object_mut().unwrap();
+                    o.remove("id");
+                    o.remove("detected_at");
+                    v.to_string()
+                })
+                .collect();
+            let records = std::fs::read(dir.join("records.jsonl")).unwrap();
+            (timeline, findings, records)
+        };
+        let first = run_once("cairn_determinism_a");
+        assert!(first.1.len() > 3, "enough findings to exercise ordering");
+        for k in 0..3 {
+            let again = run_once(&format!("cairn_determinism_b{k}"));
+            assert_eq!(first.0, again.0, "timeline.csv differs");
+            assert_eq!(first.1, again.1, "findings.jsonl differs");
+            assert_eq!(first.2, again.2, "records.jsonl differs");
+        }
     }
 
     /// Integration: the registry's brute-force heuristic detects the pattern end to end
@@ -684,7 +845,7 @@ author: test-integration
         let cfg = Config::default();
         let analyzers = registry::analyzers(&cfg, Mode::Evtx, None);
         let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedEvents(events))];
-        let outcome = run_live(&cfg, privs(), "TEST".into(), &collectors, &analyzers);
+        let outcome = run_live(&cfg, privs(), "TEST".into(), collectors, &analyzers);
 
         assert_eq!(outcome.records.len(), 5);
         let f = outcome
@@ -755,7 +916,7 @@ author: test-integration
         let cfg = Config::default();
         let analyzers = registry::analyzers(&cfg, Mode::Live, None);
         let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedRecords(records))];
-        let outcome = run_live(&cfg, privs(), "TEST".into(), &collectors, &analyzers);
+        let outcome = run_live(&cfg, privs(), "TEST".into(), collectors, &analyzers);
         for (name, mitre) in [
             (cairn_core::analyzers::CRED_DUMP, "T1003.001"),
             (cairn_core::analyzers::RANSOM, "T1490"),
@@ -850,7 +1011,7 @@ author: test-integration
         let cfg = Config::default();
         let analyzers = registry::analyzers(&cfg, Mode::Evtx, None);
         let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedEvents(events))];
-        let outcome = run_live(&cfg, privs(), "TEST".into(), &collectors, &analyzers);
+        let outcome = run_live(&cfg, privs(), "TEST".into(), collectors, &analyzers);
         let lateral: Vec<&cairn_core::Finding> = outcome
             .findings
             .iter()

@@ -435,6 +435,48 @@ mod tests {
         }
     }
 
+    /// Random, truncated and non-UTF-8 lines and files never panic the line parsers or
+    /// the tail reader (UTF-8 and UTF-16, odd lengths, tails that start mid-character).
+    #[test]
+    fn fuzzed_lines_and_files_never_panic() {
+        let mut rng = cairn_core::fuzz::Rng::new(0xA11D);
+        let frags = [
+            "Incoming",
+            "2024-03-01,",
+            "10:15",
+            "99:99",
+            "2024-02-30,",
+            "User",
+            "123456789",
+            "\t",
+            "14-03-2024 10:15:42",
+            "31-02-2024 25:61:61",
+            "\"",
+        ];
+        for _ in 0..5000 {
+            let line = rng.text(12, &frags);
+            let _ = parse_anydesk_line(&line);
+            let _ = parse_teamviewer_line(&line);
+        }
+        let d = tmp("fuzz");
+        let p = d.join("log.txt");
+        let epoch = DateTime::<Utc>::UNIX_EPOCH;
+        for i in 0..200 {
+            let mut body = if i % 2 == 0 {
+                vec![0xFF, 0xFE] // UTF-16LE BOM
+            } else {
+                Vec::new()
+            };
+            body.extend(rng.bytes(400));
+            std::fs::write(&p, &body).unwrap();
+            for max in [0, 1, 3, 7, 64, MAX_TAIL_BYTES] {
+                let _ = parse_tail(&p, epoch, max, parse_anydesk_line).unwrap();
+                let _ = parse_tail(&p, epoch, max, parse_teamviewer_line).unwrap();
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn teamviewer_incoming_lines() {
         let c = parse_teamviewer_line(

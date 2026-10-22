@@ -45,7 +45,11 @@ pub fn hash_stream_capped<R: Read>(
 }
 
 /// Read-only opener for [`hash_stream_capped`]: file length from metadata + a `File` reader.
+/// A remote (UNC) or device path is never opened (see `cairn_core::paths`).
 fn open_on_disk(path: &str) -> Option<(u64, std::fs::File)> {
+    if cairn_core::paths::must_not_probe(path) {
+        return None;
+    }
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
         return None;

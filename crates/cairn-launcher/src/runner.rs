@@ -1,5 +1,6 @@
 //! 組合 cairn.exe 的執行參數並啟動子程序。
 //!
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// cairn.exe 執行所需的所有參數。
@@ -25,38 +26,82 @@ pub struct RunConfig<'a> {
 
 /// 根據 `RunConfig` 建立 cairn.exe 的完整參數列表。
 /// 純函式，便於測試（不實際執行任何程序）。
-pub fn build_args(cfg: &RunConfig<'_>) -> Vec<String> {
-    let mut args = vec![
-        "run".to_string(),
-        "--target".to_string(),
-        "live".to_string(),
-        "--output".to_string(),
-        cfg.output_dir.display().to_string(),
-        "--since".to_string(),
-        cfg.since.to_string(),
+///
+/// 路徑以 `OsString` 原樣傳遞，不經 `display()`：含空白或中文的路徑（例如中文
+/// 使用者名稱）各自是「一個」參數（`Command` 會正確加引號），而 Windows 允許、
+/// 但不是合法 Unicode 的檔名也不會被替換成 U+FFFD 而指向不存在的路徑。
+pub fn build_args(cfg: &RunConfig<'_>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "run".into(),
+        "--target".into(),
+        "live".into(),
+        "--output".into(),
+        cfg.output_dir.as_os_str().to_owned(),
+        "--since".into(),
+        cfg.since.into(),
     ];
     if let Some(rules) = cfg.rules_dir {
-        args.push("--rules".to_string());
-        args.push(rules.display().to_string());
+        args.push("--rules".into());
+        args.push(rules.as_os_str().to_owned());
     }
     if let Some(profile) = cfg.profile {
-        args.push("--profile".to_string());
-        args.push(profile.to_string());
+        args.push("--profile".into());
+        args.push(profile.into());
     }
     if let Some(case_id) = cfg.case_id {
-        args.push("--case-id".to_string());
-        args.push(case_id.to_string());
+        args.push("--case-id".into());
+        args.push(case_id.into());
     }
     if let Some(operator) = cfg.operator {
-        args.push("--operator".to_string());
-        args.push(operator.to_string());
+        args.push("--operator".into());
+        args.push(operator.into());
     }
     args.push(if cfg.export_evtx {
-        "--export-evtx".to_string()
+        "--export-evtx".into()
     } else {
-        "--no-export-evtx".to_string()
+        "--no-export-evtx".into()
     });
     args
+}
+
+/// 啟動 cairn.exe 並等它結束；任何失敗都轉成使用者看得懂的中文訊息。
+fn run_child(exe: &Path, args: &[OsString], cwd: Option<&Path>) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    let status = cmd
+        .status()
+        .map_err(|e| anyhow::anyhow!(spawn_error(exe, &e)))?;
+    if !status.success() {
+        anyhow::bail!(exit_error(status.code()));
+    }
+    Ok(())
+}
+
+/// cairn.exe 無法啟動時的說明。純函式，可測試。
+pub fn spawn_error(exe: &Path, e: &std::io::Error) -> String {
+    let why = match e.kind() {
+        std::io::ErrorKind::NotFound => "找不到檔案（可能已被移動、刪除或被防毒軟體隔離）",
+        std::io::ErrorKind::PermissionDenied => "沒有執行權限（可能被防毒軟體或應用程式控管封鎖）",
+        _ => "系統拒絕執行",
+    };
+    format!(
+        "無法啟動 cairn.exe：{why}\n路徑：{}\n系統訊息：{e}",
+        exe.display()
+    )
+}
+
+/// cairn.exe 以非 0 結束（或被終止）時的說明。純函式，可測試。
+pub fn exit_error(code: Option<i32>) -> String {
+    match code {
+        Some(c) => format!(
+            "cairn.exe 執行失敗（結束代碼 {c}）。詳細原因請看上方訊息或結果資料夾中的 run.log。"
+        ),
+        None => "cairn.exe 被中途終止（可能被防毒軟體或使用者結束）。結果可能不完整，請勿使用。"
+            .to_string(),
+    }
 }
 
 /// 建立 output 子目錄路徑（時間戳命名，不實際建立目錄）。
@@ -68,14 +113,7 @@ pub fn timestamped_output_dir(base: &Path) -> PathBuf {
 
 /// 執行 cairn.exe，繼承 stdout/stderr（使用者可看到即時 log）。
 pub fn run_scan(cfg: &RunConfig<'_>) -> anyhow::Result<()> {
-    let args = build_args(cfg);
-    let status = std::process::Command::new(cfg.cairn_exe)
-        .args(&args)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("cairn.exe 執行失敗（exit code: {:?}）", status.code());
-    }
-    Ok(())
+    run_child(cfg.cairn_exe, &build_args(cfg), None)
 }
 
 /// 離線 EVTX 分析所需的參數。`cairn evtx` 子指令沒有 `--output` 旗標
@@ -90,14 +128,14 @@ pub struct EvtxConfig<'a> {
 }
 
 /// 建立 `cairn evtx` 的參數列表（不含 output——見上方結構註解）。
-pub fn build_evtx_args(cfg: &EvtxConfig<'_>) -> Vec<String> {
-    let mut args = vec!["evtx".to_string()];
+pub fn build_evtx_args(cfg: &EvtxConfig<'_>) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec!["evtx".into()];
     for f in cfg.files {
-        args.push(f.display().to_string());
+        args.push(f.as_os_str().to_owned());
     }
     if let Some(rules) = cfg.rules_dir {
-        args.push("--rules".to_string());
-        args.push(rules.display().to_string());
+        args.push("--rules".into());
+        args.push(rules.as_os_str().to_owned());
     }
     args
 }
@@ -106,14 +144,7 @@ pub fn build_evtx_args(cfg: &EvtxConfig<'_>) -> Vec<String> {
 /// `cairn.exe` 預設輸出的 `./out` 落在 `cfg.output_dir` 裡（golden rule 4：
 /// 輸出離 target，不寫進來源目錄）。呼叫前 `cfg.output_dir` 必須已存在。
 pub fn run_evtx(cfg: &EvtxConfig<'_>) -> anyhow::Result<PathBuf> {
-    let args = build_evtx_args(cfg);
-    let status = std::process::Command::new(cfg.cairn_exe)
-        .args(&args)
-        .current_dir(cfg.output_dir)
-        .status()?;
-    if !status.success() {
-        anyhow::bail!("cairn.exe evtx 執行失敗（exit code: {:?}）", status.code());
-    }
+    run_child(cfg.cairn_exe, &build_evtx_args(cfg), Some(cfg.output_dir))?;
     Ok(cfg.output_dir.join("out"))
 }
 
@@ -121,6 +152,13 @@ pub fn run_evtx(cfg: &EvtxConfig<'_>) -> anyhow::Result<PathBuf> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// The arguments as text, for assertions.
+    fn strs(args: Vec<OsString>) -> Vec<String> {
+        args.into_iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
 
     fn make_cfg<'a>(
         exe: &'a Path,
@@ -154,7 +192,7 @@ mod tests {
             operator: None,
             export_evtx: true,
         };
-        let args = build_args(&cfg);
+        let args = strs(build_args(&cfg));
         assert!(args.contains(&"--profile".to_string()));
         assert!(args.contains(&"minimal".to_string()));
     }
@@ -173,7 +211,7 @@ mod tests {
             operator: None,
             export_evtx: true,
         };
-        let args = build_args(&cfg);
+        let args = strs(build_args(&cfg));
         assert!(!args.contains(&"--profile".to_string()));
     }
 
@@ -183,7 +221,7 @@ mod tests {
         let rules = PathBuf::from(r"C:\tools\rules\sigma");
         let output = PathBuf::from(r"C:\tools\output\20260627_143022");
         let cfg = make_cfg(&exe, Some(&rules), &output, "2026-06-27T14:30:00Z");
-        let args = build_args(&cfg);
+        let args = strs(build_args(&cfg));
         assert_eq!(args[0], "run");
         assert!(args.contains(&"--rules".to_string()));
         assert!(args.contains(&rules.display().to_string()));
@@ -196,7 +234,7 @@ mod tests {
         let exe = PathBuf::from(r"C:\tools\cairn.exe");
         let output = PathBuf::from(r"C:\tools\output\20260627_143022");
         let cfg = make_cfg(&exe, None, &output, "2026-06-27T14:30:00Z");
-        let args = build_args(&cfg);
+        let args = strs(build_args(&cfg));
         assert!(!args.contains(&"--rules".to_string()));
         assert!(args.contains(&"--target".to_string()));
         assert!(args.contains(&"live".to_string()));
@@ -207,7 +245,7 @@ mod tests {
         let exe = PathBuf::from(r"C:\tools\cairn.exe");
         let output = PathBuf::from(r"C:\tools\output\20260627_143022");
         let cfg = make_cfg(&exe, None, &output, "2026-06-27T14:30:00Z");
-        let args = build_args(&cfg);
+        let args = strs(build_args(&cfg));
         assert!(args.contains(&"--output".to_string()));
         assert!(args.contains(&output.display().to_string()));
     }
@@ -217,7 +255,7 @@ mod tests {
         let exe = PathBuf::from(r"C:\tools\cairn.exe");
         let output = PathBuf::from(r"C:\tools\output\x");
         let mut cfg = make_cfg(&exe, None, &output, "2026-06-27T14:30:00Z");
-        let args = build_args(&cfg);
+        let args = strs(build_args(&cfg));
         assert!(
             args.contains(&"--export-evtx".to_string()),
             "export on by default"
@@ -227,7 +265,7 @@ mod tests {
         cfg.case_id = Some("IR-2026-07");
         cfg.operator = Some("王小明");
         cfg.export_evtx = false;
-        let args = build_args(&cfg);
+        let args = strs(build_args(&cfg));
         let pos = |f: &str| args.iter().position(|a| a == f).unwrap();
         assert_eq!(args[pos("--case-id") + 1], "IR-2026-07");
         assert_eq!(args[pos("--operator") + 1], "王小明");
@@ -236,6 +274,65 @@ mod tests {
             !args.contains(&"--reference-time".to_string()),
             "never prompted"
         );
+    }
+
+    /// Paths with spaces and Chinese characters (a Chinese Windows user name) stay ONE
+    /// argument each, unchanged, for both the live and the evtx command lines.
+    #[test]
+    fn paths_with_spaces_and_chinese_are_single_arguments() {
+        let exe = PathBuf::from(r"C:\Users\王小明\My Tools\cairn.exe");
+        let rules = PathBuf::from(r"C:\Users\王小明\My Tools\rules\sigma");
+        let output = PathBuf::from(r"C:\Users\王小明\My Tools\output\20260627_143022");
+        let cfg = make_cfg(&exe, Some(&rules), &output, "2026-06-27T14:30:00Z");
+        let args = strs(build_args(&cfg));
+        let after = |f: &str| args[args.iter().position(|a| a == f).unwrap() + 1].clone();
+        assert_eq!(after("--output"), output.to_str().unwrap());
+        assert_eq!(after("--rules"), rules.to_str().unwrap());
+
+        let files = vec![PathBuf::from(r"D:\事件 記錄\Security (1).evtx")];
+        let ecfg = EvtxConfig {
+            cairn_exe: &exe,
+            files: &files,
+            rules_dir: None,
+            output_dir: &output,
+        };
+        assert_eq!(
+            strs(build_evtx_args(&ecfg)),
+            vec!["evtx", r"D:\事件 記錄\Security (1).evtx"]
+        );
+    }
+
+    /// A file name that is not valid Unicode is passed through byte-for-byte, not
+    /// replaced with U+FFFD (which would name a different, non-existent file).
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_paths_pass_through_unchanged() {
+        use std::os::unix::ffi::OsStringExt;
+        let odd = PathBuf::from(OsString::from_vec(b"/evtx/\xff\xfe.evtx".to_vec()));
+        let exe = PathBuf::from("/cairn");
+        let files = vec![odd.clone()];
+        let ecfg = EvtxConfig {
+            cairn_exe: &exe,
+            files: &files,
+            rules_dir: None,
+            output_dir: &odd,
+        };
+        assert_eq!(build_evtx_args(&ecfg)[1], odd.as_os_str());
+    }
+
+    /// Spawn and exit failures read as Chinese guidance, not a raw OS error.
+    #[test]
+    fn child_failures_have_chinese_messages() {
+        let exe = Path::new(r"E:\cairn\cairn.exe");
+        let nf = spawn_error(exe, &std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert!(nf.contains("找不到檔案") && nf.contains(r"E:\cairn\cairn.exe"));
+        let pd = spawn_error(
+            exe,
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        );
+        assert!(pd.contains("防毒"));
+        assert!(exit_error(Some(2)).contains("結束代碼 2"));
+        assert!(exit_error(None).contains("不完整"));
     }
 
     #[test]
@@ -259,7 +356,7 @@ mod tests {
             rules_dir: Some(&rules),
             output_dir: &PathBuf::from(r"C:\tools\output\20260709_120000"),
         };
-        let args = build_evtx_args(&cfg);
+        let args = strs(build_evtx_args(&cfg));
         assert_eq!(args[0], "evtx");
         assert!(args.contains(&files[0].display().to_string()));
         assert!(args.contains(&"--rules".to_string()));
@@ -276,7 +373,7 @@ mod tests {
             rules_dir: None,
             output_dir: &PathBuf::from(r"C:\tools\output\20260709_120000"),
         };
-        let args = build_evtx_args(&cfg);
+        let args = strs(build_evtx_args(&cfg));
         assert!(!args.contains(&"--rules".to_string()));
         assert!(args.contains(&files[0].display().to_string()));
     }
@@ -294,7 +391,7 @@ mod tests {
             rules_dir: None,
             output_dir: &PathBuf::from(r"C:\tools\output\20260709_120000"),
         };
-        let args = build_evtx_args(&cfg);
+        let args = strs(build_evtx_args(&cfg));
         assert!(args.contains(&files[0].display().to_string()));
         assert!(args.contains(&files[1].display().to_string()));
     }

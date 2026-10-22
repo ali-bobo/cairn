@@ -50,10 +50,17 @@ mod win {
     use windows::Win32::Foundation::FILETIME;
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Security::{
-        GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, LookupAccountSidW,
-        TokenIntegrityLevel, TokenUser, SID_NAME_USE, TOKEN_INFORMATION_CLASS,
-        TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
+        GetLengthSid, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, IsValidSid,
+        LookupAccountSidW, TokenIntegrityLevel, TokenUser, PSID, SID_NAME_USE,
+        TOKEN_INFORMATION_CLASS, TOKEN_MANDATORY_LABEL, TOKEN_QUERY, TOKEN_USER,
     };
+
+    /// SID bytes -> resolved account (None cached too). LookupAccountSidW on a domain
+    /// SID is an RPC to a domain controller: with an unreachable DC each call can block
+    /// for many seconds, and hundreds of processes share a handful of SIDs. Resolving
+    /// each SID once keeps a broken DC from stalling the process collector into its
+    /// time budget (and losing the whole process list).
+    type SidCache = std::collections::HashMap<Vec<u8>, Option<String>>;
     use windows::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
         TH32CS_SNAPPROCESS,
@@ -111,7 +118,8 @@ mod win {
             };
             match r {
                 Ok(()) => {
-                    let s = String::from_utf16_lossy(&buf[..len as usize]);
+                    // `get`: never trust the returned length to fit the buffer.
+                    let s = String::from_utf16_lossy(buf.get(..len as usize)?);
                     return if s.is_empty() { None } else { Some(s) };
                 }
                 Err(_) => continue, // small buffer -> retry large; large -> give up
@@ -177,7 +185,7 @@ mod win {
     /// Best-effort `DOMAIN\user` owning the process token: GetTokenInformation(TokenUser)
     /// then LookupAccountSidW on the local system. None on any failure (access denied,
     /// unmappable SID). Read-only.
-    fn read_user(token: &TokenHandle) -> Option<String> {
+    fn read_user(token: &TokenHandle, cache: &mut SidCache) -> Option<String> {
         let buf = token_info(token, TokenUser)?;
         if buf.len() < std::mem::size_of::<TOKEN_USER>() {
             return None;
@@ -189,13 +197,44 @@ mod win {
         if sid.0.is_null() {
             return None;
         }
+        let key = sid_bytes(&buf, sid);
+        if let Some(hit) = key.as_ref().and_then(|k| cache.get(k)) {
+            return hit.clone();
+        }
+        let resolved = lookup_account(sid);
+        if let Some(k) = key {
+            cache.insert(k, resolved.clone());
+        }
+        resolved
+    }
+
+    /// The bytes of `sid`, which must point into `buf` (the TokenUser buffer). None when
+    /// the SID is invalid or does not lie wholly inside `buf`.
+    fn sid_bytes(buf: &[u8], sid: PSID) -> Option<Vec<u8>> {
+        // SAFETY: `sid` is non-null and was written by GetTokenInformation into `buf`,
+        // which is alive for this call; IsValidSid only reads the SID header and
+        // GetLengthSid is called only on a SID IsValidSid accepted.
+        let len = unsafe {
+            if !IsValidSid(sid).as_bool() {
+                return None;
+            }
+            GetLengthSid(sid)
+        } as usize;
+        // Pointer arithmetic only to find the offset; the bytes are read by safe,
+        // bounds-checked slicing of `buf`.
+        let off = (sid.0 as usize).checked_sub(buf.as_ptr() as usize)?;
+        buf.get(off..off.checked_add(len)?).map(<[u8]>::to_vec)
+    }
+
+    /// LookupAccountSidW for `sid` (valid for the duration of the call).
+    fn lookup_account(sid: PSID) -> Option<String> {
         let mut name = vec![0u16; 256];
         let mut domain = vec![0u16; 256];
         for _ in 0..2 {
             let mut name_len = name.len() as u32;
             let mut dom_len = domain.len() as u32;
             let mut use_ = SID_NAME_USE::default();
-            // SAFETY: sid points into `buf`, which is alive for this whole function;
+            // SAFETY: sid points into the caller's `buf`, alive for this whole call;
             // name/domain are live buffers whose capacities (in u16 chars) are passed in
             // name_len/dom_len; on success the API writes the lengths excluding the NUL,
             // on ERROR_INSUFFICIENT_BUFFER it writes the required sizes and we retry once.
@@ -305,6 +344,7 @@ mod win {
             ..Default::default()
         };
         let mut out = Vec::new();
+        let mut sids = SidCache::new();
 
         // SAFETY: snap.0 valid; entry.dwSize set as required by Process32FirstW.
         if unsafe { Process32FirstW(snap.0, &mut entry) }.is_err() {
@@ -335,7 +375,7 @@ mod win {
                     let cmdline = crate::cmdline_reader::read_cmdline(guard.0);
                     let token = open_token(guard.0);
                     let integrity_raw = token.as_ref().and_then(read_integrity);
-                    let user = token.as_ref().and_then(read_user);
+                    let user = token.as_ref().and_then(|t| read_user(t, &mut sids));
                     let start_time = read_start_time(guard.0);
                     (image, cmdline, integrity_raw, user, start_time)
                 }

@@ -539,7 +539,7 @@ fn make_record(
     last_write: Option<DateTime<Utc>>,
 ) -> PersistenceRecord {
     make_record_with_exists(mechanism, location, value, command, last_write, |p| {
-        std::path::Path::new(p).exists()
+        crate::local_path_exists(p)
     })
 }
 
@@ -581,12 +581,99 @@ fn read_services() -> Vec<PersistenceRecord> {
 }
 
 #[cfg(not(windows))]
-fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
+fn read_scheduled_tasks(_notes: &mut Vec<String>) -> Vec<PersistenceRecord> {
     vec![]
 }
 #[cfg(windows)]
-fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
-    win::read_scheduled_tasks()
+fn read_scheduled_tasks(notes: &mut Vec<String>) -> Vec<PersistenceRecord> {
+    win::read_scheduled_tasks(notes)
+}
+
+/// Deepest folder level walked under `System32\Tasks` (real task folders nest 2-4).
+const TASKS_MAX_DEPTH: usize = 16;
+/// Most task files read in one run.
+const TASKS_MAX_FILES: usize = 20_000;
+/// Largest task XML read (real ones are a few KB).
+const TASK_XML_MAX_BYTES: u64 = 1024 * 1024;
+
+/// One task definition file read from the Tasks tree.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct TaskFile {
+    file_name: String,
+    xml: String,
+    last_write: Option<DateTime<Utc>>,
+}
+
+/// Every task file under `root`, iteratively (no recursion, so no stack overflow).
+/// Symbolic links and junctions are never followed (a junction loop planted in the
+/// Tasks folder must not hang or crash the run), depth / file count / file size are
+/// capped, and each cap that was hit is added to `notes` once (it reaches the
+/// manifest). Files are decoded by BOM: Task Scheduler writes UTF-16LE XML.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn walk_task_files(root: &std::path::Path, notes: &mut Vec<String>) -> Vec<TaskFile> {
+    let (mut deep, mut many, mut big) = (false, false, false);
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    'walk: while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue; // ACL-blocked or missing: graceful empty
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                if depth + 1 < TASKS_MAX_DEPTH {
+                    stack.push((entry.path(), depth + 1));
+                } else {
+                    deep = true;
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            if out.len() >= TASKS_MAX_FILES {
+                many = true;
+                break 'walk;
+            }
+            let meta = entry.metadata().ok();
+            if meta.as_ref().is_some_and(|m| m.len() > TASK_XML_MAX_BYTES) {
+                big = true;
+                continue;
+            }
+            let Some(bytes) = crate::read_head_capped(&entry.path(), TASK_XML_MAX_BYTES) else {
+                continue; // unreadable file: skip
+            };
+            out.push(TaskFile {
+                file_name: entry.file_name().to_string_lossy().into_owned(),
+                xml: crate::decode_text(&bytes),
+                last_write: meta
+                    .and_then(|m| m.modified().ok())
+                    .map(DateTime::<Utc>::from),
+            });
+        }
+    }
+    if deep {
+        notes.push(format!(
+            "scheduled tasks: folders deeper than {TASKS_MAX_DEPTH} levels not read (cap)"
+        ));
+    }
+    if many {
+        notes.push(format!(
+            "scheduled tasks: more than {TASKS_MAX_FILES} task files; the rest not read (cap)"
+        ));
+    }
+    if big {
+        notes.push(format!(
+            "scheduled tasks: task files over {} KiB skipped (cap)",
+            TASK_XML_MAX_BYTES / 1024
+        ));
+    }
+    out
 }
 
 /// Startup folders: All Users (%PROGRAMDATA%), the current user (%APPDATA%) and every
@@ -921,48 +1008,25 @@ mod win {
         out
     }
 
-    /// Walk %SystemRoot%\System32\Tasks recursively; parse each task XML into records.
-    /// Best-effort + graceful: an ACL-blocked root (non-admin) or unreadable file yields
-    /// nothing rather than an error. Read-only.
-    pub fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
+    /// Walk %SystemRoot%\System32\Tasks (see `walk_task_files` for the caps and the
+    /// no-link rule); parse each task XML into records. Best-effort + graceful: an
+    /// ACL-blocked root (non-admin) or unreadable file yields nothing rather than an
+    /// error. Read-only.
+    pub fn read_scheduled_tasks(notes: &mut Vec<String>) -> Vec<PersistenceRecord> {
         let root = std::env::var("SystemRoot")
             .map(|r| format!(r"{r}\System32\Tasks"))
             .unwrap_or_else(|_| r"C:\Windows\System32\Tasks".to_string());
         let mut out = Vec::new();
-        walk_tasks(std::path::Path::new(&root), &mut out);
-        out
-    }
-
-    fn walk_tasks(dir: &std::path::Path, out: &mut Vec<PersistenceRecord>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return; // ACL-blocked or missing: graceful empty
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk_tasks(&path, out);
-            } else if path.is_file() {
-                let Ok(xml) = std::fs::read_to_string(&path) else {
-                    continue; // unreadable file: skip
-                };
-                let file_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let last_write = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .map(chrono::DateTime::<chrono::Utc>::from);
-                out.extend(super::task_records_from_xml(
-                    &xml,
-                    &file_name,
-                    last_write,
-                    |name| std::env::var(name).ok(),
-                    |p| std::path::Path::new(p).exists(),
-                ));
-            }
+        for tf in super::walk_task_files(std::path::Path::new(&root), notes) {
+            out.extend(super::task_records_from_xml(
+                &tf.xml,
+                &tf.file_name,
+                tf.last_write,
+                |name| std::env::var(name).ok(),
+                crate::local_path_exists,
+            ));
         }
+        out
     }
 }
 
@@ -984,7 +1048,7 @@ fn read_extended_aseps() -> Vec<PersistenceRecord> {
     out.extend(crate::asep::read_ps_profiles(
         &crate::asep::ps_profile_paths(|name| std::env::var(name).ok(), &user_profile_dirs()),
     ));
-    fill_command_binary_paths(&mut out, |p| std::path::Path::new(p).exists());
+    fill_command_binary_paths(&mut out, crate::local_path_exists);
     out
 }
 
@@ -1045,7 +1109,7 @@ fn resolve_relative_binary_paths_with(
 /// Process-env wrapper: %SystemRoot% with the conventional fallback.
 fn resolve_relative_binary_paths(records: &mut [PersistenceRecord]) {
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    resolve_relative_binary_paths_with(records, &sysroot, |p| std::path::Path::new(p).exists());
+    resolve_relative_binary_paths_with(records, &sysroot, crate::local_path_exists);
 }
 
 /// Fill each record's `signed` from the verifier, for records that have a binary_path.
@@ -1082,6 +1146,8 @@ fn hash_persistence_targets(
 /// injected verifier (the WinTrust seam stays in cairn-collectors-win).
 pub struct PersistCollector {
     verifier: Box<dyn FileVerifier + Send + Sync>,
+    /// Caps hit during the last collect, reported in `sources()` (never silent).
+    notes: std::sync::Mutex<Vec<String>>,
 }
 
 impl Default for PersistCollector {
@@ -1091,14 +1157,17 @@ impl Default for PersistCollector {
             Box::new(cairn_collectors_win::signature::WinSigVerifier);
         #[cfg(not(windows))]
         let verifier: Box<dyn FileVerifier + Send + Sync> = Box::new(NoopVerifier);
-        Self { verifier }
+        Self::with_verifier(verifier)
     }
 }
 
 impl PersistCollector {
     /// Construct with a specific verifier (tests inject a fake; non-default callers).
     pub fn with_verifier(verifier: Box<dyn FileVerifier + Send + Sync>) -> Self {
-        Self { verifier }
+        Self {
+            verifier,
+            notes: std::sync::Mutex::new(Vec::new()),
+        }
     }
 }
 
@@ -1108,13 +1177,16 @@ impl Collector for PersistCollector {
     }
 
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
+        let mut notes: Vec<String> = Vec::new();
+        let reg_capped_before =
+            crate::asep::REG_VALUES_CAPPED.load(std::sync::atomic::Ordering::Relaxed);
         let mut records: Vec<PersistenceRecord> = Vec::new();
         records.extend(read_run_keys());
         records.extend(read_services());
         records.extend(read_winlogon());
         records.extend(read_ifeo());
         records.extend(read_startup_folders());
-        records.extend(read_scheduled_tasks());
+        records.extend(read_scheduled_tasks(&mut notes));
         records.extend(read_extended_aseps());
         resolve_relative_binary_paths(&mut records);
         apply_signatures(&mut records, self.verifier.as_ref());
@@ -1138,10 +1210,23 @@ impl Collector for PersistCollector {
         }
         // PSReadLine history of every profile (read-only, last 500 lines per user).
         out.extend(
-            crate::history::read_psreadline_history(&user_profile_dirs())
+            crate::history::read_psreadline_history_noted(&user_profile_dirs(), &mut notes)
                 .into_iter()
                 .map(Record::CommandHistory),
         );
+        let reg_capped = crate::asep::REG_VALUES_CAPPED
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(reg_capped_before);
+        if reg_capped > 0 {
+            notes.push(format!(
+                "registry: {reg_capped} value(s) or key(s) cut at a size cap \
+                 ({} chars / {} strings / {} values per key)",
+                crate::asep::MAX_REG_STRING_CHARS,
+                crate::asep::MAX_REG_MULTI_ENTRIES,
+                crate::asep::MAX_REG_VALUES_PER_KEY
+            ));
+        }
+        *self.notes.lock().unwrap_or_else(|e| e.into_inner()) = notes;
         Ok(out)
     }
 
@@ -1153,7 +1238,7 @@ impl Collector for PersistCollector {
             method: "api".into(),
             size: 0,
             sha256: String::new(), // a live registry/folder read is not a byte stream (spec §5)
-            errors: vec![],
+            errors: self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }]
     }
 }
@@ -1785,6 +1870,57 @@ mod tests {
     }
 
     // ── S2-I Task 2: parse_task_xml ────────────────────────────────────────
+
+    /// A UTF-16LE task file (the encoding Task Scheduler writes) is decoded and parsed;
+    /// the old `read_to_string` rejected it as invalid UTF-8 and the task was lost.
+    #[test]
+    fn walk_task_files_decodes_utf16_tasks() {
+        let root = std::env::temp_dir().join(format!("cairn_tasks_u16_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Microsoft")).unwrap();
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(SAMPLE_TASK_XML.encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(root.join("Microsoft").join("Updater"), &bytes).unwrap();
+        let mut notes = Vec::new();
+        let files = walk_task_files(&root, &mut notes);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name, "Updater");
+        let recs = task_records_from_xml(&files[0].xml, "Updater", None, |_| None, |_| false);
+        assert!(!recs.is_empty(), "UTF-16 task must yield its actions");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// A directory symlink loop is not followed (no hang, no stack overflow), deep
+    /// nesting and oversized files are capped and noted.
+    #[cfg(unix)]
+    #[test]
+    fn walk_task_files_survives_loops_depth_and_size() {
+        let root = std::env::temp_dir().join(format!("cairn_tasks_loop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+        let mut deep = root.clone();
+        for i in 0..TASKS_MAX_DEPTH + 3 {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("too_deep"), SAMPLE_TASK_XML).unwrap();
+        std::fs::write(root.join("ok"), SAMPLE_TASK_XML).unwrap();
+        let f = std::fs::File::create(root.join("huge")).unwrap();
+        f.set_len(TASK_XML_MAX_BYTES + 1).unwrap();
+        let mut notes = Vec::new();
+        let files = walk_task_files(&root, &mut notes);
+        let _ = std::fs::remove_dir_all(&root);
+        let names: Vec<&str> = files.iter().map(|f| f.file_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["ok"],
+            "loop not followed, deep and huge skipped"
+        );
+        assert!(notes.iter().any(|n| n.contains("deeper than")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("KiB skipped")), "{notes:?}");
+    }
 
     const SAMPLE_TASK_XML: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.6" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">

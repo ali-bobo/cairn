@@ -29,6 +29,34 @@ pub fn parse_evtx(path: &Path) -> Result<Vec<EventRecord>, EvtxError> {
     Ok(out)
 }
 
+/// [`parse_evtx`] for an untrusted file in a multi-file run: a parser panic is
+/// contained to this file. Returns the events read (those before a panic are kept) and
+/// the reasons this file is incomplete (open error, unparsable records, panic), for the
+/// manifest. Never panics.
+pub fn parse_evtx_contained(path: &Path) -> (Vec<EventRecord>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut errors = Vec::new();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        stream_evtx(path, None, |ev| out.push(ev))
+    }));
+    match result {
+        Ok(Ok(stats)) if stats.failed > 0 => {
+            errors.push(format!("{} record(s) could not be parsed", stats.failed))
+        }
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => errors.push(e.to_string()),
+        Err(p) => errors.push(format!(
+            "parser panicked after {} events ({}); the events read before it are kept",
+            out.len(),
+            p.downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "non-string panic payload".into())
+        )),
+    }
+    (out, errors)
+}
+
 /// Per-file counts from [`stream_evtx`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct StreamStats {
@@ -426,5 +454,10 @@ mod tests {
 
         // Must return (Ok or Err) without panicking.
         let _ = parse_evtx(&p);
+        let (evs, errs) = parse_evtx_contained(&p);
+        assert!(evs.is_empty());
+        let _ = errs;
+        let (_, errs) = parse_evtx_contained(&dir.join("missing.evtx"));
+        assert_eq!(errs.len(), 1, "an open failure is reported");
     }
 }

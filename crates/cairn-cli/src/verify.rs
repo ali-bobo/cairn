@@ -50,6 +50,7 @@ pub fn run_verify(manifest_path: &Path, rules: Option<PathBuf>) -> anyhow::Resul
         .iter()
         .chain(report.sources.iter())
         .chain(report.archive.iter())
+        .chain(report.extra.iter())
     {
         match &c.status {
             cairn_report::CheckStatus::Ok => tracing::info!(file = %c.file, "verify ok"),
@@ -58,6 +59,9 @@ pub fn run_verify(manifest_path: &Path, rules: Option<PathBuf>) -> anyhow::Resul
             }
             cairn_report::CheckStatus::Missing => {
                 tracing::error!(file = %c.file, "MISSING (listed in manifest, not on disk)")
+            }
+            cairn_report::CheckStatus::Unexpected => {
+                tracing::error!(file = %c.file, "UNEXPECTED (present, not listed in manifest)")
             }
         }
     }
@@ -144,6 +148,32 @@ mod tests {
         std::fs::write(&p, &c).unwrap();
         let ok = run_verify(&dir.join("manifest.json"), None).unwrap();
         assert!(!ok, "tampered output must fail verify");
+    }
+
+    /// verify fails on a missing output and on an extra (unlisted) file, and passes
+    /// again once the extra is gone; run.log beside the manifest is fine.
+    #[test]
+    fn run_verify_fails_on_missing_and_extra_files() {
+        let dir = std::env::temp_dir().join("cairn_run_verify_missing_extra");
+        let _ = std::fs::remove_dir_all(&dir);
+        let cfg = Config::for_evtx(vec![PathBuf::from("a.evtx")], None);
+        write_run(&dir, &cfg, &[sigma_finding()]);
+        std::fs::write(dir.join("run.log"), b"log").unwrap();
+        assert!(run_verify(&dir.join("manifest.json"), None).unwrap());
+
+        std::fs::write(dir.join("extra.csv"), b"planted").unwrap();
+        assert!(
+            !run_verify(&dir.join("manifest.json"), None).unwrap(),
+            "extra file"
+        );
+        std::fs::remove_file(dir.join("extra.csv")).unwrap();
+        assert!(run_verify(&dir.join("manifest.json"), None).unwrap());
+
+        std::fs::remove_file(dir.join("timeline.csv")).unwrap();
+        assert!(
+            !run_verify(&dir.join("manifest.json"), None).unwrap(),
+            "missing file"
+        );
     }
 
     /// verify fails when the ruleset is modified vs the manifest's sigma_ruleset_ver
