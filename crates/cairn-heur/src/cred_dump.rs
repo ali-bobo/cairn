@@ -7,7 +7,7 @@
 //! - **WER LocalDumps for lsass.exe** (`dropscan` RegValue for
 //!   [`WER_LSASS_LOCALDUMPS_KEY`]): makes Windows write a full LSASS dump on the next
 //!   crash; almost never set legitimately. High.
-//! - **Command lines** (live processes and Security 4688): comsvcs.dll `MiniDump`,
+//! - **Command lines** (live processes, Security 4688 and Sysmon 1): comsvcs.dll `MiniDump`,
 //!   ProcDump of lsass, Mimikatz modules, PowerShell `Out-Minidump`, `reg save` of the
 //!   SAM / SECURITY hives, `ntdsutil` IFM and copies of `ntds.dit`. High.
 #![forbid(unsafe_code)]
@@ -433,5 +433,34 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert_eq!(f[0].severity, Severity::High);
         assert!(f[0].details.contains(r"DumpFolder=C:\d"));
+    }
+
+    /// Sysmon 1 command lines count like 4688 ones (shape of the real
+    /// `sysmon_10_1_memdump_comsvcs_minidump.evtx` event).
+    #[test]
+    fn sysmon_1_command_line_is_judged() {
+        let serde_json::Value::Object(data) = serde_json::json!({
+            "ProcessId": "1234",
+            "Image": r"C:\Windows\System32\rundll32.exe",
+            "CommandLine": r"rundll32.exe C:\windows\System32\comsvcs.dll, MiniDump 588 C:\Users\Public\l.dmp full",
+            "User": r"IEWIN7\IEUser",
+            "ParentImage": r"C:\Windows\System32\cmd.exe",
+        }) else {
+            unreachable!()
+        };
+        let ev = Record::Event(cairn_core::record::EventRecord {
+            ts: chrono::Utc::now(),
+            channel: crate::cmdline::SYSMON_CHANNEL.into(),
+            event_id: 1,
+            provider: String::new(),
+            computer: String::new(),
+            record_id: 3,
+            data,
+        });
+        let f = run(&[ev]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].mitre, vec!["T1003.001".to_string()]);
+        assert_eq!(f[0].event_id, Some(1));
+        assert_eq!(f[0].user.as_deref(), Some(r"IEWIN7\IEUser"));
     }
 }

@@ -1,7 +1,7 @@
 //! Ransomware precursors (ATT&CK T1490 Inhibit System Recovery): before encrypting,
 //! ransomware deletes the shadow copies and backups and turns off Windows recovery.
 //!
-//! - **Command lines** (live processes and Security 4688): `vssadmin delete shadows` /
+//! - **Command lines** (live processes, Security 4688 and Sysmon 1): `vssadmin delete shadows` /
 //!   `resize shadowstorage`, `wmic shadowcopy delete`, PowerShell / WMI deletion of
 //!   `Win32_ShadowCopy`, `wbadmin delete catalog|systemstatebackup|backup`, and
 //!   `bcdedit` turning off recovery or ignoring boot failures. High.

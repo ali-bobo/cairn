@@ -46,6 +46,7 @@ pub fn heuristic_channels() -> Vec<&'static str> {
         .iter()
         .chain(lateral::CHANNELS)
         .chain(ransom::CHANNELS)
+        .chain(parentchild::CHANNELS)
     {
         if !out.iter().any(|c| c.eq_ignore_ascii_case(ch)) {
             out.push(ch);
