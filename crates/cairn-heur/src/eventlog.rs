@@ -39,10 +39,13 @@ use cairn_core::traits::Analyzer;
 use cairn_core::{Finding, Result};
 use serde_json::{Map, Value};
 
+use crate::defense::{exclusion_value_note, exclusion_value_risk};
 use crate::trust::{
-    is_system_or_program_files, is_user_writable_path, is_windows_root_exe, launchers_in,
-    script_marker_labels, MICROSOFT_PROGRAMDATA,
+    invocation_args, invoked_path, is_system_or_program_files, is_user_writable_path,
+    is_windows_root_exe, launchers_in, risky_args, script_markers, MarkerKind,
+    MICROSOFT_PROGRAMDATA,
 };
+use cairn_core::record::ExclusionKind;
 
 /// Defender's operational channel.
 pub const DEFENDER_CHANNEL: &str = "Microsoft-Windows-Windows Defender/Operational";
@@ -74,21 +77,63 @@ fn field_or_dash(ev: &EventRecord, key: &str) -> String {
     field(&ev.data, key).unwrap_or_else(|| "-".to_string())
 }
 
-/// Why a service ImagePath / task command looks like a payload, if it does.
-fn command_red_flags(cmd: &str) -> Vec<String> {
-    let lower = cmd.to_ascii_lowercase();
-    let mut flags: Vec<String> = Vec::new();
-    if is_user_writable_path(&lower) {
-        flags.push("runs from a user-writable folder".to_string());
+/// What makes a service ImagePath / task command look like a payload.
+#[derive(Debug, Default)]
+struct RedFlags {
+    /// The binary itself sits in a user-writable folder.
+    writable_binary: bool,
+    /// Everything else: a launcher, script markers.
+    other: Vec<String>,
+}
+
+impl RedFlags {
+    fn is_empty(&self) -> bool {
+        !self.writable_binary && self.other.is_empty()
     }
+
+    fn reason(&self) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if self.writable_binary {
+            parts.push("runs from a user-writable folder".to_string());
+        }
+        parts.extend(self.other.iter().cloned());
+        parts.join("; ")
+    }
+}
+
+/// Why a service ImagePath / task command looks like a payload, if it does. The
+/// drop-zone check reads only the binary being run: a vendor service passing its own
+/// `C:\ProgramData\Vendor\config.xml` as an argument is not "running from" there. A URL
+/// counts only next to an interpreter / LOLBin (an agent's `--server https://...` is
+/// configuration, not a download).
+fn command_red_flags(cmd: &str) -> RedFlags {
+    let mut flags = RedFlags {
+        writable_binary: is_user_writable_path(invoked_path(cmd)),
+        ..RedFlags::default()
+    };
     // Interpreters and proxy binaries a legitimate service or task rarely launches
     // directly; attackers use them to run a payload without dropping an exe.
-    if let Some(l) = launchers_in(cmd).first() {
-        flags.push(format!("launches {l}"));
+    let launcher = launchers_in(cmd).into_iter().next();
+    if let Some(l) = &launcher {
+        let risks: Vec<String> = risky_args(invocation_args(cmd))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        if risks.is_empty() {
+            flags.other.push(format!("launches {l}"));
+        } else {
+            flags
+                .other
+                .push(format!("launches {l} with {}", risks.join(", ")));
+        }
     }
-    let markers = script_marker_labels(cmd);
+    let markers: Vec<&str> = script_markers(cmd)
+        .into_iter()
+        .filter(|m| launcher.is_some() || m.kind != MarkerKind::Remote)
+        .map(|m| m.label)
+        .collect();
     if !markers.is_empty() {
-        flags.push(format!("contains {}", markers.join(", ")));
+        flags.other.push(format!("contains {}", markers.join(", ")));
     }
     flags
 }
@@ -182,7 +227,9 @@ fn service_installed(ev: &EventRecord) -> Finding {
     let account = field_or_dash(ev, "AccountName");
     let flags = command_red_flags(&image);
     let (severity, reason) = if !flags.is_empty() {
-        (Severity::High, flags.join("; "))
+        // A service runs as SYSTEM: a binary in a user-writable folder is a privilege
+        // escalation path on its own, so every red flag is High here.
+        (Severity::High, flags.reason())
     } else if is_windows_root_exe(&image) {
         // Checked before the Windows-tree trust tier: the root of C:\Windows is the
         // ADMIN$ share, where PsExec-style tools drop their service binary.
@@ -269,8 +316,20 @@ fn task_created(ev: &EventRecord) -> Finding {
         cmd.clone()
     };
     let flags = command_red_flags(&cmd);
-    let (severity, reason) = if !flags.is_empty() {
-        (Severity::High, flags.join("; "))
+    let (severity, reason) = if !flags.other.is_empty() {
+        (Severity::High, flags.reason())
+    } else if flags.writable_binary {
+        // Per-user updaters (OneDrive, Teams, Zoom) register exactly this: a task
+        // running a binary under the user's AppData. Without a launcher or payload
+        // marker it is worth a look, not an alarm.
+        (
+            Severity::Medium,
+            format!(
+                "{}; per-user updaters (OneDrive, Teams, ...) also do this, so check the \
+                 binary's signer",
+                flags.reason()
+            ),
+        )
     } else if cmd.is_empty() || is_system_or_program_files(&normalize_image(&cmd)) {
         (
             Severity::Low,
@@ -313,18 +372,56 @@ fn defender_rtp_off(ev: &EventRecord) -> Finding {
     )
 }
 
+/// The exclusion a 5007 `New Value` adds: `...\Exclusions\Paths\C:\x = 0x0` ->
+/// (Path, `C:\x`). None when the kind list is not recognised.
+fn parse_exclusion_value(new: &str) -> Option<(ExclusionKind, String)> {
+    let lower = new.to_ascii_lowercase();
+    let at = lower.find(r"\exclusions\")? + r"\exclusions\".len();
+    let rest = new.get(at..)?;
+    let (list, item) = rest.split_once('\\')?;
+    let kind = match list.to_ascii_lowercase().as_str() {
+        "paths" => ExclusionKind::Path,
+        "extensions" => ExclusionKind::Extension,
+        "processes" => ExclusionKind::Process,
+        "ipaddresses" => ExclusionKind::IpAddress,
+        _ => return None,
+    };
+    let item = item.rsplit_once(" = ").map_or(item, |(v, _)| v).trim();
+    (!item.is_empty()).then(|| (kind, item.to_string()))
+}
+
 fn defender_exclusion(ev: &EventRecord) -> Option<Finding> {
     let new = field(&ev.data, "New Value").unwrap_or_default();
     if !new.to_ascii_lowercase().contains("\\exclusions\\") {
         return None;
     }
+    // Rated like the same exclusion found in the registry (heur_defense): High when it
+    // opens a drop zone, a drive, an executable type or an interpreter; Medium for a
+    // narrower one. An entry that cannot be parsed stays High (fail loud).
+    let (severity, why) = match parse_exclusion_value(&new) {
+        Some((kind, value)) => match exclusion_value_risk(kind, &value) {
+            Some(risk) => (Severity::High, risk),
+            None => (
+                Severity::Medium,
+                exclusion_value_note(kind, &value)
+                    .unwrap_or(
+                        "a narrow exclusion (no drop zone, drive, executable type or interpreter)",
+                    )
+                    .to_string(),
+            ),
+        },
+        None => (
+            Severity::High,
+            "exclusion entry could not be parsed".to_string(),
+        ),
+    };
     Some(finding(
         ev,
-        Severity::High,
+        severity,
         "Defender 新增排除項目".to_string(),
         &["T1562.001"],
         format!("Defender EID 5007: exclusion added: {new}"),
-        "an exclusion makes Defender skip a path, extension or process".to_string(),
+        format!("an exclusion makes Defender skip a path, extension or process: {why}"),
         format!(
             "{} Microsoft Defender 新增了排除項目（{new}）。被排除的位置不會被掃描，\
              攻擊者常用這招藏放工具；請確認是不是管理員刻意設定的。",
@@ -701,9 +798,89 @@ mod tests {
             4698,
             json!({"TaskName": "\\Updater", "TaskContent": xml, "SubjectUserName": "a"}),
         )]);
-        assert_eq!(f[0].severity, Severity::High);
+        // A bare AppData binary is what per-user updaters register: Medium.
+        assert_eq!(f[0].severity, Severity::Medium);
         assert!(f[0].details.contains("u.exe -q"), "{}", f[0].details);
         assert_eq!(f[0].mitre, vec!["T1053.005"]);
+    }
+
+    fn task_xml(cmd: &str, args: &str) -> String {
+        format!(
+            "<Task><Actions><Exec><Command>{cmd}</Command><Arguments>{args}</Arguments>\
+             </Exec></Actions></Task>"
+        )
+    }
+
+    #[test]
+    fn per_user_updater_task_is_medium_but_launcher_task_is_high() {
+        let onedrive = task_xml(
+            r"C:\Users\a\AppData\Local\Microsoft\OneDrive\OneDriveStandaloneUpdater.exe",
+            "/reporting",
+        );
+        let f = run(&[ev(
+            "Security",
+            4698,
+            json!({"TaskName": "\\OneDrive Standalone Update Task", "TaskContent": onedrive}),
+        )]);
+        assert_eq!(f[0].severity, Severity::Medium, "{:?}", f[0].reason);
+
+        let bad = task_xml(r"C:\Users\a\AppData\Local\Temp\x.exe", "-enc SQBFAFgA");
+        let f = run(&[ev(
+            "Security",
+            4698,
+            json!({"TaskName": "\\x", "TaskContent": bad}),
+        )]);
+        assert_eq!(f[0].severity, Severity::High);
+
+        let ps = task_xml("powershell.exe", "-w hidden -c iex");
+        let f = run(&[ev(
+            "Security",
+            4698,
+            json!({"TaskName": "\\y", "TaskContent": ps}),
+        )]);
+        assert_eq!(f[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn service_arguments_do_not_count_as_the_binary() {
+        for image in [
+            r#""C:\Program Files\Vendor\svc.exe" -config C:\ProgramData\Vendor\cfg.xml"#,
+            r#""C:\Program Files\Vendor\agent.exe" --server https://mgmt.vendor.example"#,
+            r"C:\Program Files\Vendor\svc.exe -log C:\Users\Public\v.log",
+        ] {
+            let f = run(&[ev(
+                "System",
+                7045,
+                json!({"ServiceName": "Vendor", "ImagePath": image}),
+            )]);
+            assert_eq!(f[0].severity, Severity::Low, "{image}: {:?}", f[0].reason);
+        }
+        // The binary itself in a writable folder stays High.
+        let f = run(&[ev(
+            "System",
+            7045,
+            json!({"ServiceName": "u", "ImagePath": r"C:\Users\Public\svc.exe -k"}),
+        )]);
+        assert_eq!(f[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn defender_exclusion_severity_follows_the_shared_risk_table() {
+        let excl = |path: &str| {
+            json!({"New Value": format!(
+                "HKLM\\SOFTWARE\\Microsoft\\Windows Defender\\Exclusions\\Paths\\{path} = 0x0"
+            )})
+        };
+        let f = run(&[ev(DEFENDER_CHANNEL, 5007, excl(r"C:\Program Files\Veeam"))]);
+        assert_eq!(f[0].severity, Severity::Medium, "{:?}", f[0].reason);
+        let f = run(&[ev(
+            DEFENDER_CHANNEL,
+            5007,
+            excl(r"C:\Users\a\AppData\Local\Temp"),
+        )]);
+        assert_eq!(f[0].severity, Severity::High, "{:?}", f[0].reason);
+        let f = run(&[ev(DEFENDER_CHANNEL, 5007, excl(r"C:\"))]);
+        assert_eq!(f[0].severity, Severity::High);
     }
 
     #[test]

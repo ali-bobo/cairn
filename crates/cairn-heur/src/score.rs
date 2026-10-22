@@ -41,12 +41,20 @@ pub fn is_rare_port(port: u16) -> bool {
 
 /// True if `addr` is a routable public IPv4 (not RFC1918/loopback/link-local/unspecified,
 /// nor CGNAT/benchmarking/IETF-protocol/reserved). A string that does not parse as IPv4
-/// returns false (the signal simply does not fire).
+/// returns false (the signal simply does not fire). The IPv4-mapped IPv6 spelling
+/// (`::ffff:8.8.8.8`, what dual-stack sockets and 4624 `IpAddress` report) is judged
+/// as the IPv4 address it carries; native IPv6 is not handled here.
 ///
 /// FUTURE: replace the manual reserved-range guards with `Ipv4Addr::is_global()` once that
 /// method stabilises (currently nightly-only behind `feature(ip)`).
 pub fn is_public_ipv4(addr: &str) -> bool {
-    match addr.parse::<Ipv4Addr>() {
+    let a = addr.trim().trim_start_matches('[').trim_end_matches(']');
+    let parsed = a.parse::<Ipv4Addr>().ok().or_else(|| {
+        a.parse::<std::net::Ipv6Addr>()
+            .ok()
+            .and_then(|v6| v6.to_ipv4_mapped())
+    });
+    match parsed.ok_or(()) {
         Ok(ip) => {
             !ip.is_private()
                 && !ip.is_loopback()
@@ -114,11 +122,16 @@ fn normalise_service_cmd(cmd: &str) -> String {
     if let Some(rest) = lower.strip_prefix(r"\systemroot\") {
         return format!(r"<win>\{rest}");
     }
-    // Drive-letter form: exactly one letter + ":\windows\" (11 chars total)
-    if lower.len() > 11 {
-        let (head, rest) = lower.split_at(11);
-        let chars: Vec<char> = head.chars().collect();
-        if chars[0].is_ascii_alphabetic() && chars[1] == ':' && &head[2..] == r"\windows\" {
+    // Drive-letter form: exactly one letter + ":\windows\" (11 bytes total). `get`
+    // instead of `split_at`: byte 11 may fall inside a non-ASCII character
+    // (`C:\Programé\x.exe`), which must not panic the analyzer.
+    if let (Some(head), Some(rest)) = (lower.get(..11), lower.get(11..)) {
+        let b = head.as_bytes();
+        if !rest.is_empty()
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && &head[2..] == r"\windows\"
+        {
             return format!(r"<win>\{rest}");
         }
     }
@@ -161,6 +174,20 @@ pub enum JoinKey {
 }
 
 impl JoinKey {
+    /// Whether two keys name the same binary, per the contract above: two full paths
+    /// must be the same path (after [`crate::trust::normalize_path`]); only when either
+    /// side is a bare name, or a path still holds an unexpanded `%VAR%`, does the
+    /// basename decide. `C:\Windows\System32\svchost.exe` and
+    /// `C:\Users\a\svchost.exe` are different binaries.
+    pub fn same_target(&self, other: &JoinKey) -> bool {
+        match (self, other) {
+            (JoinKey::Path(a), JoinKey::Path(b)) if !a.contains('%') && !b.contains('%') => {
+                crate::trust::normalize_path(a) == crate::trust::normalize_path(b)
+            }
+            _ => self.degraded_key() == other.degraded_key(),
+        }
+    }
+
     /// 兩個 JoinKey 是否應視為同一佐證目標：Path 對 Path 要求完全相同；
     /// 任一方是 Name（降級）就退回比對雙方的 basename。
     pub fn degraded_key(&self) -> String {
@@ -404,6 +431,12 @@ mod tests {
         assert!(!is_public_ipv4("169.254.1.1")); // link-local
         assert!(!is_public_ipv4("0.0.0.0")); // unspecified
         assert!(!is_public_ipv4("not-an-ip")); // unparseable -> false
+        assert!(is_public_ipv4("::ffff:8.8.8.8")); // IPv4-mapped
+        assert!(is_public_ipv4("::FFFF:104.18.0.1"));
+        assert!(!is_public_ipv4("::ffff:10.0.0.5"));
+        assert!(!is_public_ipv4("::ffff:127.0.0.1"));
+        assert!(!is_public_ipv4("::1")); // native IPv6: not judged here
+        assert!(!is_public_ipv4("::8.8.8.8")); // deprecated compatible form: not mapped
         assert!(!is_public_ipv4("100.64.0.1")); // CGNAT (RFC6598)
         assert!(!is_public_ipv4("198.18.0.1")); // benchmarking (RFC2544)
         assert!(!is_public_ipv4("240.0.0.1")); // reserved class E
@@ -560,6 +593,14 @@ mod tests {
         assert!(!is_inbox_service_command(
             r#""C:\Program Files\WindowsApps\Claude_1.15\app\resources\cowork-svc.exe""#
         ));
+    }
+
+    /// Regression: a non-ASCII character spanning byte 11 panicked `split_at(11)`.
+    #[test]
+    fn non_ascii_service_path_does_not_panic() {
+        assert!(!is_inbox_service_command("C:\\Program\u{e9}\\x.exe"));
+        assert!(!is_inbox_service_command("C:\\Windows\u{e9}x\\a.exe"));
+        assert!(is_inbox_service_command(r"C:\Windows\System32\a.exe"));
     }
 
     #[test]

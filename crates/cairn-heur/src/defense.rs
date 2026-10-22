@@ -25,25 +25,14 @@ use cairn_core::traits::Analyzer;
 use cairn_core::{Finding, Observation, Result};
 use chrono::{DateTime, Utc};
 
-use crate::trust::{exe_name, is_user_writable_path, launcher_kind};
+use crate::trust::{
+    exe_name, launcher_kind, normalize_path, MICROSOFT_PROGRAMDATA, USER_WRITABLE_DIRS,
+};
 
 /// Extensions whose exclusion lets any payload run unscanned.
 const RISKY_EXTENSIONS: &[&str] = &[
     "exe", "dll", "sys", "scr", "com", "pif", "cpl", "ocx", "msi", "ps1", "psm1", "bat", "cmd",
     "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta", "lnk", "jar", "sct",
-];
-
-/// Environment-variable spellings of drop zones (Defender stores exclusions unexpanded).
-const DROPZONE_VARS: &[&str] = &[
-    "%temp%",
-    "%tmp%",
-    "%appdata%",
-    "%localappdata%",
-    "%userprofile%",
-    "%public%",
-    "%programdata%",
-    "%allusersprofile%",
-    "%homepath%",
 ];
 
 /// What an accessibility binary must not really be.
@@ -93,20 +82,46 @@ fn heuristic(severity: Severity, title: String, mitre: &str, reason: String) -> 
     f
 }
 
-/// Why an exclusion is dangerous (None = only "an exclusion exists").
-fn exclusion_risk(e: &DefenderExclusion) -> Option<String> {
-    let v = e.value.trim().trim_matches('"');
+/// A drop zone other than ProgramData (Temp, AppData, Downloads, Public, ...).
+fn writable_outside_programdata(norm: &str) -> bool {
+    USER_WRITABLE_DIRS
+        .iter()
+        .any(|d| *d != r"\programdata\" && norm.contains(d))
+}
+
+/// `x:\programdata\<vendor>\...` outside Microsoft's subtree: a vendor folder that
+/// backup / EDR / database products tell admins to exclude.
+fn is_programdata_vendor_folder(norm: &str) -> bool {
+    norm.get(1..)
+        .is_some_and(|r| r.starts_with(r":\programdata\"))
+        && !norm.contains(MICROSOFT_PROGRAMDATA)
+}
+
+/// How dangerous one exclusion is: `Some(reason)` = High (it opens a drop zone, a
+/// whole drive, an executable type or an interpreter to unscanned use), `None` = a
+/// narrower exclusion, Medium. Shared by the posture snapshot (Defender exclusion keys)
+/// and the event log (Defender 5007 "exclusion added"), so both rate one exclusion
+/// the same way.
+pub(crate) fn exclusion_value_risk(kind: ExclusionKind, value: &str) -> Option<String> {
+    let v = value.trim().trim_matches('"');
     let lower = v.to_ascii_lowercase();
-    match e.kind {
+    match kind {
         ExclusionKind::Path => {
-            let bare = lower.trim_end_matches(['\\', '*', '.']);
+            let norm = normalize_path(v);
+            let bare = norm.trim_end_matches(['\\', '*', '.']);
             if lower == "*" || lower == "\\" || (bare.len() <= 2 && bare.ends_with(':')) {
                 Some("excludes a whole drive".into())
             } else if bare.len() > 2 && bare.ends_with(r":\users") {
                 Some(r"excludes every user profile (\Users)".into())
-            } else if is_user_writable_path(&format!("{lower}\\"))
-                || DROPZONE_VARS.iter().any(|d| lower.contains(d))
+            } else if bare
+                .get(1..)
+                .and_then(|r| r.strip_prefix(r":\users\"))
+                .is_some_and(|rest| !rest.is_empty() && !rest.contains('\\'))
             {
+                Some("excludes a whole user profile".into())
+            } else if bare.get(1..) == Some(r":\programdata") {
+                Some(r"excludes the whole ProgramData folder".into())
+            } else if writable_outside_programdata(&format!("{bare}\\")) {
                 Some("excludes a user-writable folder".into())
             } else {
                 None
@@ -124,9 +139,7 @@ fn exclusion_risk(e: &DefenderExclusion) -> Option<String> {
                 Some(format!(
                     "excludes {exe}.exe, an interpreter / proxy-execution binary"
                 ))
-            } else if is_user_writable_path(&lower)
-                || DROPZONE_VARS.iter().any(|d| lower.contains(d))
-            {
+            } else if writable_outside_programdata(&normalize_path(v)) {
                 Some("excludes a process in a user-writable folder".into())
             } else {
                 None
@@ -134,6 +147,25 @@ fn exclusion_risk(e: &DefenderExclusion) -> Option<String> {
         }
         ExclusionKind::IpAddress => None,
     }
+}
+
+/// Context for a Medium exclusion that sits in a vendor folder under ProgramData:
+/// users can sometimes add files there, but excluding a product's own data folder is
+/// what backup / EDR / database vendors document.
+pub(crate) fn exclusion_value_note(kind: ExclusionKind, value: &str) -> Option<&'static str> {
+    let norm = normalize_path(value);
+    (matches!(kind, ExclusionKind::Path | ExclusionKind::Process)
+        && exclusion_value_risk(kind, value).is_none()
+        && is_programdata_vendor_folder(&norm))
+    .then_some(
+        "a vendor folder under ProgramData, which products commonly ask to exclude; \
+         check that the vendor is installed and that the folder is not user-writable",
+    )
+}
+
+/// Why an exclusion is dangerous (None = only "an exclusion exists").
+fn exclusion_risk(e: &DefenderExclusion) -> Option<String> {
+    exclusion_value_risk(e.kind, &e.value)
 }
 
 fn kind_label(k: ExclusionKind) -> &'static str {
@@ -164,6 +196,7 @@ fn exclusion_finding(e: &DefenderExclusion, now: DateTime<Utc>) -> Finding {
         e.value,
         e.key,
         risk.as_deref()
+            .or(exclusion_value_note(e.kind, &e.value))
             .map(|r| format!(": {r}"))
             .unwrap_or_default()
     );
@@ -365,11 +398,22 @@ fn accessibility_finding(a: &AccessibilityBinary, now: DateTime<Utc>) -> Option<
         "{} OriginalFilename={:?} signed={:?} signer={:?}",
         a.path, a.original_filename, a.signed, a.signer
     );
-    f.details_client = Some(format!(
-        "Windows 的協助工具程式 {} 被換成別的程式。攻擊者用這招在登入畫面按快速鍵（例如連按 Shift）\
-         就能不用密碼取得最高權限的命令列；請從乾淨的系統還原這個檔案，並檢查是否有遠端登入紀錄。",
-        a.name
-    ));
+    f.details_client = Some(if severity == Severity::High {
+        format!(
+            "Windows 的協助工具程式 {} 被換成別的程式。攻擊者用這招在登入畫面按快速鍵（例如連按 Shift）\
+             就能不用密碼取得最高權限的命令列；請從乾淨的系統還原這個檔案，並檢查是否有遠端登入紀錄。",
+            a.name
+        )
+    } else {
+        // Signed (or signature unknown) and not a shell: a vendor accessibility tool or
+        // an OEM build can carry another internal name. Worth a check, not a verdict.
+        format!(
+            "Windows 的協助工具程式 {} 的內部檔名與 Windows 內建版本不同。這可能是廠商或第三方的\
+             協助工具取代了它，也可能是被換成別的程式（攻擊者可藉此在登入畫面不用密碼取得最高權限）；\
+             請確認這個檔案的來源與簽章是否為已知軟體。",
+            a.name
+        )
+    });
     f.entity.file = Some(EntityFile {
         path: a.path.clone(),
         sha256: a.sha256.clone(),
@@ -555,6 +599,42 @@ mod tests {
         assert_eq!(sev_of(IpAddress, "10.0.0.5"), Severity::Medium);
     }
 
+    /// Regression: a vendor data folder under ProgramData (what Veeam, SQL Server and
+    /// EDR products document as a required exclusion) was High on a clean image,
+    /// because all of ProgramData counts as a drop zone. The ProgramData root, a whole
+    /// profile and the real drop zones stay High.
+    #[test]
+    fn programdata_vendor_exclusion_is_medium_with_a_note() {
+        use ExclusionKind::*;
+        assert_eq!(
+            sev_of(Path, r"C:\ProgramData\Veeam\Backup"),
+            Severity::Medium
+        );
+        assert_eq!(sev_of(Path, r"%ProgramData%\Sophos\"), Severity::Medium);
+        assert_eq!(
+            sev_of(Process, r"C:\ProgramData\Vendor\agent.exe"),
+            Severity::Medium
+        );
+        assert_eq!(sev_of(Path, r"C:\ProgramData\"), Severity::High);
+        assert_eq!(sev_of(Path, "%ProgramData%"), Severity::High);
+        assert_eq!(sev_of(Path, "%USERPROFILE%"), Severity::High);
+        assert_eq!(sev_of(Path, r"C:\Users\bob"), Severity::High);
+        assert_eq!(
+            sev_of(Path, r"C:\ProgramData\x\..\..\Users\Public"),
+            Severity::High
+        );
+        assert_eq!(sev_of(Path, r"C:\Windows\Temp"), Severity::High);
+        let f = run(PostureRecord {
+            defender_exclusions: vec![excl(Path, r"C:\ProgramData\Veeam\Backup")],
+            ..PostureRecord::default()
+        });
+        assert!(
+            f[0].reason.as_deref().unwrap().contains("vendor folder"),
+            "{:?}",
+            f[0].reason
+        );
+    }
+
     #[test]
     fn exclusion_reason_names_the_field_and_key() {
         let f = run(PostureRecord {
@@ -688,6 +768,23 @@ mod tests {
             acc_sev("osk.exe", Some("other.exe"), Some(true)),
             Some(Severity::Low)
         );
+        // Only the High case tells the client the binary was replaced as an attack.
+        for (orig, signed, replaced) in [
+            (Some("cmd.exe"), Some(true), true),
+            (Some("evil.exe"), None, false),
+            (Some("other.exe"), Some(true), false),
+        ] {
+            let f = run(PostureRecord {
+                accessibility_binaries: vec![acc("osk.exe", orig, signed)],
+                ..PostureRecord::default()
+            });
+            let text = f[0].details_client.as_deref().unwrap();
+            assert_eq!(
+                text.contains("被換成別的程式。"),
+                replaced,
+                "{orig:?}: {text}"
+            );
+        }
         // In-box: no finding (including names that differ from the file name).
         assert_eq!(acc_sev("sethc.exe", Some("sethc.exe"), Some(true)), None);
         assert_eq!(

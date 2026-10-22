@@ -50,9 +50,78 @@ pub const USER_WRITABLE_DIRS: &[&str] = &[
 /// Start Menu lives here). Excluded from the `\ProgramData\` drop zone.
 pub const MICROSOFT_PROGRAMDATA: &str = r"\programdata\microsoft\";
 
-/// True if `path` (any case) contains a user-writable drop-zone segment.
+/// Environment-variable and NT-namespace spellings of well-known folders, mapped to a
+/// representative drive path, so a path written `%APPDATA%\x.dll` or
+/// `\SystemRoot\System32\x.sys` is judged like its expanded form. Lowercase.
+const PATH_VARS: &[(&str, &str)] = &[
+    ("%appdata%", r"c:\users\_\appdata\roaming"),
+    ("%localappdata%", r"c:\users\_\appdata\local"),
+    ("%temp%", r"c:\users\_\appdata\local\temp"),
+    ("%tmp%", r"c:\users\_\appdata\local\temp"),
+    ("%userprofile%", r"c:\users\_"),
+    ("%homedrive%%homepath%", r"c:\users\_"),
+    ("%homepath%", r"c:\users\_"),
+    ("%public%", r"c:\users\public"),
+    ("%programdata%", r"c:\programdata"),
+    ("%allusersprofile%", r"c:\programdata"),
+    ("%systemroot%", r"c:\windows"),
+    ("%windir%", r"c:\windows"),
+    ("%programfiles(x86)%", r"c:\program files (x86)"),
+    ("%programfiles%", r"c:\program files"),
+    ("%programw6432%", r"c:\program files"),
+];
+
+/// A path in one comparable shape: surrounding whitespace and quotes trimmed,
+/// lowercase, `/` turned into `\`, the `\\?\` / `\??\` prefixes dropped, a leading
+/// `\SystemRoot\` and the [`PATH_VARS`] variables expanded. For trust checks only.
+pub fn normalize_path(path: &str) -> String {
+    let mut p = path
+        .trim()
+        .trim_matches('"')
+        .to_ascii_lowercase()
+        .replace('/', r"\");
+    for prefix in [r"\\?\", r"\??\"] {
+        if let Some(rest) = p.strip_prefix(prefix) {
+            p = rest.to_string();
+        }
+    }
+    if let Some(rest) = p.strip_prefix(r"\systemroot\") {
+        p = format!(r"c:\windows\{rest}");
+    }
+    if p.contains('%') {
+        for (var, expanded) in PATH_VARS {
+            p = p.replace(var, expanded);
+        }
+    }
+    if p.contains(r"\.") {
+        p = collapse_dot_segments(&p);
+    }
+    p
+}
+
+/// Resolve `.` and `..` segments (`c:\windows\..\users\x` -> `c:\users\x`), so a
+/// traversal through a trusted folder is judged by where it really ends. A `..` never
+/// climbs above the first segment (the drive).
+fn collapse_dot_segments(p: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for (i, seg) in p.split('\\').enumerate() {
+        match seg {
+            "." if i > 0 => {}
+            ".." if i > 0 => {
+                if out.len() > 1 {
+                    out.pop();
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    out.join(r"\")
+}
+
+/// True if `path` (any case, any of the spellings [`normalize_path`] understands)
+/// contains a user-writable drop-zone segment.
 pub fn is_user_writable_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
+    let lower = normalize_path(path);
     USER_WRITABLE_DIRS.iter().any(|d| {
         lower.contains(d) && !(*d == r"\programdata\" && only_microsoft_programdata(&lower))
     })
@@ -158,6 +227,34 @@ pub fn invoked_exe(cmd: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The binary a command line runs: the quoted first token, or for an unquoted command
+/// the text up to the first executable extension followed by a space (so
+/// `C:\Users\Public\My Tools\x.exe -a` keeps its spaces), else the first token.
+pub fn invoked_path(cmd: &str) -> &str {
+    let t = cmd.trim();
+    if let Some(rest) = t.strip_prefix('"') {
+        return rest.split('"').next().unwrap_or(rest);
+    }
+    let lower = t.to_ascii_lowercase();
+    let earliest = [".exe", ".sys", ".dll", ".com", ".bat", ".cmd", ".scr"]
+        .iter()
+        .filter_map(|ext| {
+            lower
+                .match_indices(ext)
+                .map(|(i, _)| i + ext.len())
+                .find(|&end| {
+                    lower
+                        .get(end..)
+                        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+                })
+        })
+        .min();
+    match earliest {
+        Some(end) => &t[..end],
+        None => t.split_whitespace().next().unwrap_or(""),
+    }
+}
+
 /// The argument text after the invoked binary (empty when there is none).
 pub fn invocation_args(cmd: &str) -> &str {
     split_invocation(cmd).1.trim()
@@ -168,18 +265,6 @@ pub fn invocation_args(cmd: &str) -> &str {
 pub const PAYLOAD_EXTS: &[&str] = &[
     ".dll", ".ocx", ".cpl", ".sct", ".msi", ".hta", ".js", ".jse", ".vbs", ".vbe", ".wsf", ".ps1",
     ".bat", ".cmd",
-];
-
-/// Environment-variable spellings of drop zones, mapped to a representative path so
-/// [`is_user_writable_path`] recognises `%APPDATA%\x.dll` as well as the expanded form.
-const DROPZONE_VARS: &[(&str, &str)] = &[
-    ("%appdata%", r"c:\users\_\appdata\roaming"),
-    ("%localappdata%", r"c:\users\_\appdata\local"),
-    ("%temp%", r"c:\users\_\appdata\local\temp"),
-    ("%tmp%", r"c:\users\_\appdata\local\temp"),
-    ("%public%", r"c:\users\public"),
-    ("%programdata%", r"c:\programdata"),
-    ("%allusersprofile%", r"c:\programdata"),
 ];
 
 /// What makes one argument of a proxy-execution host risky.
@@ -251,11 +336,8 @@ pub fn risky_args(args: &str) -> Vec<ArgRisk> {
         } else if lower.starts_with(r"\\") && !lower.starts_with(r"\\?\") {
             Some(ArgRisk::RemoteShare(tok))
         } else if PAYLOAD_EXTS.iter().any(|e| lower.ends_with(e)) {
-            let mut expanded = lower.clone();
-            for (var, path) in DROPZONE_VARS {
-                expanded = expanded.replace(var, path);
-            }
-            is_user_writable_path(&expanded).then_some(ArgRisk::UserWritable(tok))
+            // is_user_writable_path expands %APPDATA% and friends itself.
+            is_user_writable_path(&lower).then_some(ArgRisk::UserWritable(tok))
         } else {
             None
         };
@@ -287,20 +369,52 @@ pub fn launchers_in(cmd: &str) -> Vec<String> {
     out
 }
 
+/// Dash look-alikes PowerShell's parameter binder accepts in place of `-` (en dash,
+/// em dash, horizontal bar).
+const PS_DASHES: &[char] = &['\u{2013}', '\u{2014}', '\u{2015}'];
+
+/// Text with the characters that obfuscate a command without changing what it does
+/// removed: cmd.exe carets (`p^owershell`), PowerShell backticks (`` Do`wnloadString ``)
+/// and quote characters inside words (`i"e"x`, `'Down'+'loadString'` keeps working
+/// for the substring scan once the quotes are gone). For matching only, never shown.
+pub fn deobfuscated(cmd: &str) -> String {
+    cmd.chars()
+        .filter(|c| !matches!(c, '^' | '`' | '"' | '\''))
+        .collect()
+}
+
 /// True if the command line carries a PowerShell encoded-command flag:
 /// `-EncodedCommand` or any prefix of it from `-enc` up, `-ec`, and — only when
-/// `is_powershell` — the bare `-e` short form (other tools use `-e` for unrelated
-/// things). Token-based: `--encoding` or `-encrypt` do not count.
+/// `is_powershell` — the short forms `-e` / `-en` (other tools use `-e` for unrelated
+/// things), the `/` prefix (`/enc`) and the dash look-alikes PowerShell also accepts
+/// (`–enc`). Token-based: `--encoding` or `-encrypt` do not count. Carets and quotes
+/// inside the flag (`-^e^n^c`) are ignored.
 pub fn has_encoded_flag(cmd: &str, is_powershell: bool) -> bool {
-    cmd.split_whitespace().any(|tok| {
-        let Some(flag) = tok.strip_prefix('-') else {
-            return false;
+    deobfuscated(cmd).split_whitespace().any(|tok| {
+        let flag = match tok.strip_prefix('-') {
+            Some(f) => f,
+            None if is_powershell => match tok
+                .strip_prefix(['/'])
+                .or_else(|| tok.strip_prefix(PS_DASHES))
+            {
+                Some(f) => f,
+                None => return false,
+            },
+            None => return false,
         };
         let flag = flag.to_ascii_lowercase();
         (flag.len() >= 3 && "encodedcommand".starts_with(&flag))
             || flag == "ec"
-            || (is_powershell && flag == "e")
+            || (is_powershell && (flag == "e" || flag == "en"))
     })
+}
+
+/// True when a PowerShell binary is named anywhere in the command line (as the
+/// invoked binary or further down a `cmd /c powershell ...` chain).
+pub fn mentions_powershell(cmd: &str) -> bool {
+    launchers_in(&deobfuscated(cmd))
+        .iter()
+        .any(|l| is_powershell(l))
 }
 
 /// True if `s` contains a token that really looks like base64 data: a run of the
@@ -393,14 +507,23 @@ const MARKERS: &[(Needle, &str, MarkerKind)] = &[
 /// Download / encoded-payload / remote markers in a command line or script body. The
 /// one marker scan shared by persistence (S9 script persistence, PowerShell profiles),
 /// event-log service/task commands and ClickFix Run-dialog entries. Labels are
-/// de-duplicated, in table order.
+/// de-duplicated, in table order. The scan ignores carets, backticks and quotes inside
+/// words ([`deobfuscated`]), and accepts PowerShell's short `-e` / `-en` encoded flag
+/// when the text runs PowerShell.
 pub fn script_markers(text: &str) -> Vec<ScriptMarker> {
-    let lower = text.to_ascii_lowercase();
+    let clean = deobfuscated(text);
+    let lower = clean.to_ascii_lowercase();
+    let powershell = mentions_powershell(&clean);
     let mut found: Vec<ScriptMarker> = Vec::new();
     for (needle, label, kind) in MARKERS {
         let hit = match needle {
             Needle::Sub(n) => lower.contains(n),
-            Needle::EncodedFlag => has_encoded_flag(text, false),
+            // The long forms count anywhere; the PowerShell-only short forms (`-e`,
+            // `-en`, `/enc`) also need a real base64 payload next to them.
+            Needle::EncodedFlag => {
+                has_encoded_flag(&clean, false)
+                    || (powershell && has_encoded_flag(&clean, true) && has_base64_token(&clean))
+            }
         };
         if hit && !found.iter().any(|m| m.label == *label) {
             found.push(ScriptMarker { label, kind: *kind });
@@ -419,7 +542,7 @@ pub fn script_marker_labels(text: &str) -> Vec<&'static str> {
 /// all locations where system-named binaries legitimately live (explorer.exe sits
 /// in C:\Windows directly, not System32).
 pub fn is_under_windows_tree(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
+    let lower = normalize_path(path);
     // position 1 == drive-colon form "x:\windows\"
     lower
         .get(1..)
@@ -448,14 +571,16 @@ pub fn is_windows_root_exe(image: &str) -> bool {
 
 /// True if `path` is under the Windows tree or Program Files (either bitness).
 /// Both require admin to write — "system or vendor-installed" trust tier (S4 gate).
+/// The folder name must match exactly: any user may create `C:\Program Files Evil\`
+/// (Authenticated Users can add folders to the drive root), so it earns no trust.
 pub fn is_system_or_program_files(path: &str) -> bool {
     if is_under_windows_tree(path) {
         return true;
     }
-    let lower = path.to_ascii_lowercase();
-    lower
-        .get(1..)
-        .is_some_and(|rest| rest.starts_with(r":\program files"))
+    let lower = normalize_path(path);
+    lower.get(1..).is_some_and(|rest| {
+        rest.starts_with(r":\program files\") || rest.starts_with(r":\program files (x86)\")
+    })
 }
 
 /// Where each [`PROTECTED_SYSTEM_NAMES`] binary legitimately lives, as drive-less
@@ -495,11 +620,10 @@ pub fn canonical_system_dirs(file_name: &str) -> Option<&'static [&'static str]>
 /// (`\SystemRoot\...`) return false — no drive-letter location means no verdict
 /// (honest abstain; the winlogon default `explorer.exe` is a bare name).
 pub fn is_masquerade(path: &str) -> bool {
-    let p = path.trim().trim_matches('"');
-    if !p.get(1..).is_some_and(|r| r.starts_with(":\\")) {
+    let lower = normalize_path(path);
+    if !lower.get(1..).is_some_and(|r| r.starts_with(":\\")) {
         return false; // not absolute — abstain
     }
-    let lower = p.to_ascii_lowercase();
     let Some((dir, base)) = lower.rsplit_once('\\') else {
         return false;
     };
@@ -587,6 +711,46 @@ mod tests {
         }
     }
 
+    /// Regression: `C:\Program Files Evil\` (a folder any user may create in the
+    /// drive root) passed the Program Files trust tier, and `\\?\`, forward-slash,
+    /// `%TEMP%` and `..` spellings slipped past the drop-zone / Windows-tree checks.
+    #[test]
+    fn path_spellings_are_normalized_before_trust_checks() {
+        assert!(!is_system_or_program_files(r"C:\Program Files Evil\x.exe"));
+        assert!(!is_system_or_program_files(r"C:\Program FilesX\x.exe"));
+        assert!(is_system_or_program_files(r"C:\Program Files\V\x.exe"));
+        assert!(is_system_or_program_files(r"%ProgramFiles(x86)%\V\x.exe"));
+        assert!(is_system_or_program_files(
+            r"\??\C:\Windows\System32\drivers\x.sys"
+        ));
+        assert!(!is_system_or_program_files(
+            r"C:\Windows\..\Users\Public\x.exe"
+        ));
+        assert!(!is_under_windows_tree(
+            r"C:\Windows\System32\..\..\Temp\x.exe"
+        ));
+
+        for p in [
+            r"\\?\C:\Users\a\AppData\Local\Temp\x.exe",
+            "C:/Users/a/AppData/Roaming/x.exe",
+            r"%TEMP%\x.exe",
+            r"%LocalAppData%\x.exe",
+            r"%USERPROFILE%\Downloads\x.exe",
+            r"C:\Windows\System32\..\..\Users\Public\x.exe",
+        ] {
+            assert!(is_user_writable_path(p), "{p}");
+        }
+        assert!(!is_user_writable_path(r"%SystemRoot%\System32\x.exe"));
+
+        assert!(is_masquerade(r"\\?\C:\Users\a\svchost.exe"));
+        assert!(is_masquerade("C:/ProgramData/lsass.exe"));
+        assert!(is_masquerade(
+            r"C:\Windows\System32\..\..\Users\Public\svchost.exe"
+        ));
+        assert!(!is_masquerade(r"%SystemRoot%\System32\svchost.exe"));
+        assert!(!is_masquerade(r"\??\C:\Windows\System32\smss.exe"));
+    }
+
     #[test]
     fn exe_name_and_invoked_exe_normalize_tokens() {
         assert_eq!(
@@ -662,6 +826,43 @@ mod tests {
         );
         assert!(!has_encoded_flag("tool --encoding utf8", false));
         assert!(!has_encoded_flag("tool -encrypt", false));
+    }
+
+    /// PowerShell also binds `-en`, `/enc` and dash look-alikes to -EncodedCommand,
+    /// and cmd carets inside the flag vanish before PowerShell sees it.
+    #[test]
+    fn encoded_flag_covers_powershell_spellings() {
+        for cmd in [
+            "powershell -en SQBF",
+            "powershell /enc SQBF",
+            "powershell \u{2013}enc SQBF",
+            "powershell -^e^n^c SQBF",
+        ] {
+            assert!(has_encoded_flag(cmd, true), "{cmd}");
+        }
+        // Outside PowerShell the short and slash forms mean something else.
+        assert!(!has_encoded_flag("tool -en x", false));
+        assert!(!has_encoded_flag("tool /enc x", false));
+        assert!(!has_encoded_flag("powershell -Environment x", true));
+    }
+
+    /// Regression: `powershell -e <base64>` (the most common encoded launch) was not
+    /// an Encoded marker, because the marker scan never passed `is_powershell`.
+    #[test]
+    fn script_markers_see_short_encoded_flag_and_obfuscation() {
+        let m = script_markers("powershell.exe -w hidden -e SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA");
+        assert!(m.iter().any(|m| m.kind == MarkerKind::Encoded), "{m:?}");
+        let m = script_markers(
+            r#""C:\Program Files\PowerShell\7\pwsh.exe" -en SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA"#,
+        );
+        assert!(m.iter().any(|m| m.kind == MarkerKind::Encoded), "{m:?}");
+        // cmd carets / PowerShell backticks / split quotes do not hide a download.
+        let m =
+            script_markers("cmd /c p^owershell (New-Object Net.WebClient).Do`wnload\"String\"(x)");
+        assert!(m.iter().any(|m| m.label == "DownloadString"), "{m:?}");
+        // noise: a short -e without a base64 payload, or -e for another tool
+        assert!(script_markers("powershell -e").is_empty());
+        assert!(script_markers("curl -e SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA x").is_empty());
     }
 
     #[test]

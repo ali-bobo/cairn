@@ -83,7 +83,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::cmdline::{event_field, event_str};
 use crate::rmm::is_public_ip;
-use crate::trust::{is_user_writable_path, is_windows_root_exe};
+use crate::trust::{invoked_path, is_user_writable_path, is_windows_root_exe, normalize_path};
 
 /// How long after a remote logon / share access a service install is tied to it.
 pub const CORRELATION_WINDOW_MINUTES: i64 = 10;
@@ -159,8 +159,7 @@ pub fn remote_exec_service(name: &str, image: &str) -> Option<&'static str> {
     if i.contains(r"\\127.0.0.1\") || i.contains(r"\admin$\") {
         return Some(r"service binary runs from ADMIN$ / \\127.0.0.1\ (Impacket)");
     }
-    let i = i.split_whitespace().collect::<Vec<_>>().join(" ");
-    if i.starts_with("%comspec%") || i.contains("cmd.exe /c") || i.contains("cmd.exe /q /c") {
+    if runs_cmd_one_liner(&i) {
         return Some("service binary is a cmd /c one-liner (smbexec-style)");
     }
     if is_windows_root_exe(&i) {
@@ -168,6 +167,76 @@ pub fn remote_exec_service(name: &str, image: &str) -> Option<&'static str> {
             "service binary sits directly in the Windows folder, the ADMIN$ share root where \
              PsExec-style tools (Metasploit psexec, PAExec, RemCom) copy their service exe",
         );
+    }
+    None
+}
+
+/// `cmd /c ...`, `C:\Windows\system32\cmd.exe /q /c ...`, `"cmd" /k ...`, `%COMSPEC% ...`:
+/// the service's binary is the shell and an argument is a run-and-exit/keep switch.
+fn runs_cmd_one_liner(lower: &str) -> bool {
+    let mut toks = lower.split_whitespace();
+    let Some(first) = toks.next() else {
+        return false;
+    };
+    let first = first.trim_matches('"');
+    if first.starts_with("%comspec%") {
+        return true;
+    }
+    let base = first.rsplit(['\\', '/']).next().unwrap_or(first);
+    if base != "cmd" && base != "cmd.exe" {
+        return false;
+    }
+    // Switches may be glued together (`/q/c`) or to the command (`/cecho`).
+    toks.any(|t| t.starts_with('/') && t.split('/').skip(1).any(|o| o.starts_with(['c', 'r', 'k'])))
+}
+
+/// The service's binary, normalized (`%SystemRoot%\x.exe` -> `c:\windows\x.exe`).
+fn service_binary(image: &str) -> String {
+    normalize_path(invoked_path(image))
+}
+
+/// Last path component of a share-relative or absolute path, lowercased.
+fn base_name(path: &str) -> String {
+    let p = path.trim().trim_matches('"');
+    p.rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(p)
+        .to_ascii_lowercase()
+}
+
+/// Why a service installed after admin-share access is tied to that access, if it is:
+/// it looks like remote execution, it runs a file the source just wrote through the
+/// share, or (after ADMIN$ access) its binary sits directly in the Windows folder,
+/// which is where ADMIN$ lands. A software update that installs an unrelated service
+/// in the same window is not tied.
+fn service_tie(list: &[&Access], sv: &EventRecord) -> Option<String> {
+    let name = s(sv, "ServiceName");
+    let image = s(sv, "ImagePath");
+    if let Some(why) = remote_exec_service(&name, &image) {
+        return Some(why.to_string());
+    }
+    let bin = service_binary(&image);
+    let bin_base = base_name(&bin);
+    if !bin_base.is_empty()
+        && list
+            .iter()
+            .any(|a| base_name(&s(a.ev, "RelativeTargetName")) == bin_base)
+    {
+        return Some(format!(
+            "its binary {bin_base} was written through the share"
+        ));
+    }
+    let admin = list.iter().any(|a| {
+        a.share
+            .as_deref()
+            .is_some_and(|sh| base_name(sh).eq_ignore_ascii_case("admin$"))
+    });
+    let in_windows_root = bin
+        .get(1..)
+        .and_then(|r| r.strip_prefix(r":\windows\"))
+        .is_some_and(|rest| !rest.is_empty() && !rest.contains('\\'));
+    if admin && in_windows_root {
+        return Some("its binary sits directly in the Windows folder, where ADMIN$ lands".into());
     }
     None
 }
@@ -1056,11 +1125,15 @@ impl Analyzer for LateralHeuristic {
         }
 
         let window = Duration::minutes(CORRELATION_WINDOW_MINUTES);
-        let service_after = |t: DateTime<Utc>| {
+        // The first service installed in the window after the group's accesses that
+        // is tied to them (see `service_tie`).
+        let service_after = |list: &[&Access]| {
+            let t = list[0].ev.ts;
+            let end = list[list.len() - 1].ev.ts + window;
             services
                 .iter()
-                .find(|sv| sv.ts >= t && sv.ts - t <= window)
-                .copied()
+                .filter(|sv| sv.ts >= t && sv.ts <= end)
+                .find_map(|sv| service_tie(list, sv).map(|why| (*sv, why)))
         };
         let mut out = Vec::new();
 
@@ -1078,8 +1151,8 @@ impl Analyzer for LateralHeuristic {
             let mut shares: Vec<&str> = list.iter().filter_map(|a| a.share.as_deref()).collect();
             shares.sort_unstable();
             shares.dedup();
-            let svc = list.iter().find_map(|a| service_after(a.ev.ts));
-            let (severity, mitre): (Severity, &[&str]) = match svc {
+            let svc = service_after(list);
+            let (severity, mitre): (Severity, &[&str]) = match &svc {
                 Some(_) => (Severity::High, &[ADMIN_SHARES, SERVICE_EXEC]),
                 None => (Severity::Medium, &[ADMIN_SHARES]),
             };
@@ -1114,9 +1187,11 @@ impl Analyzer for LateralHeuristic {
                     ),
                 ));
             }
-            if let Some(sv) = svc {
+            if let Some((sv, tie)) = &svc {
+                let sv = *sv;
                 reason.push_str(&format!(
-                    "; service {} ({}) installed at {}, within {CORRELATION_WINDOW_MINUTES} min",
+                    "; service {} ({}) installed at {}, within {CORRELATION_WINDOW_MINUTES} min, \
+                     and {tie}",
                     s(sv, "ServiceName"),
                     s(sv, "ImagePath"),
                     fmt_ts(sv.ts)
@@ -1330,6 +1405,63 @@ mod tests {
         assert!(f[0].reason.as_deref().unwrap().contains("Windows folder"));
         let f = run(&[service(3, "w", r"%SystemRoot%\System32\w.exe")]);
         assert!(f.is_empty(), "{f:?}");
+    }
+
+    #[test]
+    fn unrelated_service_after_share_access_stays_medium() {
+        // SCCM/patching touches C$ and an updater installs its own service minutes later.
+        let f = run(&[
+            share(0, "10.0.0.9", r"\\*\C$"),
+            service(
+                2,
+                "gupdate",
+                r#""C:\Program Files (x86)\Google\Update\GoogleUpdate.exe" /svc"#,
+            ),
+        ]);
+        assert_eq!(f[0].severity, Severity::Medium, "{:?}", f[0].reason);
+        // A Windows-root binary is only tied after ADMIN$ access, not C$.
+        let f = run(&[
+            share(0, "10.0.0.9", r"\\*\C$"),
+            service(2, "updsvc", r"C:\Windows\updsvc.exe"),
+        ]);
+        assert_eq!(f[0].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn service_running_the_file_written_through_the_share_is_high() {
+        // Payload dropped through C$ into ProgramData, then installed as a service.
+        let f = run(&[
+            share(0, "10.0.0.9", r"\\*\C$"),
+            service(4, "Updater", r"C:\ProgramData\x.exe -k"),
+        ]);
+        assert_eq!(f[0].severity, Severity::High, "{:?}", f[0].reason);
+        assert!(f[0].reason.as_deref().unwrap().contains("written through"));
+        // %SystemRoot% form after ADMIN$ access is tied too.
+        let f = run(&[
+            share(0, "10.0.0.9", r"\\*\ADMIN$"),
+            service(4, "rnd", r"%SystemRoot%\aBcD.exe"),
+        ]);
+        assert_eq!(f[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn cmd_one_liners_are_caught_in_every_spelling() {
+        for image in [
+            r"cmd /c echo x > \\127.0.0.1\c$\o",
+            r"C:\Windows\system32\cmd.exe  /Q  /c whoami",
+            r#""cmd" /k whoami"#,
+            "cmd.exe /q/c whoami",
+            "cmd /R whoami",
+        ] {
+            assert!(remote_exec_service("x", image).is_some(), "{image}");
+        }
+        for image in [
+            r"C:\Program Files\Vendor\cmdagent.exe /config x",
+            r"C:\Windows\System32\svchost.exe -k netsvcs",
+            "cmd.exe",
+        ] {
+            assert!(remote_exec_service("x", image).is_none(), "{image}");
+        }
     }
 
     #[test]

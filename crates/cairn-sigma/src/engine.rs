@@ -293,8 +293,14 @@ fn collect_rule_yamls(dir: &Path, out: &mut Vec<String>) -> Result<()> {
         Ok(rd) => rd,
         Err(_) => return Ok(()),
     };
-    for entry in rd {
-        let path = entry?.path();
+    // read_dir order is filesystem-defined (differs between NTFS, ext4, tmpfs and
+    // between runs on some): sort so rules, and the findings they emit for the same
+    // event, always come out in the same order.
+    let mut paths = rd
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    for path in paths {
         if path.is_dir() {
             collect_rule_yamls(&path, out)?;
         } else if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
@@ -372,6 +378,29 @@ detection:
             record_id: 1,
             data,
         }
+    }
+
+    #[test]
+    fn rule_files_are_collected_in_path_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "cairn-sigma-order-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let sub = dir.join("b_dir");
+        std::fs::create_dir_all(&sub).unwrap();
+        for (p, body) in [
+            (dir.join("z.yml"), "z"),
+            (dir.join("a.yaml"), "a"),
+            (sub.join("m.yml"), "m"),
+            (dir.join("c.txt"), "skipped"),
+        ] {
+            std::fs::write(p, body).unwrap();
+        }
+        let mut out = Vec::new();
+        collect_rule_yamls(&dir, &mut out).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(out, vec!["a", "m", "z"]);
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! Notify, WOW64 Run keys) rely on persist.rs's generic path/signature signals.
 use crate::persist::GateHit;
 use crate::trust::{
-    is_masquerade, is_under_windows_tree, is_user_writable_path, script_marker_labels,
+    is_masquerade, is_under_windows_tree, is_user_writable_path, script_markers, MarkerKind,
 };
 use cairn_core::record::{Mechanism, PersistenceRecord};
 use cairn_core::Severity;
@@ -219,17 +219,34 @@ pub(crate) fn asep_signal(p: &PersistenceRecord) -> Option<GateHit> {
     }
 
     if m == Mechanism::PsProfile {
-        let markers = script_marker_labels(p.command.as_deref().unwrap_or(""));
+        let markers = script_markers(p.command.as_deref().unwrap_or(""));
         if markers.is_empty() {
             return None;
         }
+        // A URL alone is common in hand-written profiles (a proxy setting, a module
+        // source, a comment linking the docs); a download, iex or encoded payload is not.
+        let url_only = markers.iter().all(|mk| mk.kind == MarkerKind::Remote);
+        let labels: Vec<&str> = markers.iter().map(|mk| mk.label).collect();
         return Some(GateHit {
-            severity: Severity::High,
-            label: "PowerShell 設定檔含下載或編碼內容",
+            severity: if url_only {
+                Severity::Medium
+            } else {
+                Severity::High
+            },
+            label: if url_only {
+                "PowerShell 設定檔含網址"
+            } else {
+                "PowerShell 設定檔含下載或編碼內容"
+            },
             reason: format!(
-                "PowerShell profile {} runs at every PowerShell start and contains {}",
+                "PowerShell profile {} runs at every PowerShell start and contains {}{}",
                 p.location,
-                markers.join(", ")
+                labels.join(", "),
+                if url_only {
+                    " (a URL only: no download, iex or encoded payload)"
+                } else {
+                    ""
+                }
             ),
             mitre,
         });
@@ -455,7 +472,18 @@ mod tests {
         );
         let hit = asep_signal(&bad).unwrap();
         assert_eq!(hit.mitre, "T1546.013");
+        assert_eq!(hit.severity, Severity::High);
         assert!(hit.reason.contains("DownloadString"));
+        // A proxy setting is a URL and nothing else: worth a look, not High.
+        let proxy = rec(
+            Mechanism::PsProfile,
+            "profile.ps1",
+            "[System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy('http://proxy.corp:8080')",
+            None,
+        );
+        let hit = asep_signal(&proxy).unwrap();
+        assert_eq!(hit.severity, Severity::Medium);
+        assert!(hit.reason.contains("URL only"), "{}", hit.reason);
     }
 
     /// Generic-signal mechanisms get no mechanism-specific hit.

@@ -4,8 +4,8 @@
 use crate::score::{build_cross_index, deescalate, escalate, join_key};
 use crate::trust::{
     exe_name, invocation_args, invoked_exe, is_interpreter, is_masquerade,
-    is_system_or_program_files, is_under_windows_tree, is_user_writable_path, risky_args,
-    script_markers, winlogon_value_is_default, ArgRisk, MarkerKind,
+    is_system_or_program_files, is_under_windows_tree, is_user_writable_path, launcher_kind,
+    risky_args, script_markers, winlogon_value_is_default, ArgRisk, MarkerKind,
 };
 use cairn_core::finding::{
     EntityFile, EntityPersistence, EntityProcess, EntityRegistry, EvidenceItem,
@@ -189,8 +189,13 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
         }
     }
 
-    // S1b: IFEO debugger — always gates (rare); severity by target trust.
-    if p.mechanism == Mechanism::Ifeo {
+    // Extended catalog / accessibility IFEO / PowerShell profile signals.
+    let asep = crate::asep::asep_signal(p);
+
+    // S1b: IFEO debugger — always gates (rare); severity by target trust. An IFEO on an
+    // accessibility binary is the same registry value, described more precisely by the
+    // asep hit (T1546.008); counting both would "escalate" one fact as two signals.
+    if p.mechanism == Mechanism::Ifeo && asep.is_none() {
         let untrusted = p.signed == Some(false) || is_user_writable_path(path);
         hits.push(GateHit {
             severity: if untrusted {
@@ -263,10 +268,7 @@ pub(crate) fn evaluate_gate(p: &PersistenceRecord, now: DateTime<Utc>) -> Vec<Ga
     // own path is the Startup folder by design (the AnyDesk.lnk false positive).
     let path = signal_path(p);
 
-    // Extended catalog / accessibility IFEO / PowerShell profile signals.
-    if let Some(hit) = crate::asep::asep_signal(p) {
-        hits.push(hit);
-    }
+    hits.extend(asep);
 
     // S2: unsigned + user-writable drop zone. Some(false) = verified unsigned.
     let s2 = p.signed == Some(false) && is_user_writable_path(path);
@@ -433,6 +435,26 @@ fn execution_evidence(entries: &[&ExecutionRecord]) -> Vec<EvidenceItem> {
         .collect()
 }
 
+/// True when the entry's binary is a launcher (interpreter / LOLBin / fetch tool):
+/// its identity is the command line, not the shared host binary.
+fn runs_through_launcher(p: &PersistenceRecord) -> bool {
+    p.binary_path
+        .as_deref()
+        .map(exe_name)
+        .filter(|e| !e.is_empty())
+        .or_else(|| p.command.as_deref().and_then(invoked_exe))
+        .is_some_and(|e| launcher_kind(&e).is_some())
+}
+
+/// Lowercase, whitespace runs collapsed, surrounding quotes of the whole string kept:
+/// the comparison form of two command lines.
+fn collapse_ws(s: &str) -> String {
+    s.to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Total order over Severity for max-selection (Severity itself has no Ord).
 fn sev_rank(s: Severity) -> u8 {
     match s {
@@ -497,8 +519,17 @@ impl Analyzer for PersistHeuristic {
                     .unwrap_or(""),
             );
             let mut evidence = vec![persistence_evidence(p)];
-            let (exec_hits, exec_degraded) = idx.lookup_exec(&key);
-            let (proc_hits, proc_degraded) = idx.lookup_proc(&key);
+            let (mut exec_hits, exec_degraded) = idx.lookup_exec(&key);
+            let (mut proc_hits, proc_degraded) = idx.lookup_proc(&key);
+            if runs_through_launcher(p) {
+                // The binary is a shared host (powershell, rundll32, cmd, ...): every
+                // host on the machine has its prefetch entry and usually a running
+                // instance, which says nothing about THIS entry. Only a process
+                // running this exact command line corroborates it.
+                exec_hits.clear();
+                let want = collapse_ws(p.command.as_deref().unwrap_or(""));
+                proc_hits.retain(|pr| !want.is_empty() && collapse_ws(&pr.cmdline) == want);
+            }
             if !exec_hits.is_empty() || !proc_hits.is_empty() {
                 sev = escalate(sev);
                 let mut corr = Vec::new();
@@ -556,8 +587,14 @@ impl Analyzer for PersistHeuristic {
             );
             f.reason = Some(reasons.join("; "));
             f.mitre = {
-                let mut m: Vec<String> = hits.iter().map(|h| h.mitre.to_string()).collect();
-                m.dedup();
+                // First-seen order, every duplicate dropped (Vec::dedup only drops
+                // adjacent ones: [T1036, T1059, T1036] stayed as is).
+                let mut m: Vec<String> = Vec::new();
+                for h in &hits {
+                    if !m.iter().any(|x| x == h.mitre) {
+                        m.push(h.mitre.to_string());
+                    }
+                }
                 m
             };
             f.artifact = "persistence".into();
@@ -1252,6 +1289,40 @@ mod tests {
         assert!(evaluate_gate(&old, now).is_empty());
     }
 
+    /// Regression: a Run key running `powershell -e <base64>` (PowerShell's short
+    /// encoded flag) was plain inventory — no S9 hit at all.
+    #[test]
+    fn gate_s9_short_encoded_flag_is_high() {
+        let now = Utc::now();
+        let p = full_rec(
+            Mechanism::RunKey,
+            Some("U"),
+            Some("powershell.exe -w hidden -e SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA"),
+            Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            Some(true),
+            None,
+        );
+        let hits = evaluate_gate(&p, now);
+        assert!(
+            hits.iter()
+                .any(|h| h.severity == Severity::High && h.mitre == "T1059"),
+            "{:?}",
+            hits.iter().map(|h| &h.reason).collect::<Vec<_>>()
+        );
+        // noise: a plain PowerShell script from Program Files stays below High
+        let plain = full_rec(
+            Mechanism::RunKey,
+            Some("U"),
+            Some(r#"powershell.exe -ExecutionPolicy Bypass -File "C:\Program Files\V\start.ps1""#),
+            Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            Some(true),
+            None,
+        );
+        assert!(evaluate_gate(&plain, now)
+            .iter()
+            .all(|h| h.severity != Severity::High));
+    }
+
     #[test]
     fn gate_s9_script_persistence_tiers() {
         let now = Utc::now();
@@ -1397,6 +1468,145 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("corroborated"));
+    }
+
+    /// Regression: a persistence entry run through a shared host (powershell,
+    /// rundll32, ...) was "corroborated — escalated" by the host's prefetch entry or by
+    /// any running instance of it, which every Windows machine has.
+    #[test]
+    fn launcher_host_is_not_corroborated_by_unrelated_runs() {
+        use cairn_core::record::ExecutionRecord;
+        let now = Utc::now();
+        let ps = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe";
+        let cmd = "powershell.exe -NoP -Enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA";
+        let entry = wrap(full_rec(
+            Mechanism::RunKey,
+            Some("U"),
+            Some(cmd),
+            Some(ps),
+            Some(true),
+            None,
+        ));
+        let prefetch = Record::Execution(ExecutionRecord {
+            source: "prefetch".into(),
+            path: "POWERSHELL.EXE".into(),
+            first_run: None,
+            last_run: Some(now),
+            run_count: Some(40),
+            sha1: None,
+            user_sid: None,
+            execution_confirmed: Some(true),
+            full_path: None,
+        });
+        let proc_with = |cmdline: &str| {
+            Record::Process(ProcessRecord {
+                pid: 77,
+                ppid: 1,
+                image: ps.into(),
+                cmdline: cmdline.into(),
+                signed: Some(true),
+                signer: None,
+                binary_sha256: None,
+                integrity: None,
+                user: None,
+                start_time: None,
+                signer_source: None,
+            })
+        };
+        let f = PersistHeuristic
+            .analyze(
+                &[
+                    entry.clone(),
+                    prefetch,
+                    proc_with("powershell.exe -File C:\\it\\inventory.ps1"),
+                ],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::High, "{:?}", f[0].reason);
+        assert!(!f[0].reason.as_deref().unwrap().contains("corroborated"));
+        // The same command line actually running does corroborate.
+        let f = PersistHeuristic
+            .analyze(
+                &[
+                    entry,
+                    proc_with("powershell.exe  -NoP -Enc SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA"),
+                ],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(f[0].severity, Severity::Critical);
+        assert!(f[0]
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("currently running"));
+    }
+
+    /// Regression: an IFEO debugger on sethc.exe produced the accessibility hit AND the
+    /// generic IFEO hit for the same registry value, and "2 independent signals —
+    /// escalated" turned one fact into Critical.
+    #[test]
+    fn accessibility_ifeo_is_one_signal() {
+        let now = Utc::now();
+        let mut p = full_rec(
+            Mechanism::Ifeo,
+            Some("sethc.exe"),
+            Some(r"C:\Windows\System32\cmd.exe"),
+            Some(r"C:\Windows\System32\cmd.exe"),
+            Some(true),
+            None,
+        );
+        let hits = evaluate_gate(&p, now);
+        assert_eq!(
+            hits.len(),
+            1,
+            "{:?}",
+            hits.iter().map(|h| &h.reason).collect::<Vec<_>>()
+        );
+        assert_eq!(hits[0].mitre, "T1546.008");
+        let f = PersistHeuristic.analyze(&[wrap(p.clone())], &[]).unwrap();
+        assert_eq!(f[0].severity, Severity::High);
+        // A real second fact (unsigned payload in a drop zone) still escalates.
+        p.command = Some(r"C:\Users\Public\x.exe".into());
+        p.binary_path = Some(r"C:\Users\Public\x.exe".into());
+        p.signed = Some(false);
+        let f = PersistHeuristic.analyze(&[wrap(p)], &[]).unwrap();
+        assert_eq!(f[0].severity, Severity::Critical);
+        // A generic IFEO still gets its S1b hit.
+        let generic = full_rec(
+            Mechanism::Ifeo,
+            Some("notepad.exe"),
+            Some(r"C:\Program Files\NPP\npp.exe"),
+            Some(r"C:\Program Files\NPP\npp.exe"),
+            Some(true),
+            None,
+        );
+        assert_eq!(evaluate_gate(&generic, now)[0].mitre, "T1546.012");
+    }
+
+    /// Non-adjacent duplicate techniques collapse (Vec::dedup kept them).
+    #[test]
+    fn finding_mitre_has_no_duplicates() {
+        // policy Run (T1547.001) + masquerade (T1036.005) + recent unverifiable
+        // (T1547.001 again): the old dedup kept both T1547.001 entries.
+        let p = full_rec(
+            Mechanism::ExplorerPolicyRun,
+            Some("x"),
+            Some(r"C:\Users\a\svchost.exe"),
+            Some(r"C:\Users\a\svchost.exe"),
+            None,
+            Some(Utc::now()),
+        );
+        assert_eq!(evaluate_gate(&p, Utc::now()).len(), 3);
+        let f = PersistHeuristic.analyze(&[wrap(p)], &[]).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        assert!(
+            f[0].mitre.iter().all(|m| seen.insert(m.clone())),
+            "{:?}",
+            f[0].mitre
+        );
     }
 
     #[test]

@@ -171,6 +171,23 @@ fn same_account(d: &serde_json::Map<String, serde_json::Value>) -> bool {
     }
 }
 
+/// Windows setup (OOBE) creates and later deletes a temporary `defaultuser0` (also
+/// `defaultuser100000`, ...) as SYSTEM / the machine account on every fresh install
+/// and feature update. True for that create/delete; anyone else touching such a name
+/// is judged normally.
+fn is_oobe_default_user(d: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let target = opt_str(d, "TargetUserName").unwrap_or_default();
+    let digits = target
+        .get(..11)
+        .filter(|p| p.eq_ignore_ascii_case("defaultuser"))
+        .map(|_| &target[11..]);
+    let is_default = digits.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let by_system = opt_str(d, "SubjectUserSid").is_some_and(|s| s == "S-1-5-18")
+        || opt_str(d, "SubjectUserName")
+            .is_some_and(|n| n.eq_ignore_ascii_case("SYSTEM") || n.ends_with('$'));
+    is_default && by_system
+}
+
 /// Parse a Security channel EventRecord into an AccountEvent; return None for irrelevant events.
 fn parse_account_event(ev: &EventRecord) -> Option<AccountEvent> {
     if ev.channel != "Security" {
@@ -272,6 +289,16 @@ impl Analyzer for AccountHeuristic {
             };
             let (t, s) = (&ae.target, &ae.subject);
 
+            let oobe = matches!(
+                ae.kind,
+                AccountEventKind::Created | AccountEventKind::Deleted
+            ) && is_oobe_default_user(&ev.data);
+            let by_recency = if oobe { Severity::Low } else { by_recency };
+            let window = if oobe {
+                format!("{window}；帳號名稱與建立者符合 Windows 安裝程式（OOBE）暫時帳號 defaultuserN 的模式")
+            } else {
+                window
+            };
             let (severity, title, details, reason) = match &ae.kind {
                 AccountEventKind::Created => (
                     by_recency,
@@ -422,6 +449,37 @@ mod tests {
         assert_eq!(findings[0].severity, Severity::High);
         assert!(findings[0].mitre.contains(&"T1136.001".to_string()));
         assert_eq!(findings[0].artifact, "account");
+    }
+
+    #[test]
+    fn windows_setup_default_user_is_low() {
+        for (eid, subject) in [(4720, "SYSTEM"), (4726, "WS01$")] {
+            let f = run(&[make_event(
+                eid,
+                "Security",
+                recent(),
+                account_data("defaultuser0", subject),
+            )]);
+            assert_eq!(f[0].severity, Severity::Low, "{eid}");
+            assert!(f[0].reason.as_deref().unwrap().contains("OOBE"));
+        }
+        let f = run(&[make_event(
+            4720,
+            "Security",
+            recent(),
+            account_data("defaultuser100000", "SYSTEM"),
+        )]);
+        assert_eq!(f[0].severity, Severity::Low);
+        // The same name created by a user account, or a look-alike name, stays High.
+        for (target, subject) in [("defaultuser0", "bob"), ("defaultuser0x", "SYSTEM")] {
+            let f = run(&[make_event(
+                4720,
+                "Security",
+                recent(),
+                account_data(target, subject),
+            )]);
+            assert_eq!(f[0].severity, Severity::High, "{target} by {subject}");
+        }
     }
 
     #[test]
