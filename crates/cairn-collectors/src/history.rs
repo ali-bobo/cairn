@@ -171,7 +171,7 @@ pub fn read_psreadline_history_noted(
 ) -> Vec<CommandHistoryRecord> {
     let mut out = Vec::new();
     for (user, path) in psreadline_paths(homes) {
-        if cairn_core::paths::must_not_probe(&path) {
+        if crate::must_not_probe(&path) {
             continue;
         }
         let Ok(f) = std::fs::File::open(&path) else {

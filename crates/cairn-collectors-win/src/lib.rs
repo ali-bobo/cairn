@@ -9,6 +9,7 @@
 pub mod auditpol;
 #[cfg(windows)]
 mod cmdline_reader;
+pub mod drive;
 pub mod evtx_export;
 pub mod host;
 pub mod logon;

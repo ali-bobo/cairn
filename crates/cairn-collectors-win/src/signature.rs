@@ -263,12 +263,12 @@ mod win {
     }
 
     /// Existing, non-empty, LOCAL path as a NUL-terminated wide string; None otherwise.
-    /// A remote (UNC / network-share) path is never opened: probing it would make an
-    /// SMB connection, which can stall for minutes and would send this host's
-    /// credentials to whatever server a hostile persistence entry names.
+    /// A remote (UNC, mapped network drive) or device path is never opened: probing it
+    /// would make an SMB connection, which can stall for minutes and would send this
+    /// host's credentials to whatever server a hostile persistence entry names.
     fn checkable(path: &str) -> Option<Vec<u16>> {
         if path.is_empty()
-            || cairn_core::paths::is_remote_path(path)
+            || crate::drive::must_not_probe(path)
             || !std::path::Path::new(path).exists()
         {
             return None;
