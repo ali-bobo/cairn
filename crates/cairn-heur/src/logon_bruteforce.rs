@@ -15,6 +15,10 @@ fn extract_str(data: &serde_json::Map<String, serde_json::Value>, key: &str) -> 
 }
 
 /// A numeric field that may be written as a string ("3", "0xC000006A") or a number.
+/// Real 4625s (DeepBlueCLI `smb-password-guessing-security.evtx`) carry `LogonType`
+/// as a JSON number and `Status` / `SubStatus` as lowercase hex strings
+/// (`0xc000006d` / `0xc0000064`), with `TargetUserName`, `IpAddress`, `IpPort` and
+/// `WorkstationName` as the attempt's fields.
 fn extract_num(data: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<u64> {
     match data.get(key)? {
         serde_json::Value::Number(n) => n.as_u64(),
@@ -34,8 +38,12 @@ fn extract_num(data: &serde_json::Map<String, serde_json::Value>, key: &str) -> 
 const NTLM_GUESS_STATUS: &[u64] = &[0xC000_006A, 0xC000_0064, 0xC000_0234];
 /// Generic "unknown user name or bad password"; the detail is in SubStatus.
 const STATUS_LOGON_FAILURE: u64 = 0xC000_006D;
-/// Kerberos 4771 failure codes of a guess: bad password (0x18), unknown principal
-/// (0x6), client revoked / locked (0x12).
+/// Kerberos failure codes of a guess: bad password (0x18), unknown principal (0x6),
+/// client revoked / locked (0x12). Real DC logs (EVTX-ATTACK-SAMPLES
+/// `kerberos_pwd_spray_4771.evtx`) split them by event: a wrong password on an
+/// existing account is 4771 (`Status` 0x18), a name that does not exist is a failed
+/// 4768 TGT request (`Status` 0x6) — so a spray over a user list shows up mostly as
+/// 4768, and both events count.
 const KERBEROS_GUESS_STATUS: &[u64] = &[0x18, 0x6, 0x12];
 
 /// Logon types never counted: 0 (system), 4 (batch), 5 (service) — a service with a
@@ -46,8 +54,8 @@ const IGNORED_LOGON_TYPES: &[u64] = &[0, 4, 5];
 /// Logon types a successful remote guess produces: Network (3), RemoteInteractive (10).
 const REMOTE_SUCCESS_TYPES: &[u64] = &[3, 10];
 
-/// A single parsed logon attempt (a 4624 remote success, or a 4625/4771/4776 guessing
-/// failure).
+/// A single parsed logon attempt (a 4624 remote success, or a 4625/4768/4771/4776
+/// guessing failure).
 #[derive(Debug, Clone)]
 struct LogonAttempt {
     ts: DateTime<Utc>,
@@ -111,6 +119,14 @@ fn parse_logon_attempt(ev: &EventRecord) -> Option<LogonAttempt> {
             }
             false
         }
+        4768 => {
+            // 4768 is mostly successful TGT requests (Status 0x0); only guessing
+            // failures count, and a success is not a remote logon.
+            if !extract_num(d, "Status").is_some_and(|c| KERBEROS_GUESS_STATUS.contains(&c)) {
+                return None;
+            }
+            false
+        }
         4776 => {
             // 4776 is logged for successes too (Status 0x0); only guessing failures count.
             if !extract_num(d, "Status").is_some_and(|c| NTLM_GUESS_STATUS.contains(&c)) {
@@ -154,6 +170,7 @@ fn evidence_label(a: &LogonAttempt) -> &'static str {
     match (a.event_id, a.success) {
         (_, true) => "4624 success",
         (4771, _) => "4771 Kerberos pre-auth failure",
+        (4768, _) => "4768 Kerberos TGT request failure",
         (4776, _) => "4776 NTLM validation failure",
         _ => "4625 failure",
     }
@@ -790,6 +807,14 @@ mod tests {
         assert_eq!(f.len(), 1);
         assert!(f[0].details.contains("10.0.0.5") && !f[0].details.contains("::ffff:"));
         assert!(f[0].evidence[0].detail.contains("4771"));
+        // Real DC shape: a guessed name that does not exist is a failed 4768 (0x6).
+        let tgt = five(4768, &[("IpAddress", "172.16.66.1"), ("Status", "0x6")]);
+        let f = heuristic().analyze(&tgt, &[]).unwrap();
+        assert_eq!(f.len(), 1);
+        assert!(f[0].evidence[0].detail.contains("4768"));
+        // A granted TGT (0x0) is neither a failure nor a remote logon.
+        let ok = five(4768, &[("IpAddress", "172.16.66.1"), ("Status", "0x0")]);
+        assert!(heuristic().analyze(&ok, &[]).unwrap().is_empty());
         let ntlm = five(
             4776,
             &[
