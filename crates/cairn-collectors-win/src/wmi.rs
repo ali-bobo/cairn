@@ -165,6 +165,57 @@ pub fn wmi_error(step: &str, hresult: i32) -> CairnError {
     }
 }
 
+/// Milliseconds one `IEnumWbemClassObject::Next` may wait for the next object. The
+/// previous `WBEM_INFINITE` (-1) could block forever on a wedged or hostile WMI
+/// provider; a finite wait turns that into a recorded error.
+pub const WMI_NEXT_TIMEOUT_MS: i32 = 60_000;
+const _: () = assert!(WMI_NEXT_TIMEOUT_MS > 0, "never WBEM_INFINITE");
+
+/// Most objects one WQL query may return before it is treated as an error. A real
+/// host has a handful of subscriptions and at most a few hundred shadow copies; tens
+/// of thousands means a flooded namespace, which must not exhaust memory.
+pub const WMI_MAX_OBJECTS: usize = 50_000;
+
+/// `WBEM_S_TIMEDOUT`: `Next` returned because its timeout elapsed, not because the
+/// enumeration ended. A success code, so `hr.is_err()` alone misses it.
+pub const WBEM_S_TIMEDOUT: i32 = 0x0004_0004;
+
+/// What to do after one `IEnumWbemClassObject::Next` call.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NextStep {
+    /// An object was returned: keep it and call `Next` again.
+    Keep,
+    /// The enumeration is complete.
+    Done,
+    /// Stop with this error reason (timeout, failure, or too many objects).
+    Fail(String),
+}
+
+/// Classify one `Next(timeout, 1 slot)` result. `hr` is its HRESULT, `returned` the
+/// object count it reported, `so_far` the objects already kept. Pure, so the timeout
+/// and cap handling is testable off Windows. A timeout must never read as "done":
+/// that would silently truncate the list and make a stuck provider look clean.
+pub fn classify_next(hr: i32, returned: u32, so_far: usize) -> NextStep {
+    if hr == WBEM_S_TIMEDOUT {
+        return NextStep::Fail(format!(
+            "timed out after {}s waiting for the next object",
+            WMI_NEXT_TIMEOUT_MS / 1000
+        ));
+    }
+    if hr < 0 {
+        return NextStep::Fail(format!("failed: HRESULT 0x{:08X}", hr as u32));
+    }
+    if returned == 0 {
+        return NextStep::Done;
+    }
+    if so_far >= WMI_MAX_OBJECTS {
+        return NextStep::Fail(format!(
+            "returned more than {WMI_MAX_OBJECTS} objects; stopped (flooded namespace?)"
+        ));
+    }
+    NextStep::Keep
+}
+
 /// Non-Windows: empty (WMI is Windows-only).
 #[cfg(not(windows))]
 pub fn enumerate_subscriptions() -> Result<Vec<RawWmiSubscription>> {
@@ -193,9 +244,14 @@ pub(crate) mod win {
     };
     use windows::Win32::System::Variant::VARIANT;
     use windows::Win32::System::Wmi::{
-        IWbemClassObject, IWbemLocator, IWbemServices, WBEM_FLAG_FORWARD_ONLY,
-        WBEM_FLAG_RETURN_IMMEDIATELY,
+        IWbemClassObject, IWbemLocator, IWbemServices, WBEM_FLAG_CONNECT_USE_MAX_WAIT,
+        WBEM_FLAG_FORWARD_ONLY, WBEM_FLAG_RETURN_IMMEDIATELY,
     };
+
+    /// `ConnectServer` security flags: `WBEM_FLAG_CONNECT_USE_MAX_WAIT` bounds the
+    /// connect to at most two minutes instead of waiting indefinitely on a hung WMI
+    /// service.
+    pub(crate) const CONNECT_FLAGS: i32 = WBEM_FLAG_CONNECT_USE_MAX_WAIT.0;
 
     // CLSID_WbemLocator {4590F811-1D3A-11D0-891F-00AA004B2E24}. The value used here
     // before (dc12a687-...) is IID_IWbemLocator, the interface id, which made every
@@ -280,20 +336,23 @@ pub(crate) mod win {
             let mut objects: [Option<IWbemClassObject>; 1] = [None];
             let mut returned: u32 = 0;
             // SAFETY: enumerator is valid; objects is a 1-element buffer matching the
-            // slice length the binding passes; returned is a valid out-param.
-            let hr = unsafe { enumerator.Next(-1, &mut objects, &mut returned) };
-            if hr.is_err() {
-                return Err(wmi_error(
-                    &format!("IEnumWbemClassObject::Next({wql})"),
-                    hr.0,
-                ));
-            }
-            if returned == 0 {
-                break; // WBEM_S_FALSE: enumeration complete
-            }
-            match objects[0].take() {
-                Some(o) => out.push(o),
-                None => break,
+            // slice length the binding passes; returned is a valid out-param. The finite
+            // timeout means a wedged provider returns WBEM_S_TIMEDOUT instead of
+            // blocking this thread forever.
+            let hr =
+                unsafe { enumerator.Next(super::WMI_NEXT_TIMEOUT_MS, &mut objects, &mut returned) };
+            match super::classify_next(hr.0, returned, out.len()) {
+                super::NextStep::Done => break,
+                super::NextStep::Fail(why) => {
+                    return Err(cairn_core::CairnError::Collector {
+                        collector: "wmi_subscription".into(),
+                        reason: format!("IEnumWbemClassObject::Next({wql}) {why}"),
+                    });
+                }
+                super::NextStep::Keep => match objects[0].take() {
+                    Some(o) => out.push(o),
+                    None => break,
+                },
             }
         }
         Ok(out)
@@ -312,9 +371,18 @@ pub(crate) mod win {
         let empty = BSTR::new();
         // SAFETY: locator is a valid IWbemLocator; empty BSTRs are the documented
         // "use defaults" for user/password/locale/authority; None for pctx.
-        let services: IWbemServices =
-            unsafe { locator.ConnectServer(&namespace, &empty, &empty, &empty, 0, &empty, None) }
-                .map_err(|e| wmi_error(r"ConnectServer(root\subscription)", e.code().0))?;
+        let services: IWbemServices = unsafe {
+            locator.ConnectServer(
+                &namespace,
+                &empty,
+                &empty,
+                &empty,
+                CONNECT_FLAGS,
+                &empty,
+                None,
+            )
+        }
+        .map_err(|e| wmi_error(r"ConnectServer(root\subscription)", e.code().0))?;
 
         let filters: Vec<RawFilter> = query_all(&services, "SELECT * FROM __EventFilter")?
             .iter()
@@ -450,6 +518,24 @@ mod tests {
         assert_eq!(out[0].filter_name, "F");
         assert_eq!(out[0].consumer_type, "NTEventLogEventConsumer");
         assert_eq!(out[0].command, None);
+    }
+
+    #[test]
+    fn next_timeout_is_an_error_not_the_end_of_the_list() {
+        assert!(matches!(
+            classify_next(WBEM_S_TIMEDOUT, 0, 3),
+            NextStep::Fail(ref w) if w.contains("timed out")
+        ));
+        assert_eq!(classify_next(1, 0, 3), NextStep::Done, "WBEM_S_FALSE = end");
+        assert_eq!(classify_next(0, 1, 3), NextStep::Keep);
+        assert!(matches!(
+            classify_next(0x8004_1006u32 as i32, 0, 0),
+            NextStep::Fail(ref w) if w.contains("0x80041006")
+        ));
+        assert!(matches!(
+            classify_next(0, 1, WMI_MAX_OBJECTS),
+            NextStep::Fail(ref w) if w.contains("more than")
+        ));
     }
 
     #[test]
