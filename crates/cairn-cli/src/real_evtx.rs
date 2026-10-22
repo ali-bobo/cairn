@@ -1,5 +1,5 @@
 //! Real EVTX samples through the offline `cairn evtx` pipeline: the EVTX collector's
-//! parser, the event-only analyzer set from the registry and the bundled Sigma rules,
+//! parser, the offline analyzer set from the registry and the bundled Sigma rules,
 //! exactly as `cairn evtx <files>` runs them ([`crate::evtx::analyze`]).
 //!
 //! The samples are public attack recordings committed under `tests/fixtures/` (source,
@@ -11,7 +11,9 @@
 //! `cargo test -p cairn-cli real_evtx::print_findings -- --ignored --nocapture` prints
 //! every finding per fixture (set `CAIRN_EVTX_DIR` to look at another directory).
 use crate::evtx::analyze;
-use cairn_core::analyzers::{ACCOUNT, EVENTLOG, LATERAL, LOGON_BRUTEFORCE, SIGMA};
+use cairn_core::analyzers::{
+    ACCOUNT, CRED_DUMP, EVENTLOG, LATERAL, LOGON_BRUTEFORCE, PARENTCHILD, SIGMA,
+};
 use cairn_core::finding::Severity;
 use cairn_core::traits::Analyzer;
 use cairn_core::{Config, Finding, Record};
@@ -329,6 +331,11 @@ fn sigma_on_real_security_and_sysmon_events() {
     assert!(fired(&f, SIGMA, Severity::High, "t1003.001")
         .iter()
         .any(|x| x.title == "Process Memory Dump Via Comsvcs.DLL"));
+    // The same Sysmon 1 command line through heur_cred_dump (it read only 4688 and
+    // did not run offline before).
+    let dump = fired(&f, CRED_DUMP, Severity::High, "T1003.001");
+    assert_eq!(dump.len(), 1, "{}", titles(&f));
+    assert_eq!(dump[0].event_id, Some(1));
     assert_explained(&f);
 }
 
@@ -393,4 +400,154 @@ fn print_findings() {
         );
         println!("{}", titles(&a.findings));
     }
+}
+
+// --- Process starts (4688 / Sysmon 1), Sysmon 10 and Sysmon 19-21 ---
+// None of these samples raised any finding through `cairn evtx` before: heur_parentchild
+// read only the live process snapshot, and no bundled rule covered Sysmon 10 / 20 / 21.
+
+/// Impacket wmiexec (WmiPrvSE parent) and dcomexec (mmc parent): each of the three
+/// `cmd.exe /Q /c ... 1> \\127.0.0.1\ADMIN$\__<time> 2>&1` starts fires, the whoami
+/// they run does not.
+#[test]
+fn impacket_wmiexec_and_dcomexec_sysmon_1() {
+    let (_, f) = run("LM_wmiexec_impacket_sysmon_whoami.evtx");
+    let pc = by(&f, PARENTCHILD);
+    assert_eq!(pc.len(), 3, "{}", titles(&f));
+    assert!(pc.iter().all(|x| x.severity == Severity::Critical
+        && has_technique(x, "T1047")
+        && has_technique(x, "T1021.002")
+        && x.title.contains("cmd.exe")
+        && x.event_id == Some(1)));
+    assert!(pc[0]
+        .details_client
+        .as_deref()
+        .is_some_and(|c| c.contains("wmiexec")));
+    let sigma = fired(&f, SIGMA, Severity::High, "t1047");
+    assert_eq!(sigma.len(), 3, "{}", titles(&f));
+    assert!(sigma
+        .iter()
+        .all(|x| x.title == "HackTool - Potential Impacket Lateral Movement Activity"));
+    assert_explained(&f);
+
+    let (_, f) = run("LM_impacket_docmexec_mmc_sysmon_01.evtx");
+    let pc = fired(&f, PARENTCHILD, Severity::High, "T1021.002");
+    assert_eq!(pc.len(), 3, "{}", titles(&f));
+    assert!(pc
+        .iter()
+        .all(|x| x.reason.as_deref().unwrap().contains("mmc.exe")));
+    assert_eq!(by(&f, PARENTCHILD).len(), 3);
+    assert_eq!(fired(&f, SIGMA, Severity::High, "t1047").len(), 3);
+    assert_explained(&f);
+}
+
+/// Windows 7 Security log: 4688 without ParentProcessName or command line. calc.exe's
+/// creator pid is the WmiPrvSE.exe started just before it.
+#[test]
+fn wmi_remote_execution_in_win7_4688() {
+    let (_, f) = run("LM_WMI_4624_4688_TargetHost.evtx");
+    let pc = by(&f, PARENTCHILD);
+    assert_eq!(pc.len(), 1, "{}", titles(&f));
+    let x = pc[0];
+    assert_eq!(x.severity, Severity::Medium);
+    assert!(has_technique(x, "T1047"));
+    assert!(x.title.contains("calc.exe"));
+    assert!(x.reason.as_deref().unwrap().contains("wmiprvse.exe"));
+    assert_eq!(x.artifact, "evtx:Security");
+    assert_eq!(x.event_id, Some(4688));
+    assert_explained(&f);
+}
+
+/// Metasploit psexec_psh: services.exe -> cmd.exe starting hidden PowerShell.
+#[test]
+fn psexec_powershell_service_sysmon_1() {
+    let (_, f) = run("LM_sysmon_psexec_smb_meterpreter.evtx");
+    let pc = fired(&f, PARENTCHILD, Severity::High, "T1569.002");
+    assert_eq!(pc.len(), 1, "{}", titles(&f));
+    assert!(has_technique(pc[0], "T1059.001"));
+    assert!(pc[0].title.contains("cmd.exe"));
+    assert_eq!(pc[0].user.as_deref(), Some(r"NT AUTHORITY\SYSTEM"));
+    assert_eq!(by(&f, PARENTCHILD).len(), 1);
+    assert_explained(&f);
+}
+
+/// IIS web shell: w3wp.exe -> cmd.exe /c net user; net.exe / net1.exe under cmd are
+/// not findings of their own.
+#[test]
+fn iis_web_shell_sysmon_1() {
+    let (_, f) = run("LM_typical_IIS_webshell_sysmon_1_10_traces.evtx");
+    let pc = by(&f, PARENTCHILD);
+    assert_eq!(pc.len(), 1, "{}", titles(&f));
+    assert_eq!(pc[0].severity, Severity::High);
+    assert!(has_technique(pc[0], "T1505.003"));
+    assert_eq!(pc[0].user.as_deref(), Some(r"IIS APPPOOL\DefaultAppPool"));
+    assert_explained(&f);
+}
+
+/// WMI handler hijack (PoisonHandler): WmiPrvSE starts rundll32 url.dll handlers, cmd
+/// and explorer. notepad (under cmd) and the DCOM explorer factory (ParentImage `?`)
+/// stay quiet.
+#[test]
+fn wmi_handler_abuse_sysmon_1() {
+    let (_, f) = run("LM_wmi_PoisonHandler_Mr-Un1k0d3r_sysmon_1_13.evtx");
+    let pc = fired(&f, PARENTCHILD, Severity::Medium, "T1047");
+    assert_eq!(pc.len(), 4, "{}", titles(&f));
+    assert_eq!(by(&f, PARENTCHILD).len(), 4);
+    assert_eq!(
+        pc.iter()
+            .filter(|x| x.title.contains("rundll32.exe"))
+            .count(),
+        2
+    );
+    assert!(!f.iter().any(|x| x.title.contains("notepad")));
+    let sigma = fired(&f, SIGMA, Severity::High, "t1047");
+    assert_eq!(sigma.len(), 2, "{}", titles(&f));
+    assert!(sigma
+        .iter()
+        .all(|x| x.title == "Suspicious WmiPrvSE Child Process"));
+    assert_explained(&f);
+}
+
+/// Sysmon 10: mimikatz sekurlsa::logonpasswords opening lsass (0x1010), and
+/// Meterpreter hashdump with PROCESS_ALL_ACCESS from a network share.
+#[test]
+fn lsass_access_sysmon_10() {
+    let (_, f) = run("sysmon_10_lsass_mimikatz_sekurlsa_logonpasswords.evtx");
+    let s = fired(&f, SIGMA, Severity::High, "t1003.001");
+    assert_eq!(s.len(), 1, "{}", titles(&f));
+    assert_eq!(s[0].title, "HackTool - Generic Process Access");
+    assert_eq!(s[0].event_id, Some(10));
+    assert_explained(&f);
+
+    let (_, f) = run("CA_sysmon_hashdump_cmd_meterpreter.evtx");
+    let s = fired(&f, SIGMA, Severity::Medium, "t1003.001");
+    assert_eq!(s.len(), 1, "{}", titles(&f));
+    assert_eq!(
+        s[0].title,
+        "Potentially Suspicious GrantedAccess Flags On LSASS"
+    );
+    assert_explained(&f);
+}
+
+/// Sysmon 19 / 20 / 21: a CommandLineEventConsumer created and deleted with WMIC (six
+/// events, one grouped finding) whose cmd.exe then runs under WmiPrvSE as SYSTEM, and
+/// WMIGhost's JScript ActiveScriptEventConsumer.
+#[test]
+fn wmi_consumers_sysmon_19_20_21() {
+    let (_, f) = run("sysmon_20_21_1_CommandLineEventConsumer.evtx");
+    let sub = fired(&f, SIGMA, Severity::Medium, "t1546.003");
+    assert_eq!(sub.len(), 1, "{}", titles(&f));
+    assert_eq!(sub[0].title, "WMI Event Subscription");
+    let pc = fired(&f, PARENTCHILD, Severity::Medium, "T1047");
+    assert_eq!(pc.len(), 1, "{}", titles(&f));
+    assert_eq!(pc[0].user.as_deref(), Some(r"NT AUTHORITY\SYSTEM"));
+    assert_explained(&f);
+
+    let (_, f) = run("wmighost_sysmon_20_21_1.evtx");
+    let script = fired(&f, SIGMA, Severity::High, "t1059.005");
+    assert_eq!(script.len(), 1, "{}", titles(&f));
+    assert_eq!(script[0].title, "Suspicious Scripting in a WMI Consumer");
+    assert_eq!(script[0].event_id, Some(20));
+    assert_eq!(fired(&f, SIGMA, Severity::Medium, "t1546.003").len(), 2);
+    assert_explained(&f);
 }

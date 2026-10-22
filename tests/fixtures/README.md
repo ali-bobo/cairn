@@ -45,6 +45,16 @@ it against `SHA256SUMS`.
 | `DE_104_system_log_cleared.evtx` | EVTX-ATTACK-SAMPLES `Defense Evasion/` | System 104, UserData `LogFileCleared`; zero (1601) record header |
 | `CA_DCSync_4662.evtx` | EVTX-ATTACK-SAMPLES `Credential Access/` | 4662 DS replication (DCSync) |
 | `sysmon_10_1_memdump_comsvcs_minidump.evtx` | EVTX-ATTACK-SAMPLES `Credential Access/` | Sysmon 1 `rundll32 comsvcs.dll MiniDump` of lsass, Sysmon 7 / 10 / 11 |
+| `sysmon_10_lsass_mimikatz_sekurlsa_logonpasswords.evtx` | EVTX-ATTACK-SAMPLES `Credential Access/` | Sysmon 10: mimikatz.exe opens lsass.exe (`GrantedAccess` 0x1010, `CallTrace`) |
+| `CA_sysmon_hashdump_cmd_meterpreter.evtx` | EVTX-ATTACK-SAMPLES `Credential Access/` | Sysmon 10 / 8: Meterpreter hashdump, PROCESS_ALL_ACCESS (0x1f1fff) to lsass and other system processes from `\\VBOXSVR\...` |
+| `LM_wmiexec_impacket_sysmon_whoami.evtx` | EVTX-ATTACK-SAMPLES `Lateral Movement/` | Sysmon 1: Impacket wmiexec, WmiPrvSE -> `cmd.exe /Q /c ... 1> \\127.0.0.1\ADMIN$\__<time> 2>&1`, then whoami |
+| `LM_impacket_docmexec_mmc_sysmon_01.evtx` | EVTX-ATTACK-SAMPLES `Lateral Movement/` | Sysmon 1 / 3: Impacket dcomexec (MMC20), mmc.exe -Embedding -> cmd.exe with the same ADMIN$ redirect |
+| `LM_WMI_4624_4688_TargetHost.evtx` | EVTX-ATTACK-SAMPLES `Lateral Movement/` | Windows 7 4688 without `ParentProcessName` and command line: WmiPrvSE.exe -> calc.exe (parent by `ProcessId`), 4624 type 3 |
+| `LM_sysmon_psexec_smb_meterpreter.evtx` | EVTX-ATTACK-SAMPLES `Lateral Movement/` | Sysmon 1 / 13 / 18: Metasploit psexec_psh, services.exe -> `cmd.exe /b /c start /b /min powershell.exe -nop -w hidden -noni ...` |
+| `LM_typical_IIS_webshell_sysmon_1_10_traces.evtx` | EVTX-ATTACK-SAMPLES `Lateral Movement/` | Sysmon 1 / 10: IIS web shell, w3wp.exe -> `cmd.exe /c net user` -> net1 |
+| `LM_wmi_PoisonHandler_Mr-Un1k0d3r_sysmon_1_13.evtx` | EVTX-ATTACK-SAMPLES `Lateral Movement/` | Sysmon 1 / 13: WMI handler hijack, WmiPrvSE -> rundll32 url.dll / cmd / explorer `ms-browser://`; `OriginalFileName`; a `ParentImage` of `?` |
+| `sysmon_20_21_1_CommandLineEventConsumer.evtx` | EVTX-ATTACK-SAMPLES `Persistence/` | Sysmon 19 / 20 / 21 create and delete a `CommandLineEventConsumer` (WMIC from python), WmiPrvSE -> cmd.exe as SYSTEM, Sysmon 10 |
+| `wmighost_sysmon_20_21_1.evtx` | EVTX-ATTACK-SAMPLES `Persistence/` | Sysmon 20 / 21: WMIGhost `ActiveScriptEventConsumer` (JScript), scrcons.exe start |
 | `metasploit-psexec-native-target-system.evtx` | DeepBlueCLI `evtx/` | Metasploit psexec: 7045 `%SYSTEMROOT%\<random>.exe`, getsystem `cmd.exe /c echo ... > \\.\pipe\...`, 7036 `param1` / `param2` / `Binary`, 104 |
 | `metasploit-psexec-powershell-target-system.evtx` | DeepBlueCLI `evtx/` | Metasploit psexec_psh: 7045 `%COMSPEC% ... powershell ... FromBase64String`, 7009, 104 |
 | `password-spray.evtx` | DeepBlueCLI `evtx/` | 294 x 4648, 41 accounts against one SMB server; TargetServerName = the local name, remote end in `IpAddress` |

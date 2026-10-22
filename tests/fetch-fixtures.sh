@@ -44,6 +44,18 @@ fetch kerberos_pwd_spray_4771.evtx "$eas/Credential%20Access/kerberos_pwd_spray_
 fetch DE_104_system_log_cleared.evtx "$eas/Defense%20Evasion/DE_104_system_log_cleared.evtx"
 fetch CA_DCSync_4662.evtx "$eas/Credential%20Access/CA_DCSync_4662.evtx"
 fetch sysmon_10_1_memdump_comsvcs_minidump.evtx "$eas/Credential%20Access/sysmon_10_1_memdump_comsvcs_minidump.evtx"
+fetch sysmon_10_lsass_mimikatz_sekurlsa_logonpasswords.evtx \
+  "$eas/Credential%20Access/sysmon_10_lsass_mimikatz_sekurlsa_logonpasswords.evtx"
+fetch CA_sysmon_hashdump_cmd_meterpreter.evtx "$eas/Credential%20Access/CA_sysmon_hashdump_cmd_meterpreter.evtx"
+fetch LM_wmiexec_impacket_sysmon_whoami.evtx "$eas/Lateral%20Movement/LM_wmiexec_impacket_sysmon_whoami.evtx"
+fetch LM_impacket_docmexec_mmc_sysmon_01.evtx "$eas/Lateral%20Movement/LM_impacket_docmexec_mmc_sysmon_01.evtx"
+fetch LM_WMI_4624_4688_TargetHost.evtx "$eas/Lateral%20Movement/LM_WMI_4624_4688_TargetHost.evtx"
+fetch LM_sysmon_psexec_smb_meterpreter.evtx "$eas/Lateral%20Movement/LM_sysmon_psexec_smb_meterpreter.evtx"
+fetch LM_typical_IIS_webshell_sysmon_1_10_traces.evtx "$eas/Lateral%20Movement/LM_typical_IIS_webshell_sysmon_1_10_traces.evtx"
+fetch LM_wmi_PoisonHandler_Mr-Un1k0d3r_sysmon_1_13.evtx \
+  "$eas/Lateral%20Movement/LM_wmi_PoisonHandler_Mr-Un1k0d3r_sysmon_1_13.evtx"
+fetch sysmon_20_21_1_CommandLineEventConsumer.evtx "$eas/Persistence/sysmon_20_21_1_CommandLineEventConsumer.evtx"
+fetch wmighost_sysmon_20_21_1.evtx "$eas/Persistence/wmighost_sysmon_20_21_1.evtx"
 fetch metasploit-psexec-native-target-system.evtx "$dbc/metasploit-psexec-native-target-system.evtx"
 fetch metasploit-psexec-powershell-target-system.evtx "$dbc/metasploit-psexec-powershell-target-system.evtx"
 fetch password-spray.evtx "$dbc/password-spray.evtx"
