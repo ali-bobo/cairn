@@ -270,7 +270,7 @@ pub fn recovery_action(prog: &str, cmd: &str) -> Option<&'static str> {
     if runs("vssadmin") && has("delete shadows") {
         return Some("vssadmin delete shadows");
     }
-    if runs("vssadmin") && has("resize shadowstorage") {
+    if runs("vssadmin") && has("resize shadowstorage") && shrinks_shadow_storage(cmd) {
         return Some("vssadmin resize shadowstorage (shrinking it deletes shadow copies)");
     }
     if runs("wmic") && has("shadowcopy") && has("delete") {
@@ -298,6 +298,50 @@ pub fn recovery_action(prog: &str, cmd: &str) -> Option<&'static str> {
         return Some("bcdedit ignores boot failures (no recovery screen)");
     }
     None
+}
+
+/// Below this a resize evicts shadow copies (Ryuk / Conti: `/maxsize=401MB`). Admins
+/// and backup agents resize the other way (`/maxsize=UNBOUNDED`, `20%`, `50GB`).
+const SHADOW_STORAGE_FLOOR_MB: f64 = 1024.0;
+/// A percentage resize at or below this is treated as shrinking.
+const SHADOW_STORAGE_FLOOR_PCT: f64 = 1.0;
+
+/// Whether a `vssadmin resize shadowstorage` command (lowercase) shrinks the storage
+/// enough to delete shadow copies. A missing or unreadable `/maxsize=` counts as
+/// shrinking: unknown is not cleared.
+fn shrinks_shadow_storage(cmd: &str) -> bool {
+    let Some(i) = cmd.find("/maxsize=") else {
+        return true;
+    };
+    let value = cmd[i + "/maxsize=".len()..]
+        .split_whitespace()
+        .next()
+        .unwrap_or("");
+    if value == "unbounded" {
+        return false;
+    }
+    if let Some(pct) = value.strip_suffix('%') {
+        return pct
+            .parse::<f64>()
+            .map_or(true, |p| p <= SHADOW_STORAGE_FLOOR_PCT);
+    }
+    let split = value
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(value.len());
+    let (num, unit) = value.split_at(split);
+    let Ok(n) = num.parse::<f64>() else {
+        return true;
+    };
+    let mb = match unit {
+        "" | "b" => n / (1024.0 * 1024.0),
+        "kb" => n / 1024.0,
+        "mb" => n,
+        "gb" => n * 1024.0,
+        "tb" => n * 1024.0 * 1024.0,
+        "pb" | "eb" => f64::MAX,
+        _ => return true,
+    };
+    mb < SHADOW_STORAGE_FLOOR_MB
 }
 
 fn cmd_finding(c: &CommandLine<'_>, action: &str) -> Finding {
@@ -425,6 +469,9 @@ mod tests {
     fn recovery_inhibition_commands_are_high() {
         for cmd in [
             "vssadmin.exe Delete Shadows /All /Quiet",
+            "vssadmin resize shadowstorage /for=c: /on=c: /maxsize=1%",
+            "vssadmin resize shadowstorage /for=c: /on=c: /maxsize=300000000",
+            "vssadmin resize shadowstorage /for=c: /on=c:",
             r"C:\Windows\System32\vssadmin.exe resize shadowstorage /for=c: /on=c: /maxsize=401MB",
             "wmic shadowcopy delete /nointeractive",
             "powershell -c \"Get-WmiObject Win32_Shadowcopy | ForEach-Object { $_.Delete() }\"",
@@ -452,6 +499,10 @@ mod tests {
             "wbadmin get versions",
             "bcdedit /enum",
             "bcdedit /set {default} recoveryenabled yes",
+            // Growing the shadow storage keeps more restore points, not fewer.
+            "vssadmin resize shadowstorage /for=C: /on=C: /maxsize=UNBOUNDED",
+            "vssadmin Resize ShadowStorage /For=C: /On=C: /MaxSize=20%",
+            "vssadmin resize shadowstorage /for=d: /on=d: /maxsize=50GB",
         ] {
             assert!(run(&[proc(cmd)]).is_empty(), "{cmd}");
         }
