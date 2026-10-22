@@ -1,7 +1,7 @@
 //! heur_netconn (FR11, SRS §10): bare public-IP remote, rare remote port, owning-proc
 //! in temp, unsigned owner, suspicious high-port listener. Pure scoring + Analyzer impl.
 use crate::score::{is_public_ipv4, is_rare_port, join_key, severity_for, Score};
-use crate::trust::is_user_writable_path;
+use crate::trust::{exe_name, is_user_writable_path, launcher_kind};
 use cairn_core::finding::{EntityNetConn, EntityProcess};
 use cairn_core::record::{NetConnRecord, ProcessRecord, Record};
 use cairn_core::traits::Analyzer;
@@ -195,18 +195,17 @@ impl Analyzer for NetConnHeuristic {
             // 各自判斷出同一個結論）。+30，與 persist.rs 內部同級跨文物佐證
             // 權重一致（那邊是直接 escalate() 一個 severity 級，這裡是分數制，
             // +30 大致對應 High(50..=69) 到 Critical(70..) 這個常見躍遷）。
-            if let Some(o) = owner {
+            // A launcher owner (powershell, rundll32, ...) is skipped: a persistence
+            // entry that runs through powershell.exe says nothing about which of the
+            // host's powershell.exe processes holds this connection.
+            if let Some(o) = owner.filter(|o| launcher_kind(&exe_name(&o.image)).is_none()) {
                 let owner_key = join_key(&o.image);
-                let owner_degraded = owner_key.degraded_key();
                 let corroborated = prior_findings.iter().any(|f| {
                     f.analyzer == crate::persist::PersistHeuristic::NAME
                         && f.evidence
                             .iter()
                             .filter_map(|e| e.path.as_deref())
-                            .any(|p| {
-                                let ev_key = join_key(p);
-                                ev_key == owner_key || ev_key.degraded_key() == owner_degraded
-                            })
+                            .any(|p| join_key(p).same_target(&owner_key))
                 });
                 if corroborated {
                     score.add(
@@ -674,6 +673,91 @@ mod tests {
             Some(1),
         );
         assert_eq!(score_conn(&listen, Some(&svchost)).weight, 0);
+    }
+
+    /// A dual-stack listener reports its IPv4 peers as `::ffff:a.b.c.d`; an inbound RDP
+    /// session from a public address in that spelling was silently skipped.
+    #[test]
+    fn ipv4_mapped_peer_is_judged_as_ipv4() {
+        let svchost = owner(r"C:\Windows\System32\svchost.exe", Some(true));
+        let c = conn(
+            "tcp6",
+            3389,
+            Some("::ffff:45.33.32.156"),
+            Some(51234),
+            Some("established"),
+            Some(1),
+        );
+        assert_eq!(score_conn(&c, Some(&svchost)).weight, 55);
+        let lan = conn(
+            "tcp6",
+            3389,
+            Some("::ffff:10.0.0.5"),
+            Some(51234),
+            Some("established"),
+            Some(1),
+        );
+        assert_eq!(score_conn(&lan, Some(&svchost)).weight, 0);
+    }
+
+    fn persist_finding(path: &str) -> Finding {
+        let mut f = Finding::new(cairn_core::Severity::High, "p", FindingSource::Heuristic);
+        f.analyzer = crate::persist::PersistHeuristic::NAME.into();
+        f.evidence = vec![cairn_core::finding::EvidenceItem {
+            artifact: "run_key".into(),
+            path: Some(path.into()),
+            ts: None,
+            detail: String::new(),
+        }];
+        f
+    }
+
+    /// Corroboration needs the same binary: a persistence finding on a fake
+    /// `C:\Users\a\svchost.exe` must not lift the real System32 svchost's connection,
+    /// and an entry that runs through powershell.exe says nothing about which
+    /// powershell process owns a connection.
+    #[test]
+    fn persist_corroboration_requires_the_same_binary() {
+        let c = || {
+            conn(
+                "tcp",
+                50000,
+                Some("104.18.0.1"),
+                Some(4444),
+                Some("established"),
+                Some(1),
+            )
+        };
+        let real = owner(r"C:\Windows\System32\svchost.exe", Some(true));
+        let fake = persist_finding(r"C:\Users\a\svchost.exe");
+        let f = NetConnHeuristic
+            .analyze(&[Record::NetConn(c()), Record::Process(real)], &[fake])
+            .unwrap();
+        assert!(f.is_empty(), "{f:?}");
+
+        let ps = owner(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            Some(true),
+        );
+        let entry = persist_finding(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let f = NetConnHeuristic
+            .analyze(&[Record::NetConn(c()), Record::Process(ps)], &[entry])
+            .unwrap();
+        assert!(f.is_empty(), "{f:?}");
+
+        // Same binary spelled differently still corroborates; a bare name too.
+        for ev_path in [r#""C:\TOOLS\evil.exe""#, "evil.exe"] {
+            let f = NetConnHeuristic
+                .analyze(
+                    &[
+                        Record::NetConn(c()),
+                        Record::Process(owner(r"C:\Tools\evil.exe", None)),
+                    ],
+                    &[persist_finding(ev_path)],
+                )
+                .unwrap();
+            assert_eq!(f.len(), 1, "{ev_path}");
+        }
     }
 
     /// Unsigned drop-zone owner plus one more signal (rare port) is High.
