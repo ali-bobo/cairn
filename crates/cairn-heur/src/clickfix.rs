@@ -21,7 +21,7 @@ use cairn_core::record::{Record, RegValueRecord};
 use cairn_core::traits::Analyzer;
 use cairn_core::{Finding, Result};
 
-use crate::trust::{has_arguments, invoked_exe, launcher_kind, script_marker_labels};
+use crate::trust::{deobfuscated, has_arguments, invoked_exe, launcher_kind, script_marker_labels};
 
 /// Extra markers seen in paste-and-run payloads beyond the shared script markers.
 const PAYLOAD_MARKERS: &[(&str, &str)] = &[
@@ -30,9 +30,12 @@ const PAYLOAD_MARKERS: &[(&str, &str)] = &[
     ("--headless", "headless console"),
     ("| iex", "pipe to iex"),
     ("|iex", "pipe to iex"),
-    ("-nop", "-NoProfile"),
     ("/i http", "msiexec from URL"),
 ];
+
+/// Markers that add context to the reason but are not a payload on their own: admins
+/// type `powershell -nop` by hand all the time.
+const CONTEXT_MARKERS: &[(&str, &str)] = &[("-nop", "-NoProfile")];
 
 /// Which paste-and-run surface a registry value comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,8 +65,10 @@ fn launcher(cmd: &str) -> Option<String> {
     (launcher_kind(&exe).is_some() && has_arguments(cmd)).then_some(exe)
 }
 
+/// Payload markers (any one makes the entry High), on the de-obfuscated command so
+/// `-w^ h` and `|"iex"` are seen too.
 fn payload_markers(cmd: &str) -> Vec<&'static str> {
-    let lower = cmd.to_ascii_lowercase();
+    let lower = deobfuscated(cmd).to_ascii_lowercase();
     let mut out = script_marker_labels(cmd);
     for (needle, label) in PAYLOAD_MARKERS {
         if lower.contains(needle) && !out.contains(label) {
@@ -71,6 +76,15 @@ fn payload_markers(cmd: &str) -> Vec<&'static str> {
         }
     }
     out
+}
+
+fn context_markers(cmd: &str) -> Vec<&'static str> {
+    let lower = deobfuscated(cmd).to_ascii_lowercase();
+    CONTEXT_MARKERS
+        .iter()
+        .filter(|(needle, _)| lower.contains(needle))
+        .map(|(_, label)| *label)
+        .collect()
 }
 
 /// Run-dialog (RunMRU) payload commands.
@@ -96,12 +110,13 @@ impl Analyzer for ClickFixHeuristic {
             let Some(exe) = launcher(&rv.data) else {
                 continue;
             };
-            let markers = payload_markers(&rv.data);
+            let mut markers = payload_markers(&rv.data);
             let severity = if markers.is_empty() {
                 Severity::Medium
             } else {
                 Severity::High
             };
+            markers.extend(context_markers(&rv.data));
             let (place, title, artifact) = match surface {
                 Surface::RunDialog => (
                     "the Run dialog (Win+R)",
@@ -200,6 +215,19 @@ mod tests {
     fn launcher_with_plain_args_is_medium() {
         let f = run(r"cmd /c dir C:\");
         assert_eq!(f[0].severity, Severity::Medium);
+        // An admin's `powershell -nop` is not a payload; -NoProfile is only context.
+        let f = run("powershell -nop");
+        assert_eq!(f[0].severity, Severity::Medium);
+        assert!(f[0].reason.as_deref().unwrap().contains("NoProfile"));
+        // -nop next to a real payload marker is still High.
+        let f = run("powershell -nop -w hidden -c calc");
+        assert_eq!(f[0].severity, Severity::High);
+    }
+
+    #[test]
+    fn caret_obfuscated_hidden_window_is_high() {
+        let f = run(r#"powershell -w^ h -c "Start-Process calc""#);
+        assert_eq!(f[0].severity, Severity::High, "{:?}", f[0].reason);
     }
 
     #[test]
