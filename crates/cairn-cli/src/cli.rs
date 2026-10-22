@@ -88,6 +88,11 @@ pub struct RunArgs {
     /// Do NOT lower process priority on a live run (opt out of below-normal).
     #[arg(long)]
     pub full_speed: bool,
+    /// Per-collector time budget in seconds (0 = unlimited). A collector still running
+    /// after this long (e.g. a stuck WMI query) is abandoned and recorded in the
+    /// manifest; the run continues with the next one.
+    #[arg(long, default_value_t = cairn_core::config::DEFAULT_COLLECTOR_TIMEOUT_SECS)]
+    pub collector_timeout: u64,
 }
 
 impl RunArgs {

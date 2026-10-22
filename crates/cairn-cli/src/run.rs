@@ -45,6 +45,7 @@ fn build_config(args: &RunArgs, profile: Profile) -> anyhow::Result<Config> {
     };
     cfg.rules_dir = args.rules.clone().or_else(output::default_rules_dir);
     cfg.case_id = args.case_id.clone().unwrap_or_default();
+    cfg.collector_timeout_secs = args.collector_timeout;
     cfg.operator = args.operator.clone().unwrap_or_default();
     // Resource governance (NFR9/NFR10): `run` only triages the live host.
     cfg.governance.low_priority =
@@ -134,7 +135,7 @@ fn collect_then_analyze(
     cfg: &Config,
     privileges: cairn_core::manifest::Privileges,
     hostname: String,
-    collectors: &[Box<dyn Collector>],
+    collectors: Vec<Box<dyn Collector>>,
     analyzers: &[Box<dyn Analyzer>],
     hash_fn: impl Fn(&str) -> Option<String> + Copy,
 ) -> RunOutcome {
@@ -288,7 +289,7 @@ pub fn run(args: &RunArgs) -> anyhow::Result<()> {
         &cfg,
         privileges,
         hostname,
-        &collectors,
+        collectors,
         &analyzers,
         crate::enrich::hash_on_disk,
     );
@@ -366,6 +367,18 @@ mod tests {
         let age = Utc::now() - since;
         assert!(age >= chrono::Duration::days(30) && age < chrono::Duration::days(31));
         assert!(build_config(&args(&["--since", "nope"]), Profile::Standard).is_err());
+        assert_eq!(
+            cfg.collector_timeout_secs,
+            cairn_core::config::DEFAULT_COLLECTOR_TIMEOUT_SECS,
+            "every live run has a per-collector budget by default"
+        );
+        let a = args(&["--collector-timeout", "0"]);
+        assert_eq!(
+            build_config(&a, Profile::Standard)
+                .unwrap()
+                .collector_timeout_secs,
+            0
+        );
     }
 
     /// Without a reference the skew is explicitly "not measured"; with one it is
@@ -448,7 +461,7 @@ mod tests {
             &Config::default(),
             privs(),
             "T".into(),
-            &collectors,
+            collectors,
             &analyzers,
             |_| Some("abc123".into()),
         );
@@ -531,7 +544,7 @@ author: test-integration
             Some(cairn_heur::SigmaAnalyzer::new(engine)),
         );
         let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedEvents(vec![ev]))];
-        let outcome = run_live(&cfg, privs(), "TEST".into(), &collectors, &analyzers);
+        let outcome = run_live(&cfg, privs(), "TEST".into(), collectors, &analyzers);
 
         assert_eq!(outcome.records.len(), 1, "event record must be collected");
         let sigma: Vec<_> = outcome
@@ -684,7 +697,7 @@ author: test-integration
         let cfg = Config::default();
         let analyzers = registry::analyzers(&cfg, Mode::Evtx, None);
         let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedEvents(events))];
-        let outcome = run_live(&cfg, privs(), "TEST".into(), &collectors, &analyzers);
+        let outcome = run_live(&cfg, privs(), "TEST".into(), collectors, &analyzers);
 
         assert_eq!(outcome.records.len(), 5);
         let f = outcome
@@ -755,7 +768,7 @@ author: test-integration
         let cfg = Config::default();
         let analyzers = registry::analyzers(&cfg, Mode::Live, None);
         let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedRecords(records))];
-        let outcome = run_live(&cfg, privs(), "TEST".into(), &collectors, &analyzers);
+        let outcome = run_live(&cfg, privs(), "TEST".into(), collectors, &analyzers);
         for (name, mitre) in [
             (cairn_core::analyzers::CRED_DUMP, "T1003.001"),
             (cairn_core::analyzers::RANSOM, "T1490"),
@@ -850,7 +863,7 @@ author: test-integration
         let cfg = Config::default();
         let analyzers = registry::analyzers(&cfg, Mode::Evtx, None);
         let collectors: Vec<Box<dyn Collector>> = vec![Box::new(FixedEvents(events))];
-        let outcome = run_live(&cfg, privs(), "TEST".into(), &collectors, &analyzers);
+        let outcome = run_live(&cfg, privs(), "TEST".into(), collectors, &analyzers);
         let lateral: Vec<&cairn_core::Finding> = outcome
             .findings
             .iter()

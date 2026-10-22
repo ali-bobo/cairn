@@ -84,6 +84,22 @@ pub struct Config {
     pub password_spraying_threshold: u32,
     /// Resource governance (NFR9): priority posture.
     pub governance: Governance,
+    /// Wall-clock budget per live collector, in seconds; 0 = unlimited. A collector
+    /// still running when its budget expires is abandoned (its result is discarded and
+    /// the reason recorded in the manifest) so one stuck WMI/COM query, signature check
+    /// or network-path stat cannot hang the whole run (golden rule 8).
+    #[serde(default = "default_collector_timeout_secs")]
+    pub collector_timeout_secs: u64,
+}
+
+/// Default per-collector budget: 20 minutes. Generous on purpose: a large Security.evtx
+/// read over the 30-day window on a busy server legitimately takes minutes, and a
+/// budget that cuts a healthy collector short loses evidence. It only has to stop a
+/// collector that is genuinely stuck.
+pub const DEFAULT_COLLECTOR_TIMEOUT_SECS: u64 = 20 * 60;
+
+fn default_collector_timeout_secs() -> u64 {
+    DEFAULT_COLLECTOR_TIMEOUT_SECS
 }
 
 impl Default for Config {
@@ -102,6 +118,7 @@ impl Default for Config {
             password_spraying_window_minutes: 1,
             password_spraying_threshold: 10,
             governance: Governance::default(),
+            collector_timeout_secs: DEFAULT_COLLECTOR_TIMEOUT_SECS,
         }
     }
 }
