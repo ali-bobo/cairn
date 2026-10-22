@@ -42,8 +42,10 @@ pub struct StreamStats {
 
 /// Stream one .evtx file, handing each normalized record to `sink`.
 ///
-/// The `since` filter runs on the record HEADER timestamp, before the record's BinXML
-/// is rendered to JSON, so an old record costs no JSON/map allocation at all. Memory is
+/// The `since` filter runs first on the record HEADER timestamp, before the record's
+/// BinXML is rendered to JSON, so an old record costs no JSON/map allocation at all; a
+/// header time that is not plausible (zero / pre-1980, as in exported logs) is not
+/// trusted, and such a record is rendered and filtered on its TimeCreated. Memory is
 /// bounded per record (plus the `evtx` crate's per-chunk batch), not per file: records
 /// are converted one at a time and given to `sink` immediately. A record that fails to
 /// parse is counted and skipped (threat-model untrusted-input #1).
@@ -59,17 +61,21 @@ pub fn stream_evtx(
     let mut stats = StreamStats::default();
     let iter = parser.serialized_records(move |record| {
         let record = record?;
-        let ts = jiff_to_utc(record.timestamp);
-        if since.is_some_and(|s| ts < s) {
+        let header_ts = jiff_to_utc(record.timestamp);
+        // Cheap pre-filter on the header's written time. Only a plausible header time
+        // is trusted: exported / carved logs carry zero (1601) headers whose events
+        // can still be recent, and those must be rendered to read TimeCreated.
+        if since.is_some_and(|s| header_ts >= plausible_floor() && header_ts < s) {
             return Ok(None); // old: skip before rendering
         }
         let id = record.event_record_id;
         let json = record.into_json_value()?;
-        Ok(Some(normalize(&json.data, id, ts)))
+        Ok(Some(normalize(&json.data, id, header_ts)))
     });
     for item in iter {
         match item {
             Ok(None) => stats.skipped_old += 1,
+            Ok(Some(Some(ev))) if since.is_some_and(|s| ev.ts < s) => stats.skipped_old += 1,
             Ok(Some(Some(ev))) => {
                 stats.kept += 1;
                 sink(ev);
@@ -118,11 +124,34 @@ fn jiff_to_utc(ts: evtx::Timestamp) -> DateTime<Utc> {
         .unwrap_or(DateTime::UNIX_EPOCH)
 }
 
+/// Header times before this are not a real write time (a zeroed FILETIME renders as
+/// 1601-01-01): seen in exported / carved logs such as EVTX-ATTACK-SAMPLES.
+fn plausible_floor() -> DateTime<Utc> {
+    DateTime::from_timestamp(315_532_800, 0).unwrap_or(DateTime::UNIX_EPOCH) // 1980-01-01
+}
+
+/// The event's own creation time, `System/TimeCreated/@SystemTime` (RFC3339 UTC).
+fn time_created(system: Option<&Value>) -> Option<DateTime<Utc>> {
+    let raw = system?
+        .get("TimeCreated")?
+        .get("#attributes")?
+        .get("SystemTime")?
+        .as_str()?;
+    DateTime::parse_from_rfc3339(raw.trim())
+        .ok()
+        .map(|t| t.with_timezone(&Utc))
+}
+
 /// Map one EVTX JSON record (`{"Event": {"System": {...}, "EventData": {...}}}`)
 /// into an `EventRecord`, flattening System + EventData into `data`.
-fn normalize(value: &Value, record_id: u64, ts: DateTime<Utc>) -> Option<EventRecord> {
+///
+/// `ts` is `System/TimeCreated/@SystemTime`, the time the event happened. The record
+/// header's written time (`header_ts`) is only the fallback: real exported logs
+/// (EVTX-ATTACK-SAMPLES) carry headers that are zero (1601) or days after the event.
+fn normalize(value: &Value, record_id: u64, header_ts: DateTime<Utc>) -> Option<EventRecord> {
     let event = value.get("Event")?;
     let system = event.get("System");
+    let ts = time_created(system).unwrap_or(header_ts);
 
     let channel = sys_str(system, "Channel").unwrap_or_default();
     let event_id = sys_event_id(system);
@@ -160,21 +189,26 @@ fn sys_str(system: Option<&Value>, key: &str) -> Option<String> {
     system?.get(key)?.as_str().map(str::to_owned)
 }
 
-/// EventID may be a number or, when it has qualifiers, an object `{"#text": "1", ...}`.
+/// EventID may be a number or, when it has qualifiers, an object
+/// `{"#attributes": {"Qualifiers": 16384}, "#text": 7045}`. The `evtx` crate renders
+/// that `#text` as a JSON number (seen on every Service Control Manager event: 7036,
+/// 7040, 7045), so a number and a string are both accepted there.
 fn sys_event_id(system: Option<&Value>) -> u32 {
+    fn scalar(v: &Value) -> Option<u32> {
+        match v {
+            Value::Number(n) => n.as_u64().and_then(|n| u32::try_from(n).ok()),
+            Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        }
+    }
     let Some(eid) = system.and_then(|s| s.get("EventID")) else {
         return 0;
     };
     match eid {
-        Value::Number(n) => n.as_u64().unwrap_or(0) as u32,
-        Value::String(s) => s.parse().unwrap_or(0),
-        Value::Object(o) => o
-            .get("#text")
-            .and_then(Value::as_str)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0),
-        _ => 0,
+        Value::Object(o) => o.get("#text").and_then(scalar),
+        v => scalar(v),
     }
+    .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -182,11 +216,21 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn fixture(name: &str) -> PathBuf {
+    fn fixture_path(name: &str) -> PathBuf {
         // Workspace tests/fixtures/, relative to this crate (crates/cairn-collectors).
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures")
             .join(name)
+    }
+
+    /// A committed real EVTX fixture. Missing is a failure, never a silent skip.
+    fn fixture(name: &str) -> PathBuf {
+        let p = fixture_path(name);
+        assert!(
+            p.is_file(),
+            "fixture missing: {p:?} (committed; restore with tests/fetch-fixtures.sh)"
+        );
+        p
     }
 
     /// A real EVTX fixture parses into one or more EventRecords with the core fields
@@ -194,10 +238,6 @@ mod tests {
     #[test]
     fn parses_real_evtx_into_event_records() {
         let path = fixture("sysmon_compiledhtml.evtx");
-        if !path.exists() {
-            eprintln!("skipping: fixture missing (run tests/fetch-fixtures.sh): {path:?}");
-            return;
-        }
         let records = parse_evtx(&path).expect("should parse a valid evtx");
         assert!(!records.is_empty(), "expected at least one record");
 
@@ -220,10 +260,6 @@ mod tests {
     #[test]
     fn record_count_matches_evtx_crate() {
         let path = fixture("sysmon_compiledhtml.evtx");
-        if !path.exists() {
-            eprintln!("skipping: fixture missing: {path:?}");
-            return;
-        }
         let ours = parse_evtx(&path).unwrap().len();
 
         let mut parser = evtx::EvtxParser::from_path(&path).unwrap();
@@ -238,10 +274,6 @@ mod tests {
     #[test]
     fn stream_since_filter_partitions_records() {
         let path = fixture("sysmon_compiledhtml.evtx");
-        if !path.exists() {
-            eprintln!("skipping: fixture missing: {path:?}");
-            return;
-        }
         let all = parse_evtx(&path).unwrap();
         let mut ts: Vec<_> = all.iter().map(|e| e.ts).collect();
         ts.sort();
@@ -278,13 +310,105 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!((h2, n2), (want, big.len() as u64));
-        assert!(sha256_file(&fixture("does_not_exist.evtx")).is_err());
+        assert!(sha256_file(&fixture_path("does_not_exist.evtx")).is_err());
+    }
+
+    /// Service Control Manager events carry `Qualifiers`, which the `evtx` crate
+    /// renders as `{"#attributes": {"Qualifiers": 16384}, "#text": 7045}` with a
+    /// NUMBER `#text`. Before the fix every such event came out as EventID 0.
+    #[test]
+    fn qualified_event_ids_from_real_logs() {
+        let recs = parse_evtx(&fixture("LM_Remote_Service02_7045.evtx")).unwrap();
+        assert_eq!(recs.len(), 3);
+        assert!(recs.iter().all(|r| r.event_id == 7045), "{recs:?}");
+        assert_eq!(recs[0].data["ServiceName"], "spoolfool");
+        assert_eq!(recs[0].data["ImagePath"], "cmd.exe");
+        let recs = parse_evtx(&fixture("metasploit-psexec-native-target-system.evtx")).unwrap();
+        let ids: Vec<u32> = recs.iter().map(|r| r.event_id).collect();
+        assert_eq!(ids, vec![104, 7045, 7036, 7036, 7036, 7045, 7009]);
+        // 7036 as Windows writes it: param1 service, param2 state, Binary key name.
+        let r7036 = &recs[2];
+        assert_eq!(r7036.data["param1"], "KgXItsbKgTJzdzwl");
+        assert_eq!(r7036.data["param2"], "running");
+        assert!(r7036.data["Binary"]
+            .as_str()
+            .unwrap()
+            .ends_with("2F0034000000"));
+    }
+
+    #[test]
+    fn event_id_shapes() {
+        let ev = |eid: Value| serde_json::json!({"Event": {"System": {"EventID": eid, "Channel": "System"}}});
+        let ts = DateTime::UNIX_EPOCH;
+        for (shape, want) in [
+            (serde_json::json!(4624), 4624),
+            (serde_json::json!("4624"), 4624),
+            (
+                serde_json::json!({"#attributes": {"Qualifiers": 16384}, "#text": 7045}),
+                7045,
+            ),
+            (
+                serde_json::json!({"#attributes": {"Qualifiers": 0}, "#text": "7036"}),
+                7036,
+            ),
+            (serde_json::json!({"#text": null}), 0),
+            (serde_json::json!(-1), 0),
+        ] {
+            let r = normalize(&ev(shape.clone()), 1, ts).unwrap();
+            assert_eq!(r.event_id, want, "{shape}");
+        }
+    }
+
+    /// `ts` is TimeCreated. Exported logs carry zero (1601) record headers and headers
+    /// written days after the event; neither may become the event time.
+    #[test]
+    fn timestamps_come_from_time_created_not_the_record_header() {
+        let recs = parse_evtx(&fixture("DE_104_system_log_cleared.evtx")).unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0]
+                .ts
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            "2019-03-19T23:34:25.894341Z"
+        );
+        let rcm = "DE_RDP_Tunneling_TerminalServices-RemoteConnectionManagerOperational_1149.evtx";
+        let recs = parse_evtx(&fixture(rcm)).unwrap();
+        let r = recs.iter().find(|r| r.record_id == 9).unwrap();
+        // The record header says 2018-11-22; the event happened on 2018-11-06.
+        assert_eq!(
+            r.ts.to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            "2018-11-06T21:49:31.193924Z"
+        );
+        // A zero header never pre-filters a record that is inside the window.
+        let since = "2019-03-01T00:00:00Z".parse().unwrap();
+        let mut kept = Vec::new();
+        let p = fixture("DE_104_system_log_cleared.evtx");
+        let stats = stream_evtx(&p, Some(since), |e| kept.push(e)).unwrap();
+        assert_eq!((stats.kept, kept.len()), (1, 1));
+        let late = "2019-03-20T00:00:00Z".parse().unwrap();
+        let stats = stream_evtx(&p, Some(late), |_| panic!("before since")).unwrap();
+        assert_eq!((stats.kept, stats.skipped_old), (0, 1));
+    }
+
+    /// `UserData` payloads stay one object level below `data`, as the analyzers'
+    /// `event_field` lookups expect (real 1149: `EventXML.Param1..3`).
+    #[test]
+    fn user_data_payload_is_nested_one_level() {
+        let rcm = "DE_RDP_Tunneling_TerminalServices-RemoteConnectionManagerOperational_1149.evtx";
+        let recs = parse_evtx(&fixture(rcm)).unwrap();
+        let r = recs.iter().find(|r| r.event_id == 1149).unwrap();
+        let xml = r.data["EventXML"].as_object().unwrap();
+        assert_eq!(xml["Param1"], "administrator");
+        assert_eq!(xml["Param2"], "ie11win7");
+        assert_eq!(xml["Param3"], "10.0.2.16");
+        let recs = parse_evtx(&fixture("DE_104_system_log_cleared.evtx")).unwrap();
+        assert_eq!(recs[0].data["LogFileCleared"]["SubjectUserName"], "user01");
     }
 
     /// A missing file returns Err, never panics (graceful degrade, golden rule 8).
     #[test]
     fn missing_file_is_err_not_panic() {
-        let res = parse_evtx(&fixture("does_not_exist.evtx"));
+        let res = parse_evtx(&fixture_path("does_not_exist.evtx"));
         assert!(res.is_err());
     }
 

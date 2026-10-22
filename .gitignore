@@ -12,15 +12,20 @@
 /test-data
 
 # Forensic fixtures & sample evidence — kept out of git (size + sensitivity).
-# EVTX-ATTACK-SAMPLES is fetched by a script into tests/ (stage1-plan T8), not committed.
+# The full EVTX-ATTACK-SAMPLES corpus stays out (fetched for parity work, T8).
 *.evtx
 *.zip
 *.hve
 *.dat
 *.bad
 /tests/samples/
-/tests/fixtures/
 /tests/EVTX-ATTACK-SAMPLES/
+# The real-sample EVTX fixtures are GPL-3.0 and are NOT committed: tests/fetch-fixtures.sh
+# downloads them and checks tests/fixtures/SHA256SUMS (CI runs it before the tests).
+# Only the README (sources) and the checksums are tracked.
+/tests/fixtures/*
+!/tests/fixtures/README.md
+!/tests/fixtures/SHA256SUMS
 
 # Machine-specific cargo target-dir override. The committed .cargo/config.toml contains
 # cross-machine settings (CRT static link rustflags). The target-dir line in that file is

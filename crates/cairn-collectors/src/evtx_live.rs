@@ -439,10 +439,10 @@ mod tests {
     fn fixture_resolved_hashed_and_filtered() {
         let fx = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../tests/fixtures/sysmon_compiledhtml.evtx");
-        if !fx.exists() {
-            eprintln!("skipping: fixture missing: {fx:?}");
-            return;
-        }
+        assert!(
+            fx.is_file(),
+            "fixture missing: {fx:?} (committed; restore with tests/fetch-fixtures.sh)"
+        );
         let fx_s = fx.to_string_lossy().to_string();
         let ch = "Microsoft-Windows-Sysmon/Operational".to_string();
         let reg = FakeReg::default().file(&format!(r"{WINEVT_CHANNELS_KEY}\{ch}"), &fx_s);
