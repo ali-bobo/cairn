@@ -1,6 +1,7 @@
 # Sigma 規則清冊
 
-> 涵蓋 `rules/ruleset.toml` 全部規則（既有 50 條 + 段 2 新增 30 條 + 階段 3G 新增 6 條 = 86 條）。
+> 涵蓋 `rules/ruleset.toml` 全部規則（既有 50 條 + 段 2 新增 30 條 + 階段 3G 新增 6 條
+> + 行程建立／Sysmon 補強 10 條 = 96 條）。
 > 「是否確認會 fire」欄位如實記錄——沒有測試覆蓋的規則明確標示，不倒填假驗證。
 > **既有 50 條規則的驗證現況**：`crates/cairn-sigma/tests/parity.rs` 目前只有 3 個
 > 針對既有規則的專屬 firing 測試（`hh_chm_execution_fires`、`msxsl_execution_fires`、
@@ -99,6 +100,16 @@
 | windows/process_creation/proc_creation_win_susp_eventlog_clear.yml | Suspicious Eventlog Clearing or Configuration Change Activity | wevtutil cl/sl、Clear-EventLog、ClearEventLog 等清除或縮小事件記錄（T1070.001；heur_eventlog 看的是清除後的 1102/104，這條看的是下指令的行程） | 需啟用 Process Creation 稽核 + 命令列記錄 | parity.rs::wevtutil_clear_log_fires_on_4688 | 是 |
 | windows/process_creation/proc_creation_win_powershell_defender_exclusion.yml | Powershell Defender Exclusion | Add-/Set-MpPreference 加入 Defender 排除路徑、副檔名、行程或 IP | 需啟用 Process Creation 稽核 + 命令列記錄 | parity.rs::defender_exclusion_and_tamper_fire | 是 |
 | windows/powershell/powershell_script/posh_ps_tamper_windows_defender_set_mp.yml | Tamper Windows Defender - ScriptBlockLogging | Set-MpPreference 關閉即時保護、行為監控等，或把威脅預設動作設為 Allow | 需啟用 PowerShell Script Block Logging（4104） | parity.rs::defender_exclusion_and_tamper_fire | 是 |
+| windows/process_creation/proc_creation_win_hktl_impacket_lateral_movement.yml | HackTool - Potential Impacket Lateral Movement Activity | Impacket wmiexec／dcomexec／smbexec 的 `cmd.exe /Q /c ... \\127.0.0.1\ADMIN$\__<時間> 2>&1`（父程序 WmiPrvSE／mmc／explorer／services），或 atexec 的 `cmd.exe /C ... Windows\Temp\... 2>&1`（T1047、T1021） | 需啟用 Process Creation 稽核 + 命令列記錄；4688 要 Windows 10 以後才有 `ParentProcessName`，或 Sysmon 1 | parity.rs::impacket_lateral_movement_fires；real_evtx.rs::impacket_wmiexec_and_dcomexec_sysmon_1（真實樣本） | 是 |
+| windows/process_creation/proc_creation_win_wmiprvse_susp_child_processes.yml | Suspicious WmiPrvSE Child Process | WmiPrvSE 啟動 rundll32、regsvr32、mshta、wscript 等 LOLBin，或啟動帶 powershell／mshta 的 cmd（WMI 遠端執行，T1047） | 同上（需要父程序映像檔） | parity.rs::wmiprvse_suspicious_child_fires_benign_does_not；real_evtx.rs::wmi_handler_abuse_sysmon_1（真實樣本） | 是 |
+| windows/process_access/proc_access_win_lsass_memdump.yml | Potential Credential Dumping Activity Via LSASS | 以 0x1038／0x1438／0x143a／0x1fffff 存取 LSASS 且呼叫堆疊經過 dbghelp／dbgcore 等（T1003.001） | **需要 Sysmon（事件 10）** | parity.rs::suspicious_access_mask_on_lsass_fires | 是（合成事件） |
+| windows/process_access/proc_access_win_lsass_susp_access_flag.yml | Potentially Suspicious GrantedAccess Flags On LSASS | 非系統、非 Program Files 的程式以可讀記憶體的權限遮罩（0x1f1fff、0x1438 等）存取 LSASS（T1003.001） | **需要 Sysmon（事件 10）** | parity.rs::suspicious_access_mask_on_lsass_fires；real_evtx.rs::lsass_access_sysmon_10（真實樣本） | 是 |
+| windows/process_access/proc_access_win_lsass_dump_comsvcs_dll.yml | Lsass Memory Dump via Comsvcs DLL | rundll32 經 comsvcs.dll 存取 LSASS（MiniDump 傾印，T1003.001） | **需要 Sysmon（事件 10）** | parity.rs::suspicious_access_mask_on_lsass_fires | 是（合成事件） |
+| windows/process_access/proc_access_win_lsass_dump_keyword_image.yml | LSASS Memory Access by Tool With Dump Keyword In Name | 檔名含 dump 的程式以讀取權限存取 LSASS（procdump、nanodump 等，T1003.001） | **需要 Sysmon（事件 10）** | parity.rs::suspicious_access_mask_on_lsass_fires | 是（合成事件） |
+| windows/process_access/proc_access_win_hktl_generic_access.yml | HackTool - Generic Process Access | mimikatz、Rubeus、SafetyKatz、Impacket 編譯版等駭客工具的預設檔名存取其他行程（T1003.001） | **需要 Sysmon（事件 10）** | parity.rs::mimikatz_lsass_access_fires_hacktool_rule；real_evtx.rs::lsass_access_sysmon_10（真實樣本） | 是 |
+| windows/wmi_event/sysmon_wmi_event_subscription.yml | WMI Event Subscription | 建立／修改／刪除 WMI 永久事件訂閱（filter、consumer、binding；T1546.003） | **需要 Sysmon（事件 19／20／21）** | parity.rs::wmi_consumer_creation_fires；real_evtx.rs::wmi_consumers_sysmon_19_20_21（真實樣本） | 是 |
+| windows/wmi_event/sysmon_wmi_susp_scripting.yml | Suspicious Scripting in a WMI Consumer | WMI consumer 內容含下載執行、`-nop`、`-enc`、WScript.Shell 等（T1059.005） | **需要 Sysmon（事件 20）** | parity.rs::wmi_consumer_creation_fires | 是（合成事件） |
+| windows/wmi_event/sysmon_wmi_susp_encoded_scripts.yml | Suspicious Encoded Scripts in a WMI Consumer | WMI consumer 內容藏有 base64 編碼的 PE 或 WriteProcessMemory（T1546.003） | **需要 Sysmon（事件 20）** | parity.rs::wmi_consumer_creation_fires | 是（合成事件） |
 
 ## 每次執行的可行性檢查（階段 3G）
 
@@ -115,7 +126,9 @@
   事件卻沒有任何 4688 代表行程建立稽核沒開；有 4688 但都沒有命令列代表命令列記錄沒開；
   沒有任何 Sysmon 事件代表沒有 Sysmon。預設開啟的稽核（登入、帳戶管理、群組管理）在
   讀得到 Security 時視為開啟。其他預設關閉、又沒看到事件的設定標為「無法確認」。
-- 目前唯一的 Sysmon-only 規則是 Renamed Whoami Execution（只比對 `OriginalFileName`）。
+- Sysmon-only 規則：Renamed Whoami Execution（只比對 `OriginalFileName`），以及 5 條
+  LSASS 存取規則（Sysmon 10）與 3 條 WMI 事件訂閱規則（Sysmon 19／20／21）。沒有裝
+  Sysmon 的主機上這 9 條會標成不可能觸發；`wmi_event` 對到 Sysmon 19、20、21 三個事件。
   需要 NTLM 稽核、物件 SACL、詳細檔案共用稽核或網域控制站的規則也保留，這些規則
   在一般工作站上會被標成不可能觸發或無法確認，而不是默默不命中。
 
@@ -125,7 +138,11 @@
 
 ## 統計摘要
 
-- 規則總數：86 條（既有 50 條 + 段 2 新增 30 條 + 階段 3G 新增 6 條）。
+- 規則總數：96 條（既有 50 條 + 段 2 新增 30 條 + 階段 3G 新增 6 條 + 行程建立／Sysmon
+  補強 10 條）。
+- **行程建立／Sysmon 補強 10 條**：每條都有專屬合成事件測試（含不誤報的陰性案例
+  `benign_lsass_access_fires_nothing`、`wmi_rules_ignore_other_sysmon_events`），其中 5 條
+  另以 EVTX-ATTACK-SAMPLES 真實樣本驗證（`crates/cairn-cli/src/real_evtx.rs`）。
 - **既有 50 條規則測試覆蓋現況**：3 條有專屬 firing 測試（`hh_chm_execution_fires`、
   `msxsl_execution_fires`、`mshta_suspicious_extension_fires`），**47 條無現存測試**，
   狀態不明——僅通過載入時的 DRL 1.1 author 檢查與 YAML 語法解析，detection 邏輯

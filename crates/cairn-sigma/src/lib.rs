@@ -203,12 +203,26 @@ impl LogsourceMap {
                 17,
                 &[],
             ),
-            // wmi_event -> Sysmon EID 19
+            // wmi_event -> Sysmon EID 19 (filter), 20 (consumer), 21 (binding)
             (
                 Some("wmi_event"),
                 None,
                 "Microsoft-Windows-Sysmon/Operational",
                 19,
+                &[],
+            ),
+            (
+                Some("wmi_event"),
+                None,
+                "Microsoft-Windows-Sysmon/Operational",
+                20,
+                &[],
+            ),
+            (
+                Some("wmi_event"),
+                None,
+                "Microsoft-Windows-Sysmon/Operational",
+                21,
                 &[],
             ),
             // process_termination -> Sysmon EID 5
