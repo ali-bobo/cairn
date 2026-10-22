@@ -50,9 +50,76 @@ pub const USER_WRITABLE_DIRS: &[&str] = &[
 /// Start Menu lives here). Excluded from the `\ProgramData\` drop zone.
 pub const MICROSOFT_PROGRAMDATA: &str = r"\programdata\microsoft\";
 
-/// True if `path` (any case) contains a user-writable drop-zone segment.
+/// Environment-variable and NT-namespace spellings of well-known folders, mapped to a
+/// representative drive path, so a path written `%APPDATA%\x.dll` or
+/// `\SystemRoot\System32\x.sys` is judged like its expanded form. Lowercase.
+const PATH_VARS: &[(&str, &str)] = &[
+    ("%appdata%", r"c:\users\_\appdata\roaming"),
+    ("%localappdata%", r"c:\users\_\appdata\local"),
+    ("%temp%", r"c:\users\_\appdata\local\temp"),
+    ("%tmp%", r"c:\users\_\appdata\local\temp"),
+    ("%userprofile%", r"c:\users\_"),
+    ("%public%", r"c:\users\public"),
+    ("%programdata%", r"c:\programdata"),
+    ("%allusersprofile%", r"c:\programdata"),
+    ("%systemroot%", r"c:\windows"),
+    ("%windir%", r"c:\windows"),
+    ("%programfiles(x86)%", r"c:\program files (x86)"),
+    ("%programfiles%", r"c:\program files"),
+    ("%programw6432%", r"c:\program files"),
+];
+
+/// A path in one comparable shape: surrounding whitespace and quotes trimmed,
+/// lowercase, `/` turned into `\`, the `\\?\` / `\??\` prefixes dropped, a leading
+/// `\SystemRoot\` and the [`PATH_VARS`] variables expanded. For trust checks only.
+pub fn normalize_path(path: &str) -> String {
+    let mut p = path
+        .trim()
+        .trim_matches('"')
+        .to_ascii_lowercase()
+        .replace('/', r"\");
+    for prefix in [r"\\?\", r"\??\"] {
+        if let Some(rest) = p.strip_prefix(prefix) {
+            p = rest.to_string();
+        }
+    }
+    if let Some(rest) = p.strip_prefix(r"\systemroot\") {
+        p = format!(r"c:\windows\{rest}");
+    }
+    if p.contains('%') {
+        for (var, expanded) in PATH_VARS {
+            p = p.replace(var, expanded);
+        }
+    }
+    if p.contains(r"\.") {
+        p = collapse_dot_segments(&p);
+    }
+    p
+}
+
+/// Resolve `.` and `..` segments (`c:\windows\..\users\x` -> `c:\users\x`), so a
+/// traversal through a trusted folder is judged by where it really ends. A `..` never
+/// climbs above the first segment (the drive).
+fn collapse_dot_segments(p: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    for (i, seg) in p.split('\\').enumerate() {
+        match seg {
+            "." if i > 0 => {}
+            ".." if i > 0 => {
+                if out.len() > 1 {
+                    out.pop();
+                }
+            }
+            s => out.push(s),
+        }
+    }
+    out.join(r"\")
+}
+
+/// True if `path` (any case, any of the spellings [`normalize_path`] understands)
+/// contains a user-writable drop-zone segment.
 pub fn is_user_writable_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
+    let lower = normalize_path(path);
     USER_WRITABLE_DIRS.iter().any(|d| {
         lower.contains(d) && !(*d == r"\programdata\" && only_microsoft_programdata(&lower))
     })
@@ -170,18 +237,6 @@ pub const PAYLOAD_EXTS: &[&str] = &[
     ".bat", ".cmd",
 ];
 
-/// Environment-variable spellings of drop zones, mapped to a representative path so
-/// [`is_user_writable_path`] recognises `%APPDATA%\x.dll` as well as the expanded form.
-const DROPZONE_VARS: &[(&str, &str)] = &[
-    ("%appdata%", r"c:\users\_\appdata\roaming"),
-    ("%localappdata%", r"c:\users\_\appdata\local"),
-    ("%temp%", r"c:\users\_\appdata\local\temp"),
-    ("%tmp%", r"c:\users\_\appdata\local\temp"),
-    ("%public%", r"c:\users\public"),
-    ("%programdata%", r"c:\programdata"),
-    ("%allusersprofile%", r"c:\programdata"),
-];
-
 /// What makes one argument of a proxy-execution host risky.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ArgRisk {
@@ -251,11 +306,8 @@ pub fn risky_args(args: &str) -> Vec<ArgRisk> {
         } else if lower.starts_with(r"\\") && !lower.starts_with(r"\\?\") {
             Some(ArgRisk::RemoteShare(tok))
         } else if PAYLOAD_EXTS.iter().any(|e| lower.ends_with(e)) {
-            let mut expanded = lower.clone();
-            for (var, path) in DROPZONE_VARS {
-                expanded = expanded.replace(var, path);
-            }
-            is_user_writable_path(&expanded).then_some(ArgRisk::UserWritable(tok))
+            // is_user_writable_path expands %APPDATA% and friends itself.
+            is_user_writable_path(&lower).then_some(ArgRisk::UserWritable(tok))
         } else {
             None
         };
@@ -460,7 +512,7 @@ pub fn script_marker_labels(text: &str) -> Vec<&'static str> {
 /// all locations where system-named binaries legitimately live (explorer.exe sits
 /// in C:\Windows directly, not System32).
 pub fn is_under_windows_tree(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
+    let lower = normalize_path(path);
     // position 1 == drive-colon form "x:\windows\"
     lower
         .get(1..)
@@ -469,14 +521,16 @@ pub fn is_under_windows_tree(path: &str) -> bool {
 
 /// True if `path` is under the Windows tree or Program Files (either bitness).
 /// Both require admin to write — "system or vendor-installed" trust tier (S4 gate).
+/// The folder name must match exactly: any user may create `C:\Program Files Evil\`
+/// (Authenticated Users can add folders to the drive root), so it earns no trust.
 pub fn is_system_or_program_files(path: &str) -> bool {
     if is_under_windows_tree(path) {
         return true;
     }
-    let lower = path.to_ascii_lowercase();
-    lower
-        .get(1..)
-        .is_some_and(|rest| rest.starts_with(r":\program files"))
+    let lower = normalize_path(path);
+    lower.get(1..).is_some_and(|rest| {
+        rest.starts_with(r":\program files\") || rest.starts_with(r":\program files (x86)\")
+    })
 }
 
 /// Where each [`PROTECTED_SYSTEM_NAMES`] binary legitimately lives, as drive-less
@@ -516,11 +570,10 @@ pub fn canonical_system_dirs(file_name: &str) -> Option<&'static [&'static str]>
 /// (`\SystemRoot\...`) return false — no drive-letter location means no verdict
 /// (honest abstain; the winlogon default `explorer.exe` is a bare name).
 pub fn is_masquerade(path: &str) -> bool {
-    let p = path.trim().trim_matches('"');
-    if !p.get(1..).is_some_and(|r| r.starts_with(":\\")) {
+    let lower = normalize_path(path);
+    if !lower.get(1..).is_some_and(|r| r.starts_with(":\\")) {
         return false; // not absolute — abstain
     }
-    let lower = p.to_ascii_lowercase();
     let Some((dir, base)) = lower.rsplit_once('\\') else {
         return false;
     };
@@ -559,6 +612,46 @@ mod tests {
         ] {
             assert!(!is_user_writable_path(p), "{p}");
         }
+    }
+
+    /// Regression: `C:\Program Files Evil\` (a folder any user may create in the
+    /// drive root) passed the Program Files trust tier, and `\\?\`, forward-slash,
+    /// `%TEMP%` and `..` spellings slipped past the drop-zone / Windows-tree checks.
+    #[test]
+    fn path_spellings_are_normalized_before_trust_checks() {
+        assert!(!is_system_or_program_files(r"C:\Program Files Evil\x.exe"));
+        assert!(!is_system_or_program_files(r"C:\Program FilesX\x.exe"));
+        assert!(is_system_or_program_files(r"C:\Program Files\V\x.exe"));
+        assert!(is_system_or_program_files(r"%ProgramFiles(x86)%\V\x.exe"));
+        assert!(is_system_or_program_files(
+            r"\??\C:\Windows\System32\drivers\x.sys"
+        ));
+        assert!(!is_system_or_program_files(
+            r"C:\Windows\..\Users\Public\x.exe"
+        ));
+        assert!(!is_under_windows_tree(
+            r"C:\Windows\System32\..\..\Temp\x.exe"
+        ));
+
+        for p in [
+            r"\\?\C:\Users\a\AppData\Local\Temp\x.exe",
+            "C:/Users/a/AppData/Roaming/x.exe",
+            r"%TEMP%\x.exe",
+            r"%LocalAppData%\x.exe",
+            r"%USERPROFILE%\Downloads\x.exe",
+            r"C:\Windows\System32\..\..\Users\Public\x.exe",
+        ] {
+            assert!(is_user_writable_path(p), "{p}");
+        }
+        assert!(!is_user_writable_path(r"%SystemRoot%\System32\x.exe"));
+
+        assert!(is_masquerade(r"\\?\C:\Users\a\svchost.exe"));
+        assert!(is_masquerade("C:/ProgramData/lsass.exe"));
+        assert!(is_masquerade(
+            r"C:\Windows\System32\..\..\Users\Public\svchost.exe"
+        ));
+        assert!(!is_masquerade(r"%SystemRoot%\System32\svchost.exe"));
+        assert!(!is_masquerade(r"\??\C:\Windows\System32\smss.exe"));
     }
 
     #[test]
