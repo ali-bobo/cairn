@@ -1,11 +1,5 @@
-//! 選單渲染與使用者輸入。純 I/O，無業務邏輯。
+//! 終端輸出與使用者輸入（摘要框、按 Enter、路徑清理）。純 I/O，無業務邏輯。
 use std::io::{self, BufRead, Write};
-
-/// 清除終端畫面（ANSI escape sequence，支援 Windows Terminal / PowerShell）
-pub fn clear_screen() {
-    print!("\x1B[2J\x1B[H");
-    let _ = io::stdout().flush();
-}
 
 /// 讀取使用者輸入的一行，回傳第一個非空白字元（大寫）。
 /// 若輸入為空或 EOF，回傳 '\0'。
@@ -20,46 +14,31 @@ pub fn read_choice() -> char {
         .unwrap_or('\0')
 }
 
-/// 印主選單（標題 + 環境資訊 + 選項）
-pub fn print_main_menu(hostname: &str, rules_ver: &str, rules_loaded: bool) {
-    let rules_info = if rules_loaded {
-        format!("規則版本：{}", truncate_rules_ver(rules_ver))
-    } else {
-        "規則：未載入（僅啟發式偵測）".to_string()
-    };
-    println!("╔══════════════════════════════════════════╗");
-    println!("║    Cairn 威脅鑑識工具                    ║");
-    println!("╠══════════════════════════════════════════╣");
-    println!("║  主機名稱：{:<30}║", truncate(hostname, 28));
-    println!("║  {:<40}║", truncate(&rules_info, 38));
-    println!("╠══════════════════════════════════════════╣");
-    println!("║  [1] 快速掃描（最近 24 小時）            ║");
-    println!("║  [2] 自訂時間範圍                        ║");
-    println!("║  [3] 工程師模式                          ║");
-    println!("║  [Q] 離開                               ║");
-    println!("╚══════════════════════════════════════════╝");
-    print!("請選擇：");
-    let _ = io::stdout().flush();
+/// 讀取使用者輸入的一整行（去頭尾空白）。EOF 回傳空字串。
+pub fn read_line() -> String {
+    let mut line = String::new();
+    let _ = io::stdin().lock().read_line(&mut line);
+    line.trim().to_string()
 }
 
-/// 印時間範圍選單，回傳使用者選擇的 (小時數, 描述字串)。
-pub fn print_time_menu() -> (u64, &'static str) {
-    println!("\n選擇掃描時間範圍：");
-    println!("  [1] 最近 1 小時");
-    println!("  [2] 最近 6 小時");
-    println!("  [3] 最近 24 小時");
-    println!("  [4] 最近 72 小時");
-    println!("  [5] 最近 7 天（168 小時）");
-    print!("請選擇（預設 3）：");
+/// 顯示提示並讀一行。
+pub fn prompt(msg: &str) -> String {
+    print!("{msg}");
     let _ = io::stdout().flush();
-    let choice = read_choice();
-    match choice {
-        '1' => (1, "最近 1 小時"),
-        '2' => (6, "最近 6 小時"),
-        '4' => (72, "最近 72 小時"),
-        '5' => (168, "最近 7 天"),
-        _ => (24, "最近 24 小時"),
-    }
+    read_line()
+}
+
+/// Y/N 回答：只有 Y / YES / 是（不分大小寫）算同意；Enter、N 或其他都算不同意
+/// （預設 N）。純函式，可測試。
+pub fn is_yes(input: &str) -> bool {
+    let t = input.trim();
+    t.eq_ignore_ascii_case("y") || t.eq_ignore_ascii_case("yes") || t == "是"
+}
+
+/// 選填欄位：空白（直接按 Enter）回傳 None，否則回傳去頭尾空白後的內容。
+pub fn optional_field(input: &str) -> Option<String> {
+    let t = input.trim();
+    (!t.is_empty()).then(|| t.to_string())
 }
 
 /// 印掃描摘要框
@@ -141,59 +120,6 @@ pub fn clean_path_input(raw: &str) -> Option<String> {
     }
 }
 
-/// 提示使用者輸入路徑，回傳清理過的字串；空輸入回傳 None。
-pub fn read_path_input(prompt: &str) -> Option<String> {
-    print!("{prompt}");
-    let _ = io::stdout().flush();
-    let stdin = io::stdin();
-    let mut line = String::new();
-    let _ = stdin.lock().read_line(&mut line);
-    clean_path_input(&line)
-}
-
-/// 數字選項 → cairn --profile 的字串值。對應 `cairn_core::Profile` 三個變體
-/// （Minimal/Standard/Verbose，見 crates/cairn-core/src/config.rs:17-21）。
-/// 未知選項一律回退 "standard"（與 cairn-cli RunArgs::profile 的預設值一致，
-/// 不是自造的行為）。
-pub fn profile_choice_to_value(choice: char) -> &'static str {
-    match choice {
-        '1' => "minimal",
-        '3' => "verbose",
-        _ => "standard",
-    }
-}
-
-/// 印工程師模式子選單，回傳使用者選擇的字元。
-pub fn print_engineer_menu() {
-    println!("\n╔══════════════════════════════════════════╗");
-    println!("║  工程師模式                              ║");
-    println!("╠══════════════════════════════════════════╣");
-    println!("║  [1] 選擇 Profile 掃描                   ║");
-    println!("║  [2] 離線 EVTX 分析                      ║");
-    println!("║  [B] 返回主選單                          ║");
-    println!("╚══════════════════════════════════════════╝");
-    print!("請選擇：");
-    let _ = io::stdout().flush();
-}
-
-/// 印 profile 選單，回傳 (cairn --profile 值, 描述字串)。
-pub fn print_profile_menu() -> (&'static str, &'static str) {
-    println!("\n選擇掃描 Profile：");
-    println!("  [1] Minimal（最小模組集，速度優先）");
-    println!("  [2] Standard（標準模組集，預設）");
-    println!("  [3] Verbose（完整模組集，含耗時的 raw-NTFS 收集）");
-    print!("請選擇（預設 2）：");
-    let _ = io::stdout().flush();
-    let choice = read_choice();
-    let value = profile_choice_to_value(choice);
-    let desc = match value {
-        "minimal" => "Minimal",
-        "verbose" => "Verbose",
-        _ => "Standard",
-    };
-    (value, desc)
-}
-
 fn truncate(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -202,7 +128,8 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
-fn truncate_rules_ver(ver: &str) -> String {
+/// 規則版本的短格式（pin 前 7 碼 + 聚合雜湊前 8 碼）。
+pub fn truncate_rules_ver(ver: &str) -> String {
     if let Some((pin, agg)) = ver.split_once('+') {
         let short_pin = &pin[..pin.len().min(7)];
         let short_agg = &agg[..agg.len().min(8)];
@@ -213,22 +140,30 @@ fn truncate_rules_ver(ver: &str) -> String {
 }
 
 #[cfg(test)]
-mod engineer_menu_tests {
+mod prompt_tests {
+    use super::{is_yes, optional_field};
+
+    #[test]
+    fn only_explicit_yes_continues() {
+        for y in ["y", "Y", "yes", " YES ", "是"] {
+            assert!(is_yes(y), "{y}");
+        }
+        for n in ["", "n", "N", "no", "ok", "否"] {
+            assert!(!is_yes(n), "{n}");
+        }
+    }
+
+    #[test]
+    fn optional_field_skips_on_enter() {
+        assert_eq!(optional_field(""), None);
+        assert_eq!(optional_field("   "), None);
+        assert_eq!(optional_field(" IR-1 "), Some("IR-1".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod path_input_tests {
     use super::clean_path_input;
-    use super::profile_choice_to_value;
-
-    #[test]
-    fn maps_known_choices() {
-        assert_eq!(profile_choice_to_value('1'), "minimal");
-        assert_eq!(profile_choice_to_value('2'), "standard");
-        assert_eq!(profile_choice_to_value('3'), "verbose");
-    }
-
-    #[test]
-    fn unknown_choice_defaults_to_standard() {
-        assert_eq!(profile_choice_to_value('9'), "standard");
-        assert_eq!(profile_choice_to_value('\0'), "standard");
-    }
 
     #[test]
     fn strips_surrounding_quotes_and_whitespace() {

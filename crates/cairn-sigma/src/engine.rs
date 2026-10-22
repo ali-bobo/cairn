@@ -5,8 +5,10 @@
 //! tags (from `tags`). The engine stays behind the `SigmaMatcher` trait so it can be
 //! swapped (e.g. for tau-engine) per ADR-0001's fallback.
 
+use crate::viability::{self, HostLogging, RuleProfile};
 use crate::{LogsourceMap, SigmaMatcher};
 use cairn_core::finding::{Finding, FindingSource, Severity};
+use cairn_core::observation::SigmaRuleStatus;
 use cairn_core::record::EventRecord;
 use cairn_core::{CairnError, Result};
 use sigma_rust::Rule;
@@ -18,6 +20,8 @@ use std::path::Path;
 #[derive(Default)]
 pub struct Engine {
     rules: Vec<Rule>,
+    /// Viability profile per rule, index-aligned with `rules`.
+    profiles: Vec<RuleProfile>,
     channels: Vec<String>,
     logsource: LogsourceMap,
     ruleset_ver: String,
@@ -28,29 +32,81 @@ impl Engine {
     /// after decoding). A rule that fails to parse is a hard error — bundled rules are
     /// trusted/pinned (ADR-0003), so a parse failure is a packaging bug, not input.
     pub fn from_rules(rules: &[&str]) -> Result<Self> {
+        let logsource = LogsourceMap::windows_builtin();
         let mut parsed = Vec::with_capacity(rules.len());
+        let mut profiles = Vec::with_capacity(rules.len());
         for (i, yaml) in rules.iter().enumerate() {
             let rule = sigma_rust::rule_from_yaml(yaml)
                 .map_err(|e| CairnError::Other(format!("sigma rule #{i} parse error: {e}")))?;
+            let profile = viability::profile_rule(yaml, &logsource)
+                .map_err(|e| CairnError::Other(format!("sigma rule #{i} profile error: {e}")))?;
             parsed.push(rule);
+            profiles.push(profile);
         }
-        Ok(Self::from_parsed(parsed))
+        Ok(Self::from_parsed(parsed, profiles, logsource))
     }
 
-    fn from_parsed(rules: Vec<Rule>) -> Self {
-        // Distinct channels referenced via logsource.service (used as a channel hint).
+    fn from_parsed(rules: Vec<Rule>, profiles: Vec<RuleProfile>, logsource: LogsourceMap) -> Self {
+        // Distinct EVTX channel names the rules' logsources resolve to (e.g.
+        // `service: security` -> "Security", `category: process_creation` -> "Security"
+        // + Sysmon). These are real channel names, so EvtxLiveCollector can map them to
+        // on-disk `.evtx` files. A rule whose logsource is unmapped contributes nothing.
         let mut channels: Vec<String> = rules
             .iter()
-            .filter_map(|r| r.logsource.service.clone())
+            .flat_map(|r| {
+                let ls = &r.logsource;
+                logsource
+                    .resolve(
+                        ls.category.as_deref(),
+                        ls.product.as_deref(),
+                        ls.service.as_deref(),
+                    )
+                    .into_iter()
+                    .map(|e| e.channel.clone())
+                    .collect::<Vec<_>>()
+            })
             .collect();
         channels.sort();
         channels.dedup();
         Engine {
             rules,
+            profiles,
             channels,
-            logsource: LogsourceMap::windows_builtin(),
+            logsource,
             ruleset_ver: String::new(),
         }
+    }
+
+    /// Static viability profile of every loaded rule, in load order.
+    pub fn profiles(&self) -> &[RuleProfile] {
+        &self.profiles
+    }
+
+    /// Each loaded rule's viability on a host with the given logging, in load order.
+    pub fn rule_statuses(&self, host: &HostLogging) -> Vec<(&RuleProfile, SigmaRuleStatus)> {
+        self.profiles
+            .iter()
+            .map(|p| (p, viability::assess(p, host)))
+            .collect()
+    }
+
+    /// Number of loaded rules tagged with each ATT&CK technique, keyed by the
+    /// upper-case technique ID (`attack.t1059.001` -> `T1059.001`). Tactic tags
+    /// (`attack.execution`) and non-ATT&CK tags are ignored.
+    pub fn technique_counts(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut counts = std::collections::BTreeMap::new();
+        for rule in &self.rules {
+            let mut seen = std::collections::BTreeSet::new();
+            for tag in rule.tags.iter().flatten() {
+                if let Some(id) = technique_from_tag(tag) {
+                    seen.insert(id);
+                }
+            }
+            for id in seen {
+                *counts.entry(id).or_insert(0) += 1;
+            }
+        }
+        counts
     }
 
     /// Version string recorded by `load()` from the PROVENANCE file in the rules dir.
@@ -85,13 +141,61 @@ impl Engine {
 
     /// Convert one normalized EventRecord into a sigma-rust Event by serializing its
     /// flattened `data` map to JSON (the fields Sigma matches against).
-    fn to_sigma_event(ev: &EventRecord) -> Result<sigma_rust::Event> {
-        let json = serde_json::Value::Object(ev.data.clone()).to_string();
-        sigma_rust::event_from_json(&json)
-            .map_err(|e| CairnError::Other(format!("event to sigma: {e}")))
+    ///
+    /// Field aliases from every LogsourceMap entry matching the event's channel/EID are
+    /// applied first: e.g. a Security 4688 carries `NewProcessName`, so `Image` is added
+    /// with the same value, letting process_creation rules written against Sysmon
+    /// field names match it. An alias never overwrites a field the event already has.
+    fn to_sigma_event(
+        &self,
+        ev: &EventRecord,
+    ) -> Result<(
+        sigma_rust::Event,
+        serde_json::Map<String, serde_json::Value>,
+    )> {
+        let mut data = ev.data.clone();
+        // The flattened System section keeps `Provider` as an object and `EventID` as an
+        // object when it has qualifiers; Sigma rules match `Provider_Name` and a numeric
+        // `EventID`, so give them the normalized values the EventRecord already holds.
+        if !data.contains_key("Provider_Name") && !ev.provider.is_empty() {
+            data.insert(
+                "Provider_Name".into(),
+                serde_json::Value::String(ev.provider.clone()),
+            );
+        }
+        if !data
+            .get("EventID")
+            .is_some_and(serde_json::Value::is_number)
+        {
+            data.insert("EventID".into(), serde_json::Value::from(ev.event_id));
+        }
+        for entry in self
+            .logsource
+            .entries
+            .iter()
+            .filter(|e| e.channel == ev.channel && e.event_id == ev.event_id)
+        {
+            for (sigma_field, evtx_field) in &entry.field_aliases {
+                if data.contains_key(sigma_field) {
+                    continue;
+                }
+                if let Some(v) = ev.data.get(evtx_field) {
+                    data.insert(sigma_field.clone(), v.clone());
+                }
+            }
+        }
+        let json = serde_json::Value::Object(data.clone()).to_string();
+        let event = sigma_rust::event_from_json(&json)
+            .map_err(|e| CairnError::Other(format!("event to sigma: {e}")))?;
+        Ok((event, data))
     }
 
-    fn finding_from(rule: &Rule, ev: &EventRecord) -> Finding {
+    fn finding_from(
+        rule: &Rule,
+        profile: &RuleProfile,
+        ev: &EventRecord,
+        data: &serde_json::Map<String, serde_json::Value>,
+    ) -> Finding {
         let mut f = Finding::new(
             level_to_severity(&rule.level),
             &rule.title,
@@ -105,8 +209,64 @@ impl Engine {
         f.artifact = format!("evtx:{}", ev.channel);
         f.event_id = Some(ev.event_id);
         f.evidence_ref = Some(ev.record_id.to_string());
+        f.details = matched_fields(profile, data);
         f
     }
+}
+
+/// Longest field value quoted in a finding's matched-fields line.
+const MATCHED_VALUE_MAX: usize = 200;
+
+/// `matched fields: CommandLine=...; Image=...` — the values of the fields the rule's
+/// detection references, as this event carried them (after field aliasing). Empty when
+/// the event has none of them (a keyword rule).
+pub(crate) fn matched_fields(
+    profile: &RuleProfile,
+    data: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let parts: Vec<String> = profile
+        .fields
+        .iter()
+        .filter(|f| !viability::UNINTERESTING_FIELDS.contains(&f.as_str()))
+        .filter_map(|f| {
+            let v = data.get(f)?;
+            let text = match v {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => return None,
+                other => other.to_string(),
+            };
+            let text = if text.chars().count() > MATCHED_VALUE_MAX {
+                let cut: String = text.chars().take(MATCHED_VALUE_MAX).collect();
+                format!("{cut}...")
+            } else {
+                text
+            };
+            Some(format!("{f}={text}"))
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("matched fields: {}", parts.join("; "))
+    }
+}
+
+/// `attack.t1059.001` -> `Some("T1059.001")`; tactic or other tags -> None.
+fn technique_from_tag(tag: &str) -> Option<String> {
+    let id = tag.strip_prefix("attack.")?;
+    let rest = id.strip_prefix('t').or_else(|| id.strip_prefix('T'))?;
+    let (major, sub) = rest
+        .split_once('.')
+        .map_or((rest, None), |(a, b)| (a, Some(b)));
+    if major.len() != 4 || !major.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    if let Some(sub) = sub {
+        if sub.len() != 3 || !sub.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(format!("T{}", rest))
 }
 
 /// Map sigma-rust's `Level` to our `Severity`. sigma-rust does not re-export the
@@ -126,20 +286,25 @@ fn level_to_severity<L: std::fmt::Debug>(level: &Option<L>) -> Severity {
     }
 }
 
-/// Recursively collect decoded rule YAML strings from `dir` and all subdirectories.
-/// Bundled rules are XOR-encoded (`plain=false`); `--rules-plain` passes `true`.
+/// Recursively collect rule YAML strings from `dir` and all subdirectories.
 /// A directory that cannot be read is skipped (graceful degrade, golden rule 8).
-fn collect_rule_yamls(dir: &Path, plain: bool, out: &mut Vec<String>) -> Result<()> {
+fn collect_rule_yamls(dir: &Path, out: &mut Vec<String>) -> Result<()> {
     let rd = match std::fs::read_dir(dir) {
         Ok(rd) => rd,
         Err(_) => return Ok(()),
     };
-    for entry in rd {
-        let path = entry?.path();
+    // read_dir order is filesystem-defined (differs between NTFS, ext4, tmpfs and
+    // between runs on some): sort so rules, and the findings they emit for the same
+    // event, always come out in the same order.
+    let mut paths = rd
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    paths.sort();
+    for path in paths {
         if path.is_dir() {
-            collect_rule_yamls(&path, plain, out)?;
+            collect_rule_yamls(&path, out)?;
         } else if path.extension().is_some_and(|e| e == "yml" || e == "yaml") {
-            let bytes = crate::codec::load_rule_bytes(&path, plain)?;
+            let bytes = std::fs::read(&path)?;
             out.push(String::from_utf8_lossy(&bytes).into_owned());
         }
     }
@@ -147,25 +312,26 @@ fn collect_rule_yamls(dir: &Path, plain: bool, out: &mut Vec<String>) -> Result<
 }
 
 impl SigmaMatcher for Engine {
-    fn load(&mut self, rules_dir: &Path, plain: bool) -> Result<usize> {
+    fn load(&mut self, rules_dir: &Path) -> Result<usize> {
         let mut yamls: Vec<String> = Vec::new();
-        collect_rule_yamls(rules_dir, plain, &mut yamls)?;
+        collect_rule_yamls(rules_dir, &mut yamls)?;
         let refs: Vec<&str> = yamls.iter().map(String::as_str).collect();
         *self = Engine::from_rules(&refs)?;
         // Populate ruleset_ver from the PROVENANCE file for manifest integrity (ADR-0003).
-        self.ruleset_ver = crate::ruleset::ruleset_version(rules_dir, plain).unwrap_or_default();
+        self.ruleset_ver = crate::ruleset::ruleset_version(rules_dir).unwrap_or_default();
         Ok(self.rules.len())
     }
 
     fn match_event(&self, ev: &EventRecord) -> Result<Vec<Finding>> {
-        let sigma_ev = Self::to_sigma_event(ev)?;
+        let (sigma_ev, data) = self.to_sigma_event(ev)?;
         let findings = self
             .rules
             .iter()
+            .zip(&self.profiles)
             // Gate first (cheap channel/EID check) so a rule only matches events of the
             // type its logsource denotes; then run the full content match.
-            .filter(|rule| self.event_passes_logsource(rule, ev) && rule.is_match(&sigma_ev))
-            .map(|rule| Self::finding_from(rule, ev))
+            .filter(|(rule, _)| self.event_passes_logsource(rule, ev) && rule.is_match(&sigma_ev))
+            .map(|(rule, profile)| Self::finding_from(rule, profile, ev, &data))
             .collect();
         Ok(findings)
     }
@@ -214,6 +380,43 @@ detection:
         }
     }
 
+    #[test]
+    fn rule_files_are_collected_in_path_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "cairn-sigma-order-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let sub = dir.join("b_dir");
+        std::fs::create_dir_all(&sub).unwrap();
+        for (p, body) in [
+            (dir.join("z.yml"), "z"),
+            (dir.join("a.yaml"), "a"),
+            (sub.join("m.yml"), "m"),
+            (dir.join("c.txt"), "skipped"),
+        ] {
+            std::fs::write(p, body).unwrap();
+        }
+        let mut out = Vec::new();
+        collect_rule_yamls(&dir, &mut out).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(out, vec!["a", "m", "z"]);
+    }
+
+    #[test]
+    fn technique_tags_are_parsed_and_tactics_ignored() {
+        assert_eq!(
+            technique_from_tag("attack.t1059.001").as_deref(),
+            Some("T1059.001")
+        );
+        assert_eq!(technique_from_tag("attack.t1218").as_deref(), Some("T1218"));
+        assert_eq!(technique_from_tag("attack.execution"), None);
+        assert_eq!(technique_from_tag("attack.g0016"), None);
+        assert_eq!(technique_from_tag("car.2013-05-004"), None);
+        let engine = Engine::from_rules(&[RULE]).unwrap();
+        assert_eq!(engine.technique_counts().get("T1059"), Some(&1));
+    }
+
     /// A matching event fires the rule and the Finding carries author (DRL 1.1),
     /// severity mapped from `level`, MITRE from `tags`, and the rule id + source=sigma.
     #[test]
@@ -249,6 +452,70 @@ detection:
     fn referenced_channels_is_available() {
         let engine = Engine::from_rules(&[RULE]).unwrap();
         let _ = engine.referenced_channels();
+    }
+
+    /// referenced_channels() returns real EVTX channel names resolved from each rule's
+    /// logsource (not raw Sigma service names like "security"), so the live collector
+    /// can map them to on-disk files. process_creation -> Security + Sysmon.
+    #[test]
+    fn referenced_channels_are_resolved_channel_names() {
+        const SVC: &str = r#"
+title: Svc rule
+id: svc-0001
+author: T
+level: low
+logsource:
+    product: windows
+    service: security
+detection:
+    selection:
+        EventID: 4625
+    condition: selection
+"#;
+        let engine = Engine::from_rules(&[RULE, SVC]).unwrap();
+        assert_eq!(
+            engine.referenced_channels(),
+            &[
+                "Microsoft-Windows-Sysmon/Operational".to_string(),
+                "Security".to_string(),
+            ]
+        );
+    }
+
+    /// A real Security 4688 carries `NewProcessName`/`ParentProcessName`, not the Sysmon
+    /// `Image`/`ParentImage` names that process_creation rules use. The 4688 field
+    /// aliases bridge that, so the rule fires on a real-shaped 4688.
+    #[test]
+    fn process_creation_rule_fires_on_real_shaped_4688() {
+        let engine = Engine::from_rules(&[RULE]).unwrap();
+        let mut data = serde_json::Map::new();
+        data.insert(
+            "NewProcessName".into(),
+            serde_json::json!(r"C:\Windows\System32\cmd.exe"),
+        );
+        let ev = EventRecord {
+            ts: Utc::now(),
+            channel: "Security".into(),
+            event_id: 4688,
+            provider: "Microsoft-Windows-Security-Auditing".into(),
+            computer: "WS01".into(),
+            record_id: 1,
+            data,
+        };
+        assert_eq!(engine.match_event(&ev).unwrap().len(), 1);
+    }
+
+    /// Aliases only fill in missing fields: an event that already carries `Image`
+    /// keeps its own value even if `NewProcessName` says otherwise.
+    #[test]
+    fn field_alias_never_overwrites_existing_field() {
+        let engine = Engine::from_rules(&[RULE]).unwrap();
+        let mut ev = event(r"C:\Windows\System32\notepad.exe");
+        ev.data.insert(
+            "NewProcessName".into(),
+            serde_json::json!(r"C:\Windows\System32\cmd.exe"),
+        );
+        assert!(engine.match_event(&ev).unwrap().is_empty());
     }
 
     /// Logsource gate (T8 follow-up): a `process_creation` rule must fire on a
@@ -316,35 +583,20 @@ detection:
         );
     }
 
-    /// `--rules-plain` parity (ADR-0002 / T8b): loading the SAME rule from a plain `.yml`
-    /// dir (plain=true) and from an XOR-encoded dir (plain=false) yields an engine that
-    /// matches identically — the codec layer is invisible to detection results.
+    /// `load` reads every `.yml` under a directory tree as plain YAML.
     #[test]
-    fn load_plain_and_encoded_dirs_match_identically() {
+    fn load_reads_plain_yaml_dir() {
         let root = std::env::temp_dir().join("cairn_engine_plain_test");
         let _ = std::fs::remove_dir_all(&root);
-        let plain_dir = root.join("plain");
-        let enc_dir = root.join("encoded");
-        std::fs::create_dir_all(&plain_dir).unwrap();
-        std::fs::create_dir_all(&enc_dir).unwrap();
+        let dir = root.join("sub");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("r.yml"), RULE).unwrap();
 
-        std::fs::write(plain_dir.join("r.yml"), RULE).unwrap();
-        std::fs::write(enc_dir.join("r.yml"), crate::codec::xor(RULE.as_bytes())).unwrap();
-
-        let mut plain_engine = Engine::default();
-        let n_plain = plain_engine.load(&plain_dir, true).unwrap();
-        let mut enc_engine = Engine::default();
-        let n_enc = enc_engine.load(&enc_dir, false).unwrap();
-        assert_eq!(n_plain, 1);
-        assert_eq!(n_enc, 1);
-
-        let ev = event(r"C:\Windows\System32\cmd.exe");
-        let p = plain_engine.match_event(&ev).unwrap();
-        let e = enc_engine.match_event(&ev).unwrap();
-        assert_eq!(p.len(), 1);
-        assert_eq!(e.len(), 1);
-        assert_eq!(p[0].rule_id, e[0].rule_id);
-        assert_eq!(p[0].rule_author, e[0].rule_author);
-        assert_eq!(p[0].severity, e[0].severity);
+        let mut engine = Engine::default();
+        assert_eq!(engine.load(&root).unwrap(), 1);
+        let hits = engine
+            .match_event(&event(r"C:\Windows\System32\cmd.exe"))
+            .unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }

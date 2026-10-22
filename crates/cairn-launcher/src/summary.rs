@@ -119,7 +119,7 @@ mod tests {
   "sources": [], "outputs": [],
   "counts": {{"records":100,"findings_by_sev":{{"critical":{},"high":{},"medium":{},"low":0,"info":0}}}},
   "integrity_note":"",
-  "governance": {{"effective_threads":4,"low_priority_applied":false,"truncations":[]}}
+  "governance": {{"low_priority_applied":false}}
 }}"#,
             critical, high, medium
         )

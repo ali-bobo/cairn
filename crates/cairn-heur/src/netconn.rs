@@ -1,8 +1,7 @@
 //! heur_netconn (FR11, SRS §10): bare public-IP remote, rare remote port, owning-proc
 //! in temp, unsigned owner, suspicious high-port listener. Pure scoring + Analyzer impl.
-use crate::score::{
-    is_public_ipv4, is_rare_port, is_suspicious_path, join_key, severity_for, Score,
-};
+use crate::score::{is_public_ipv4, is_rare_port, join_key, severity_for, Score};
+use crate::trust::{exe_name, is_user_writable_path, launcher_kind};
 use cairn_core::finding::{EntityNetConn, EntityProcess};
 use cairn_core::record::{NetConnRecord, ProcessRecord, Record};
 use cairn_core::traits::Analyzer;
@@ -11,8 +10,47 @@ use std::collections::HashMap;
 
 /// Gate floor (spec §4.2 S7): single weak signals (rare port 20, public+rare 45,
 /// suspicious-path owner 30) are inventory-grade and never emit alone; a finding
-/// requires a corroborated combo (e.g. public+rare+unsigned = 65).
+/// requires a corroborated combo (e.g. public+rare+unsigned = 65). The one exception
+/// is an unsigned owner in a drop zone (see [`owner_is_unsigned_dropzone`]), which
+/// emits on its own at Medium.
 const NETCONN_GATE_FLOOR: u32 = 50;
+
+/// Weight of "owner is unsigned and runs from a user-writable folder": Medium on its
+/// own (an unsigned per-user tool talking to the network is worth a look, not an
+/// alarm); any further signal lifts it to High.
+const UNSIGNED_DROPZONE_OWNER: u32 = 40;
+
+/// Remote-access services whose LOCAL port is the listening port: a connection to
+/// one of them from a public address is someone on the internet logged in to (or
+/// knocking on) this host.
+const INBOUND_REMOTE_SERVICES: &[(u16, &str, &str)] = &[
+    (3389, "RDP", "T1021.001"),
+    (445, "SMB", "T1021.002"),
+    (22, "SSH", "T1021.004"),
+];
+
+/// True if the connection's owner is explicitly unsigned AND runs from a drop zone.
+fn owner_is_unsigned_dropzone(owner: Option<&ProcessRecord>) -> bool {
+    owner.is_some_and(|o| o.signed == Some(false) && is_user_writable_path(&o.image))
+}
+
+/// The remote-access service a public peer is connected to on this host, if any:
+/// local port 3389/445/22, a public remote address, not a listening socket, and the
+/// remote port is not itself that service port (an outbound session from here has an
+/// ephemeral local port, so it never matches).
+fn inbound_public_service(c: &NetConnRecord) -> Option<(&'static str, &'static str)> {
+    if c.state.as_deref() == Some("listen") {
+        return None;
+    }
+    let raddr = c.raddr.as_deref()?;
+    if !is_public_ipv4(raddr) {
+        return None;
+    }
+    let (port, name, mitre) = INBOUND_REMOTE_SERVICES
+        .iter()
+        .find(|(p, _, _)| *p == c.lport)?;
+    (c.rport != Some(*port)).then_some((name, mitre))
+}
 
 /// Score one connection against its (optional) owning process.
 fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
@@ -23,7 +61,14 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
     // stays quiet.
     // A remote port of 0 (or None) means "no remote endpoint" — a listening socket, not
     // egress. Only a real (non-zero) remote port can be a rare-egress signal.
-    let rare = c.rport.is_some_and(|p| p != 0 && is_rare_port(p));
+    // An inbound session's remote port is the client's ephemeral port, not egress, so
+    // the rare-port signals do not apply to it.
+    let inbound = inbound_public_service(c);
+    let serving = c.state.as_deref() != Some("listen")
+        && INBOUND_REMOTE_SERVICES
+            .iter()
+            .any(|(p, _, _)| *p == c.lport && c.rport != Some(*p));
+    let rare = !serving && c.rport.is_some_and(|p| p != 0 && is_rare_port(p));
     if let Some(raddr) = c.raddr.as_deref() {
         if is_public_ipv4(raddr) && rare {
             s.add(
@@ -38,6 +83,20 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
             s.add(20, format!("uncommon remote port {rport}"), &[]);
         }
     }
+    // 3389/445/22 are "common" only as REMOTE ports (this host connecting out). As the
+    // LOCAL port with a public peer they mean the service is exposed to the internet
+    // and someone is using it: High on its own (T1021 remote services / T1133).
+    if let Some((name, mitre)) = inbound {
+        s.add(
+            55,
+            format!(
+                "inbound {name} connection from public IP {} to local port {}",
+                c.raddr.as_deref().unwrap_or("-"),
+                c.lport
+            ),
+            &[mitre, "T1133"],
+        );
+    }
     if let Some(o) = owner {
         let mut owner_path_suspicious = false;
         // 獨立訊號（段 11）：owner 未簽章 + 可疑路徑的組合，不需要連線本身先觸發
@@ -47,9 +106,9 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
         // C2 最常見的偽裝手法正是用常見埠（443/80）混在正常流量裡——不能因為埠
         // 是常見埠就假設這是正常流量。MITRE T1036 (Masquerading)，比照
         // parentchild.rs 對同性質訊號的標籤。
-        if is_suspicious_path(&o.image) && o.signed == Some(false) {
+        if is_user_writable_path(&o.image) && o.signed == Some(false) {
             s.add(
-                50,
+                UNSIGNED_DROPZONE_OWNER,
                 format!(
                     "owning process is unsigned and runs from a suspicious path: {}",
                     o.image
@@ -57,7 +116,7 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
                 &["T1036"],
             );
             owner_path_suspicious = true;
-        } else if is_suspicious_path(&o.image) {
+        } else if is_user_writable_path(&o.image) {
             s.add(
                 30,
                 format!("owning process runs from a suspicious path: {}", o.image),
@@ -95,13 +154,18 @@ fn score_conn(c: &NetConnRecord, owner: Option<&ProcessRecord>) -> Score {
 /// Analyzer: scores every connection against its owning process.
 pub struct NetConnHeuristic;
 
+impl NetConnHeuristic {
+    /// This analyzer's `name()`, also stamped into `Finding.analyzer`.
+    pub const NAME: &'static str = cairn_core::analyzers::NETCONN;
+}
+
 impl Analyzer for NetConnHeuristic {
     fn name(&self) -> &str {
-        "heur_netconn"
+        Self::NAME
     }
 
     fn depends_on(&self) -> &[&str] {
-        &["heur_persist"]
+        &[crate::persist::PersistHeuristic::NAME]
     }
 
     fn analyze(&self, records: &[Record], prior_findings: &[Finding]) -> Result<Vec<Finding>> {
@@ -131,20 +195,17 @@ impl Analyzer for NetConnHeuristic {
             // 各自判斷出同一個結論）。+30，與 persist.rs 內部同級跨文物佐證
             // 權重一致（那邊是直接 escalate() 一個 severity 級，這裡是分數制，
             // +30 大致對應 High(50..=69) 到 Critical(70..) 這個常見躍遷）。
-            if let Some(o) = owner {
+            // A launcher owner (powershell, rundll32, ...) is skipped: a persistence
+            // entry that runs through powershell.exe says nothing about which of the
+            // host's powershell.exe processes holds this connection.
+            if let Some(o) = owner.filter(|o| launcher_kind(&exe_name(&o.image)).is_none()) {
                 let owner_key = join_key(&o.image);
-                let owner_degraded = owner_key.degraded_key();
                 let corroborated = prior_findings.iter().any(|f| {
-                    f.reason
-                        .as_deref()
-                        .is_some_and(|r| r.contains(crate::persist::PERSIST_SOURCE_MARKER))
+                    f.analyzer == crate::persist::PersistHeuristic::NAME
                         && f.evidence
                             .iter()
                             .filter_map(|e| e.path.as_deref())
-                            .any(|p| {
-                                let ev_key = join_key(p);
-                                ev_key == owner_key || ev_key.degraded_key() == owner_degraded
-                            })
+                            .any(|p| join_key(p).same_target(&owner_key))
                 });
                 if corroborated {
                     score.add(
@@ -158,7 +219,9 @@ impl Analyzer for NetConnHeuristic {
                 }
             }
 
-            if score.weight < NETCONN_GATE_FLOOR {
+            // Below the floor only the unsigned drop-zone owner emits (alone: Medium).
+            let standalone = owner_is_unsigned_dropzone(owner);
+            if score.weight < NETCONN_GATE_FLOOR && !standalone {
                 continue;
             }
             let Some(severity) = severity_for(score.weight) else {
@@ -183,12 +246,22 @@ impl Analyzer for NetConnHeuristic {
                 })
                 .or_else(|| c.pid.map(|pid| pid.to_string()))
                 .unwrap_or_else(|| "unknown".into());
-            f.details = format!(
-                "{} → {}:{}",
-                proc_label,
-                c.raddr.as_deref().unwrap_or("-"),
-                c.rport.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-            );
+            f.details = if inbound_public_service(c).is_some() {
+                format!(
+                    "{} ← {}:{} (local port {})",
+                    proc_label,
+                    c.raddr.as_deref().unwrap_or("-"),
+                    c.rport.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                    c.lport,
+                )
+            } else {
+                format!(
+                    "{} → {}:{}",
+                    proc_label,
+                    c.raddr.as_deref().unwrap_or("-"),
+                    c.rport.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                )
+            };
             f.entity = Entity {
                 netconn: Some(EntityNetConn {
                     laddr: c.laddr.clone(),
@@ -209,7 +282,7 @@ impl Analyzer for NetConnHeuristic {
             };
             out.push(f);
         }
-        Ok(out)
+        Ok(crate::stamped(out, Self::NAME))
     }
 }
 
@@ -252,6 +325,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         }
     }
 
@@ -297,9 +371,9 @@ mod tests {
     }
 
     /// An unsigned process running from a suspicious path (Temp), connecting to a
-    /// public IP on port 443 (common port — the real-world C2 disguise this segment
-    /// fixes), must now score independently of port rarity: suspicious-path(30) +
-    /// unsigned(20) as a single combined signal = 50, clearing the gate floor.
+    /// public IP on port 443 (common port — the real-world C2 disguise), scores
+    /// independently of port rarity: the combined unsigned+drop-zone signal (40) emits
+    /// on its own, at Medium — no longer High without a second signal.
     #[test]
     fn unsigned_suspicious_path_owner_scores_independently_of_port_443() {
         let c = conn(
@@ -312,11 +386,7 @@ mod tests {
         );
         let o = owner(r"C:\Users\a\AppData\Local\Temp\evil.exe", Some(false));
         let s = score_conn(&c, Some(&o));
-        assert!(
-            s.weight >= NETCONN_GATE_FLOOR,
-            "weight {} must clear the gate floor even on a common port",
-            s.weight
-        );
+        assert_eq!(s.weight, UNSIGNED_DROPZONE_OWNER);
         assert!(s
             .reasons
             .iter()
@@ -325,10 +395,12 @@ mod tests {
         let findings = NetConnHeuristic
             .analyze(&[Record::NetConn(c), Record::Process(o)], &[])
             .expect("analyze");
-        assert!(
-            !findings.is_empty(),
+        assert_eq!(
+            findings.len(),
+            1,
             "a 443-port C2 disguise with an unsigned+suspicious-path owner must be flagged"
         );
+        assert_eq!(findings[0].severity, cairn_core::Severity::Medium);
     }
 
     /// A signed, normal-path owner connecting on port 443 must still stay quiet —
@@ -384,8 +456,8 @@ mod tests {
         let c = conn("tcp", 4444, None, None, Some("listen"), Some(1));
         let o = owner(r"C:\Users\a\AppData\Local\Temp\svc.exe", Some(false));
         let s = score_conn(&c, Some(&o));
-        // suspicious path (30) + unsigned (20) + listener (25) = 75
-        assert!(s.weight >= 70, "weight {}", s.weight);
+        // unsigned + suspicious path (40) + listener (25) = 65 (High)
+        assert_eq!(s.weight, 65);
         assert!(s
             .reasons
             .iter()
@@ -537,12 +609,173 @@ mod tests {
         // signal (50) — NOT suspicious-path(30) and unsigned(20) added separately, since
         // those would double-count the same underlying fact. owner_path_suspicious is
         // still set true by that branch, so the listener signal (25) still fires on top:
-        // 50 + 25 = 75.
-        assert_eq!(s.weight, 75);
+        // 40 + 25 = 65.
+        assert_eq!(s.weight, 65);
         assert!(s
             .reasons
             .iter()
             .any(|r| r.contains("listening on high port")));
+    }
+
+    /// Inbound RDP / SMB / SSH from a public address is High on its own, even with a
+    /// signed system owner; the same ports used outbound, or from a private peer, are
+    /// not.
+    #[test]
+    fn inbound_public_remote_service_is_high() {
+        let svchost = owner(r"C:\Windows\System32\svchost.exe", Some(true));
+        for (lport, mitre) in [(3389, "T1021.001"), (445, "T1021.002"), (22, "T1021.004")] {
+            let c = conn(
+                "tcp",
+                lport,
+                Some("45.33.32.156"),
+                Some(51234),
+                Some("established"),
+                Some(1),
+            );
+            let s = score_conn(&c, Some(&svchost));
+            assert_eq!(s.weight, 55, "{lport}");
+            assert!(s.mitre.contains(&mitre.to_string()));
+            assert!(s.mitre.contains(&"T1133".to_string()));
+            let f = NetConnHeuristic
+                .analyze(&[Record::NetConn(c), Record::Process(svchost.clone())], &[])
+                .unwrap();
+            assert_eq!(f.len(), 1, "{lport}");
+            assert_eq!(f[0].severity, cairn_core::Severity::High);
+            assert!(f[0].details.contains('←'), "{}", f[0].details);
+        }
+        // outbound RDP from this host: ephemeral local port -> not inbound
+        let out = conn(
+            "tcp",
+            50123,
+            Some("45.33.32.156"),
+            Some(3389),
+            Some("established"),
+            Some(1),
+        );
+        assert_eq!(score_conn(&out, Some(&svchost)).weight, 0);
+        // inbound from a private peer -> quiet
+        let lan = conn(
+            "tcp",
+            3389,
+            Some("10.0.0.5"),
+            Some(51234),
+            Some("established"),
+            Some(1),
+        );
+        assert_eq!(score_conn(&lan, Some(&svchost)).weight, 0);
+        // the listening socket itself -> quiet
+        let listen = conn(
+            "tcp",
+            3389,
+            Some("0.0.0.0"),
+            Some(0),
+            Some("listen"),
+            Some(1),
+        );
+        assert_eq!(score_conn(&listen, Some(&svchost)).weight, 0);
+    }
+
+    /// A dual-stack listener reports its IPv4 peers as `::ffff:a.b.c.d`; an inbound RDP
+    /// session from a public address in that spelling was silently skipped.
+    #[test]
+    fn ipv4_mapped_peer_is_judged_as_ipv4() {
+        let svchost = owner(r"C:\Windows\System32\svchost.exe", Some(true));
+        let c = conn(
+            "tcp6",
+            3389,
+            Some("::ffff:45.33.32.156"),
+            Some(51234),
+            Some("established"),
+            Some(1),
+        );
+        assert_eq!(score_conn(&c, Some(&svchost)).weight, 55);
+        let lan = conn(
+            "tcp6",
+            3389,
+            Some("::ffff:10.0.0.5"),
+            Some(51234),
+            Some("established"),
+            Some(1),
+        );
+        assert_eq!(score_conn(&lan, Some(&svchost)).weight, 0);
+    }
+
+    fn persist_finding(path: &str) -> Finding {
+        let mut f = Finding::new(cairn_core::Severity::High, "p", FindingSource::Heuristic);
+        f.analyzer = crate::persist::PersistHeuristic::NAME.into();
+        f.evidence = vec![cairn_core::finding::EvidenceItem {
+            artifact: "run_key".into(),
+            path: Some(path.into()),
+            ts: None,
+            detail: String::new(),
+        }];
+        f
+    }
+
+    /// Corroboration needs the same binary: a persistence finding on a fake
+    /// `C:\Users\a\svchost.exe` must not lift the real System32 svchost's connection,
+    /// and an entry that runs through powershell.exe says nothing about which
+    /// powershell process owns a connection.
+    #[test]
+    fn persist_corroboration_requires_the_same_binary() {
+        let c = || {
+            conn(
+                "tcp",
+                50000,
+                Some("104.18.0.1"),
+                Some(4444),
+                Some("established"),
+                Some(1),
+            )
+        };
+        let real = owner(r"C:\Windows\System32\svchost.exe", Some(true));
+        let fake = persist_finding(r"C:\Users\a\svchost.exe");
+        let f = NetConnHeuristic
+            .analyze(&[Record::NetConn(c()), Record::Process(real)], &[fake])
+            .unwrap();
+        assert!(f.is_empty(), "{f:?}");
+
+        let ps = owner(
+            r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+            Some(true),
+        );
+        let entry = persist_finding(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let f = NetConnHeuristic
+            .analyze(&[Record::NetConn(c()), Record::Process(ps)], &[entry])
+            .unwrap();
+        assert!(f.is_empty(), "{f:?}");
+
+        // Same binary spelled differently still corroborates; a bare name too.
+        for ev_path in [r#""C:\TOOLS\evil.exe""#, "evil.exe"] {
+            let f = NetConnHeuristic
+                .analyze(
+                    &[
+                        Record::NetConn(c()),
+                        Record::Process(owner(r"C:\Tools\evil.exe", None)),
+                    ],
+                    &[persist_finding(ev_path)],
+                )
+                .unwrap();
+            assert_eq!(f.len(), 1, "{ev_path}");
+        }
+    }
+
+    /// Unsigned drop-zone owner plus one more signal (rare port) is High.
+    #[test]
+    fn unsigned_dropzone_owner_with_another_signal_is_high() {
+        let c = conn(
+            "tcp",
+            50000,
+            Some("10.0.0.5"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        );
+        let o = owner(r"C:\Users\a\AppData\Roaming\x\x.exe", Some(false));
+        let f = NetConnHeuristic
+            .analyze(&[Record::NetConn(c), Record::Process(o)], &[])
+            .unwrap();
+        assert_eq!(f[0].severity, cairn_core::Severity::High);
     }
 
     use cairn_core::record::Record;
@@ -590,6 +823,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         });
         let findings = NetConnHeuristic
             .analyze(&[bad, proc_rec], &[])
@@ -659,6 +893,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         });
         let findings = NetConnHeuristic
             .analyze(&[bad, proc_rec], &[])
@@ -777,12 +1012,17 @@ mod tests {
         );
     }
 
-    /// A connection whose owner also appears in a prior_findings entry sourced from
-    /// heur_persist (same image path) gets a +30 corroboration bonus, which can push
-    /// a below-floor connection over the gate.
+    /// A connection whose owner also has a heur_persist finding (same image path)
+    /// gets a +30 corroboration bonus, which pushes a below-floor connection over the
+    /// gate. The prior finding comes from the real PersistHeuristic, and the match is
+    /// on the typed `Finding.analyzer`, not on reason text.
     #[test]
     fn netconn_corroborated_by_persist_finding_clears_gate() {
-        // Connection alone: public+rare (25+20=45) — below the 50 gate floor.
+        use crate::persist::PersistHeuristic;
+        use cairn_core::record::{Mechanism, PersistenceRecord};
+        // Connection alone: public+rare (25+20=45) — below the 50 gate floor, and the
+        // owner is outside every drop zone so no owner-path signal adds weight.
+        let image = r"C:\Tools\evil.exe";
         let c = conn(
             "tcp",
             50000,
@@ -791,30 +1031,29 @@ mod tests {
             Some("established"),
             Some(1),
         );
-        let o = owner(r"C:\Users\a\AppData\Local\Temp\evil.exe", None);
-        let proc_rec = Record::Process(o);
+        let records = vec![Record::NetConn(c), Record::Process(owner(image, None))];
+        assert!(NetConnHeuristic.analyze(&records, &[]).unwrap().is_empty());
 
-        // A prior_findings entry from heur_persist, whose evidence includes the SAME
-        // image path as the netconn owner.
-        let mut persist_finding = Finding::new(
-            cairn_core::Severity::High,
-            "Persistence: evil.exe",
-            FindingSource::Heuristic,
-        );
-        persist_finding.reason = Some(format!(
-            "some persist reason; {}",
-            crate::persist::PERSIST_SOURCE_MARKER
-        ));
-        persist_finding.evidence = vec![cairn_core::finding::EvidenceItem {
-            artifact: "run_key".into(),
-            path: Some(r"C:\Users\a\AppData\Local\Temp\evil.exe".into()),
-            ts: None,
-            detail: "".into(),
-        }];
+        // Recent, unverifiable, non-system run key -> persist S4 finding on evil.exe.
+        let persist_rec = Record::Persistence(PersistenceRecord {
+            mechanism: Mechanism::RunKey,
+            location: r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run".into(),
+            value: Some("evil".into()),
+            command: Some(image.into()),
+            binary_path: Some(image.into()),
+            binary_sha256: None,
+            signed: None,
+            signer: None,
+            last_write: Some(chrono::Utc::now()),
+            bound: None,
+            signer_source: None,
+            service_start: None,
+        });
+        let prior = PersistHeuristic.analyze(&[persist_rec], &[]).unwrap();
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0].analyzer, PersistHeuristic::NAME);
 
-        let findings = NetConnHeuristic
-            .analyze(&[Record::NetConn(c), proc_rec], &[persist_finding])
-            .expect("analyze");
+        let findings = NetConnHeuristic.analyze(&records, &prior).expect("analyze");
         assert_eq!(
             findings.len(),
             1,
@@ -828,6 +1067,37 @@ mod tests {
             "reason must mention the corroborating source: {:?}",
             findings[0].reason
         );
+    }
+
+    /// Only a finding whose `analyzer` is heur_persist corroborates; reason text
+    /// that merely mentions it (the old string-marker contract) does not.
+    #[test]
+    fn netconn_corroboration_keys_on_analyzer_field_not_reason_text() {
+        let image = r"C:\Tools\evil.exe";
+        let c = conn(
+            "tcp",
+            50000,
+            Some("104.18.0.1"),
+            Some(4444),
+            Some("established"),
+            Some(1),
+        );
+        let mut other = Finding::new(cairn_core::Severity::High, "x", FindingSource::Heuristic);
+        other.analyzer = "heur_eventlog".into();
+        other.reason = Some("source: heur_persist".into());
+        other.evidence = vec![cairn_core::finding::EvidenceItem {
+            artifact: "run_key".into(),
+            path: Some(image.into()),
+            ts: None,
+            detail: String::new(),
+        }];
+        let findings = NetConnHeuristic
+            .analyze(
+                &[Record::NetConn(c), Record::Process(owner(image, None))],
+                &[other],
+            )
+            .unwrap();
+        assert!(findings.is_empty());
     }
 
     /// Without a matching prior_findings entry, the connection's score is unaffected

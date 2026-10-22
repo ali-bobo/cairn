@@ -108,4 +108,9 @@ pub trait FileVerifier: Send + Sync {
     fn signer(&self, _path: &str) -> Option<String> {
         None
     }
+    /// Where `signer(path)` came from: the embedded signature or a system catalog. Default
+    /// None (unknown); additive so existing verifiers need not implement it. Total.
+    fn signer_source(&self, _path: &str) -> Option<crate::record::SignerSource> {
+        None
+    }
 }

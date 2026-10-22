@@ -1,34 +1,44 @@
 //! cairn-core: shared contracts for the Cairn live-forensics triage engine.
 //!
 //! This crate defines the *typed bus* every other crate speaks:
-//!   - [`Record`]   : normalized output of a Collector (raw artifact -> typed row)
-//!   - [`Finding`]  : normalized output of an Analyzer (Sigma or heuristic)
-//!   - [`Manifest`] : integrity + chain-of-custody record of a run
-//!   - traits       : Collector, Analyzer, OutputSink (see `traits`)
+//!   - [`Record`]    : normalized output of a Collector (raw artifact -> typed row);
+//!     persistence entries carry a typed [`Mechanism`]
+//!   - [`Finding`]   : normalized output of an Analyzer (Sigma or heuristic), stamped
+//!     with the producing analyzer's name (`Finding.analyzer`)
+//!   - [`Observation`]: inventory that did not clear an analyzer's gate
+//!   - [`Manifest`]  : integrity + chain-of-custody record of a run
+//!   - traits        : Collector, Analyzer, OutputSink, FileVerifier (see `traits`)
+//!   - [`collectors`] / [`analyzers`]: the canonical collector / analyzer names
+//!   - [`orchestrator`]: runs collectors then dependency-ordered analyzers; a failing
+//!     or panicking collector/analyzer is recorded in the manifest and skipped
+//!   - [`selection`] : pure profile / `--only` collector selection
 //!
 //! Design rule: Collectors NEVER analyze; Analyzers NEVER touch the host.
-//! See ../../docs (SRS §3-§5) for the authoritative spec.
-//!
-//! NOTE: not yet compiled in the authoring environment. Run `cargo check` first.
+//! Authoritative spec: cairn-SRS.md at the repo root (§3-§5).
 
 #![forbid(unsafe_code)] // raw-volume/WinAPI unsafe lives only in collector crates, behind review.
 
+pub mod analyzers;
+pub mod collectors;
 pub mod config;
 pub mod finding;
+#[cfg(any(test, feature = "test-util"))]
+pub mod fuzz;
 pub mod manifest;
 pub mod observation;
 pub mod orchestrator;
+pub mod paths;
 pub mod record;
 pub mod selection;
 pub mod time;
 pub mod traits;
 
-pub use config::{resolve_max_threads, Config, Governance, OutputKind, Profile, Target};
-pub use finding::{Entity, Finding, FindingSource, Severity};
-pub use manifest::{GovernanceReport, Manifest, SourceEntry, Truncation};
+pub use config::{Config, Governance, OutputKind, Profile, Target};
+pub use finding::{Entity, EntityPersistence, Finding, FindingSource, Severity};
+pub use manifest::{GovernanceReport, Manifest, SourceEntry};
 pub use observation::Observation;
-pub use record::Record;
-pub use selection::{select_modules, SelectionOutcome};
+pub use record::{Mechanism, Record};
+pub use selection::{select_modules, ModuleInfo, SelectionOutcome};
 pub use time::filetime_to_utc;
 pub use traits::{Analyzer, CollectCtx, Collector, OutputSink};
 

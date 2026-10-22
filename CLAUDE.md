@@ -1,21 +1,18 @@
 # CLAUDE.md — Cairn project guide for Claude Code
 
-> **Status: S1–S4 complete; post-S4 hardening merged (gate redesign, IR panels,
-> BYOVD, dependency-audit fix). Current backlog: `docs/REMAINING-WORK.md`.**
+> **Status: S1–S4 complete; post-S4 hardening merged. Phase 0 cleanup removed the
+> raw-disk collectors, the updater, age/bodyfile output and rule XOR encoding.
+> Current backlog: `docs/REMAINING-WORK.md`.**
 
 This file is the operating contract for Claude Code working in this repo. Read it
 fully before writing code. Authoritative spec: `cairn-SRS.md`.
 Backlog + per-segment known risks: `docs/REMAINING-WORK.md`.
 Decision context: `cairn-decision-summary.md`.
 
-Before diving into any individual spec/plan under `docs/dev-history/`, check
-`docs/dev-history/INDEX.md` first — it records merge status per topic so you
-don't have to open a spec just to find out it's already shipped.
-
 ## What this is
 A single signed Rust binary: agentless, **user-space only**, on-host Windows
-live-forensics triage. It parses live state + EVTX + offline NTFS artifacts,
-runs Sigma rules + heuristics, and emits a small severity/ATT&CK-tagged, hashed
+live-forensics triage. It reads live state (processes, network, logon sessions,
+persistence/ASEPs, WMI subscriptions, scheduled tasks, prefetch) + EVTX, runs Sigma rules + heuristics, and emits a small severity/ATT&CK-tagged, hashed
 timeline. Model = Hayabusa(engine)+Chainsaw(artifact hunt)+KAPE(collect/process
 split)+Velociraptor offline-collector(packaging), fused in one process.
 
@@ -50,17 +47,16 @@ split)+Velociraptor offline-collector(packaging), fused in one process.
    manifest, continue. Never abort the whole run for one collector.
 
 ## Workspace map
-- `crates/cairn-core`  — typed contracts: Record, Finding (+ EvidenceItem), Manifest, traits, Config, orchestrator. Depend-on-only crate; no host or external-forensic deps.
-- `crates/cairn-collectors` — artifact->Record collectors (evtx live; proc/net/persist pure logic; offline raw-NTFS/hive/prefetch/srum parsers). `#![forbid(unsafe_code)]`.
-- `crates/cairn-collectors-win` — Windows unsafe FFI ONLY (proc/net/host/privilege/logon; raw `\\.\C:` VolumeReader). The single `#![allow(unsafe_code)]` crate; `cfg(windows)`, empty shell elsewhere.
-- `crates/cairn-sigma` — SigmaMatcher trait + sigma-rust engine + LogsourceMap + XOR rule codec.
-- `crates/cairn-heur`  — heuristic analyzers (parentchild/persist gate/netconn/account/timestomp/byovd) + trust.rs path-trust knowledge + known-vulnerable-drivers list.
-- `crates/cairn-report`— timeline(csv)/findings(jsonl)/observations(jsonl)/manifest/report.html, sha256, output sinks (Dir/Zip/Age/DryRun), bodyfile, client_text (zh-TW).
-- `crates/cairn-updater` — `cairn update-rules`: SSRF-gated SigmaHQ fetch + DRL 1.1 + XOR encode + PROVENANCE. `#![forbid(unsafe_code)]`.
-- `crates/cairn-cli`   — `cairn` binary, clap CLI (SRS §6). Subcommands: run / evtx / update-rules / verify.
+- `crates/cairn-core`  — typed contracts: Record (persistence `Mechanism` enum), Finding (+ EvidenceItem; `analyzer` = producing analyzer's name), Observation, Manifest (`SourceEntry.collector`), traits, Config, selection, orchestrator (panic-guarded collector/analyzer runs; `run_analyzers` shared by live and evtx), canonical `collectors::*` / `analyzers::*` name constants. Depend-on-only crate; no host or external-forensic deps.
+- `crates/cairn-collectors` — artifact->Record collectors (evtx file + live; proc/net/logon_session; persist + asep incl. per-user HKU; WMI subscriptions; scheduled tasks; prefetch). `#![forbid(unsafe_code)]`.
+- `crates/cairn-collectors-win` — Windows unsafe FFI ONLY (proc/net/host/privilege/logon/signature/WMI/priority). The single `#![allow(unsafe_code)]` crate; `cfg(windows)`, empty shell elsewhere.
+- `crates/cairn-sigma` — SigmaMatcher trait + sigma-rust engine + LogsourceMap + ruleset aggregate hash (ADR-0003).
+- `crates/cairn-heur`  — heuristic analyzers (parentchild/netconn/account/logon_bruteforce/eventlog/clickfix/persist/asep) + score.rs scoring/cross-artifact corroboration + trust.rs, the single home of shared detection knowledge (drop-zone dirs, launcher table, exe-name tokenizer, encoded-command/base64 checks, script markers) + coverage table. Analyzers set `Finding.analyzer` and correlate on it, never on reason/title text.
+- `crates/cairn-report`— timeline(csv)/findings(jsonl)/observations(jsonl)/manifest/report.html, sha256, output sinks (Dir/Zip/DryRun), verify, client_text (zh-TW client wording, chosen from `Finding.analyzer` + typed mechanism).
+- `crates/cairn-cli`   — `cairn` binary, clap CLI (SRS §6). Subcommands: run / evtx / coverage / verify. Modules: cli (args), registry (THE collector table + analyzer set for live/evtx — add a collector or analyzer there, nowhere else), run, evtx, coverage, verify, enrich, output.
 - `crates/cairn-launcher` — interactive CLI launcher for end users; double-click entry point that wraps cairn.exe.
-- `rules/`             — bundled Sigma (DRL 1.1) + config maps. XOR-encoded on disk (avoid AV FP on .yml; encode RULES, never the tool). Subset list: `rules/ruleset.toml`.
-- `docs/`              — REMAINING-WORK (backlog), threat-model, SOC-runbook, dev-history (INDEX.md first).
+- `rules/`             — bundled Sigma (DRL 1.1, plain YAML under `rules/sigma/`) + config maps. Bundle manifest: `rules/ruleset.toml` (a test keeps it in sync with `rules/sigma/`).
+- `docs/`              — REMAINING-WORK (backlog), COVERAGE, threat-model, SOC-runbook, ADRs.
 - `tests/`             — EVTX-ATTACK-SAMPLES fixtures + Sigma match-parity tests.
 
 ## Build / test commands
@@ -88,15 +84,19 @@ scoped `cargo test` gate before moving on.
   only in the cli bin.
 - Serialize with serde; keep schema strings from `cairn_core::schema`.
 - Determinism: sort output by (ts, record_id). Reproducible builds in CI.
-- Prefer streaming iteration over loading whole artifacts (EVTX, MFT).
-- Parallelism via `rayon`; collectors are independent, analyzers fan-in.
+- Prefer streaming iteration over loading whole artifacts (EVTX).
+- Collectors run sequentially and independently; analyzers fan in over the
+  accumulated records in `depends_on()` order.
+- No stringly-typed coupling: match on typed fields (`Mechanism`,
+  `Finding.analyzer`, `SourceEntry.collector`) and the name constants in
+  `cairn_core::{collectors, analyzers}`, never on titles or reason text.
 
 ## Skills to lean on (Claude Code)
 There is no project-specific "skill" to install — for Claude Code the equivalent
 is THIS file. Use the available engineering workflow skills where they fit:
 - architecture / system-design : when adding a new collector or the orchestrator.
 - testing-strategy : when building the EVTX-ATTACK-SAMPLES parity harness (T8).
-- code-review : before each task's acceptance gate, esp. the unsafe raw-NTFS module.
+- code-review : before each task's acceptance gate, esp. the unsafe cairn-collectors-win FFI.
 - debug : EVTX/Sigma match mismatches.
 Do not invent new skills; do not add SKILL.md files (that format is for claude.ai
 /Cowork, not Claude Code).
@@ -117,23 +117,14 @@ finishing-a-branch → post-merge). Split responsibility:
 - **Post-merge**: do not re-run the full suite again; the pre-merge gate already
   covered HEAD.
 
-## SeBackupPrivilege constraint (real-machine e2e limitation)
-A normal Administrator token does NOT include `SeBackupPrivilege` by default (it
-must be explicitly enabled, which most interactive admin sessions don't do). The
-7 collectors that depend on raw-NTFS / raw-hive reads for real-machine e2e
-verification — amcache, mft, usn, shimcache, bam, userassist, srum — will
-silently produce zero records under a normal admin session, not because of a
-bug but because of this privilege gap. When validating this class of feature:
-- Do not treat an empty real-machine e2e run as a regression signal by itself —
-  first check whether the run actually had the privilege.
-- Prefer synthetic integration tests that exercise the pipeline without needing
-  the real privilege, following the existing pattern of tests like
-  `byovd_driver_list_override_pipeline_end_to_end` and
-  `sigma_analyzer_findings_appear_in_live_outcome` (fake collector data fed
-  through the real `run_live` + analyzer + report path).
-- Real-machine e2e with the privilege genuinely enabled remains the final
-  acceptance bar for these 7 collectors, but is not the day-to-day dev loop
-  verification method.
+## Testing collectors and analyzers
+- Prefer synthetic integration tests that exercise the pipeline through `run_live`
+  with a fake collector (pattern: `sigma_analyzer_findings_appear_in_live_outcome`,
+  `logon_bruteforce_heuristic_fires_in_live_outcome` in cairn-cli `run.rs`).
+- Report wording tests feed findings produced by the real analyzers (see
+  cairn-report `client_text.rs`), not hand-built titles.
+- Real-machine e2e as elevated admin remains the final acceptance bar for the live
+  collectors.
 
 ## Legitimacy work (must exist before first real client use, any stage)
 Authenticode-sign + timestamp releases; ship README intent statement (done);

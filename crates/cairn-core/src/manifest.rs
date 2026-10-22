@@ -33,7 +33,7 @@ pub struct RunInfo {
     pub cmdline: String,
     pub operator: String,
     pub case_id: String,
-    /// The active run profile (minimal|standard|verbose) — transparency (FR6).
+    /// The active run profile (minimal|standard) — transparency (FR6).
     /// Additive (S2-L); `#[serde(default)]` keeps pre-S2-L manifests parseable.
     #[serde(default)]
     pub profile: String,
@@ -48,7 +48,35 @@ pub struct HostInfo {
     pub hostname: String,
     pub os_build: String,
     pub timezone: String,
+    /// Host clock vs true UTC. Without a reference this is [`SKEW_NOT_MEASURED`]: a
+    /// user-space tool with no network time source cannot measure it. With an
+    /// operator-supplied reference time it is `"+Ns"` / `"-Ns"` (host ahead / behind).
     pub wall_clock_utc_skew: String,
+    /// Host UTC offset in seconds at run start (e.g. 28800 for UTC+08:00). Additive;
+    /// absent on old manifests and on offline runs (the analysed host is not this one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub utc_offset_seconds: Option<i32>,
+    /// The operator-supplied true UTC time at run start (`--reference-time`), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_time_utc: Option<DateTime<Utc>>,
+    /// `run.started_utc - reference_time_utc` in whole seconds: positive means the
+    /// host clock is ahead. Present only when `reference_time_utc` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skew_seconds: Option<i64>,
+}
+
+/// `wall_clock_utc_skew` when no reference time was supplied.
+pub const SKEW_NOT_MEASURED: &str = "not measured (no network time source)";
+
+/// Host-clock skew in whole seconds against an operator reference: positive means the
+/// host clock is ahead of the reference.
+pub fn skew_seconds(host_utc: DateTime<Utc>, reference_utc: DateTime<Utc>) -> i64 {
+    (host_utc - reference_utc).num_seconds()
+}
+
+/// The `wall_clock_utc_skew` string for a measured skew, e.g. `"+12s"` / `"-3s"`.
+pub fn format_skew(seconds: i64) -> String {
+    format!("{seconds:+}s")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,9 +88,15 @@ pub struct Privileges {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceEntry {
+    /// Canonical `Collector::name()` of the collector that produced this entry (see
+    /// [`crate::collectors`]), stamped by the orchestrator; or `analyzer:<name>` for an
+    /// analyzer failure entry. Lets reports tie a source to a collector without guessing
+    /// from `artifact`. Additive; old manifests default to "".
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub collector: String,
     pub artifact: String,
     pub path: String,
-    pub method: String, // api|raw_ntfs|vss
+    pub method: String, // e.g. api|fs|file_api|com|toolhelp
     pub size: u64,
     pub sha256: String,
     #[serde(default)]
@@ -71,8 +105,13 @@ pub struct SourceEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutputEntry {
+    /// Path relative to the output root (the manifest's directory, or the zip root),
+    /// `/`-separated, e.g. `timeline.csv` or `evidence/evtx/Security.evtx`.
     pub file: String,
     pub sha256: String,
+    /// Byte length of the file. Additive; old manifests default to 0 (unknown).
+    #[serde(default)]
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -84,34 +123,14 @@ pub struct Counts {
     pub observations: u64,
 }
 
-/// Resource-governance report (NFR9/NFR10): what the run throttled or truncated.
+/// Resource-governance report (NFR9): how the run was throttled.
 /// Additive; `#[serde(default)]` on the `Manifest` field keeps pre-governance
 /// manifests parseable.
-/// Truncations here are the structured form; the same event is also recorded as a
-/// string in `manifest.sources[].errors` for SRS NFR10 compatibility.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GovernanceReport {
-    /// Effective rayon thread count used this run.
-    #[serde(default)]
-    pub effective_threads: usize,
     /// True if the process priority was successfully lowered (live + not --full-speed).
     #[serde(default)]
     pub low_priority_applied: bool,
-    /// One entry per collector that hit a record cap / circuit breaker.
-    #[serde(default)]
-    pub truncations: Vec<Truncation>,
-}
-
-/// A single circuit-breaker / cap hit, recorded for transparency (NFR10).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Truncation {
-    /// The collector module that was truncated, e.g. `"mft"`.
-    pub collector: String,
-    /// The cap value that fired, in the collector's natural unit (e.g. a record
-    /// count for `max_mft_records`); see `reason` for the unit context.
-    pub cap: u64,
-    /// Human-readable explanation, e.g. `"max_mft_records reached"`.
-    pub reason: String,
 }
 
 #[cfg(test)]
@@ -145,6 +164,9 @@ mod tests {
                 os_build: "Windows 11 26200".into(),
                 timezone: "Asia/Taipei".into(),
                 wall_clock_utc_skew: "+0s".into(),
+                utc_offset_seconds: Some(28800),
+                reference_time_utc: None,
+                skew_seconds: None,
             },
             privileges: Privileges {
                 admin: false,
@@ -152,6 +174,7 @@ mod tests {
                 se_debug: false,
             },
             sources: vec![SourceEntry {
+                collector: String::new(),
                 artifact: "evtx:Security".into(),
                 path: r"C:\evidence\Security.evtx".into(),
                 method: "api".into(),
@@ -162,6 +185,7 @@ mod tests {
             outputs: vec![OutputEntry {
                 file: "timeline.csv".into(),
                 sha256: "f".repeat(64),
+                size: 42,
             }],
             counts: Counts {
                 records: 5000,
@@ -218,28 +242,15 @@ mod tests {
     #[test]
     fn governance_report_round_trips_and_old_json_defaults() {
         let r = GovernanceReport {
-            effective_threads: 8,
             low_priority_applied: true,
-            truncations: vec![Truncation {
-                collector: "mft".into(),
-                cap: 1_000_000,
-                reason: "max_mft_records reached".into(),
-            }],
         };
         let json = serde_json::to_string(&r).unwrap();
         let back: GovernanceReport = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.effective_threads, 8);
         assert!(back.low_priority_applied);
-        assert_eq!(back.truncations.len(), 1);
-        assert_eq!(back.truncations[0].collector, "mft");
-        assert_eq!(back.truncations[0].cap, 1_000_000);
-        assert_eq!(back.truncations[0].reason, "max_mft_records reached");
 
-        // A GovernanceReport with no truncations omits/defaults the vec.
+        // An empty object (pre-governance) defaults every field.
         let empty: GovernanceReport = serde_json::from_str("{}").unwrap();
-        assert_eq!(empty.effective_threads, 0);
         assert!(!empty.low_priority_applied);
-        assert!(empty.truncations.is_empty());
     }
 
     #[test]
@@ -249,8 +260,32 @@ mod tests {
         let mut v: serde_json::Value = serde_json::to_value(&m).unwrap();
         v.as_object_mut().unwrap().remove("governance");
         let back: Manifest = serde_json::from_value(v).unwrap();
-        assert_eq!(back.governance.effective_threads, 0);
-        assert!(back.governance.truncations.is_empty());
+        assert!(!back.governance.low_priority_applied);
+    }
+
+    /// Old manifests (no output `size`, no host offset/reference/skew) still parse.
+    #[test]
+    fn old_output_and_host_json_defaults_new_fields() {
+        let o: OutputEntry = serde_json::from_str(r#"{"file":"a","sha256":"b"}"#).unwrap();
+        assert_eq!(o.size, 0);
+        let h: HostInfo = serde_json::from_str(
+            r#"{"hostname":"h","os_build":"","timezone":"UTC","wall_clock_utc_skew":"unknown"}"#,
+        )
+        .unwrap();
+        assert!(h.utc_offset_seconds.is_none());
+        assert!(h.reference_time_utc.is_none() && h.skew_seconds.is_none());
+    }
+
+    /// Skew is host minus reference: a host 90s fast reports +90s.
+    #[test]
+    fn skew_is_host_minus_reference() {
+        let reference = Utc.with_ymd_and_hms(2026, 10, 1, 0, 0, 0).unwrap();
+        let host = reference + chrono::Duration::seconds(90);
+        assert_eq!(skew_seconds(host, reference), 90);
+        assert_eq!(skew_seconds(reference, host), -90);
+        assert_eq!(format_skew(90), "+90s");
+        assert_eq!(format_skew(-3), "-3s");
+        assert_eq!(format_skew(0), "+0s");
     }
 
     #[test]

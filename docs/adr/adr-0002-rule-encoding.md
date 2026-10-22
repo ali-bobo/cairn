@@ -1,6 +1,7 @@
 # ADR-0002: On-disk rule encoding (XOR)
 
-- **Status:** Accepted
+- **Status:** Superseded (2026-10-21, Phase 0 cleanup): bundled rules are now stored
+  as plain YAML, the XOR codec and `--rules-plain` were removed. Kept for history.
 - **Date:** 2026-06-10 (UTC)
 - **Deciders:** project owner
 - **SRS / spec link:** §8 NFR1, §17 D4; threat-model.md (FORBIDDEN list; untrusted-input)

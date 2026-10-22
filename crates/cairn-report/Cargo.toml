@@ -13,4 +13,7 @@ sha2.workspace = true
 csv.workspace = true
 thiserror.workspace = true
 zip.workspace = true
-age.workspace = true
+
+[dev-dependencies]
+# client_text tests run the real analyzers so they exercise production finding shapes.
+cairn-heur = { path = "../cairn-heur" }

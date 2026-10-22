@@ -7,6 +7,7 @@ use crate::observation::Observation;
 use crate::record::Record;
 use crate::traits::{Analyzer, CollectCtx, Collector};
 use crate::Config;
+use std::sync::Arc;
 
 /// Result of a live run, ready to feed the manifest builder + reporter.
 #[derive(Debug)]
@@ -79,29 +80,263 @@ fn topo_sort(analyzers: &[Box<dyn Analyzer>]) -> Vec<usize> {
     order
 }
 
+/// Text of a caught panic payload (`panic!("..")` carries a `&str` or a `String`).
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Run `f`, turning a panic into `Err("panicked: <msg>")`. One misbehaving collector or
+/// analyzer must not abort the whole run (golden rule 8). `AssertUnwindSafe` is sound
+/// here: on a panic the callee's partial output is dropped and never observed, and the
+/// trait objects hold no state the run reads afterwards.
+fn guarded<T>(f: impl FnOnce() -> T) -> std::result::Result<T, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f))
+        .map_err(|p| format!("panicked: {}", panic_message(p.as_ref())))
+}
+
+/// A manifest source entry for a collector that produced nothing usable.
+fn failure_entry(collector: &str, error: String) -> SourceEntry {
+    SourceEntry {
+        collector: collector.to_string(),
+        artifact: collector.to_string(),
+        path: format!("live:{collector}"),
+        method: "api".into(),
+        size: 0,
+        sha256: String::new(),
+        errors: vec![error],
+    }
+}
+
+/// A manifest source entry recording an analyzer that failed or panicked. Analyzers
+/// read no host artifact, so the entry has no path or hash; `collector` is
+/// `analyzer:<name>` so reports never mistake it for a collector.
+fn analyzer_failure_entry(analyzer: &str, error: String) -> SourceEntry {
+    SourceEntry {
+        collector: format!("analyzer:{analyzer}"),
+        artifact: format!("analyzer:{analyzer}"),
+        path: format!("analyzer:{analyzer}"),
+        method: "analyzer".into(),
+        size: 0,
+        sha256: String::new(),
+        errors: vec![error],
+    }
+}
+
+/// The collector's own provenance, each entry stamped with its canonical name. A
+/// panicking `sources()` yields one failure entry instead.
+fn stamped_sources(c: &dyn Collector) -> Vec<SourceEntry> {
+    match guarded(|| c.sources()) {
+        Ok(mut entries) => {
+            for e in &mut entries {
+                e.collector = c.name().to_string();
+            }
+            entries
+        }
+        Err(msg) => vec![failure_entry(c.name(), format!("sources(): {msg}"))],
+    }
+}
+
+/// Output of the analyzer fan-in.
+#[derive(Debug, Default)]
+pub struct AnalysisOutcome {
+    pub findings: Vec<Finding>,
+    pub observations: Vec<Observation>,
+    /// One `analyzer:<name>` entry per failed or panicked analyze/observe call, for
+    /// the manifest's `sources` (graceful degrade is recorded, not silent).
+    pub errors: Vec<SourceEntry>,
+}
+
+/// Remove from `earlier` every heuristic finding that one of `new` merged and lists in
+/// its `supersedes`. A Sigma finding stays whatever a heuristic claims: the rule hit
+/// and its author attribution (DRL 1.1) are never folded away.
+fn drop_superseded(earlier: &mut Vec<Finding>, new: &[Finding]) {
+    let gone: std::collections::HashSet<uuid::Uuid> = new
+        .iter()
+        .flat_map(|f| f.supersedes.iter().copied())
+        .collect();
+    if gone.is_empty() {
+        return;
+    }
+    earlier.retain(|f| f.source == crate::finding::FindingSource::Sigma || !gone.contains(&f.id));
+}
+
+/// Fan analyzers in over `records` (SRS §3), in `depends_on()` order. Each analyzer
+/// sees the records plus every earlier analyzer's findings. A failing or panicking
+/// analyzer is logged, recorded in `errors`, and skipped. Shared by the live run and
+/// the offline `cairn evtx` path so both behave the same. Findings whose analyzer left
+/// `Finding.analyzer` empty are stamped with its `name()`. Earlier heuristic findings
+/// that a new finding lists in `Finding.supersedes` (it merged them: same evidence,
+/// see `cairn_heur::dedup`) are dropped; Sigma findings never are.
+pub fn run_analyzers(records: &[Record], analyzers: &[Box<dyn Analyzer>]) -> AnalysisOutcome {
+    let order = topo_sort(analyzers);
+    let mut out = AnalysisOutcome::default();
+    for &idx in &order {
+        let a = &analyzers[idx];
+        let result = guarded(|| a.analyze(records, &out.findings))
+            .and_then(|r| r.map_err(|e| e.to_string()));
+        match result {
+            Ok(mut fs) => {
+                for f in &mut fs {
+                    if f.analyzer.is_empty() {
+                        f.analyzer = a.name().to_string();
+                    }
+                }
+                drop_superseded(&mut out.findings, &fs);
+                out.findings.append(&mut fs);
+            }
+            Err(e) => {
+                tracing::warn!(analyzer = a.name(), error = %e, "analyzer failed; skipping");
+                out.errors.push(analyzer_failure_entry(a.name(), e));
+            }
+        }
+    }
+    // Observation fan-in (spec §6): inventory from analyzers that own one, with the
+    // same failure contract as analyze.
+    for a in analyzers {
+        let result = guarded(|| a.observe(records)).and_then(|r| r.map_err(|e| e.to_string()));
+        match result {
+            Ok(mut os) => out.observations.append(&mut os),
+            Err(e) => {
+                tracing::warn!(analyzer = a.name(), error = %e, "observe failed; skipping");
+                out.errors
+                    .push(analyzer_failure_entry(a.name(), format!("observe(): {e}")));
+            }
+        }
+    }
+    out
+}
+
+/// How one collector's run ended.
+enum Collected {
+    /// It returned (Ok records, or Err/panic text).
+    Finished(std::result::Result<Vec<Record>, String>),
+    /// It was still running when its budget expired and was abandoned.
+    TimedOut(std::time::Duration),
+}
+
+/// The manifest error recorded for a collector abandoned after `budget`.
+fn timeout_reason(budget: std::time::Duration) -> String {
+    format!(
+        "timed out after {}s; collector abandoned and its partial result discarded \
+         (the run continued without it)",
+        budget.as_secs()
+    )
+}
+
+/// Stack for a collector worker thread. Generous so a deep (but bounded) recursive
+/// parse never overflows where the main thread would not have.
+const WORKER_STACK_BYTES: usize = 8 * 1024 * 1024;
+
+/// Run `c.collect` with `cfg` + `p`, turning an error or a panic into its text.
+fn collect_on(
+    c: &dyn Collector,
+    cfg: &Config,
+    p: &Privileges,
+) -> std::result::Result<Vec<Record>, String> {
+    let ctx = CollectCtx {
+        config: cfg,
+        admin: p.admin,
+        se_backup: p.se_backup,
+        se_debug: p.se_debug,
+    };
+    guarded(|| c.collect(&ctx)).and_then(|r| r.map_err(|e| e.to_string()))
+}
+
+/// Run one collector, bounded by `budget` (None = unlimited, run on this thread).
+///
+/// With a budget the collector runs on its own named worker thread and this thread
+/// waits on a channel for at most `budget`. Collectors still run one at a time: the
+/// next one starts only after this one finished or was abandoned.
+///
+/// A thread cannot be killed safely, so a collector that overruns is ABANDONED, not
+/// stopped:
+/// - its worker keeps running detached. It owns everything it touches (an `Arc` of
+///   the collector and of the config), so nothing it holds is borrowed from the run;
+/// - its late result is discarded: the receiver is dropped on timeout, so the
+///   worker's final `send` fails and the records are freed on that thread;
+/// - its `sources()` is NOT called (the worker may still hold the collector's own
+///   locks); a single `live:<name>` entry records the timeout instead;
+/// - it does not block shutdown: the worker is never joined, and process exit ends it.
+///
+/// COM is thread-affine: the WMI helpers (cairn-collectors-win `wmi::win::init_com`)
+/// initialize COM on whichever thread calls them and undo it on the same thread via
+/// an RAII guard, so running a collector on a worker thread is sound. An abandoned
+/// worker keeps its COM apartment until process exit; it never shares COM objects with
+/// any other thread.
+///
+/// If the worker thread cannot be spawned (resource exhaustion), the collector runs on
+/// this thread without a budget rather than being skipped.
+fn run_collector(
+    c: &Arc<dyn Collector>,
+    cfg: &Arc<Config>,
+    privileges: &Privileges,
+    budget: Option<std::time::Duration>,
+) -> Collected {
+    let Some(budget) = budget else {
+        return Collected::Finished(collect_on(c.as_ref(), cfg, privileges));
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (wc, wcfg, wp) = (Arc::clone(c), Arc::clone(cfg), privileges.clone());
+    let spawned = std::thread::Builder::new()
+        .name(format!("cairn-collector-{}", c.name()))
+        .stack_size(WORKER_STACK_BYTES)
+        .spawn(move || {
+            let result = collect_on(wc.as_ref(), &wcfg, &wp);
+            // Err only when the run already gave up on this collector: drop the result.
+            let _ = tx.send(result);
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(
+            collector = c.name(),
+            error = %e,
+            "could not start a worker thread; running the collector without a time budget"
+        );
+        return Collected::Finished(collect_on(c.as_ref(), cfg, privileges));
+    }
+    match rx.recv_timeout(budget) {
+        Ok(result) => Collected::Finished(result),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Collected::TimedOut(budget),
+        // The worker ended without sending: only possible if it died outside `guarded`.
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Collected::Finished(Err("collector worker ended without a result".to_string()))
+        }
+    }
+}
+
 /// Run the given collectors against the host, then fan-in analyzers over the accumulated
 /// records. `privileges`/`hostname` are provided by the caller (real probe in the bin;
 /// fakes in tests) so this stays pure + testable.
+///
+/// Graceful degrade (golden rule 8): a collector that returns `Err` or panics is
+/// recorded and skipped. Its own `sources()` entries are kept (with their partial
+/// errors) and the failure reason is appended to them; only a collector with no
+/// provenance of its own gets a generic `live:<name>` entry. A collector that overruns
+/// `cfg.collector_timeout_secs` is abandoned (see [`run_collector`]) and recorded with
+/// a `live:<name>` entry naming the timeout.
 pub fn run_live(
     cfg: &Config,
     privileges: Privileges,
     hostname: String,
-    collectors: &[Box<dyn Collector>],
+    collectors: Vec<Box<dyn Collector>>,
     analyzers: &[Box<dyn Analyzer>],
 ) -> RunOutcome {
-    let ctx = CollectCtx {
-        config: cfg,
-        admin: privileges.admin,
-        se_backup: privileges.se_backup,
-        se_debug: privileges.se_debug,
-    };
+    let shared_cfg = Arc::new(cfg.clone());
+    let budget = (cfg.collector_timeout_secs > 0)
+        .then(|| std::time::Duration::from_secs(cfg.collector_timeout_secs));
     let mut records = Vec::new();
     let mut sources = Vec::new();
     for c in collectors {
+        let c: Arc<dyn Collector> = Arc::from(c);
         let started = std::time::Instant::now();
         tracing::info!(collector = c.name(), "collector started");
-        match c.collect(&ctx) {
-            Ok(mut recs) => {
+        match run_collector(&c, &shared_cfg, &privileges, budget) {
+            Collected::Finished(Ok(mut recs)) => {
                 tracing::info!(
                     collector = c.name(),
                     records = recs.len(),
@@ -109,56 +344,43 @@ pub fn run_live(
                     "collector finished"
                 );
                 records.append(&mut recs);
-                sources.extend(c.sources());
+                sources.extend(stamped_sources(c.as_ref()));
             }
-            Err(e) => {
-                // Graceful degrade: record the failure as a source entry, keep going.
+            Collected::Finished(Err(e)) => {
                 tracing::warn!(
                     collector = c.name(),
                     error = %e,
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "collector failed; skipping"
                 );
-                sources.push(SourceEntry {
-                    artifact: c.name().to_string(),
-                    path: format!("live:{}", c.name()),
-                    method: "api".into(),
-                    size: 0,
-                    sha256: String::new(),
-                    errors: vec![e.to_string()],
-                });
+                let mut own = stamped_sources(c.as_ref());
+                if own.is_empty() {
+                    sources.push(failure_entry(c.name(), e));
+                } else {
+                    for entry in &mut own {
+                        if !entry.errors.contains(&e) {
+                            entry.errors.push(e.clone());
+                        }
+                    }
+                    sources.extend(own);
+                }
+            }
+            Collected::TimedOut(b) => {
+                tracing::error!(
+                    collector = c.name(),
+                    budget_secs = b.as_secs(),
+                    "collector timed out; abandoned, run continues"
+                );
+                sources.push(failure_entry(c.name(), timeout_reason(b)));
             }
         }
     }
-    // Analyzer fan-in (SRS §3): each analyzer reads the accumulated records + prior
-    // analyzers' findings (dependency-ordered) and emits findings. A failing analyzer is
-    // logged + skipped (graceful degrade), never aborts.
-    let order = topo_sort(analyzers);
-    let mut findings = Vec::new();
-    for &idx in &order {
-        let a = &analyzers[idx];
-        match a.analyze(&records, &findings) {
-            Ok(mut fs) => findings.append(&mut fs),
-            Err(e) => {
-                tracing::warn!(analyzer = a.name(), error = %e, "analyzer failed; skipping");
-            }
-        }
-    }
-    // Observation fan-in (spec §6): inventory from analyzers that own one. A failing
-    // observe is logged + skipped, mirroring the analyze contract.
-    let mut observations = Vec::new();
-    for a in analyzers {
-        match a.observe(&records) {
-            Ok(mut os) => observations.append(&mut os),
-            Err(e) => {
-                tracing::warn!(analyzer = a.name(), error = %e, "observe failed; skipping");
-            }
-        }
-    }
+    let analysis = run_analyzers(&records, analyzers);
+    sources.extend(analysis.errors);
     RunOutcome {
         records,
-        findings,
-        observations,
+        findings: analysis.findings,
+        observations: analysis.observations,
         sources,
         privileges,
         hostname,
@@ -203,6 +425,7 @@ mod tests {
         }
         fn sources(&self) -> Vec<SourceEntry> {
             vec![SourceEntry {
+                collector: String::new(),
                 artifact: self.name.into(),
                 path: format!("live:{}", self.name),
                 method: "api".into(),
@@ -232,6 +455,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         })
     }
     fn net_rec() -> Record {
@@ -255,7 +479,7 @@ mod tests {
             FakeCollector::ok("proc", vec![proc_rec()]),
             FakeCollector::ok("net", vec![net_rec()]),
         ];
-        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &[]);
+        let out = run_live(&cfg, privs(), "WS01".into(), collectors, &[]);
         assert_eq!(out.records.len(), 2);
         assert_eq!(out.sources.len(), 2);
         assert_eq!(out.hostname, "WS01");
@@ -271,7 +495,7 @@ mod tests {
             FakeCollector::err("proc"),
             FakeCollector::ok("net", vec![net_rec()]),
         ];
-        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &[]);
+        let out = run_live(&cfg, privs(), "WS01".into(), collectors, &[]);
         // net still produced its record.
         assert_eq!(out.records.len(), 1);
         // proc's failure is captured as a source entry carrying the error.
@@ -363,7 +587,7 @@ mod tests {
             FakeAnalyzer::with_deps("b", &["a"]), // declared first, but must run AFTER a
             FakeAnalyzer::ok("a", vec![a_finding()]),
         ];
-        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
+        let out = run_live(&cfg, privs(), "WS01".into(), collectors, &analyzers);
         // a's finding (title "t") + b's finding (title "saw:1", since it saw a's 1 finding)
         assert_eq!(out.findings.len(), 2);
         assert!(
@@ -378,15 +602,14 @@ mod tests {
     #[test]
     fn no_deps_execution_order_is_stable_and_matches_injection_order() {
         let cfg = Config::default();
-        let collectors: Vec<Box<dyn Collector>> = vec![];
         let build = || -> Vec<Box<dyn Analyzer>> {
             vec![
                 FakeAnalyzer::ok("first", vec![a_finding()]),
                 FakeAnalyzer::ok("second", vec![a_finding()]),
             ]
         };
-        let out1 = run_live(&cfg, privs(), "WS01".into(), &collectors, &build());
-        let out2 = run_live(&cfg, privs(), "WS01".into(), &collectors, &build());
+        let out1 = run_live(&cfg, privs(), "WS01".into(), vec![], &build());
+        let out2 = run_live(&cfg, privs(), "WS01".into(), vec![], &build());
         let titles1: Vec<&str> = out1.findings.iter().map(|f| f.title.as_str()).collect();
         let titles2: Vec<&str> = out2.findings.iter().map(|f| f.title.as_str()).collect();
         assert_eq!(
@@ -406,7 +629,7 @@ mod tests {
             FakeAnalyzer::with_deps("a", &["b"]),
             FakeAnalyzer::with_deps("b", &["a"]),
         ];
-        run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
+        run_live(&cfg, privs(), "WS01".into(), collectors, &analyzers);
     }
 
     /// Declaring a dependency on an analyzer name that isn't present in the current run
@@ -417,7 +640,7 @@ mod tests {
         let collectors: Vec<Box<dyn Collector>> = vec![];
         let analyzers: Vec<Box<dyn Analyzer>> =
             vec![FakeAnalyzer::with_deps("solo", &["nonexistent"])];
-        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
+        let out = run_live(&cfg, privs(), "WS01".into(), collectors, &analyzers);
         assert_eq!(
             out.findings.len(),
             1,
@@ -431,11 +654,13 @@ mod tests {
         let cfg = Config::default();
         let collectors = vec![FakeCollector::ok("proc", vec![proc_rec()])];
         let analyzers = vec![FakeAnalyzer::ok("h", vec![a_finding()])];
-        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
+        let out = run_live(&cfg, privs(), "WS01".into(), collectors, &analyzers);
         assert_eq!(out.findings.len(), 1);
     }
 
-    /// A failing analyzer is skipped; the run still returns the other's findings.
+    /// A failing analyzer is skipped; the run still returns the other's findings, and
+    /// the failure is recorded as an `analyzer:<name>` source entry (golden rule 8:
+    /// degrade is recorded, not silent).
     #[test]
     fn failing_analyzer_is_skipped_run_continues() {
         let cfg = Config::default();
@@ -444,14 +669,256 @@ mod tests {
             FakeAnalyzer::err("bad"),
             FakeAnalyzer::ok("good", vec![a_finding()]),
         ];
-        let out = run_live(&cfg, privs(), "WS01".into(), &collectors, &analyzers);
+        let out = run_live(&cfg, privs(), "WS01".into(), collectors, &analyzers);
         assert_eq!(out.findings.len(), 1, "good analyzer still ran");
-        // The failing analyzer must NOT pollute provenance: sources holds only the
-        // collector's entry (analyzer failures are logged, not recorded as sources).
+        assert_eq!(out.findings[0].analyzer, "good", "stamped with name()");
+        let bad = out
+            .sources
+            .iter()
+            .find(|s| s.collector == "analyzer:bad")
+            .expect("analyzer failure recorded");
+        assert!(bad.errors[0].contains("boom"), "{:?}", bad.errors);
+        assert!(bad.sha256.is_empty(), "nothing for verify to re-hash");
+    }
+
+    /// A collector that panics.
+    struct PanickingCollector;
+    impl Collector for PanickingCollector {
+        fn name(&self) -> &str {
+            "boom_collector"
+        }
+        fn collect(&self, _ctx: &CollectCtx<'_>) -> crate::Result<Vec<Record>> {
+            panic!("index out of range in parser")
+        }
+    }
+
+    /// One panicking collector does NOT abort the run: later collectors and analyzers
+    /// still run, and the manifest records "panicked: <msg>" for it.
+    #[test]
+    fn panicking_collector_is_recorded_and_run_continues() {
+        let cfg = Config::default();
+        let collectors: Vec<Box<dyn Collector>> = vec![
+            Box::new(PanickingCollector),
+            FakeCollector::ok("net", vec![net_rec()]),
+        ];
+        let analyzers = vec![FakeAnalyzer::ok("h", vec![a_finding()])];
+        let out = run_live(&cfg, privs(), "WS01".into(), collectors, &analyzers);
+        assert_eq!(out.records.len(), 1, "net still collected");
+        assert_eq!(out.findings.len(), 1, "analyzers still ran");
+        let failed = out
+            .sources
+            .iter()
+            .find(|s| s.collector == "boom_collector")
+            .expect("panicking collector recorded");
         assert_eq!(
-            out.sources.len(),
-            1,
-            "analyzer failure must not add a source"
+            failed.errors,
+            vec!["panicked: index out of range in parser".to_string()]
         );
+        let net = out.sources.iter().find(|s| s.artifact == "net").unwrap();
+        assert_eq!(
+            net.collector, "net",
+            "orchestrator stamps the collector name"
+        );
+    }
+
+    struct PanickingAnalyzer;
+    impl Analyzer for PanickingAnalyzer {
+        fn name(&self) -> &str {
+            "boom_analyzer"
+        }
+        fn analyze(&self, _r: &[Record], _p: &[Finding]) -> crate::Result<Vec<Finding>> {
+            panic!("{}", String::from("bad regex"))
+        }
+    }
+
+    #[test]
+    fn panicking_analyzer_is_recorded_and_others_still_run() {
+        let cfg = Config::default();
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![
+            Box::new(PanickingAnalyzer),
+            FakeAnalyzer::ok("good", vec![a_finding()]),
+        ];
+        let out = run_live(&cfg, privs(), "WS01".into(), vec![], &analyzers);
+        assert_eq!(out.findings.len(), 1);
+        let e = out
+            .sources
+            .iter()
+            .find(|s| s.collector == "analyzer:boom_analyzer")
+            .expect("recorded");
+        assert_eq!(e.errors, vec!["panicked: bad regex".to_string()]);
+    }
+
+    /// A collector that fails but reported its own provenance (e.g. which hive or log
+    /// it could not open): those entries and their reasons survive, the top-level
+    /// error is appended, and no generic `live:<name>` entry replaces them.
+    struct PartialCollector;
+    impl Collector for PartialCollector {
+        fn name(&self) -> &str {
+            "persist"
+        }
+        fn collect(&self, _ctx: &CollectCtx<'_>) -> crate::Result<Vec<Record>> {
+            Err(CairnError::Collector {
+                collector: "persist".into(),
+                reason: "registry unavailable".into(),
+            })
+        }
+        fn sources(&self) -> Vec<SourceEntry> {
+            vec![SourceEntry {
+                collector: String::new(),
+                artifact: "persistence".into(),
+                path: r"live:HKLM\SOFTWARE".into(),
+                method: "api".into(),
+                size: 0,
+                sha256: String::new(),
+                errors: vec!["RegOpenKeyEx: access denied".into()],
+            }]
+        }
+    }
+
+    #[test]
+    fn failing_collector_keeps_its_own_sources_and_reasons() {
+        let cfg = Config::default();
+        let collectors: Vec<Box<dyn Collector>> = vec![Box::new(PartialCollector)];
+        let out = run_live(&cfg, privs(), "WS01".into(), collectors, &[]);
+        assert_eq!(out.sources.len(), 1, "{:?}", out.sources);
+        let s = &out.sources[0];
+        assert_eq!(s.collector, "persist");
+        assert_eq!(s.artifact, "persistence");
+        assert!(s.path.contains("HKLM"), "real path kept: {}", s.path);
+        assert_eq!(s.errors[0], "RegOpenKeyEx: access denied");
+        assert!(
+            s.errors[1].contains("registry unavailable"),
+            "{:?}",
+            s.errors
+        );
+    }
+
+    /// A collector that blocks far longer than any test budget, and holds its own lock
+    /// while doing so (as a real collector recording provenance would). Its
+    /// `sources()` would block on that lock, so the orchestrator must not call it.
+    struct HangingCollector {
+        state: std::sync::Mutex<()>,
+    }
+    impl Collector for HangingCollector {
+        fn name(&self) -> &str {
+            "stuck_wmi"
+        }
+        fn collect(&self, _ctx: &CollectCtx<'_>) -> crate::Result<Vec<Record>> {
+            let _held = self.state.lock().unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(30));
+            Ok(vec![proc_rec()])
+        }
+        fn sources(&self) -> Vec<SourceEntry> {
+            let _held = self.state.lock().unwrap();
+            vec![]
+        }
+    }
+
+    /// A stuck collector is abandoned at its budget: the run continues with the next
+    /// collector and the analyzers, the timeout is recorded in the manifest sources,
+    /// and the stuck collector's late records never appear.
+    #[test]
+    fn stuck_collector_is_abandoned_and_recorded() {
+        let cfg = Config {
+            collector_timeout_secs: 1,
+            ..Config::default()
+        };
+        let collectors: Vec<Box<dyn Collector>> = vec![
+            Box::new(HangingCollector {
+                state: std::sync::Mutex::new(()),
+            }),
+            FakeCollector::ok("net", vec![net_rec()]),
+        ];
+        let analyzers = vec![FakeAnalyzer::ok("h", vec![a_finding()])];
+        let started = std::time::Instant::now();
+        let out = run_live(&cfg, privs(), "WS01".into(), collectors, &analyzers);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "run must not wait for the stuck collector"
+        );
+        assert_eq!(out.records.len(), 1, "only net's record");
+        assert!(matches!(out.records[0], Record::NetConn(_)));
+        assert_eq!(out.findings.len(), 1, "analyzers still ran");
+        let stuck = out
+            .sources
+            .iter()
+            .find(|s| s.collector == "stuck_wmi")
+            .expect("timeout recorded");
+        assert_eq!(stuck.path, "live:stuck_wmi");
+        assert!(stuck.errors[0].contains("timed out after 1s"), "{stuck:?}");
+    }
+
+    /// Budget 0 = unlimited: the collector runs on the calling thread.
+    #[test]
+    fn zero_budget_runs_inline() {
+        struct ThreadProbe(std::sync::Mutex<Option<std::thread::ThreadId>>);
+        impl Collector for ThreadProbe {
+            fn name(&self) -> &str {
+                "probe"
+            }
+            fn collect(&self, _ctx: &CollectCtx<'_>) -> crate::Result<Vec<Record>> {
+                *self.0.lock().unwrap() = Some(std::thread::current().id());
+                Ok(vec![])
+            }
+        }
+        let probe = Arc::new(ThreadProbe(std::sync::Mutex::new(None)));
+        let cfg = Arc::new(Config {
+            collector_timeout_secs: 0,
+            ..Config::default()
+        });
+        let c: Arc<dyn Collector> = probe.clone();
+        assert!(matches!(
+            run_collector(&c, &cfg, &privs(), None),
+            Collected::Finished(Ok(_))
+        ));
+        assert_eq!(*probe.0.lock().unwrap(), Some(std::thread::current().id()));
+        // With a budget it runs on a worker, and a panic there is still caught.
+        let boom: Arc<dyn Collector> = Arc::new(PanickingCollector);
+        match run_collector(
+            &boom,
+            &cfg,
+            &privs(),
+            Some(std::time::Duration::from_secs(10)),
+        ) {
+            Collected::Finished(Err(e)) => assert!(e.starts_with("panicked:"), "{e}"),
+            _ => panic!("expected a caught panic"),
+        }
+    }
+
+    /// A later finding that merged earlier ones drops the heuristic ones it lists in
+    /// `supersedes`; a Sigma finding it lists stays (DRL attribution), and the merged
+    /// finding itself is kept.
+    #[test]
+    fn superseded_heuristic_findings_are_dropped_sigma_never() {
+        let heur = a_finding();
+        let sigma = Finding::new(Severity::Medium, "rule", FindingSource::Sigma);
+        let other = a_finding();
+        let mut merged = a_finding();
+        merged.supersedes = vec![heur.id, sigma.id];
+        let (heur_id, sigma_id, other_id, merged_id) = (heur.id, sigma.id, other.id, merged.id);
+        let analyzers = vec![
+            FakeAnalyzer::ok("first", vec![heur, sigma, other]),
+            FakeAnalyzer::ok("second", vec![merged]),
+        ];
+        let out = run_analyzers(&[proc_rec()], &analyzers);
+        let ids: Vec<uuid::Uuid> = out.findings.iter().map(|f| f.id).collect();
+        assert!(
+            !ids.contains(&heur_id),
+            "superseded heuristic must be dropped"
+        );
+        assert!(ids.contains(&sigma_id), "a Sigma finding is never dropped");
+        assert!(ids.contains(&other_id) && ids.contains(&merged_id));
+        assert_eq!(ids.len(), 3);
+        // Never serialized: the finding schema is unchanged.
+        let json = serde_json::to_string(&out.findings[2]).unwrap();
+        assert!(!json.contains("supersedes"), "{json}");
+    }
+
+    #[test]
+    fn run_analyzers_is_usable_without_collectors() {
+        let analyzers = vec![FakeAnalyzer::ok("solo", vec![a_finding()])];
+        let out = run_analyzers(&[proc_rec()], &analyzers);
+        assert_eq!(out.findings.len(), 1);
+        assert!(out.errors.is_empty());
     }
 }

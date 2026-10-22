@@ -40,6 +40,9 @@ jobs:
       - name: Check
         run: cargo check --workspace --locked
 
+      - name: Fetch real EVTX fixtures (GPL-3.0 test data, not committed)
+        shell: bash
+        run: bash tests/fetch-fixtures.sh
       - name: Test
         run: cargo test --workspace --locked
 
@@ -55,6 +58,20 @@ jobs:
         run: rustc --version; cargo --version
       - name: Build (release — exercises the version-resource embed)
         run: cargo build --workspace --release --locked
+      - name: Package (cairn.exe + launcher + rules + manual + CHECKSUMS.txt)
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ github.workspace }}\target
+        run: ./scripts/package.ps1
+      - name: Upload package (unsigned test build)
+        uses: actions/upload-artifact@v7
+        with:
+          name: cairn-forensics-unsigned-${{ github.sha }}
+          path: dist/cairn-forensics
+          retention-days: 14
+      - name: Fetch real EVTX fixtures (GPL-3.0 test data, not committed)
+        shell: bash
+        run: bash tests/fetch-fixtures.sh
       - name: Test
         # Require the symlink output-path-safety test to actually run (the windows-latest
         # runner can create symlinks); a silent skip would hide a broken guard.

@@ -1,15 +1,22 @@
 # Cairn bundled Sigma rule subset (FR19 / ADR-0003).
-# `cairn update-rules` fetches these from SigmaHQ at the pinned commit.
-# All paths are relative to the SigmaHQ `rules/` directory.
+# The manifest of what ships in rules/sigma/: each `path` is relative to the SigmaHQ
+# `rules/` directory at the pinned commit, and the rule is stored verbatim at
+# rules/sigma/<path>. A cairn-sigma test checks this list matches rules/sigma/ exactly.
 # All listed rules MUST carry an `author:` field (DRL 1.1).
 # Verified: paths confirmed to exist at pin + author field present.
 # Updated: 2026-07-11 — expanded from 50 to 80 rules (segment 2: PowerShell 4104
 # script block, authentication/logon abuse, System 7045 service installs, and
-# additional process_creation coverage — see docs/dev-history/specs/
-# 2026-07-11-sigma-ruleset-expansion-design.md).
-# Scope: no-Sysmon environments (Security.evtx + System.evtx + PowerShell
-# Operational/classic + process_creation via EID 4688). Sysmon rules deliberately
-# excluded — see design doc for rationale.
+# additional process_creation coverage).
+# Updated: 2026-10-21 — 86 rules (phase 3G: shadow-copy deletion, event-log clearing
+# and Defender tampering via 4688/4104). Each run reports per rule whether the host's
+# logging lets it fire (sigma_rule observations).
+# Updated: 2026-10-22 — 96 rules (Sysmon process access and WMI consumers, Impacket /
+# WmiPrvSE process creation). The 8 process_access / wmi_event rules can only fire
+# where Sysmon is installed (EID 10 / 19-21); each run reports them as not runnable
+# elsewhere (sigma_rule observations), so they cost nothing on a host without Sysmon.
+# Scope: mainly no-Sysmon environments (Security.evtx + System.evtx + PowerShell
+# Operational/classic + process_creation via EID 4688), plus the Sysmon-only rules
+# in the last section, kept for hosts and offline logs that do have Sysmon.
 # Prerequisites for full process_creation coverage:
 #   1. Audit Process Creation + command line: GPO or reg key ProcessCreationIncludeCmdLine_Enabled=1
 #   2. PowerShell Script Block Logging: reg key EnableScriptBlockLogging=1
@@ -329,3 +336,66 @@ path = "windows/process_creation/proc_creation_win_adplus_memory_dump.yml"
 
 [[rules]]
 path = "windows/process_creation/proc_creation_win_certreq_download.yml"
+
+# ============================================================
+# Phase 3G: ransomware precursors and defense impairment (same pin)
+# All run on Security 4688 (process creation + command line) or 4104.
+# ============================================================
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_susp_shadow_copies_deletion.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_powershell_shadowcopy_deletion.yml"
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_susp_win32_shadowcopy_deletion.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_susp_eventlog_clear.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_powershell_defender_exclusion.yml"
+
+[[rules]]
+path = "windows/powershell/powershell_script/posh_ps_tamper_windows_defender_set_mp.yml"
+
+# ============================================================
+# Lateral movement via WMI / DCOM / SMB (process_creation; 4688 with
+# ParentProcessName (Win10+) and command line, or Sysmon 1). Same pin.
+# ============================================================
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_hktl_impacket_lateral_movement.yml"
+
+[[rules]]
+path = "windows/process_creation/proc_creation_win_wmiprvse_susp_child_processes.yml"
+
+# ============================================================
+# Sysmon only (same pin): LSASS process access (EID 10) and WMI event
+# subscriptions (EID 19 / 20 / 21). Not runnable without Sysmon.
+# ============================================================
+
+[[rules]]
+path = "windows/process_access/proc_access_win_lsass_memdump.yml"
+
+[[rules]]
+path = "windows/process_access/proc_access_win_lsass_susp_access_flag.yml"
+
+[[rules]]
+path = "windows/process_access/proc_access_win_lsass_dump_comsvcs_dll.yml"
+
+[[rules]]
+path = "windows/process_access/proc_access_win_lsass_dump_keyword_image.yml"
+
+[[rules]]
+path = "windows/process_access/proc_access_win_hktl_generic_access.yml"
+
+[[rules]]
+path = "windows/wmi_event/sysmon_wmi_event_subscription.yml"
+
+[[rules]]
+path = "windows/wmi_event/sysmon_wmi_susp_scripting.yml"
+
+[[rules]]
+path = "windows/wmi_event/sysmon_wmi_susp_encoded_scripts.yml"

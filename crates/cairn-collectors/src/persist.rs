@@ -1,11 +1,15 @@
 //! PersistCollector (FR9 subset, SRS §4): reads high-value live persistence mechanisms
-//! (Run/RunOnce, Services, Winlogon, IFEO, Startup folders) via the safe `winreg` wrapper
-//! and std::fs, mapping each to a PersistenceRecord. Read-only; never modifies the host.
-//! `binary_sha256` is left None (FR14 deferred); `signed` is backfilled by `apply_signatures`
-//! via the injected `FileVerifier` (S2-D, WinVerifyTrust behind the cairn-collectors-win seam).
+//! (Run/RunOnce, Services incl. demand-start + svchost ServiceDll, Winlogon, IFEO incl.
+//! WOW6432Node, Startup folders with .lnk target resolution) via the safe `winreg`
+//! wrapper and std::fs, mapping each to a PersistenceRecord. Read-only; never modifies
+//! the host. `signed` is backfilled by `apply_signatures` via the injected `FileVerifier`
+//! (S2-D, WinVerifyTrust behind the cairn-collectors-win seam); `binary_sha256` goes
+//! through `hash_persistence_targets` with the shared size-capped `hash::hash_file_capped`.
+//! Alongside, the collector emits RunMRU / TypedPaths as `RegValue` and PSReadLine
+//! history as `CommandHistory` records.
 
 use cairn_core::manifest::SourceEntry;
-use cairn_core::record::{PersistenceRecord, Record};
+use cairn_core::record::{Mechanism, PersistenceRecord, Record};
 use cairn_core::traits::{CollectCtx, Collector, FileVerifier};
 use cairn_core::Result;
 use chrono::{DateTime, Utc};
@@ -275,7 +279,7 @@ pub(crate) fn pick_binary_path(
 /// var name (`%%`) is treated as unknown and kept literal. Never panics (the `%` byte is
 /// ASCII, so all slice indices are char-boundary-safe).
 #[allow(dead_code)]
-fn expand_env_vars(s: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
+pub(crate) fn expand_env_vars(s: &str, lookup: &impl Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(start) = rest.find('%') {
@@ -341,14 +345,104 @@ fn normalize_service_path(path: &str, windir: &str) -> String {
     format!(r"{windir}\{rel}")
 }
 
+/// Highest service `Start` value collected: 0 boot, 1 system, 2 auto, 3 demand.
+/// Disabled (4) services cannot start and are skipped.
+#[cfg_attr(not(windows), allow(dead_code))]
+const MAX_COLLECTED_SERVICE_START: u32 = 3;
+
+/// True when a service ImagePath runs the shared service host (`svchost.exe`).
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_svchost(image_path: &str) -> bool {
+    extract_binary_path_with(image_path, |_| None)
+        .map(|p| {
+            p.rsplit(['\\', '/'])
+                .next()
+                .unwrap_or("")
+                .eq_ignore_ascii_case("svchost.exe")
+        })
+        .unwrap_or(false)
+}
+
+/// PURE: build a `service` record from the registry values of one service key.
+/// `start` is the `Start` DWORD (None when absent), `image_path` the raw ImagePath,
+/// `service_dll` the `Parameters\ServiceDll` (or legacy key-level `ServiceDll`).
+///
+/// - Start 0..=3 are kept and tagged in `service_start`; 4 (disabled), unknown values,
+///   and a missing Start or ImagePath yield None.
+/// - `command` is the raw ImagePath (forensic fidelity).
+/// - `binary_path` is the service's effective code: for an svchost-hosted service
+///   with a ServiceDll, that DLL (env-expanded, normalized); otherwise the ImagePath
+///   executable normalized to an absolute path.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(windows), allow(dead_code))]
+fn service_record(
+    name: &str,
+    location: String,
+    start: Option<u32>,
+    image_path: Option<String>,
+    service_dll: Option<String>,
+    last_write: Option<DateTime<Utc>>,
+    windir: &str,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Option<PersistenceRecord> {
+    let start = start.filter(|s| *s <= MAX_COLLECTED_SERVICE_START)?;
+    let image = image_path.filter(|i| !i.trim().is_empty())?;
+    // %SystemRoot% / %windir% always resolve to the injected windir.
+    let env = |var: &str| {
+        if var.eq_ignore_ascii_case("SystemRoot") || var.eq_ignore_ascii_case("windir") {
+            Some(windir.trim_end_matches(['\\', '/']).to_string())
+        } else {
+            lookup(var)
+        }
+    };
+    let dll = service_dll
+        .map(|d| {
+            d.trim()
+                .trim_matches('"')
+                .trim_end_matches('\0')
+                .to_string()
+        })
+        .filter(|d| !d.is_empty());
+    let binary_path = match dll {
+        Some(d) if is_svchost(&image) => {
+            Some(normalize_service_path(&expand_env_vars(&d, &env), windir))
+        }
+        _ => extract_binary_path_with(&image, env).map(|p| normalize_service_path(&p, windir)),
+    };
+    Some(PersistenceRecord {
+        mechanism: Mechanism::Service,
+        location,
+        value: Some(name.to_string()),
+        command: Some(image),
+        binary_path,
+        binary_sha256: None,
+        signed: None,
+        signer: None,
+        last_write,
+        service_start: Some(start),
+        bound: None,
+        signer_source: None,
+    })
+}
+
+/// IFEO roots: the native view and the WOW64 (32-bit) view, which 32-bit processes
+/// consult and which is a separate hijack location on 64-bit Windows.
+#[allow(dead_code)]
+const IFEO_KEYS: &[&str] = &[
+    r"Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
+    r"Software\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
+];
+
 /// Case-insensitive prefix strip: if `s` starts with `prefix` ignoring ASCII case, return
 /// the remainder; else None.
 #[allow(dead_code)]
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
+    // `get`, not indexing: prefix.len() may fall inside a non-ASCII character of `s`
+    // (an ImagePath like `abc\u{e9}...`), and a panic here would drop every
+    // persistence record of the run.
+    match (s.get(..prefix.len()), s.get(prefix.len()..)) {
+        (Some(head), Some(rest)) if head.eq_ignore_ascii_case(prefix) => Some(rest),
+        _ => None,
     }
 }
 
@@ -384,7 +478,7 @@ fn task_records_from_xml(
             .unwrap_or_else(|| file_name.to_string());
 
         out.push(PersistenceRecord {
-            mechanism: "scheduled_task".to_string(),
+            mechanism: Mechanism::ScheduledTask,
             location,
             value: Some(value),
             command: Some(command),
@@ -393,6 +487,9 @@ fn task_records_from_xml(
             signed: None,
             signer: None,
             last_write,
+            bound: None,
+            signer_source: None,
+            service_start: None,
         });
     }
     out
@@ -403,7 +500,7 @@ fn task_records_from_xml(
 /// `make_record` (below) calls this with the real `Path::exists`.
 #[allow(dead_code)]
 fn make_record_with_exists(
-    mechanism: &str,
+    mechanism: Mechanism,
     location: String,
     value: Option<String>,
     command: Option<String>,
@@ -418,7 +515,7 @@ fn make_record_with_exists(
         pick_binary_path(&candidates, &exists)
     });
     PersistenceRecord {
-        mechanism: mechanism.to_string(),
+        mechanism,
         location,
         value,
         command,
@@ -427,6 +524,9 @@ fn make_record_with_exists(
         signed: None,
         signer: None,
         last_write,
+        bound: None,
+        signer_source: None,
+        service_start: None,
     }
 }
 
@@ -434,14 +534,14 @@ fn make_record_with_exists(
 /// Uses the candidate-list model (S2-F) so unquoted spaced paths resolve correctly.
 #[allow(dead_code)]
 fn make_record(
-    mechanism: &str,
+    mechanism: Mechanism,
     location: String,
     value: Option<String>,
     command: Option<String>,
     last_write: Option<DateTime<Utc>>,
 ) -> PersistenceRecord {
     make_record_with_exists(mechanism, location, value, command, last_write, |p| {
-        std::path::Path::new(p).exists()
+        crate::local_path_exists(p)
     })
 }
 
@@ -483,24 +583,154 @@ fn read_services() -> Vec<PersistenceRecord> {
 }
 
 #[cfg(not(windows))]
-fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
+fn read_scheduled_tasks(_notes: &mut Vec<String>) -> Vec<PersistenceRecord> {
     vec![]
 }
 #[cfg(windows)]
-fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
-    win::read_scheduled_tasks()
+fn read_scheduled_tasks(notes: &mut Vec<String>) -> Vec<PersistenceRecord> {
+    win::read_scheduled_tasks(notes)
 }
 
-/// Startup folders: per-user (%APPDATA%) and All Users (%PROGRAMDATA%) Startup dirs.
-/// Reads the real process env; delegates to the testable core. Read-only.
+/// Deepest folder level walked under `System32\Tasks` (real task folders nest 2-4).
+const TASKS_MAX_DEPTH: usize = 16;
+/// Most task files read in one run.
+const TASKS_MAX_FILES: usize = 20_000;
+/// Largest task XML read (real ones are a few KB).
+const TASK_XML_MAX_BYTES: u64 = 1024 * 1024;
+
+/// One task definition file read from the Tasks tree.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct TaskFile {
+    file_name: String,
+    xml: String,
+    last_write: Option<DateTime<Utc>>,
+}
+
+/// Every task file under `root`, iteratively (no recursion, so no stack overflow).
+/// Symbolic links and junctions are never followed (a junction loop planted in the
+/// Tasks folder must not hang or crash the run), depth / file count / file size are
+/// capped, and each cap that was hit is added to `notes` once (it reaches the
+/// manifest). Files are decoded by BOM: Task Scheduler writes UTF-16LE XML.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn walk_task_files(root: &std::path::Path, notes: &mut Vec<String>) -> Vec<TaskFile> {
+    let (mut deep, mut many, mut big) = (false, false, false);
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    'walk: while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue; // ACL-blocked or missing: graceful empty
+        };
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let Ok(ft) = entry.file_type() else { continue };
+            if ft.is_symlink() {
+                continue;
+            }
+            if ft.is_dir() {
+                if depth + 1 < TASKS_MAX_DEPTH {
+                    stack.push((entry.path(), depth + 1));
+                } else {
+                    deep = true;
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            if out.len() >= TASKS_MAX_FILES {
+                many = true;
+                break 'walk;
+            }
+            let meta = entry.metadata().ok();
+            if meta.as_ref().is_some_and(|m| m.len() > TASK_XML_MAX_BYTES) {
+                big = true;
+                continue;
+            }
+            let Some(bytes) = crate::read_head_capped(&entry.path(), TASK_XML_MAX_BYTES) else {
+                continue; // unreadable file: skip
+            };
+            out.push(TaskFile {
+                file_name: entry.file_name().to_string_lossy().into_owned(),
+                xml: crate::decode_text(&bytes),
+                last_write: meta
+                    .and_then(|m| m.modified().ok())
+                    .map(DateTime::<Utc>::from),
+            });
+        }
+    }
+    if deep {
+        notes.push(format!(
+            "scheduled tasks: folders deeper than {TASKS_MAX_DEPTH} levels not read (cap)"
+        ));
+    }
+    if many {
+        notes.push(format!(
+            "scheduled tasks: more than {TASKS_MAX_FILES} task files; the rest not read (cap)"
+        ));
+    }
+    if big {
+        notes.push(format!(
+            "scheduled tasks: task files over {} KiB skipped (cap)",
+            TASK_XML_MAX_BYTES / 1024
+        ));
+    }
+    out
+}
+
+/// Startup folders: All Users (%PROGRAMDATA%), the current user (%APPDATA%) and every
+/// other user profile's roaming Startup dir. Reads the real process env; delegates to
+/// the testable core. Read-only.
 fn read_startup_folders() -> Vec<PersistenceRecord> {
+    read_startup_dirs(&startup_dirs(
+        |var| std::env::var(var).ok(),
+        &user_profile_dirs(),
+    ))
+}
+
+/// Startup directories to scan, without duplicates (case-insensitive).
+fn startup_dirs(env: impl Fn(&str) -> Option<String>, homes: &[String]) -> Vec<String> {
     let rel = r"Microsoft\Windows\Start Menu\Programs\Startup";
-    let dirs: Vec<String> = ["APPDATA", "PROGRAMDATA"]
+    let mut dirs: Vec<String> = ["PROGRAMDATA", "APPDATA"]
         .iter()
-        .filter_map(|var| std::env::var(var).ok())
+        .filter_map(|var| env(var))
         .map(|base| format!(r"{base}\{rel}"))
         .collect();
-    read_startup_dirs(&dirs)
+    for home in homes {
+        let d = format!(r"{home}\AppData\Roaming\{rel}");
+        if !dirs.iter().any(|x| x.eq_ignore_ascii_case(&d)) {
+            dirs.push(d);
+        }
+    }
+    dirs
+}
+
+/// Profile folders that hold real users: the subfolders of the folder containing
+/// %USERPROFILE% (normally `C:\Users`), minus the shared/template ones.
+fn user_profile_dirs() -> Vec<String> {
+    let Some(root) = std::env::var("USERPROFILE")
+        .ok()
+        .and_then(|p| std::path::Path::new(&p).parent().map(|r| r.to_path_buf()))
+    else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().to_ascii_lowercase();
+            !matches!(
+                n.as_str(),
+                "public" | "default" | "default user" | "all users"
+            )
+        })
+        .map(|e| e.path().display().to_string())
+        .collect();
+    out.sort();
+    out
 }
 
 /// Pure core: scan the given Startup directories for files, each -> a `startup`
@@ -530,24 +760,82 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
                 .and_then(|m| m.modified().ok())
                 .map(chrono::DateTime::<chrono::Utc>::from);
             let full = path.to_string_lossy().to_string();
-            // A startup item's path is a FILE path (often a .lnk), not a command line, so
-            // we do NOT run it through extract_binary_path (which would clip at the first
-            // space in "Start Menu"). binary_path is the file path verbatim; resolving a
-            // .lnk to its real target is deferred (S2-D shortcut parsing).
-            out.push(PersistenceRecord {
-                mechanism: "startup".to_string(),
-                location: dir.clone(),
-                value: Some(name),
-                command: Some(full.clone()),
-                binary_path: Some(full),
-                binary_sha256: None,
-                signed: None,
-                signer: None,
+            // A .lnk is resolved to what it launches (bounded, read-only read). Any other
+            // file (or an unparseable .lnk) keeps the file itself as the target.
+            let lnk = if name.to_ascii_lowercase().ends_with(".lnk") {
+                read_capped(&path, MAX_LNK_BYTES).and_then(|b| crate::lnk::parse_lnk(&b))
+            } else {
+                None
+            };
+            out.push(startup_record(
+                dir,
+                name,
+                full,
+                lnk.as_ref(),
                 last_write,
-            });
+                |v| std::env::var(v).ok(),
+            ));
         }
     }
     out
+}
+
+/// Shortcuts are tiny; anything larger is not a real .lnk and is not parsed.
+const MAX_LNK_BYTES: u64 = 1024 * 1024;
+
+/// Read a whole file if it is at most `cap` bytes. Read-only; None on any error.
+fn read_capped(path: &std::path::Path, cap: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let f = std::fs::File::open(path).ok()?;
+    if f.metadata().ok()?.len() > cap {
+        return None;
+    }
+    let mut buf = Vec::new();
+    f.take(cap).read_to_end(&mut buf).ok()?;
+    Some(buf)
+}
+
+/// PURE: one `startup` record for a Startup-folder file. With a parsed shortcut whose
+/// target is known, `binary_path` is the (env-expanded) target and `command` is
+/// `target [arguments]` (target quoted when it has spaces); otherwise both are the
+/// file's own path. A startup item's own path is a FILE path, not a command line, so it
+/// never goes through the candidate model (which would clip at "Start Menu").
+fn startup_record(
+    dir: &str,
+    name: String,
+    full: String,
+    lnk: Option<&crate::lnk::LnkInfo>,
+    last_write: Option<DateTime<Utc>>,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> PersistenceRecord {
+    let resolved = lnk.and_then(|info| {
+        let target = expand_env_vars(&info.target(dir)?, &lookup);
+        let shown = if target.contains(' ') {
+            format!("\"{target}\"")
+        } else {
+            target.clone()
+        };
+        let command = match info.arguments.as_deref() {
+            Some(args) => format!("{shown} {args}"),
+            None => shown,
+        };
+        Some((target, command))
+    });
+    let (binary_path, command) = resolved.unwrap_or_else(|| (full.clone(), full));
+    PersistenceRecord {
+        mechanism: Mechanism::Startup,
+        location: dir.to_string(),
+        value: Some(name),
+        command: Some(command),
+        binary_path: Some(binary_path),
+        binary_sha256: None,
+        signed: None,
+        signer: None,
+        last_write,
+        service_start: None,
+        bound: None,
+        signer_source: None,
+    }
 }
 
 /// Windows registry readers for persistence mechanisms.
@@ -566,9 +854,9 @@ fn read_startup_dirs(dirs: &[String]) -> Vec<PersistenceRecord> {
 ///     `.expect()` internally and would panic on a malformed timestamp.
 #[cfg(windows)]
 mod win {
-    use super::{extract_binary_path, make_record, normalize_service_path, PersistenceRecord};
+    use super::{make_record, Mechanism, PersistenceRecord};
     use chrono::{DateTime, TimeZone, Utc};
-    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::enums::HKEY_LOCAL_MACHINE;
     use winreg::RegKey;
 
     /// Best-effort last-write of a key as UTC; None if unavailable or out of range.
@@ -587,10 +875,11 @@ mod win {
         .single()
     }
 
-    /// Run + RunOnce under both HKLM and HKCU.
+    /// Run + RunOnce under HKLM.
     pub fn read_run_keys() -> Vec<PersistenceRecord> {
         let mut out = Vec::new();
-        let bases = [(HKEY_LOCAL_MACHINE, "HKLM"), (HKEY_CURRENT_USER, "HKCU")];
+        // HKCU Run/RunOnce are read per loaded user hive by the asep catalog.
+        let bases = [(HKEY_LOCAL_MACHINE, "HKLM")];
         let subs = [
             r"Software\Microsoft\Windows\CurrentVersion\Run",
             r"Software\Microsoft\Windows\CurrentVersion\RunOnce",
@@ -612,7 +901,7 @@ mod win {
                     // decimal, binary as debug byte array).
                     let data = val.to_string();
                     out.push(make_record(
-                        "run_key",
+                        Mechanism::RunKey,
                         location.clone(),
                         Some(name),
                         Some(data),
@@ -637,7 +926,7 @@ mod win {
         for name in ["Shell", "Userinit"] {
             if let Ok(data) = key.get_value::<String, _>(name) {
                 out.push(make_record(
-                    "winlogon",
+                    Mechanism::Winlogon,
                     location.clone(),
                     Some(name.to_string()),
                     Some(data),
@@ -648,30 +937,41 @@ mod win {
         out
     }
 
-    /// IFEO subkeys that carry a Debugger value (the hijack vector).
+    /// IFEO subkeys that carry a Debugger value (the hijack vector), in both the native
+    /// and the WOW6432Node view.
     pub fn read_ifeo() -> Vec<PersistenceRecord> {
         let mut out = Vec::new();
-        let sub = r"Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options";
         let root = RegKey::predef(HKEY_LOCAL_MACHINE);
-        let Ok(ifeo) = root.open_subkey(sub) else {
-            return out;
-        };
-        for name in ifeo.enum_keys().flatten() {
-            let Ok(img) = ifeo.open_subkey(&name) else {
+        for sub in super::IFEO_KEYS {
+            let Ok(ifeo) = root.open_subkey(sub) else {
                 continue;
             };
-            if let Ok(dbg) = img.get_value::<String, _>("Debugger") {
-                let lw = key_last_write(&img);
-                let location = format!("HKLM\\{sub}\\{name}");
-                out.push(make_record("ifeo", location, Some(name), Some(dbg), lw));
+            for name in ifeo.enum_keys().flatten() {
+                let Ok(img) = ifeo.open_subkey(&name) else {
+                    continue;
+                };
+                if let Ok(dbg) = img.get_value::<String, _>("Debugger") {
+                    let lw = key_last_write(&img);
+                    let location = format!("HKLM\\{sub}\\{name}");
+                    out.push(make_record(
+                        Mechanism::Ifeo,
+                        location,
+                        Some(name),
+                        Some(dbg),
+                        lw,
+                    ));
+                }
             }
         }
         out
     }
 
-    /// Autostart services: HKLM\SYSTEM\CurrentControlSet\Services\* with Start in {0,1,2}
-    /// (boot/system/auto) and an ImagePath. Manual/disabled services (Start 3/4) are skipped
-    /// (not a persistence focus). Best-effort: unreadable subkeys are skipped (non-admin).
+    /// Services: HKLM\SYSTEM\CurrentControlSet\Services\* with Start in {0,1,2,3}
+    /// (boot/system/auto/demand) and an ImagePath; the Start value is kept in
+    /// `service_start` so analyzers can weigh demand-start lower. Disabled (4) services
+    /// are skipped. For svchost-hosted services `Parameters\ServiceDll` (falling back to
+    /// a key-level `ServiceDll`) is the effective target. Best-effort: unreadable
+    /// subkeys are skipped (non-admin). Read-only opens only.
     pub fn read_services() -> Vec<PersistenceRecord> {
         let mut out = Vec::new();
         let sub = r"SYSTEM\CurrentControlSet\Services";
@@ -679,86 +979,91 @@ mod win {
         let Ok(services) = root.open_subkey(sub) else {
             return out;
         };
+        let windir = std::env::var("SystemRoot")
+            .or_else(|_| std::env::var("windir"))
+            .unwrap_or_else(|_| r"C:\Windows".to_string());
         for name in services.enum_keys().flatten() {
             let Ok(svc) = services.open_subkey(&name) else {
                 continue;
             };
-            // Start is a REG_DWORD; only 0/1/2 are autostart.
-            let start: u32 = match svc.get_value::<u32, _>("Start") {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if start > 2 {
-                continue;
-            }
-            let Ok(image) = svc.get_value::<String, _>("ImagePath") else {
-                continue;
-            };
-            let lw = key_last_write(&svc);
+            let start = svc.get_value::<u32, _>("Start").ok();
+            let image = svc.get_value::<String, _>("ImagePath").ok();
+            let service_dll = svc
+                .open_subkey("Parameters")
+                .ok()
+                .and_then(|p| p.get_value::<String, _>("ServiceDll").ok())
+                .or_else(|| svc.get_value::<String, _>("ServiceDll").ok());
             let location = format!("HKLM\\{sub}\\{name}");
-            // Preserve the raw ImagePath as `command` (forensic fidelity); derive a normalized
-            // binary_path so service paths like `System32\drivers\x.sys` or `\SystemRoot\...`
-            // resolve to a real file for signature verification.
-            let windir = std::env::var("SystemRoot")
-                .or_else(|_| std::env::var("windir"))
-                .unwrap_or_else(|_| r"C:\Windows".to_string());
-            let bin = extract_binary_path(&image).map(|p| normalize_service_path(&p, &windir));
-            out.push(PersistenceRecord {
-                mechanism: "service".to_string(),
+            if let Some(rec) = super::service_record(
+                &name,
                 location,
-                value: Some(name),
-                command: Some(image),
-                binary_path: bin,
-                binary_sha256: None,
-                signed: None,
-                signer: None,
-                last_write: lw,
-            });
+                start,
+                image,
+                service_dll,
+                key_last_write(&svc),
+                &windir,
+                |v| std::env::var(v).ok(),
+            ) {
+                out.push(rec);
+            }
         }
         out
     }
 
-    /// Walk %SystemRoot%\System32\Tasks recursively; parse each task XML into records.
-    /// Best-effort + graceful: an ACL-blocked root (non-admin) or unreadable file yields
-    /// nothing rather than an error. Read-only.
-    pub fn read_scheduled_tasks() -> Vec<PersistenceRecord> {
+    /// Walk %SystemRoot%\System32\Tasks (see `walk_task_files` for the caps and the
+    /// no-link rule); parse each task XML into records. Best-effort + graceful: an
+    /// ACL-blocked root (non-admin) or unreadable file yields nothing rather than an
+    /// error. Read-only.
+    pub fn read_scheduled_tasks(notes: &mut Vec<String>) -> Vec<PersistenceRecord> {
         let root = std::env::var("SystemRoot")
             .map(|r| format!(r"{r}\System32\Tasks"))
             .unwrap_or_else(|_| r"C:\Windows\System32\Tasks".to_string());
         let mut out = Vec::new();
-        walk_tasks(std::path::Path::new(&root), &mut out);
+        for tf in super::walk_task_files(std::path::Path::new(&root), notes) {
+            out.extend(super::task_records_from_xml(
+                &tf.xml,
+                &tf.file_name,
+                tf.last_write,
+                |name| std::env::var(name).ok(),
+                crate::local_path_exists,
+            ));
+        }
         out
     }
+}
 
-    fn walk_tasks(dir: &std::path::Path, out: &mut Vec<PersistenceRecord>) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return; // ACL-blocked or missing: graceful empty
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                walk_tasks(&path, out);
-            } else if path.is_file() {
-                let Ok(xml) = std::fs::read_to_string(&path) else {
-                    continue; // unreadable file: skip
-                };
-                let file_name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                let last_write = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .map(chrono::DateTime::<chrono::Utc>::from);
-                out.extend(super::task_records_from_xml(
-                    &xml,
-                    &file_name,
-                    last_write,
-                    |name| std::env::var(name).ok(),
-                    |p| std::path::Path::new(p).exists(),
-                ));
-            }
+/// Extended ASEP catalog (crate::asep) + PowerShell profiles. Command-line targets get
+/// their binary_path from the same candidate model as the core readers; DLL targets
+/// arrive already resolved.
+fn read_extended_aseps() -> Vec<PersistenceRecord> {
+    let mut out = Vec::new();
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var("SystemRoot")
+            .or_else(|_| std::env::var("windir"))
+            .unwrap_or_else(|_| r"C:\Windows".to_string());
+        out.extend(crate::asep::read_catalog(
+            &crate::asep::WinReg,
+            &system_root,
+        ));
+    }
+    out.extend(crate::asep::read_ps_profiles(
+        &crate::asep::ps_profile_paths(|name| std::env::var(name).ok(), &user_profile_dirs()),
+    ));
+    fill_command_binary_paths(&mut out, crate::local_path_exists);
+    out
+}
+
+/// For records whose binary_path is unset but carry a command line, derive it with the
+/// S2-F candidate model (same as `make_record`). Injectable `exists` for tests.
+fn fill_command_binary_paths(records: &mut [PersistenceRecord], exists: impl Fn(&str) -> bool) {
+    for r in records.iter_mut() {
+        if r.binary_path.is_some() {
+            continue;
+        }
+        if let Some(cmd) = r.command.as_deref() {
+            let candidates = extract_binary_path_candidates(cmd, |name| std::env::var(name).ok());
+            r.binary_path = pick_binary_path(&candidates, &exists);
         }
     }
 }
@@ -806,7 +1111,7 @@ fn resolve_relative_binary_paths_with(
 /// Process-env wrapper: %SystemRoot% with the conventional fallback.
 fn resolve_relative_binary_paths(records: &mut [PersistenceRecord]) {
     let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    resolve_relative_binary_paths_with(records, &sysroot, |p| std::path::Path::new(p).exists());
+    resolve_relative_binary_paths_with(records, &sysroot, crate::local_path_exists);
 }
 
 /// Fill each record's `signed` from the verifier, for records that have a binary_path.
@@ -817,6 +1122,23 @@ fn apply_signatures(records: &mut [PersistenceRecord], verifier: &dyn FileVerifi
         if let Some(p) = r.binary_path.as_deref() {
             r.signed = verifier.verify(p);
             r.signer = verifier.signer(p);
+            r.signer_source = verifier.signer_source(p);
+        }
+    }
+}
+
+/// Fill `binary_sha256` for records that have a `binary_path` and no hash yet, using the
+/// injected `hasher` (path -> lowercase sha256 hex, None when it cannot hash). Pure wiring.
+fn hash_persistence_targets(
+    records: &mut [PersistenceRecord],
+    hasher: impl Fn(&str) -> Option<String>,
+) {
+    for r in records.iter_mut() {
+        if r.binary_sha256.is_some() {
+            continue;
+        }
+        if let Some(p) = r.binary_path.as_deref() {
+            r.binary_sha256 = hasher(p);
         }
     }
 }
@@ -826,6 +1148,8 @@ fn apply_signatures(records: &mut [PersistenceRecord], verifier: &dyn FileVerifi
 /// injected verifier (the WinTrust seam stays in cairn-collectors-win).
 pub struct PersistCollector {
     verifier: Box<dyn FileVerifier + Send + Sync>,
+    /// Caps hit during the last collect, reported in `sources()` (never silent).
+    notes: std::sync::Mutex<Vec<String>>,
 }
 
 impl Default for PersistCollector {
@@ -835,43 +1159,88 @@ impl Default for PersistCollector {
             Box::new(cairn_collectors_win::signature::WinSigVerifier);
         #[cfg(not(windows))]
         let verifier: Box<dyn FileVerifier + Send + Sync> = Box::new(NoopVerifier);
-        Self { verifier }
+        Self::with_verifier(verifier)
     }
 }
 
 impl PersistCollector {
     /// Construct with a specific verifier (tests inject a fake; non-default callers).
     pub fn with_verifier(verifier: Box<dyn FileVerifier + Send + Sync>) -> Self {
-        Self { verifier }
+        Self {
+            verifier,
+            notes: std::sync::Mutex::new(Vec::new()),
+        }
     }
 }
 
 impl Collector for PersistCollector {
     fn name(&self) -> &str {
-        "persist"
+        cairn_core::collectors::PERSIST
     }
 
     fn collect(&self, _ctx: &CollectCtx<'_>) -> Result<Vec<Record>> {
+        let mut notes: Vec<String> = Vec::new();
+        let reg_capped_before =
+            crate::asep::REG_VALUES_CAPPED.load(std::sync::atomic::Ordering::Relaxed);
         let mut records: Vec<PersistenceRecord> = Vec::new();
         records.extend(read_run_keys());
         records.extend(read_services());
         records.extend(read_winlogon());
         records.extend(read_ifeo());
         records.extend(read_startup_folders());
-        records.extend(read_scheduled_tasks());
+        records.extend(read_scheduled_tasks(&mut notes));
+        records.extend(read_extended_aseps());
         resolve_relative_binary_paths(&mut records);
         apply_signatures(&mut records, self.verifier.as_ref());
-        Ok(records.into_iter().map(Record::Persistence).collect())
+        hash_persistence_targets(&mut records, crate::hash::hash_file_capped);
+        let mut out: Vec<Record> = records.into_iter().map(Record::Persistence).collect();
+        // Run-dialog + Explorer address-bar history ride along with the registry sweep:
+        // not persistence, but the direct trace of a ClickFix paste-and-run (judged by
+        // cairn-heur::clickfix).
+        #[cfg(windows)]
+        {
+            out.extend(
+                crate::asep::read_run_mru(&crate::asep::WinReg)
+                    .into_iter()
+                    .map(Record::RegValue),
+            );
+            out.extend(
+                crate::asep::read_typed_paths(&crate::asep::WinReg)
+                    .into_iter()
+                    .map(Record::RegValue),
+            );
+        }
+        // PSReadLine history of every profile (read-only, last 500 lines per user).
+        out.extend(
+            crate::history::read_psreadline_history_noted(&user_profile_dirs(), &mut notes)
+                .into_iter()
+                .map(Record::CommandHistory),
+        );
+        let reg_capped = crate::asep::REG_VALUES_CAPPED
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_sub(reg_capped_before);
+        if reg_capped > 0 {
+            notes.push(format!(
+                "registry: {reg_capped} value(s) or key(s) cut at a size cap \
+                 ({} chars / {} strings / {} values per key)",
+                crate::asep::MAX_REG_STRING_CHARS,
+                crate::asep::MAX_REG_MULTI_ENTRIES,
+                crate::asep::MAX_REG_VALUES_PER_KEY
+            ));
+        }
+        *self.notes.lock().unwrap_or_else(|e| e.into_inner()) = notes;
+        Ok(out)
     }
 
     fn sources(&self) -> Vec<SourceEntry> {
         vec![SourceEntry {
+            collector: String::new(),
             artifact: "persistence".into(),
             path: "live:registry+startup+tasks".into(),
             method: "api".into(),
             size: 0,
             sha256: String::new(), // a live registry/folder read is not a byte stream (spec §5)
-            errors: vec![],
+            errors: self.notes.lock().unwrap_or_else(|e| e.into_inner()).clone(),
         }]
     }
 }
@@ -888,6 +1257,50 @@ mod tests {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         move |name: &str| map.get(name).cloned()
+    }
+
+    /// Catalog command-line records get a binary_path; DLL records keep theirs.
+    #[test]
+    fn fill_command_binary_paths_only_fills_missing() {
+        let mut recs = vec![
+            PersistenceRecord {
+                mechanism: Mechanism::CmdAutorun,
+                location: r"HKCU\Software\Microsoft\Command Processor".into(),
+                value: Some("AutoRun".into()),
+                command: Some(r#""C:\Users\Public\run.exe" /q"#.into()),
+                binary_path: None,
+                binary_sha256: None,
+                signed: None,
+                signer: None,
+                last_write: None,
+                bound: None,
+                signer_source: None,
+                service_start: None,
+            },
+            PersistenceRecord {
+                mechanism: Mechanism::NetshHelper,
+                location: r"HKLM\SOFTWARE\Microsoft\NetSh".into(),
+                value: Some("x".into()),
+                command: Some("x.dll".into()),
+                binary_path: Some(r"C:\Windows\System32\x.dll".into()),
+                binary_sha256: None,
+                signed: None,
+                signer: None,
+                last_write: None,
+                bound: None,
+                signer_source: None,
+                service_start: None,
+            },
+        ];
+        fill_command_binary_paths(&mut recs, |_| false);
+        assert_eq!(
+            recs[0].binary_path.as_deref(),
+            Some(r"C:\Users\Public\run.exe")
+        );
+        assert_eq!(
+            recs[1].binary_path.as_deref(),
+            Some(r"C:\Windows\System32\x.dll")
+        );
     }
 
     #[test]
@@ -969,8 +1382,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
 
         assert!(
-            recs.iter()
-                .any(|r| r.value.as_deref() == Some("evil.lnk") && r.mechanism == "startup"),
+            recs.iter().any(
+                |r| r.value.as_deref() == Some("evil.lnk") && r.mechanism == Mechanism::Startup
+            ),
             "evil.lnk should be a startup record"
         );
         assert!(
@@ -1035,7 +1449,7 @@ mod tests {
         let verifier = FakeVerifier(map);
         let mut recs = vec![
             PersistenceRecord {
-                mechanism: "run_key".into(),
+                mechanism: Mechanism::RunKey,
                 location: "HKCU\\...\\Run".into(),
                 value: Some("X".into()),
                 command: Some(r"C:\trusted\a.exe".into()),
@@ -1044,9 +1458,12 @@ mod tests {
                 signed: None,
                 signer: None,
                 last_write: None,
+                bound: None,
+                signer_source: None,
+                service_start: None,
             },
             PersistenceRecord {
-                mechanism: "run_key".into(),
+                mechanism: Mechanism::RunKey,
                 location: "HKCU\\...\\Run".into(),
                 value: Some("Y".into()),
                 command: Some(r"C:\unknown\u.exe".into()),
@@ -1055,6 +1472,9 @@ mod tests {
                 signed: None,
                 signer: None,
                 last_write: None,
+                bound: None,
+                signer_source: None,
+                service_start: None,
             },
         ];
         apply_signatures(&mut recs, &verifier);
@@ -1071,7 +1491,7 @@ mod tests {
         let verifier = FakeVerifier(map);
 
         let mk = |name: &str, bin: Option<&str>| PersistenceRecord {
-            mechanism: "run_key".into(),
+            mechanism: Mechanism::RunKey,
             location: "HKLM\\...\\Run".into(),
             value: Some(name.into()),
             command: bin.map(|b| b.to_string()),
@@ -1080,6 +1500,9 @@ mod tests {
             signed: None,
             signer: None,
             last_write: None,
+            bound: None,
+            signer_source: None,
+            service_start: None,
         };
         let mut records = vec![
             mk("a", Some(r"C:\trusted\a.exe")),
@@ -1092,6 +1515,23 @@ mod tests {
         assert_eq!(records[1].signed, Some(false));
         assert_eq!(records[2].signed, None); // verifier didn't know it
         assert_eq!(records[3].signed, None); // no binary_path -> not queried
+    }
+
+    #[test]
+    fn normalize_service_path_survives_non_ascii_at_prefix_boundary() {
+        // Regression: `s[..4]` panicked when byte 4 fell inside `é` (bytes 3..5),
+        // which would have dropped every persistence record of the run.
+        let windir = r"C:\Windows";
+        assert_eq!(
+            normalize_service_path("ab\\\u{e9}x.sys", windir),
+            "C:\\Windows\\ab\\\u{e9}x.sys"
+        );
+        assert_eq!(
+            normalize_service_path("\u{e9}\u{e9}", windir),
+            "C:\\Windows\\\u{e9}\u{e9}"
+        );
+        assert_eq!(strip_prefix_ci("abc\u{e9}", r"\??\"), None);
+        assert_eq!(strip_prefix_ci(r"\??\C:\x", r"\??\"), Some(r"C:\x"));
     }
 
     #[test]
@@ -1327,7 +1767,7 @@ mod tests {
     #[test]
     fn make_record_quoted_cmdline_unchanged() {
         let r = make_record_with_exists(
-            "run_key",
+            Mechanism::RunKey,
             "HKLM\\...\\Run".into(),
             Some("MyApp".into()),
             Some(r#""C:\Program Files\App\app.exe" -silent"#.to_string()),
@@ -1354,7 +1794,7 @@ mod tests {
         // fake_exists: only [1] exists -> [1] should be chosen.
         let fake_exists = |p: &str| p == r"C:\Program Files\App\My App.exe";
         let r = make_record_with_exists(
-            "run_key",
+            Mechanism::RunKey,
             "HKLM\\...\\Run".into(),
             Some("MyApp".into()),
             Some(r"C:\Program Files\App\My App.exe -x".to_string()),
@@ -1371,7 +1811,7 @@ mod tests {
     #[test]
     fn make_record_unquoted_spaced_fallback_when_nothing_exists() {
         let r = make_record_with_exists(
-            "run_key",
+            Mechanism::RunKey,
             "HKLM\\...\\Run".into(),
             Some("MyApp".into()),
             Some(r"C:\Program Files\App\My App.exe -x".to_string()),
@@ -1398,7 +1838,10 @@ mod tests {
             se_debug: false,
         };
         let recs = c.collect(&ctx).expect("collect");
-        assert!(recs.iter().all(|r| matches!(r, Record::Persistence(_))));
+        assert!(recs.iter().all(|r| matches!(
+            r,
+            Record::Persistence(_) | Record::RegValue(_) | Record::CommandHistory(_)
+        )));
         assert_eq!(c.sources().len(), 1);
         assert_eq!(c.sources()[0].artifact, "persistence");
         assert_eq!(c.sources()[0].method, "api");
@@ -1413,7 +1856,7 @@ mod tests {
         let recs = task_records_from_xml(SAMPLE_TASK_XML, "SynchronizeTime", None, &env, exists);
         assert_eq!(recs.len(), 1);
         let r = &recs[0];
-        assert_eq!(r.mechanism, "scheduled_task");
+        assert_eq!(r.mechanism, Mechanism::ScheduledTask);
         assert_eq!(
             r.location.as_str(),
             r"\Microsoft\Windows\Time Synchronization\SynchronizeTime"
@@ -1446,6 +1889,57 @@ mod tests {
     }
 
     // ── S2-I Task 2: parse_task_xml ────────────────────────────────────────
+
+    /// A UTF-16LE task file (the encoding Task Scheduler writes) is decoded and parsed;
+    /// the old `read_to_string` rejected it as invalid UTF-8 and the task was lost.
+    #[test]
+    fn walk_task_files_decodes_utf16_tasks() {
+        let root = std::env::temp_dir().join(format!("cairn_tasks_u16_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("Microsoft")).unwrap();
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend(SAMPLE_TASK_XML.encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(root.join("Microsoft").join("Updater"), &bytes).unwrap();
+        let mut notes = Vec::new();
+        let files = walk_task_files(&root, &mut notes);
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].file_name, "Updater");
+        let recs = task_records_from_xml(&files[0].xml, "Updater", None, |_| None, |_| false);
+        assert!(!recs.is_empty(), "UTF-16 task must yield its actions");
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    /// A directory symlink loop is not followed (no hang, no stack overflow), deep
+    /// nesting and oversized files are capped and noted.
+    #[cfg(unix)]
+    #[test]
+    fn walk_task_files_survives_loops_depth_and_size() {
+        let root = std::env::temp_dir().join(format!("cairn_tasks_loop_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+        let mut deep = root.clone();
+        for i in 0..TASKS_MAX_DEPTH + 3 {
+            deep = deep.join(format!("d{i}"));
+        }
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("too_deep"), SAMPLE_TASK_XML).unwrap();
+        std::fs::write(root.join("ok"), SAMPLE_TASK_XML).unwrap();
+        let f = std::fs::File::create(root.join("huge")).unwrap();
+        f.set_len(TASK_XML_MAX_BYTES + 1).unwrap();
+        let mut notes = Vec::new();
+        let files = walk_task_files(&root, &mut notes);
+        let _ = std::fs::remove_dir_all(&root);
+        let names: Vec<&str> = files.iter().map(|f| f.file_name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["ok"],
+            "loop not followed, deep and huge skipped"
+        );
+        assert!(notes.iter().any(|n| n.contains("deeper than")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("KiB skipped")), "{notes:?}");
+    }
 
     const SAMPLE_TASK_XML: &str = r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.6" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -1549,7 +2043,7 @@ mod tests {
 
     fn rec_with_path(p: Option<&str>) -> PersistenceRecord {
         PersistenceRecord {
-            mechanism: "winlogon".into(),
+            mechanism: Mechanism::Winlogon,
             location: r"HKLM\...\Winlogon".into(),
             value: Some("Shell".into()),
             command: p.map(|s| s.to_string()),
@@ -1558,6 +2052,9 @@ mod tests {
             signed: None,
             signer: None,
             last_write: None,
+            bound: None,
+            signer_source: None,
+            service_start: None,
         }
     }
 
@@ -1598,5 +2095,205 @@ mod tests {
         assert_eq!(recs[1].binary_path.as_deref(), Some(r"\\srv\share\x.exe"));
         assert_eq!(recs[2].binary_path.as_deref(), Some("ghost.exe")); // stays; verifier -> None
         assert_eq!(recs[3].binary_path, None);
+    }
+
+    // ── phase 2B: services, IFEO, startup .lnk, hashing hook ────────────────
+
+    fn svc(
+        start: Option<u32>,
+        image: Option<&str>,
+        dll: Option<&str>,
+    ) -> Option<PersistenceRecord> {
+        service_record(
+            "Svc",
+            r"HKLM\SYSTEM\CurrentControlSet\Services\Svc".into(),
+            start,
+            image.map(str::to_string),
+            dll.map(str::to_string),
+            None,
+            r"C:\Windows",
+            |_| None,
+        )
+    }
+
+    #[test]
+    fn service_start_types_kept_and_tagged_disabled_dropped() {
+        for start in 0..=3u32 {
+            let r = svc(Some(start), Some(r"C:\svc\a.exe"), None).expect("kept");
+            assert_eq!(r.service_start, Some(start));
+            assert_eq!(r.mechanism, Mechanism::Service);
+        }
+        assert!(svc(Some(4), Some(r"C:\svc\a.exe"), None).is_none());
+        assert!(svc(Some(99), Some(r"C:\svc\a.exe"), None).is_none());
+        assert!(svc(None, Some(r"C:\svc\a.exe"), None).is_none());
+        assert!(svc(Some(2), None, None).is_none());
+        assert!(svc(Some(2), Some("  "), None).is_none());
+    }
+
+    #[test]
+    fn svchost_service_dll_is_the_effective_target() {
+        let r = svc(
+            Some(3),
+            Some(r"%SystemRoot%\system32\svchost.exe -k netsvcs -p"),
+            Some(r"%SystemRoot%\System32\evil.dll"),
+        )
+        .unwrap();
+        assert_eq!(
+            r.binary_path.as_deref(),
+            Some(r"C:\Windows\System32\evil.dll")
+        );
+        // command keeps the raw ImagePath
+        assert_eq!(
+            r.command.as_deref(),
+            Some(r"%SystemRoot%\system32\svchost.exe -k netsvcs -p")
+        );
+        // a ServiceDll on a non-svchost service is ignored (ImagePath is what runs)
+        let own = svc(
+            Some(2),
+            Some(r#""C:\Program Files\V\v.exe" /svc"#),
+            Some(r"C:\x.dll"),
+        )
+        .unwrap();
+        assert_eq!(
+            own.binary_path.as_deref(),
+            Some(r"C:\Program Files\V\v.exe")
+        );
+        // svchost without a ServiceDll falls back to svchost itself
+        let bare = svc(Some(2), Some(r"C:\Windows\System32\svchost.exe -k x"), None).unwrap();
+        assert_eq!(
+            bare.binary_path.as_deref(),
+            Some(r"C:\Windows\System32\svchost.exe")
+        );
+        // driver-style relative ImagePath still normalized
+        let drv = svc(Some(0), Some(r"System32\drivers\x.sys"), None).unwrap();
+        assert_eq!(
+            drv.binary_path.as_deref(),
+            Some(r"C:\Windows\System32\drivers\x.sys")
+        );
+    }
+
+    #[test]
+    fn is_svchost_matches_file_name_only() {
+        assert!(is_svchost(
+            r"C:\WINDOWS\System32\SVCHOST.EXE -k LocalService"
+        ));
+        assert!(is_svchost(r#""C:\Windows\system32\svchost.exe" -k x"#));
+        assert!(!is_svchost(r"C:\Users\Public\svchost.exe.bak"));
+        assert!(!is_svchost(r"C:\Temp\notsvchost.exe"));
+    }
+
+    #[test]
+    fn ifeo_keys_include_wow6432node() {
+        assert_eq!(IFEO_KEYS.len(), 2);
+        assert!(IFEO_KEYS[1].contains("WOW6432Node"));
+        assert!(IFEO_KEYS
+            .iter()
+            .all(|k| k.ends_with("Image File Execution Options")));
+    }
+
+    #[test]
+    fn startup_lnk_resolves_target_and_arguments() {
+        let bytes = crate::lnk::tests::sample_lnk(
+            r"C:\Users\Public\Upd ate\run.exe",
+            "-w hidden -enc AAAA",
+        );
+        let info = crate::lnk::parse_lnk(&bytes).unwrap();
+        let r = startup_record(
+            r"C:\Users\v\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup",
+            "Updater.lnk".into(),
+            r"C:\Users\v\...\Startup\Updater.lnk".into(),
+            Some(&info),
+            None,
+            |_| None,
+        );
+        assert_eq!(
+            r.binary_path.as_deref(),
+            Some(r"C:\Users\Public\Upd ate\run.exe")
+        );
+        assert_eq!(
+            r.command.as_deref(),
+            Some(r#""C:\Users\Public\Upd ate\run.exe" -w hidden -enc AAAA"#)
+        );
+        assert_eq!(r.value.as_deref(), Some("Updater.lnk"));
+    }
+
+    #[test]
+    fn startup_lnk_env_target_is_expanded_and_non_lnk_kept() {
+        let info = crate::lnk::LnkInfo {
+            env_target: Some(r"%windir%\system32\cmd.exe".into()),
+            ..Default::default()
+        };
+        let env = fake_env(&[("windir", r"C:\Windows")]);
+        let r = startup_record(
+            "D",
+            "c.lnk".into(),
+            "D\\c.lnk".into(),
+            Some(&info),
+            None,
+            env,
+        );
+        assert_eq!(
+            r.binary_path.as_deref(),
+            Some(r"C:\Windows\system32\cmd.exe")
+        );
+        assert_eq!(r.command.as_deref(), Some(r"C:\Windows\system32\cmd.exe"));
+
+        let plain = startup_record("D", "x.bat".into(), "D\\x.bat".into(), None, None, |_| None);
+        assert_eq!(plain.binary_path.as_deref(), Some("D\\x.bat"));
+        assert_eq!(plain.command.as_deref(), Some("D\\x.bat"));
+    }
+
+    /// A real .lnk on disk in a Startup dir is resolved by read_startup_dirs.
+    #[test]
+    fn read_startup_dirs_parses_real_lnk_file() {
+        let tmp = std::env::temp_dir().join(format!("cairn_2b_lnk_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let bytes = crate::lnk::tests::sample_lnk(r"C:\ProgramData\x.exe", "/silent");
+        std::fs::write(tmp.join("x.lnk"), &bytes).unwrap();
+        let recs = read_startup_dirs(&[tmp.to_string_lossy().to_string()]);
+        let after = std::fs::read(tmp.join("x.lnk")).unwrap();
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert_eq!(after, bytes, "the .lnk must not be modified");
+        assert_eq!(recs.len(), 1);
+        assert_eq!(
+            recs[0].binary_path.as_deref(),
+            Some(r"C:\ProgramData\x.exe")
+        );
+        assert_eq!(
+            recs[0].command.as_deref(),
+            Some(r"C:\ProgramData\x.exe /silent")
+        );
+    }
+
+    #[test]
+    fn hash_hook_fills_only_missing_hashes_with_a_path() {
+        let mut recs = vec![
+            rec_with_path(Some(r"C:\a.exe")),
+            rec_with_path(None),
+            PersistenceRecord {
+                binary_sha256: Some("keep".into()),
+                ..rec_with_path(Some(r"C:\b.exe"))
+            },
+        ];
+        hash_persistence_targets(&mut recs, |p| Some(format!("h:{p}")));
+        assert_eq!(recs[0].binary_sha256.as_deref(), Some(r"h:C:\a.exe"));
+        assert_eq!(recs[1].binary_sha256, None);
+        assert_eq!(recs[2].binary_sha256.as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn startup_dirs_cover_every_profile_without_duplicates() {
+        let env = |v: &str| match v {
+            "PROGRAMDATA" => Some(r"C:\ProgramData".to_string()),
+            "APPDATA" => Some(r"C:\Users\admin\AppData\Roaming".to_string()),
+            _ => None,
+        };
+        let homes = vec![
+            r"C:\Users\admin".to_string(),
+            r"C:\Users\victim".to_string(),
+        ];
+        let dirs = startup_dirs(env, &homes);
+        assert_eq!(dirs.len(), 3, "{dirs:?}");
+        assert!(dirs[2].starts_with(r"C:\Users\victim\AppData\Roaming\"));
     }
 }

@@ -11,16 +11,14 @@
 
 use cairn_core::{finding::Finding, record::EventRecord, Result};
 
-pub mod codec;
 pub mod engine;
 pub mod ruleset;
+pub mod viability;
 
 /// Swappable engine seam. Implement once an engine is chosen in T6.
 pub trait SigmaMatcher: Send + Sync {
-    /// Load + compile rules from a directory of `.yml`. `plain = false` XOR-decodes the
-    /// bundled rules (ADR-0002); `plain = true` reads un-encoded `.yml` as-is, the
-    /// `--rules-plain` bypass a SOC uses to audit exactly what runs.
-    fn load(&mut self, rules_dir: &std::path::Path, plain: bool) -> Result<usize>;
+    /// Load + compile every plain-YAML rule (`.yml`/`.yaml`) under `rules_dir`.
+    fn load(&mut self, rules_dir: &std::path::Path) -> Result<usize>;
     /// Match a single event; return zero or more Findings (author surfaced per DRL).
     fn match_event(&self, ev: &EventRecord) -> Result<Vec<Finding>>;
     /// Channels referenced by loaded rules (for load-optimization: skip absent channels).
@@ -102,6 +100,30 @@ impl LogsourceMap {
                 1,
                 &[],
             ),
+            // ps_script -> PowerShell Operational 4104 (script block logging)
+            (
+                Some("ps_script"),
+                None,
+                "Microsoft-Windows-PowerShell/Operational",
+                4104,
+                &[],
+            ),
+            // ps_module -> PowerShell Operational 4103 (module logging)
+            (
+                Some("ps_module"),
+                None,
+                "Microsoft-Windows-PowerShell/Operational",
+                4103,
+                &[],
+            ),
+            // ps_classic_start -> Windows PowerShell 400 (engine start)
+            (
+                Some("ps_classic_start"),
+                None,
+                "Windows PowerShell",
+                400,
+                &[],
+            ),
             // network_connection -> Sysmon EID 3
             (
                 Some("network_connection"),
@@ -181,12 +203,26 @@ impl LogsourceMap {
                 17,
                 &[],
             ),
-            // wmi_event -> Sysmon EID 19
+            // wmi_event -> Sysmon EID 19 (filter), 20 (consumer), 21 (binding)
             (
                 Some("wmi_event"),
                 None,
                 "Microsoft-Windows-Sysmon/Operational",
                 19,
+                &[],
+            ),
+            (
+                Some("wmi_event"),
+                None,
+                "Microsoft-Windows-Sysmon/Operational",
+                20,
+                &[],
+            ),
+            (
+                Some("wmi_event"),
+                None,
+                "Microsoft-Windows-Sysmon/Operational",
+                21,
                 &[],
             ),
             // process_termination -> Sysmon EID 5
@@ -400,24 +436,16 @@ mod tests {
         assert!(hits.iter().any(|e| e.channel == "Security"));
     }
 
-    /// `category: ps_script` (the logsource used by segment-2's PowerShell 4104 rules)
-    /// has no dedicated LogsourceMap seed — only `service: powershell` is mapped. This
-    /// is expected: LogsourceMap only decides which channels to watch, it does not
-    /// participate in rule matching. `Engine::match_event` compares the synthetic
-    /// EventRecord's channel/event_id/data directly against each rule's `detection`
-    /// block (see parity.rs's `ps_script_*_fires` tests, which pass without any
-    /// `ps_script` LogsourceMap entry). This test documents the gap rather than
-    /// papering over it with a seed that isn't exercised by the matching path.
+    /// `category: ps_script` (segment-2's PowerShell 4104 rules) resolves to the
+    /// PowerShell Operational channel, so live EVTX collection reads that log.
     #[test]
-    fn ps_script_category_has_no_dedicated_logsource_seed() {
+    fn ps_script_category_resolves_to_powershell_4104() {
         let map = LogsourceMap::windows_builtin();
-        let hits = map.resolve(Some("ps_script"), None, None);
+        let hits = map.resolve(Some("ps_script"), Some("windows"), None);
         assert!(
-            hits.is_empty(),
-            "ps_script has no dedicated seed today; if this starts returning \
-             entries, update this test's assertion rather than deleting it — \
-             the point is to make the current gap visible, not silently pass \
-             either way"
+            hits.iter()
+                .any(|e| e.channel == "Microsoft-Windows-PowerShell/Operational"
+                    && e.event_id == 4104)
         );
     }
 

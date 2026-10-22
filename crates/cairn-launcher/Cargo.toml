@@ -11,11 +11,16 @@ path = "src/main.rs"
 # Dependencies used by modules added in subsequent tasks (T2-T6).
 [dependencies]
 cairn-core = { path = "../cairn-core" }
+cairn-collectors-win = { path = "../cairn-collectors-win" }
 cairn-sigma = { path = "../cairn-sigma" }
 serde_json.workspace = true
 chrono.workspace = true
 zip.workspace = true
 anyhow.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true

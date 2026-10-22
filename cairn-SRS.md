@@ -509,6 +509,9 @@ captures the *why* that git messages omit.
 **Heuristic calibration lessons (S2-H/noise-reduction segment):**
 - Inbox Windows services (DcomLaunch, Dhcp, tcpip.sys…) flood findings — suppressed via
   `is_inbox_service_command()` gate before scoring (not a whitelist, a structural check).
+  (Later removed: the gate moved into the persistence trust tiers, the helper was left
+  only to its own tests, and it accepted `system32\..\` traversal and
+  `system32\cmd.exe /c ...` as inbox.)
 - cairn.exe itself scored Medium (AppData path); suppressed by excluding own PID.
 - `details_client` said "未知程式" even when path known — template dispatch by `f.artifact`.
 - Timeline `Details` was debug-format key=value — replaced with human-readable sentences.

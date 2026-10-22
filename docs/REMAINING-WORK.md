@@ -7,7 +7,46 @@
 > 各自的已知坑」。
 >
 > 權威來源：`cairn-SRS.md`（§4 collector 表、§16 stage gate、NFR9-12）。
-> 歷史段落狀態：`docs/dev-history/INDEX.md`（一行一 topic + merge commit，先查這裡再展開個別 spec）。
+> 歷史 spec/plan（原 `docs/dev-history/`）已於 Phase 0 移除，需要時從 git 歷史取回。
+
+---
+
+## Phase 0 清理（2026-10-21）✅ 完成
+
+經 repo 擁有者核准，整批刪除以下功能（下方歷史紀錄若提到它們，描述的是已移除的程式碼）：
+
+- raw 磁碟 collector：mft、usn、amcache、shimcache、bam、userassist、srum、hive_reader、
+  `cairn-collectors-win` 的 raw volume reader、`can_read_raw_volume`；Record 種類
+  `FileMeta`/`UsnEvent`；HTML 檔案活動（MOTW/USN）面板；manifest `governance.truncations`。
+- heuristic：timestomp、temporal（TemporalWindowCorrelator）、live_exec、BYOVD 與內建驅動清單。
+- `cairn-updater` 與 `update-rules` 子指令（cairn 不再含任何連網程式碼）。
+- age 加密輸出（`--encrypt`）與 mactime bodyfile（`--bodyfile`）。
+- Sigma 規則 XOR 編碼：`rules/sigma/` 改為原始 YAML，`--rules-plain` 一併移除；
+  `rules/ruleset.toml` 保留為規則清單，測試確保與 `rules/sigma/` 一致（80 條）。
+- 失效旗標：`--use-vss`、`--admin-features`、`--target <dir>`、`--max-mft-records`、
+  `--max-usn-records`、`--driver-list`、`--max-threads`（連同未使用的 rayon 執行緒池）；
+  `--profile verbose`。
+
+保留：process、network、logon session、persist + asep（含 per-user HKU）、WMI 訂閱、
+排程工作、prefetch、EVTX（live + 離線）+ Sigma；heuristic parentchild/netconn/account/
+logon_bruteforce/eventlog/clickfix/persist/asep；HTML/CSV/JSONL 報告、zip、dry-run、
+manifest + verify、coverage、launcher。
+
+---
+
+## Phase 1 核心契約（2026-10-21）✅ 完成
+
+- `Mechanism` enum 取代 `PersistenceRecord.mechanism` 字串（JSON 值不變）；`Finding.analyzer`、
+  `Entity.persistence`、`SourceEntry.collector` 為新增欄位（舊 JSON 以預設值讀入）。
+  `PERSIST_SOURCE_MARKER` 已移除：netconn 以 `f.analyzer == "heur_persist"` 判斷來源。
+- orchestrator 以 `catch_unwind` 包住每個 collector / analyzer；panic 記為
+  `panicked: <msg>` 寫入 manifest sources，run 繼續（golden rule 8）。
+- `cairn-cli` 拆成 cli/registry/run/evtx/coverage/verify/enrich/output；collector 與
+  analyzer 各只有一份註冊表（live 與 evtx 共用）。
+- 偵測知識集中在 `cairn-heur/src/trust.rs`（drop zone、launcher 表、exe 名稱、
+  encoded/base64、script markers）。
+- 殘留：`heur_eventlog` 仍自帶 `details_client`（需要 Finding 沒有結構化保存的事件欄位）；
+  analyzer 的 finding 標題、gate label 與 persist `details` 片段仍為 zh-TW，尚未移到 report 層。
 
 ---
 
@@ -184,7 +223,7 @@ parsing 或記憶體耗盡，等於攻擊者能對鑑識工具本身做 DoS（�
 
 ## 待辦清單（段 0 之後，依建議實作順序）
 
-### 段 1 — HTML 報告強化 ✅ 已完成並合併（2026-07-08，`74aefba`，見 `docs/dev-history/INDEX.md`）
+### 段 1 — HTML 報告強化 ✅ 已完成並合併（2026-07-08，`74aefba`）
 
 **2026-07-11 查證更正**：本檔先前版本仍把段 1 列為待辦，實際上 severity/artifact/
 關鍵字 client-side 篩選、同 binary 聚合面板（`evidence_source_summary_panel()`，
@@ -209,7 +248,7 @@ Defender/TaskScheduler/WMI 等頻道（整頻道粒度）——**頻道管線是
 `ruleset.toml` 選集工作。
 
 **問題**（BYOVD brainstorm 時確立的判斷）：真正限制偵測廣度的不是 heuristic 數量而是
-Sigma 規則覆蓋。`update-rules` 管線（FR19）已完成，擴充只是選集 + 重跑 encode。
+Sigma 規則覆蓋，擴充只是選集工作（Phase 0 後：直接把 SigmaHQ YAML 放進 `rules/sigma/` 並登記到 `ruleset.toml`）。
 
 **解法方向**：從 SigmaHQ 穩定規則裡按 logsource 對照已映射頻道挑高價值規則
 （PowerShell 4104 script block、認證 4624/4625/4648/4672、System 7045 服務安裝——
@@ -225,41 +264,9 @@ false positives）；規則量影響掃描時間，NFR9 資源治理要重測；
 
 **估**：1–2 段（選集審核是主要工時）。
 
-### 段 3 — TemporalWindowCorrelator ✅ 完成並已 merge（2026-07-15，PR #37，main `e9035a6`）
+### 段 3 — TemporalWindowCorrelator（已於 Phase 0 移除）
 
-原 spec `docs/dev-history/specs/2026-07-04-temporal-window-correlator-design.md`
-（`dca7951`）2026-07-08 複審通過後，2026-07-15 開工前重新查證發現兩處前提已
-過時，**改走 v2 spec**：`docs/dev-history/specs/2026-07-15-temporal-window-correlator-v2-design.md`。
-
-- **前提1（已過時）**：spec Task 0（`ProcessRecord.start_time` 真實收集）其實
-  已在段9完成（`proc.rs` 的 `read_start_time()` 有真機測試）——實作範圍縮小為
-  只做 spec 原 Task 1。
-- **前提2（架構調整）**：原 spec 決定「不新增獨立 Analyzer，塞進
-  persist.rs/parentchild.rs 內部各寫一份」，本次重新查證後推翻——段10
-  （`depends_on()`+`prior_findings`）與段11（netconn.rs 讀取 persist Finding
-  佐證的先例）已提供現成模式，改成獨立 Analyzer `TemporalWindowCorrelator`
-  （`depends_on(["heur_persist","heur_parentchild"])`），消除跨兩檔案的邏輯
-  重複，且不違反「只服務已 gate 通過行程」的核心設計原則。
-
-**核心邏輯**：對 `prior_findings` 裡帶 `entity.process` 的 Finding，用 pid
-反查 `ProcessRecord`（拿 `start_time`），收集 5 分鐘固定時間窗內的 USN 事件
-（線性掃描+ts區間過濾，不限路徑，最多200筆+超量摘要註記）與同 PID 的 NetConn
-（存在性非時序），命中任一項則 escalate severity 一級。所有 evidence 含
-「非確認因果」/「存在性關聯」誠實用語。
-
-**開工前發現的真實缺口**：`persist.rs` 產生的 Finding 原本不保證填
-`entity.process`（常填 `entity.file`/`entity.registry`），這會讓新 Analyzer
-完全抓不到 persist 來源的行程 pid——已作為 Task 0 優先修掉（S9 執行證據命中
-時新增填值，不影響既有欄位邏輯）。順手把 `escalate()` 從 persist.rs 私有函式
-搬到共用 `score.rs`（比照段11 `JoinKey` 搬遷先例），供 persist.rs 與
-temporal.rs 共用。
-
-5 個 Task 全部一次到位（implementer 首次執行即通過，僅 Task4 全量驗證時
-clippy 抓到 `needless_lifetimes`、fmt 抓到未格式化程式碼，皆為預期內的
-收尾修正，非邏輯錯誤）。11 個新單元測試 + 1 個端到端整合測試（真正
-`run_live` pipeline，串接驗證 Task0 的 entity.process 填值與 Task2 的
-反查消費協作）。全 workspace 驗證：667 個測試 0 failed、clippy 零警告、
-fmt --check 通過。
+2026-07-15 完成（PR #37），依賴 USN 事件；raw 磁碟 collector 移除後一併刪除。
 
 ### 段外 — AV 誤判緩解（合法工程優化，非規避）✅ 完成並已 merge（2026-07-16，PR #38，main `5e6cbff`）
 
@@ -298,7 +305,7 @@ heuristic 評分規則不透明，未簽章執行檔的信譽分數需要時間�
 
 ### 段 4 — WMI 持久化（Observation-first 重設計）✅ 全部完成
 
-spec 基礎：`docs/dev-history/specs/2026-07-03-fileless-attack-coverage-design.md`（FUTURE）。
+spec 基礎：fileless-attack-coverage 設計（FUTURE，原存於已移除的 dev-history，git 歷史可查）。
 **2026-07-08 查證後範圍縮減**：原三塊（A=WMI collector、B=EVTX 頻道+規則、C=爆破
 heuristic）中，塊 B 的頻道映射其實已存在、Security 頻道已被現有規則引用（見段 2
 現況），塊 B 併入段 2 處理。**塊 C（登入爆破）✅ 已完成並 merge**（見下方段 4-塊C
@@ -312,8 +319,7 @@ heuristic）中，塊 B 的頻道映射其實已存在、Security 頻道已被�
 `#![forbid(unsafe_code)]`）讀取 `root\subscription` 下的 WMI 永久事件訂閱
 （`__EventFilter`/`__EventConsumer`/`__FilterToConsumerBinding`）。
 
-**關鍵決策：不引入現成 `wmi` crate**——brainstorm 階段的技術可行性研究
-（`docs/dev-history/2026-07-16-wmi-persistence-research.md`）發現 `wmi` crate
+**關鍵決策：不引入現成 `wmi` crate**——brainstorm 階段的技術可行性研究發現 `wmi` crate
 有已查證、官方 WONTFIX 的已知 UB 問題（自身 COM 生命週期管理與 windows-rs
 的 `CoIncrementMTAUsage` 機制交錯時可能 segfault），對鑑識工具是不可接受的
 風險。改用 `windows` crate 既有依賴新增 `Win32_System_Wmi`/`Win32_System_Com`
@@ -379,60 +385,15 @@ clippy（零警告）/fmt --check（抓到 8 處未格式化程式碼並修正�
 測試指令獨立驗證，不僅採信 subagent 文字回報（段2教訓，見上方段2記錄）——
 本段驗證均與 subagent 回報一致，無再次踩到空洞回報的情況。
 
-### 段 5 — LiveExecHeuristic（原待辦 D）✅ 完成並已 merge（2026-07-19，PR #40，main `e999581`）
+### 段 5 — LiveExecHeuristic（已於 Phase 0 移除）
 
-「正在跑（ProcessRecord）+ 最近才首次出現（ExecutionRecord.first_run ≤30 天）+ unsigned」
-→ High；「正在跑但執行文物完全缺席」→ High。
-
-**2026-07-19 brainstorm 階段查證更正**：backlog 原文「prefetch 檔名粒度需 basename
-正規化」的已知坑經查證**不成立**——`prefetch.rs` collector 寫入
-`ExecutionRecord.path` 的是 `.pf` 檔內部 header 的 NAME 欄位（純檔名，如
-`NOTEPAD.EXE`），不含目錄也不含 hash 後綴；真正帶 hash 後綴的是 `.pf` 檔案本身
-的檔名，collector 從未把它寫進 `ExecutionRecord`。現有 `join_key()` 對純
-basename 已足夠比對，本段未新增額外正規化邏輯。詳見
-`docs/dev-history/specs/2026-07-19-live-exec-heuristic-design.md`。
-
-新建 `crates/cairn-heur/src/live_exec.rs`（`LiveExecHeuristic`，
-`depends_on()` 為空、完全獨立於其他 analyzer），實作兩個互斥訊號：訊號A（三來源
-prefetch/amcache/shimcache 執行文物皆缺席）與訊號B（至少一來源命中、取最早
-first_run、≤30天且 `signed==Some(false)`；`signed==None` 一律 abstain）。複用
-既有 `persist.rs` 的 `CrossIndex`/`build_cross_index` 三來源比對邏輯——**該邏輯
-本段順手從 `persist.rs` 私有搬到 `score.rs` 公開**（比照段11 `JoinKey` 搬遷、
-段3 `escalate()` 搬遷先例），供兩個模組共用，純重構零行為變化。MITRE 標籤：
-訊號A 刻意留空（沒有任何 ATT&CK 技術能誠實對應「執行文物缺席」本身——可能從未
-執行、可能清除痕跡、也可能只是覆蓋率缺口，三者無法區分，標記具體技術即為過度
-宣稱）；訊號B 用 `T1036`（Masquerading），與既有 `netconn.rs`/`persist.rs`
-「未簽章+可疑」類訊號標籤慣例一致。
-
-已接線進 `cairn-cli` 的 live 分析器清單（`TemporalWindowCorrelator` 之後），
-含端到端 synthetic integration test（真正 `run_live` pipeline）。全 workspace
-驗證：test（全 crate 0 failed）/clippy（零警告）/fmt --check 全數通過。
-
-**Subagent-driven-development 執行過程中的兩次真實發現**（均由審查抓到、實作者
-修正）：(1) spec-reviewer 抓到一個測試構造缺陷——「多來源取最早 first_run」的
-測試原本讓兩筆佐證記錄落在 `CrossIndex` 不同層（一筆純檔名、一筆完整路徑），
-`lookup_exec` 對完整路徑 exact 命中即提前返回，導致該測試實際上只看到單一來源，
-沒有真正測到 `.min()` 跨來源比較邏輯（斷言仍為真，但理由錯誤——假綠燈）；修正
-為兩筆記錄用同一完整路徑（同落 `exec_exact`），並用 mutation test（暫改
-`.min()`→`.max()` 確認測試會失敗）驗證修復有效。(2) 兩輪 code-quality review
-各抓到一次遺漏 `cargo fmt`（`score.rs`、`live_exec.rs` 各一次）——與段2/段4-塊A
-教訓同類，此後每個 subagent 任務都在派工 prompt 明確要求收尾前跑 fmt。
-
-**估**：1 段。實際：5 個實作任務（Task 1-5）+ fresh-context spec/quality 雙軌
-審查全數跑完，無需升級模型、無需重派。
+2026-07-19 完成（PR #40），依賴 amcache/shimcache 執行文物；raw 磁碟 collector 移除後一併刪除。
 
 ### 段 6 — NetConn 跨進程強化（原待辦 E）
 
 同 PID 多 /24 段聚合、可疑 parent + 外連交叉升級。需遵守 gate floor 哲學（弱信號單獨不發）。
 
 **估**：1 段。
-
-### 段 7 — BYOVD 清單維護機制（BYOVD 殘留項）
-
-`known-vulnerable-drivers.txt` 目前 19 個 SHA1 編譯內嵌 + `--driver-list` 覆寫。長期可考慮
-併入 `update-rules` 式更新管線（SSRF 白名單限 loldrivers.io）。低優先，清單手動維護可撐。
-
-**估**：0.5–1 段。
 
 ### 段 F — 合法性層（給真實客戶用前必做；自用階段跳過，2026-06-22 決定維持）
 
@@ -448,12 +409,12 @@ SOC pre-allowlist runbook、提交 MS WDSI。**觸發條件**：第一次要給�
   → 段 1（HTML 報告）✅ 完成（2026-07-08 查證發現本段落已於此前完成，見上方記錄）
   → 段 2（Sigma 擴充）✅ 完成（PR #35，2026-07-14）
   → 段 4-塊C（登入爆破）✅ 完成（PR #36，2026-07-15）
-  → 段 3（TemporalWindowCorrelator）✅ 完成（PR #37，2026-07-15）
+  → 段 3（TemporalWindowCorrelator）✅ 完成（PR #37，2026-07-15；Phase 0 移除）
   → 段外（AV 誤判緩解，合法工程優化）✅ 完成（PR #38，2026-07-16）
   → 段 4-塊A（WMI 持久化偵測）✅ 完成（PR #39，2026-07-17）— 段 4 全部完成
-  → 段 5（LiveExecHeuristic）✅ 完成（PR #40，2026-07-19）
+  → 段 5（LiveExecHeuristic）✅ 完成（PR #40，2026-07-19；Phase 0 移除）
+  → Phase 0 清理 ✅ 完成（2026-10-21）
   → 段 6（NetConn 跨進程強化）← 下一步
-  → 段 7（維護機制）
 段 F 由「要交付外部」事件觸發，不排時序。
 ```
 
@@ -472,9 +433,7 @@ SOC pre-allowlist runbook、提交 MS WDSI。**觸發條件**：第一次要給�
 | `WtsSession.client_address` 恆為 `None`（WTS_CLIENT_ADDRESS 位元組配置無法驗證） | ir-panels | RDP 判定已改用 `pWinStationName`，client IP 留待權威文件 |
 | `WtsSession.state_active` 已收集但無面板讀取 | ir-panels | 低優先，段 1 可順手顯示 |
 | 「對外連線」面板標題涵蓋 listener 與 UDP，語意略寬 | ir-panels | 低影響命名問題，段 1 順手修 |
-| BYOVD 精確雜湊只抓已知樣本，客製驅動可繞過 | byovd | spec §6 已誠實標示，多層偵測之一環 |
 | prefetch v30 run_count offset 0xD0 未真機驗證（只有 v31 機器） | prefetch | 常數註解標 historical |
-| mft/usn/shimcache/amcache/bam/userassist/srum 需 SeBackupPrivilege（一般 admin 不附帶） | S2 各段 | CLAUDE.md 已載明：日常驗收用合成整合測試，真機 e2e 留最終驗收 |
 | WMI 事件訂閱持久化、互動登入爆破＝Sigma 與 heuristic 雙盲區 | 段8審計 F-2/F-6（中） | 已由段 4 追蹤（塊 A/塊 C）；本列僅登記「目前兩層都不偵測」的事實 |
 | `is_wow64` 未涵蓋 ARM64 host 上的 x64 模擬程序，bitness 判定僅對 x86/x64 host 驗證過 | 段9 Task6 quality 審查 L1（低） | `cairn-collectors-win/src/proc.rs::is_wow64`；實務會被後續 null/長度檢查攔成 None，不會 UB，僅可能靜默 abstain。accepted residual，比照 prefetch v30 offset 的處理風格 |
 | `read_cmdline` 對撕裂/半寫的 UTF-16 buffer 用 `from_utf16_lossy` 靜默產生替代字元而非 abstain | 段9 Task6 quality 審查 L2（低） | 目標程序正好在寫 cmdline 途中的極窄競態窗口；下游 heuristic 對含 U+FFFD 字串的行為未特別測試，非阻擋 |
@@ -484,7 +443,7 @@ SOC pre-allowlist runbook、提交 MS WDSI。**觸發條件**：第一次要給�
 
 ## 段 8 附錄：健全性審計結果（2026-07-10）
 
-完整報告：`docs/dev-history/2026-07-10-resilience-audit.md`（12 findings：高 3、中 5、低 4）。
+完整報告原存於已移除的 dev-history（git 歷史可查；12 findings：高 3、中 5、低 4）。
 本輪審計焦點為使用者指定的「功能健全性 + 有效使用」。摘要：
 
 - **F-1（高，已登記上表）**：live 掃描下 parentchild heuristic 實際只剩 image-name 比對
@@ -520,8 +479,7 @@ SOC pre-allowlist runbook、提交 MS WDSI。**觸發條件**：第一次要給�
   教訓：main 曾因此紅 4 天）。CARGO_TARGET_DIR 在 OneDrive 外。
 - **合併一律走 GitHub PR**（CI 綠才 merge），不本機 `git merge` 直推 main
   （2026-07-08 教訓，見「流程缺陷教訓」節）。
-- 真機 e2e 涉 raw-NTFS 段落：遵守 CLAUDE.md SeBackupPrivilege 節（合成整合測試為日常，
-  真機為最終驗收）。
+- 真機 e2e：合成整合測試為日常，真機為最終驗收（CLAUDE.md「Testing collectors and analyzers」）。
 - **`cfg(windows)` 邊界要顯式核對，不能靠本機「看起來沒事」**（第三次出現同類問題，
   2026-07-16/17 升級為正式規則）：本機開發環境固定是 Windows，`cargo check`/`clippy`
   預設只驗證 host target，`#[cfg(not(windows))]` 分支永遠不會在本機被觸發編譯。

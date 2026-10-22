@@ -3,16 +3,6 @@
 use cairn_core::Severity;
 use std::net::Ipv4Addr;
 
-/// Directories whose presence in an image path is a suspicious-execution signal.
-/// Matched case-insensitively as a substring of the path.
-pub const SUSPICIOUS_DIRS: &[&str] = &[
-    r"\temp\",
-    r"\appdata\",
-    r"\programdata\",
-    r"\downloads\",
-    r"\public\", // matches C:\Users\Public (world-readable shared dir) too
-];
-
 /// The canonical install subpath for modern signed per-user apps (Notion, Warp, VS Code, …).
 /// Matched case-insensitively as a substring. Only THIS AppData subpath earns suspicious-path
 /// suppression; Temp/Roaming/other AppData subpaths stay suspicious (droppers favor them).
@@ -38,12 +28,6 @@ pub const WINLOGON_SHELL_DEFAULT: &str = "explorer.exe";
 pub const WINLOGON_USERINIT_DEFAULTS: &[&str] =
     &[r"c:\windows\system32\userinit.exe", "userinit.exe"];
 
-/// True if `path` (any case) contains one of the suspicious directory segments.
-pub fn is_suspicious_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    SUSPICIOUS_DIRS.iter().any(|d| lower.contains(d))
-}
-
 /// True if `path` (any case) is under the trusted per-user app install directory
 /// (`\AppData\Local\Programs\`). Used only in combination with `signed==Some(true)`.
 pub fn is_trusted_appdata_location(path: &str) -> bool {
@@ -57,12 +41,20 @@ pub fn is_rare_port(port: u16) -> bool {
 
 /// True if `addr` is a routable public IPv4 (not RFC1918/loopback/link-local/unspecified,
 /// nor CGNAT/benchmarking/IETF-protocol/reserved). A string that does not parse as IPv4
-/// returns false (the signal simply does not fire).
+/// returns false (the signal simply does not fire). The IPv4-mapped IPv6 spelling
+/// (`::ffff:8.8.8.8`, what dual-stack sockets and 4624 `IpAddress` report) is judged
+/// as the IPv4 address it carries; native IPv6 is not handled here.
 ///
 /// FUTURE: replace the manual reserved-range guards with `Ipv4Addr::is_global()` once that
 /// method stabilises (currently nightly-only behind `feature(ip)`).
 pub fn is_public_ipv4(addr: &str) -> bool {
-    match addr.parse::<Ipv4Addr>() {
+    let a = addr.trim().trim_start_matches('[').trim_end_matches(']');
+    let parsed = a.parse::<Ipv4Addr>().ok().or_else(|| {
+        a.parse::<std::net::Ipv6Addr>()
+            .ok()
+            .and_then(|v6| v6.to_ipv4_mapped())
+    });
+    match parsed.ok_or(()) {
         Ok(ip) => {
             !ip.is_private()
                 && !ip.is_loopback()
@@ -118,54 +110,8 @@ fn normalize_winlogon_command(command: &str) -> String {
     s
 }
 
-/// Collapses Windows env-var / path-root prefixes to a canonical `<win>\` prefix
-/// (case-insensitive), so the inbox-pattern check only needs one code path.
-fn normalise_service_cmd(cmd: &str) -> String {
-    let lower = cmd.trim().to_ascii_lowercase();
-    for prefix in [r"%systemroot%\", r"%windir%\"] {
-        if let Some(rest) = lower.strip_prefix(prefix) {
-            return format!(r"<win>\{rest}");
-        }
-    }
-    if let Some(rest) = lower.strip_prefix(r"\systemroot\") {
-        return format!(r"<win>\{rest}");
-    }
-    // Drive-letter form: exactly one letter + ":\windows\" (11 chars total)
-    if lower.len() > 11 {
-        let (head, rest) = lower.split_at(11);
-        let chars: Vec<char> = head.chars().collect();
-        if chars[0].is_ascii_alphabetic() && chars[1] == ':' && &head[2..] == r"\windows\" {
-            return format!(r"<win>\{rest}");
-        }
-    }
-    lower
-}
-
-/// Returns `true` when `cmd` is a Windows inbox service binary (System32 / SysWOW64),
-/// excluding DriverStore paths (OEM drivers are not suppressed).
-pub fn is_inbox_service_command(cmd: &str) -> bool {
-    if cmd.trim().is_empty() {
-        return false;
-    }
-    let norm = normalise_service_cmd(cmd);
-    // DriverStore OEM drivers are NOT suppressed even if under System32
-    if norm.contains(r"\driverstore\") {
-        return false;
-    }
-    // Absolute canonical form
-    if norm.starts_with(r"<win>\system32\") || norm.starts_with(r"<win>\syswow64\") {
-        return true;
-    }
-    // Relative bare form (may have a leading quote from registry ImagePath)
-    let stripped = norm.strip_prefix('"').unwrap_or(&norm);
-    if stripped.starts_with(r"system32\") || stripped.starts_with(r"syswow64\") {
-        return true;
-    }
-    false
-}
-
 /// 跨文物比對鍵：有完整路徑（含目錄分隔符）就用正規化後的完整路徑比對；
-/// 只有檔名（來源本身缺路徑資訊，如多數 prefetch 條目、srum 的 "id:<n>" 回退）
+/// 只有檔名（來源本身缺路徑資訊，如多數 prefetch 條目）
 /// 就降級成純檔名比對。降級佐證的信心度低於完整路徑相符，呼叫端在組
 /// finding reason 時必須標註「降級佐證」。
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -177,6 +123,20 @@ pub enum JoinKey {
 }
 
 impl JoinKey {
+    /// Whether two keys name the same binary, per the contract above: two full paths
+    /// must be the same path (after [`crate::trust::normalize_path`]); only when either
+    /// side is a bare name, or a path still holds an unexpanded `%VAR%`, does the
+    /// basename decide. `C:\Windows\System32\svchost.exe` and
+    /// `C:\Users\a\svchost.exe` are different binaries.
+    pub fn same_target(&self, other: &JoinKey) -> bool {
+        match (self, other) {
+            (JoinKey::Path(a), JoinKey::Path(b)) if !a.contains('%') && !b.contains('%') => {
+                crate::trust::normalize_path(a) == crate::trust::normalize_path(b)
+            }
+            _ => self.degraded_key() == other.degraded_key(),
+        }
+    }
+
     /// 兩個 JoinKey 是否應視為同一佐證目標：Path 對 Path 要求完全相同；
     /// 任一方是 Name（降級）就退回比對雙方的 basename。
     pub fn degraded_key(&self) -> String {
@@ -188,7 +148,7 @@ impl JoinKey {
 }
 
 /// 從一個原始路徑/檔名字串建立 JoinKey：trim + 去引號 + 小寫，再判斷是否含
-/// 目錄分隔符（`\` 或 `/`）。不含分隔符（如純檔名、或 srum 的 "id:42" 回退）
+/// 目錄分隔符（`\` 或 `/`）。不含分隔符（如純檔名）
 /// 一律視為 Name（降級）鍵。
 pub fn join_key(raw: &str) -> JoinKey {
     let normalized = raw.trim().trim_matches('"').to_ascii_lowercase();
@@ -259,11 +219,21 @@ pub fn escalate(sev: Severity) -> Severity {
     }
 }
 
+/// Lower one severity band (a mitigating fact, e.g. a demand-start service). Floors
+/// at Low: a finding that cleared a gate never drops to Info.
+pub fn deescalate(sev: Severity) -> Severity {
+    match sev {
+        Severity::Critical => Severity::High,
+        Severity::High => Severity::Medium,
+        Severity::Medium | Severity::Low | Severity::Info => Severity::Low,
+    }
+}
+
 /// Index execution + process records for corroboration lookups. Two-layer index:
 /// exact (JoinKey equality — Path==Path or Name==Name with identical string) built
 /// for **all** records; degraded (basename-only) built **only** from records whose
-/// source itself lacks path information (`JoinKey::Name`, e.g. prefetch filenames,
-/// srum's `id:<n>` fallback) — records with a full path (`JoinKey::Path`) are never
+/// source itself lacks path information (`JoinKey::Name`, e.g. prefetch filenames)
+/// — records with a full path (`JoinKey::Path`) are never
 /// inserted into the degraded index. On lookup, exact is tried first regardless of
 /// the query's own key kind; degraded is only consulted on an exact miss. Because
 /// the degraded index only ever holds path-less records, two records that both carry
@@ -392,26 +362,6 @@ mod tests {
     }
 
     #[test]
-    fn join_key_srum_id_fallback_is_name_only() {
-        // srum's resolve_app_name falls back to "id:<n>" when unmapped — must be
-        // treated as a Name key (no directory component), not misparsed as a path.
-        let k = join_key("id:42");
-        assert!(
-            matches!(k, JoinKey::Name(_)),
-            "id: fallback must be a Name key"
-        );
-    }
-
-    #[test]
-    fn suspicious_path_matches_each_dir_case_insensitively() {
-        assert!(is_suspicious_path(r"C:\Users\a\AppData\Local\Temp\x.exe"));
-        assert!(is_suspicious_path(r"c:\users\a\downloads\y.exe"));
-        assert!(is_suspicious_path(r"C:\ProgramData\z.exe"));
-        // a normal system path is not suspicious
-        assert!(!is_suspicious_path(r"C:\Windows\System32\cmd.exe"));
-    }
-
-    #[test]
     fn rare_port_excludes_common_ports() {
         assert!(!is_rare_port(443));
         assert!(!is_rare_port(53));
@@ -430,6 +380,12 @@ mod tests {
         assert!(!is_public_ipv4("169.254.1.1")); // link-local
         assert!(!is_public_ipv4("0.0.0.0")); // unspecified
         assert!(!is_public_ipv4("not-an-ip")); // unparseable -> false
+        assert!(is_public_ipv4("::ffff:8.8.8.8")); // IPv4-mapped
+        assert!(is_public_ipv4("::FFFF:104.18.0.1"));
+        assert!(!is_public_ipv4("::ffff:10.0.0.5"));
+        assert!(!is_public_ipv4("::ffff:127.0.0.1"));
+        assert!(!is_public_ipv4("::1")); // native IPv6: not judged here
+        assert!(!is_public_ipv4("::8.8.8.8")); // deprecated compatible form: not mapped
         assert!(!is_public_ipv4("100.64.0.1")); // CGNAT (RFC6598)
         assert!(!is_public_ipv4("198.18.0.1")); // benchmarking (RFC2544)
         assert!(!is_public_ipv4("240.0.0.1")); // reserved class E
@@ -517,83 +473,6 @@ mod tests {
     }
 
     #[test]
-    fn inbox_svchost_pct_systemroot_suppressed() {
-        assert!(is_inbox_service_command(
-            r"%SystemRoot%\system32\svchost.exe -k DcomLaunch -p"
-        ));
-    }
-
-    #[test]
-    fn inbox_svchost_pct_windir_suppressed() {
-        assert!(is_inbox_service_command(
-            r"%windir%\system32\svchost.exe -k netsvcs"
-        ));
-    }
-
-    #[test]
-    fn inbox_backslash_systemroot_suppressed() {
-        assert!(is_inbox_service_command(r"\SystemRoot\system32\lsass.exe"));
-    }
-
-    #[test]
-    fn inbox_absolute_cwindows_suppressed() {
-        assert!(is_inbox_service_command(
-            r"C:\Windows\system32\SearchIndexer.exe /Embedding"
-        ));
-    }
-
-    #[test]
-    fn inbox_relative_system32_suppressed() {
-        assert!(is_inbox_service_command(r"System32\drivers\tcpip.sys"));
-    }
-
-    #[test]
-    fn inbox_relative_syswow64_suppressed() {
-        assert!(is_inbox_service_command(r"SysWOW64\some32bitbin.exe"));
-    }
-
-    #[test]
-    fn inbox_case_insensitive() {
-        assert!(is_inbox_service_command(r"SYSTEM32\DRIVERS\WDF01000.SYS"));
-        assert!(is_inbox_service_command(
-            r"%SYSTEMROOT%\SYSTEM32\SVCHOST.EXE -k LocalService"
-        ));
-    }
-
-    #[test]
-    fn driverstore_not_suppressed_abs() {
-        assert!(!is_inbox_service_command(
-            r"%SystemRoot%\System32\DriverStore\FileRepository\asusptpfilter.inf_amd64_e109\AsusPTPService.exe"
-        ));
-    }
-
-    #[test]
-    fn driverstore_not_suppressed_rel() {
-        assert!(!is_inbox_service_command(
-            r"System32\DriverStore\FileRepository\genpass.inf_amd64_0c82d80c\genpass.sys"
-        ));
-    }
-
-    #[test]
-    fn program_files_not_suppressed() {
-        assert!(!is_inbox_service_command(
-            r#""C:\Program Files\Trend Micro\AMSP\coreServiceShell.exe""#
-        ));
-    }
-
-    #[test]
-    fn windowsapps_not_suppressed() {
-        assert!(!is_inbox_service_command(
-            r#""C:\Program Files\WindowsApps\Claude_1.15\app\resources\cowork-svc.exe""#
-        ));
-    }
-
-    #[test]
-    fn empty_command_not_suppressed() {
-        assert!(!is_inbox_service_command(""));
-    }
-
-    #[test]
     fn escalate_caps_at_critical() {
         assert_eq!(escalate(Severity::Low), Severity::Medium);
         assert_eq!(escalate(Severity::Medium), Severity::High);
@@ -618,6 +497,7 @@ mod tests {
             sha1: None,
             user_sid: None,
             execution_confirmed: Some(true),
+            full_path: None,
         };
         let temp = ExecutionRecord {
             source: "shimcache".into(),
@@ -628,6 +508,7 @@ mod tests {
             sha1: None,
             user_sid: None,
             execution_confirmed: Some(true),
+            full_path: None,
         };
         let records = vec![
             Record::Execution(sys32.clone()),

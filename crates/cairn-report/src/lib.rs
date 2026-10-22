@@ -1,16 +1,15 @@
 //! cairn-report: timeline + summary + manifest + output sinks. SRS §5.2, §6, §12.
 #![forbid(unsafe_code)] // pure formatting + hashing + file I/O; no raw-volume/WinAPI.
 
-pub mod age_sink;
-pub mod bodyfile;
 pub mod client_text;
 pub mod dry_run;
 pub mod html;
+pub mod sink;
 pub mod zip_sink;
 
-pub use age_sink::AgeSink;
 pub use dry_run::DryRunSink;
-pub use zip_sink::ZipSink;
+pub use sink::Sink;
+pub use zip_sink::{verify_zip, ZipSink};
 
 use cairn_core::{
     finding::Finding,
@@ -26,6 +25,72 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
     h.update(bytes);
     hex(&h.finalize())
+}
+
+/// Streaming SHA-256 + byte count of everything `r` yields. Evidence files (exported
+/// EVTX) can be large, so they are never loaded whole just to be hashed.
+pub fn sha256_reader(mut r: impl std::io::Read) -> std::io::Result<(String, u64)> {
+    let mut h = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let n = r.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+        total += n as u64;
+    }
+    Ok((hex(&h.finalize()), total))
+}
+
+/// Streaming SHA-256 + size of the file at `path`.
+pub fn sha256_file(path: &std::path::Path) -> std::io::Result<(String, u64)> {
+    sha256_reader(std::fs::File::open(path)?)
+}
+
+/// The manifest entry for an output named `name` with contents `bytes`.
+pub(crate) fn output_entry(name: &str, bytes: &[u8]) -> OutputEntry {
+    OutputEntry {
+        file: name.to_string(),
+        sha256: sha256_hex(bytes),
+        size: bytes.len() as u64,
+    }
+}
+
+/// `base` joined with a `/`-separated output name (e.g. `evidence/evtx/Security.evtx`),
+/// one component at a time so the result uses the platform separator. Empty, `.` and
+/// `..` components are dropped: an output name can never climb out of the output root.
+pub fn output_path(base: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let mut p = base.to_path_buf();
+    for part in name.split(['/', '\\']) {
+        if !part.is_empty() && part != "." && part != ".." {
+            p.push(part);
+        }
+    }
+    p
+}
+
+/// findings.jsonl body: one Finding per line.
+pub(crate) fn findings_jsonl(findings: &[Finding]) -> Result<String> {
+    let mut buf = String::new();
+    for f in findings {
+        buf.push_str(&serde_json::to_string(f)?);
+        buf.push('\n');
+    }
+    Ok(buf)
+}
+
+/// records.jsonl body: every collected Record (the internal bus type, versioned by
+/// `schema::RECORD`), one per line, so a live run's raw data is reviewable and
+/// replayable.
+pub fn records_jsonl(records: &[cairn_core::Record]) -> Result<String> {
+    let mut buf = String::new();
+    for r in records {
+        buf.push_str(&serde_json::to_string(r)?);
+        buf.push('\n');
+    }
+    Ok(buf)
 }
 
 fn hex(b: &[u8]) -> String {
@@ -122,7 +187,10 @@ fn timeline_row(f: &Finding) -> [String; 13] {
         f.rule_author.clone().unwrap_or_default(),
         f.mitre.join(";"),
         f.details.clone(),
-        f.reason.clone().unwrap_or_default(),
+        f.reason
+            .clone()
+            .or_else(|| client_text::sigma_reason(f))
+            .unwrap_or_default(),
         entity_summary(f),
         f.details_client.clone().unwrap_or_default(),
     ]
@@ -241,6 +309,27 @@ pub(crate) fn write_output_safe(path: &std::path::Path, bytes: &[u8]) -> Result<
     Ok(())
 }
 
+/// [`write_output_safe`], but atomic: the bytes go to `<name>.partial` first and are
+/// then renamed over `path`. A crash mid-write leaves at most a `.partial` file (which
+/// `verify` reports as unexpected), never a truncated file under the real name. Used
+/// for the manifest, the file that vouches for every other output.
+pub(crate) fn write_output_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(cairn_core::CairnError::Other(format!(
+                "refusing to write through a symlinked output: {}",
+                path.display()
+            )));
+        }
+    }
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".partial");
+    let tmp = std::path::PathBuf::from(tmp);
+    write_output_safe(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Writes results to a plain directory. S1 default. Off-target path recommended (FR16).
 /// Records each written file's SHA-256 so `finalize` can emit the manifest outputs
 /// (chain-of-custody, SRS §12).
@@ -265,26 +354,46 @@ impl DirSink {
         self.outputs.clone()
     }
 
-    /// Write `bytes` to `name` in the output dir and record its SHA-256.
+    /// The output directory this sink writes into.
+    pub fn dir(&self) -> &std::path::Path {
+        &self.dir
+    }
+
+    /// Write `bytes` to `name` (a `/`-separated path under the output dir) and record
+    /// its SHA-256 + size.
     ///
     /// Output-path safety (threat-model #3): refuse to write if the target name is
     /// already a symlink — following it could redirect the write through to another
     /// volume (e.g. the source/target being investigated). We never modify sources.
     fn write_file(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
         std::fs::create_dir_all(&self.dir)?;
-        let path = self.dir.join(name);
-        if let Ok(meta) = std::fs::symlink_metadata(&path) {
-            if meta.file_type().is_symlink() {
-                return Err(cairn_core::CairnError::Other(format!(
-                    "refusing to write through a symlinked output: {}",
-                    path.display()
-                )));
-            }
+        write_output_safe(&output_path(&self.dir, name), bytes)?;
+        self.outputs.push(output_entry(name, bytes));
+        Ok(())
+    }
+
+    /// Write records.jsonl (every collected Record) and record its hash.
+    pub fn write_records_jsonl(&mut self, records: &[cairn_core::Record]) -> Result<()> {
+        let buf = records_jsonl(records)?;
+        self.write_file("records.jsonl", buf.as_bytes())
+    }
+
+    /// Record a file that something else already wrote at `name` under the output dir
+    /// (e.g. an EVTX export produced by the Windows API): stream-hash it in place and
+    /// add it to the outputs. Errs if the file is missing or is a symlink.
+    pub fn register_existing(&mut self, name: &str) -> Result<()> {
+        let path = output_path(&self.dir, name);
+        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(cairn_core::CairnError::Other(format!(
+                "refusing to hash through a symlinked output: {}",
+                path.display()
+            )));
         }
-        std::fs::write(&path, bytes)?;
+        let (sha256, size) = sha256_file(&path)?;
         self.outputs.push(OutputEntry {
             file: name.to_string(),
-            sha256: sha256_hex(bytes),
+            sha256,
+            size,
         });
         Ok(())
     }
@@ -297,11 +406,7 @@ impl OutputSink for DirSink {
     }
 
     fn write_findings_jsonl(&mut self, findings: &[Finding]) -> Result<()> {
-        let mut buf = String::new();
-        for f in findings {
-            buf.push_str(&serde_json::to_string(f)?);
-            buf.push('\n');
-        }
+        let buf = findings_jsonl(findings)?;
         self.write_file("findings.jsonl", buf.as_bytes())
     }
 
@@ -310,9 +415,14 @@ impl OutputSink for DirSink {
         self.write_file("observations.jsonl", buf.as_bytes())
     }
 
+    /// Written last and atomically (see [`write_output_atomic`]): a run that dies
+    /// before this point leaves no manifest, so its outputs can never verify.
     fn write_manifest(&mut self, manifest: &Manifest) -> Result<()> {
         let json = serde_json::to_vec_pretty(manifest)?;
-        self.write_file("manifest.json", &json)
+        std::fs::create_dir_all(&self.dir)?;
+        write_output_atomic(&output_path(&self.dir, "manifest.json"), &json)?;
+        self.outputs.push(output_entry("manifest.json", &json));
+        Ok(())
     }
 
     fn write_html_report(
@@ -330,7 +440,6 @@ impl OutputSink for DirSink {
         Ok(std::mem::take(&mut self.outputs))
     }
 }
-// TODO(claude-code) S3: ZipSink + EncryptedZipSink (asymmetric, public key only); DryRunSink.
 
 /// One file's integrity status during `verify` (SRS §12 / stage1-plan T9).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +450,10 @@ pub enum CheckStatus {
     Mismatch { expected: String, actual: String },
     /// File listed in the manifest is absent on disk.
     Missing,
+    /// File present in the output (directory or archive) but NOT listed in the
+    /// manifest: nothing vouches for it (planted, left by a crashed run, or added
+    /// after the fact).
+    Unexpected,
 }
 
 /// One verified entry: which file, and whether it matched.
@@ -355,26 +468,89 @@ pub struct CheckResult {
 #[derive(Debug, Default)]
 pub struct VerifyReport {
     pub outputs: Vec<CheckResult>,
+    /// Source files re-hashed at their recorded host paths. Informational only: a live
+    /// log keeps growing after collection, and verify normally runs on the analyst's
+    /// machine where the target's paths do not exist, so a changed or missing source is
+    /// reported but never fails `ok()`. Integrity rests on the outputs, which include
+    /// the exported EVTX copies.
     pub sources: Vec<CheckResult>,
+    /// The manifest lists no outputs at all. A manifest is only ever written by a real
+    /// (non-dry-run) run, which always produces outputs, so an empty list means there is
+    /// nothing to vouch for: verify must FAIL rather than pass vacuously.
+    pub no_outputs: bool,
+    /// For a zip: the archive checked against its `<zip>.sha256` sidecar. `None` when
+    /// not a zip, or when the sidecar is absent (reported, not failed: the members are
+    /// still verified against the manifest inside the archive).
+    pub archive: Option<CheckResult>,
+    /// Files in the output that the manifest does not list ([`CheckStatus::Unexpected`]).
+    pub extra: Vec<CheckResult>,
 }
 
 impl VerifyReport {
-    /// All checked entries are `Ok` (no mismatch, no missing).
+    /// All checked entries are `Ok` (no mismatch, no missing) and there was something
+    /// to check.
     pub fn ok(&self) -> bool {
-        self.outputs
-            .iter()
-            .chain(&self.sources)
-            .all(|c| c.status == CheckStatus::Ok)
+        !self.no_outputs && self.failures().is_empty()
     }
 
-    /// Just the failing entries (mismatch or missing), for reporting.
+    /// Just the failing entries (output mismatch, missing or unexpected), for
+    /// reporting. Source drift is not a failure; see [`Self::source_changes`].
     pub fn failures(&self) -> Vec<&CheckResult> {
         self.outputs
             .iter()
-            .chain(&self.sources)
+            .chain(self.archive.as_ref())
+            .chain(&self.extra)
             .filter(|c| c.status != CheckStatus::Ok)
             .collect()
     }
+
+    /// Sources that changed or are not reachable from here since collection.
+    pub fn source_changes(&self) -> Vec<&CheckResult> {
+        self.sources
+            .iter()
+            .filter(|c| c.status != CheckStatus::Ok)
+            .collect()
+    }
+}
+
+/// Compare an expected SHA-256 against a hashing attempt; a read error is `Missing`.
+pub(crate) fn check_hash(
+    name: &str,
+    expected: &str,
+    actual: std::io::Result<(String, u64)>,
+) -> CheckResult {
+    let status = match actual {
+        Ok((actual, _)) if actual == expected => CheckStatus::Ok,
+        Ok((actual, _)) => CheckStatus::Mismatch {
+            expected: expected.to_string(),
+            actual,
+        },
+        Err(_) => CheckStatus::Missing,
+    };
+    CheckResult {
+        file: name.to_string(),
+        status,
+    }
+}
+
+/// Re-hash the file-backed sources (by their recorded absolute paths).
+///
+/// Only file-backed sources can be re-hashed. A live/API source (process or net table)
+/// has an empty sha256 and a `live:` pseudo-path — there are no bytes to re-read, so it
+/// is not a verifiable artifact. Skip those (don't flag Missing).
+pub(crate) fn verify_sources(manifest: &Manifest) -> Vec<CheckResult> {
+    manifest
+        .sources
+        .iter()
+        .filter(|s| !s.sha256.is_empty())
+        .map(|s| {
+            check_hash(
+                &s.path,
+                &s.sha256,
+                sha256_file(std::path::Path::new(&s.path)),
+            )
+        })
+        .collect()
 }
 
 /// Read and parse a `manifest.json` from disk (verify entry point). Keeps serde_json in
@@ -392,43 +568,73 @@ pub fn read_manifest(path: &std::path::Path) -> Result<Manifest> {
 /// A read error on a listed file is reported as `Missing` rather than aborting the whole
 /// verify (graceful degrade, golden rule 8) — verify should report ALL problems at once.
 pub fn verify_manifest(manifest: &Manifest, base_dir: &std::path::Path) -> VerifyReport {
-    let check = |name: &str, path: std::path::PathBuf, expected: &str| -> CheckResult {
-        let status = match std::fs::read(&path) {
-            Ok(bytes) => {
-                let actual = sha256_hex(&bytes);
-                if actual == expected {
-                    CheckStatus::Ok
-                } else {
-                    CheckStatus::Mismatch {
-                        expected: expected.to_string(),
-                        actual,
-                    }
-                }
-            }
-            Err(_) => CheckStatus::Missing,
-        };
-        CheckResult {
-            file: name.to_string(),
-            status,
-        }
-    };
-
     VerifyReport {
         outputs: manifest
             .outputs
             .iter()
-            .map(|o| check(&o.file, base_dir.join(&o.file), &o.sha256))
+            .map(|o| {
+                check_hash(
+                    &o.file,
+                    &o.sha256,
+                    sha256_file(&output_path(base_dir, &o.file)),
+                )
+            })
             .collect(),
-        // Only file-backed sources can be re-hashed. A live/API source (process or net
-        // table) has an empty sha256 and a `live:` pseudo-path — there are no bytes to
-        // re-read, so it is not a verifiable artifact. Skip those (don't flag Missing).
-        sources: manifest
-            .sources
-            .iter()
-            .filter(|s| !s.sha256.is_empty())
-            .map(|s| check(&s.path, std::path::PathBuf::from(&s.path), &s.sha256))
-            .collect(),
+        sources: verify_sources(manifest),
+        no_outputs: manifest.outputs.is_empty(),
+        archive: None,
+        extra: unexpected(manifest, list_files(base_dir)),
     }
+}
+
+/// Files a run writes into its output location that the manifest cannot list:
+/// itself, and run.log (still being written after the manifest).
+const UNLISTED_BY_DESIGN: &[&str] = &["manifest.json", "run.log"];
+
+/// `Unexpected` results for every name in `present` that the manifest neither lists
+/// nor exempts, sorted.
+pub(crate) fn unexpected(manifest: &Manifest, present: Vec<String>) -> Vec<CheckResult> {
+    let listed: std::collections::HashSet<&str> =
+        manifest.outputs.iter().map(|o| o.file.as_str()).collect();
+    let mut extra: Vec<CheckResult> = present
+        .into_iter()
+        .filter(|n| !listed.contains(n.as_str()) && !UNLISTED_BY_DESIGN.contains(&n.as_str()))
+        .map(|file| CheckResult {
+            file,
+            status: CheckStatus::Unexpected,
+        })
+        .collect();
+    extra.sort_by(|a, b| a.file.cmp(&b.file));
+    extra
+}
+
+/// Every non-directory entry under `dir`, as `/`-separated names relative to it.
+/// Symbolic links are listed (as entries), never followed; depth and count are capped
+/// so a hostile output directory cannot hang verify.
+fn list_files(dir: &std::path::Path) -> Vec<String> {
+    const MAX_DEPTH: usize = 32;
+    const MAX_ENTRIES: usize = 100_000;
+    let mut out = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), String::new(), 0usize)];
+    while let Some((d, prefix, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if out.len() >= MAX_ENTRIES {
+                return out;
+            }
+            let name = format!("{prefix}{}", e.file_name().to_string_lossy());
+            match e.file_type() {
+                Ok(t) if t.is_dir() && depth < MAX_DEPTH => {
+                    stack.push((e.path(), format!("{name}/"), depth + 1));
+                }
+                Ok(t) if t.is_dir() => out.push(format!("{name}/")),
+                _ => out.push(name),
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -537,6 +743,20 @@ mod tests {
         assert!(
             row.contains("service autostart persistence"),
             "reason not in row: {row}"
+        );
+    }
+
+    /// A Sigma finding without a reason gets the rule/author/level/record explanation
+    /// in the Reason column.
+    #[test]
+    fn timeline_csv_sigma_reason_fallback() {
+        let csv = timeline_csv(&[finding(1_700_000_000, "Susp PS", 42)]);
+        let row = csv.lines().nth(1).unwrap();
+        assert!(
+            row.contains(
+                "sigma rule 'Susp PS' by Author A (level high) matched Security EID 4688 record 42"
+            ),
+            "{row}"
         );
     }
 
@@ -654,6 +874,9 @@ mod tests {
                 os_build: String::new(),
                 timezone: "UTC".into(),
                 wall_clock_utc_skew: "+0s".into(),
+                utc_offset_seconds: None,
+                reference_time_utc: None,
+                skew_seconds: None,
             },
             privileges: Privileges {
                 admin: false,
@@ -778,6 +1001,35 @@ mod tests {
         assert_eq!(report.outputs.len(), 2);
     }
 
+    /// A host source that is gone or changed (verify on the analyst's machine, or a
+    /// live log that kept growing) is reported, not a verify failure.
+    #[test]
+    fn source_drift_is_reported_but_does_not_fail_verify() {
+        use cairn_core::manifest::SourceEntry;
+        let dir = std::env::temp_dir().join("cairn_verify_source_drift_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(dir.clone());
+        sink.write_timeline_csv(&[]).unwrap();
+        sink.write_findings_jsonl(&[]).unwrap();
+
+        let mut manifest = minimal_manifest();
+        manifest.outputs = sink.outputs_so_far();
+        manifest.sources = vec![SourceEntry {
+            collector: "evtx_live".into(),
+            artifact: "evtx_live:Security".into(),
+            path: dir.join("not-on-this-machine.evtx").display().to_string(),
+            method: "file".into(),
+            size: 1,
+            sha256: "00".repeat(32),
+            errors: vec![],
+        }];
+        let report = verify_manifest(&manifest, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(report.source_changes().len(), 1);
+        assert!(report.failures().is_empty(), "{:?}", report.failures());
+        assert!(report.ok());
+    }
+
     /// A live/API source (empty sha256, `live:` pseudo-path — e.g. a process or net
     /// table) is NOT a file and must be skipped by verify, not flagged Missing. This is
     /// the fix surfaced by the S2-A `cairn run --target live` end-to-end run.
@@ -793,6 +1045,7 @@ mod tests {
         let mut manifest = minimal_manifest();
         manifest.outputs = sink.outputs_so_far();
         manifest.sources = vec![SourceEntry {
+            collector: String::new(),
             artifact: "process".into(),
             path: "live:process".into(),
             method: "api".into(),
@@ -850,11 +1103,134 @@ mod tests {
         manifest.outputs = vec![OutputEntry {
             file: "nope.csv".into(),
             sha256: "0".repeat(64),
+            size: 0,
         }];
 
         let report = verify_manifest(&manifest, &dir);
         assert!(!report.ok());
         assert_eq!(report.outputs[0].status, CheckStatus::Missing);
+    }
+
+    /// A file in the output dir that the manifest does not list fails verify as
+    /// Unexpected; manifest.json and run.log are exempt by design.
+    #[test]
+    fn verify_reports_extra_files() {
+        let dir = std::env::temp_dir().join("cairn_verify_extra_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(&dir);
+        sink.write_timeline_csv(&[]).unwrap();
+        let mut manifest = minimal_manifest();
+        manifest.outputs = sink.outputs_so_far();
+        sink.write_manifest(&manifest).unwrap();
+        std::fs::write(dir.join("run.log"), b"log").unwrap();
+        assert!(verify_manifest(&manifest, &dir).ok(), "clean dir verifies");
+
+        std::fs::create_dir_all(dir.join("evidence").join("evtx")).unwrap();
+        std::fs::write(dir.join("evidence").join("evtx").join("planted.evtx"), b"x").unwrap();
+        std::fs::write(dir.join("manifest.json.partial"), b"{").unwrap();
+        let report = verify_manifest(&manifest, &dir);
+        assert!(!report.ok(), "an unlisted file must fail verify");
+        let names: Vec<&str> = report.extra.iter().map(|c| c.file.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["evidence/evtx/planted.evtx", "manifest.json.partial"]
+        );
+        assert!(report
+            .extra
+            .iter()
+            .all(|c| c.status == CheckStatus::Unexpected));
+    }
+
+    /// The manifest is written via a .partial file and renamed: no .partial is left
+    /// behind, and the manifest is not listed among the outputs it vouches for.
+    #[test]
+    fn manifest_write_is_atomic_and_leaves_no_partial() {
+        let dir = std::env::temp_dir().join("cairn_manifest_atomic_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(&dir);
+        sink.write_findings_jsonl(&[]).unwrap();
+        let mut manifest = minimal_manifest();
+        manifest.outputs = sink.outputs_so_far();
+        sink.write_manifest(&manifest).unwrap();
+        assert!(dir.join("manifest.json").is_file());
+        assert!(!dir.join("manifest.json.partial").exists());
+        let back = read_manifest(&dir.join("manifest.json")).unwrap();
+        assert!(back.outputs.iter().all(|o| o.file != "manifest.json"));
+    }
+
+    /// A manifest that lists no outputs has nothing to vouch for: verify must fail
+    /// instead of passing vacuously (the old live-run bug wrote `outputs: []`).
+    #[test]
+    fn verify_fails_when_manifest_lists_no_outputs() {
+        let dir = std::env::temp_dir().join("cairn_verify_empty_outputs_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let report = verify_manifest(&minimal_manifest(), &dir);
+        assert!(report.no_outputs);
+        assert!(!report.ok(), "empty outputs must not verify");
+    }
+
+    /// Every output entry carries the byte size alongside the hash.
+    #[test]
+    fn dirsink_records_size_and_records_jsonl() {
+        let dir = std::env::temp_dir().join("cairn_dirsink_size_records_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(dir.clone());
+        sink.write_findings_jsonl(&[finding(1, "f", 1)]).unwrap();
+        sink.write_records_jsonl(&[]).unwrap();
+        let outs = sink.outputs_so_far();
+        let fj = outs.iter().find(|o| o.file == "findings.jsonl").unwrap();
+        let on_disk = std::fs::metadata(dir.join("findings.jsonl")).unwrap().len();
+        assert_eq!(fj.size, on_disk);
+        assert!(fj.size > 0);
+        assert!(outs.iter().any(|o| o.file == "records.jsonl"));
+        assert!(dir.join("records.jsonl").exists());
+    }
+
+    /// A file written by someone else under the output dir (an EVTX export) is hashed
+    /// in place under its `/`-separated name, and verify re-checks it.
+    #[test]
+    fn dirsink_register_existing_hashes_nested_file_and_verify_checks_it() {
+        let dir = std::env::temp_dir().join("cairn_dirsink_register_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let nested = output_path(&dir, "evidence/evtx/Security.evtx");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, b"ElfFile\0fake").unwrap();
+        let mut sink = DirSink::new(dir.clone());
+        sink.register_existing("evidence/evtx/Security.evtx")
+            .unwrap();
+        assert!(sink.register_existing("evidence/evtx/absent.evtx").is_err());
+        let mut manifest = minimal_manifest();
+        manifest.outputs = sink.outputs_so_far();
+        assert_eq!(manifest.outputs[0].size, 12);
+        assert_eq!(manifest.outputs[0].sha256, sha256_hex(b"ElfFile\0fake"));
+        assert!(verify_manifest(&manifest, &dir).ok());
+
+        std::fs::write(&nested, b"ElfFile\0FAKE").unwrap();
+        assert!(!verify_manifest(&manifest, &dir).ok(), "tampered evidence");
+    }
+
+    /// Output names cannot climb out of the output root.
+    #[test]
+    fn output_path_drops_parent_components() {
+        let base = std::path::Path::new("out");
+        assert_eq!(
+            output_path(base, "../../etc/x"),
+            std::path::Path::new("out").join("etc").join("x")
+        );
+        assert_eq!(
+            output_path(base, "evidence/evtx/a.evtx"),
+            base.join("evidence").join("evtx").join("a.evtx")
+        );
+    }
+
+    /// Streaming hash equals the one-shot hash and reports the length.
+    #[test]
+    fn sha256_reader_matches_one_shot() {
+        let data = vec![7u8; 200_000];
+        let (h, n) = sha256_reader(std::io::Cursor::new(&data)).unwrap();
+        assert_eq!(h, sha256_hex(&data));
+        assert_eq!(n, 200_000);
     }
 
     /// Output-path safety (threat-model #3): if an output name is a pre-planted symlink,

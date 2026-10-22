@@ -44,18 +44,21 @@ aggregate hash is stable under the XOR codec (compute pre-encode).
 
 ### Accepted — implementation (T8a)
 
-`cairn_sigma::ruleset::aggregate_hash(dir, plain)` implements the canonicalization:
-per-file SHA-256 over the **decoded** YAML (`load_rule_bytes(path, plain)`), relative
-paths joined with `/` (OS-independent), sorted lexicographically, each emitted as
+`cairn_sigma::ruleset::aggregate_hash(dir)` implements the canonicalization:
+per-file SHA-256 over the rule YAML bytes, relative paths joined with `/`
+(OS-independent), sorted lexicographically, each emitted as
 `"<relpath>\n<file-hash-hex>\n"` into a final SHA-256. Unit tests pin the invariants:
-stable under the XOR codec (encoded `plain=false` and plain `--rules-plain` trees of the
-same rules hash identically), order-independent, tamper-evident, and an empty set hashes
-to the well-defined SHA-256 of empty input.
+order-independent, tamper-evident, and an empty set hashes to the well-defined SHA-256
+of empty input.
+
+**Phase 0 update (2026-10-21):** `cairn update-rules` and the XOR codec were removed.
+Rules are stored as plain YAML; because the aggregate was always computed over decoded
+bytes, the bundle's `sigma_ruleset_ver` did not change. Refreshing the bundle is now a
+manual copy from SigmaHQ at the pin, listed in `rules/ruleset.toml`.
 
 ### Bundled rule set — current pin (T8c)
 
-The Stage-1 bundle (`rules/sigma/`, XOR-encoded; plain copies regenerated into the
-gitignored `rules/plain/`) is pinned to:
+The bundle (`rules/sigma/`, plain YAML) is pinned to:
 
 - **SigmaHQ/sigma @ `98781da19cf60c48ce6e7f2d3ad11c9ba389191a`**
 

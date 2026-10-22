@@ -2,6 +2,7 @@
 //! No external dependencies; CSS is inlined.
 #![allow(clippy::too_many_lines)]
 
+use cairn_core::collectors;
 use cairn_core::{
     finding::{Finding, Severity},
     manifest::Manifest,
@@ -253,77 +254,6 @@ fn execution_panel(records: &[cairn_core::Record]) -> String {
     )
 }
 
-/// Suspicious-file-activity panel: MOTW-tagged files first (download provenance),
-/// then recent USN create/rename events (capped at 200; total noted in summary).
-fn file_activity_panel(records: &[cairn_core::Record]) -> String {
-    use cairn_core::record::Record;
-    const USN_CAP: usize = 200;
-
-    let motw: Vec<&cairn_core::record::FileMetaRecord> = records
-        .iter()
-        .filter_map(|r| match r {
-            Record::FileMeta(m) if m.zone_identifier.is_some() => Some(m),
-            _ => None,
-        })
-        .collect();
-
-    let mut usn: Vec<&cairn_core::record::UsnEventRecord> = records
-        .iter()
-        .filter_map(|r| match r {
-            Record::UsnEvent(u) => Some(u),
-            _ => None,
-        })
-        .filter(|u| {
-            let re = u.reason.to_ascii_lowercase();
-            re.contains("create") || re.contains("rename")
-        })
-        .collect();
-
-    if motw.is_empty() && usn.is_empty() {
-        return String::new();
-    }
-    let usn_total = usn.len();
-    usn.sort_by_key(|u| std::cmp::Reverse(u.ts)); // newest first
-    usn.truncate(USN_CAP);
-
-    let motw_rows: String = motw
-        .iter()
-        .map(|m| {
-            format!(
-                "<tr><td>MOTW</td><td>{}</td><td>{}</td></tr>",
-                esc(&m.path),
-                esc(m.zone_identifier.as_deref().unwrap_or("-")),
-            )
-        })
-        .collect();
-    let usn_rows: String = usn
-        .iter()
-        .map(|u| {
-            format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td></tr>",
-                esc(&u.reason),
-                esc(&u.path),
-                esc(&u.ts.format("%Y-%m-%d %H:%MZ").to_string()),
-            )
-        })
-        .collect();
-    let usn_note = if usn_total > USN_CAP {
-        format!("（顯示前 {USN_CAP} 筆，共 {usn_total} 筆，完整見 records.jsonl）")
-    } else {
-        String::new()
-    };
-    format!(
-        "<details class=\"inventory\"><summary><h2 style=\"display:inline\">可疑檔案活動 ({} 個 MOTW 檔案 / {} 筆近期檔案事件)</h2></summary>\
-         <p style=\"font-size:0.8em;color:#6b7280\">{}</p>\
-         <table><tr><th>類型/動作</th><th>路徑</th><th>詳細</th></tr>{}{}</table></details>",
-        motw.len(),
-        usn_total,
-        usn_note,
-        motw_rows,
-        usn_rows,
-    )
-}
-
 /// Logon-session panel: RemoteInteractive (RDP) first.
 fn logon_panel(records: &[cairn_core::Record]) -> String {
     use cairn_core::record::Record;
@@ -406,6 +336,283 @@ fn evidence_source_summary_panel(findings: &[&Finding]) -> String {
 }
 
 /// Generate a self-contained HTML report from findings, observations and manifest.
+/// One row of the "what was checked" overview.
+struct Area {
+    name: &'static str,
+    /// Finding artifacts that belong to this area.
+    artifacts: fn(&str) -> bool,
+    /// Live records this area inspected.
+    records: fn(&cairn_core::Record) -> bool,
+    /// Canonical collector names (`cairn_core::collectors`, matched against
+    /// `SourceEntry.collector`) whose failure means the area was not checked.
+    modules: &'static [&'static str],
+    /// Shown in offline EVTX mode too (event-log areas only).
+    offline: bool,
+}
+
+fn is_run_mru(r: &cairn_core::Record) -> bool {
+    matches!(r, cairn_core::Record::RegValue(v) if v.key.to_ascii_lowercase().ends_with(r"\explorer\runmru"))
+}
+
+fn is_event_on(r: &cairn_core::Record, channel: &str) -> bool {
+    matches!(r, cairn_core::Record::Event(e) if e.channel.eq_ignore_ascii_case(channel))
+}
+
+const AREAS: &[Area] = &[
+    Area {
+        name: "持久化（開機或登入時自動執行的程式）",
+        artifacts: |a| a == "persistence" || a == "run_key",
+        records: |r| matches!(r, cairn_core::Record::Persistence(_)),
+        modules: &[collectors::PERSIST, collectors::WMI_SUBSCRIPTION],
+        offline: false,
+    },
+    Area {
+        name: "正在執行的程式",
+        artifacts: |a| a == "process",
+        records: |r| matches!(r, cairn_core::Record::Process(_)),
+        modules: &[collectors::PROC],
+        offline: false,
+    },
+    Area {
+        name: "網路連線",
+        artifacts: |a| a.starts_with("netconn"),
+        records: |r| matches!(r, cairn_core::Record::NetConn(_)),
+        modules: &[collectors::NET],
+        offline: false,
+    },
+    Area {
+        name: "「執行」對話框貼上的指令（ClickFix）",
+        artifacts: |a| a == "run_mru",
+        records: is_run_mru,
+        modules: &[collectors::PERSIST],
+        offline: false,
+    },
+    Area {
+        name: "帳號建立、群組變更、密碼猜測",
+        artifacts: |a| a == "account" || a == "logon_bruteforce",
+        records: |r| is_event_on(r, "Security"),
+        modules: &[collectors::EVTX_LIVE],
+        offline: true,
+    },
+    Area {
+        name: "事件記錄（清除記錄、新服務、新排程、Defender、Sigma 規則）",
+        artifacts: |a| a.starts_with("evtx:"),
+        records: |r| matches!(r, cairn_core::Record::Event(_)),
+        modules: &[collectors::EVTX_LIVE],
+        offline: true,
+    },
+];
+
+/// "這次檢查了什麼" — one row per area with its status, so a reader can tell a clean
+/// area from one that was never checked. Offline EVTX runs (no live records) show only
+/// the event-log areas.
+fn overview_panel(
+    findings: &[Finding],
+    records: &[cairn_core::Record],
+    manifest: &Manifest,
+) -> String {
+    let offline = records.is_empty();
+    let mut rows = String::new();
+    for area in AREAS.iter().filter(|a| !offline || a.offline) {
+        let hits: Vec<&Finding> = findings
+            .iter()
+            .filter(|f| (area.artifacts)(&f.artifact))
+            .collect();
+        let high = hits
+            .iter()
+            .filter(|f| matches!(f.severity, Severity::Critical | Severity::High))
+            .count();
+        let medium = hits
+            .iter()
+            .filter(|f| f.severity == Severity::Medium)
+            .count();
+        let failed = manifest
+            .sources
+            .iter()
+            .find(|s| !s.errors.is_empty() && area.modules.contains(&s.collector.as_str()));
+        let inspected = if offline {
+            manifest.counts.records as usize
+        } else {
+            records.iter().filter(|r| (area.records)(r)).count()
+        };
+        let (color, status) = if high > 0 {
+            ("#b91c1c", format!("發現 {high} 筆高風險"))
+        } else if medium > 0 {
+            ("#b45309", format!("{medium} 筆需要確認"))
+        } else if let Some(src) = failed {
+            (
+                "#6b7280",
+                format!("未檢查：{}", esc(&src.errors.join("; "))),
+            )
+        } else if inspected == 0 {
+            ("#6b7280", "沒有收集到資料，無法判斷".to_string())
+        } else {
+            ("#15803d", format!("未發現異常（檢查了 {inspected} 筆）"))
+        };
+        rows.push_str(&format!(
+            "<tr><td>{}</td><td style=\"color:{color};font-weight:600\">{status}</td></tr>",
+            area.name
+        ));
+    }
+    format!(
+        "<div class=\"card\"><div class=\"card-title\">這次檢查了什麼</div>\
+         <table><tr><th>項目</th><th>結果</th></tr>{rows}</table></div>"
+    )
+}
+
+/// Logging gaps that make a clean result less meaningful, inferred from what the live
+/// EVTX collection actually returned. Empty for offline runs and when nothing is missing.
+fn blind_spots_panel(records: &[cairn_core::Record], manifest: &Manifest) -> String {
+    if records.is_empty() {
+        return String::new();
+    }
+    let count = |channel: &str, eid: Option<u32>| {
+        records
+            .iter()
+            .filter(|r| match r {
+                cairn_core::Record::Event(e) => {
+                    e.channel.eq_ignore_ascii_case(channel) && eid.is_none_or(|id| e.event_id == id)
+                }
+                _ => false,
+            })
+            .count()
+    };
+    let mut items: Vec<&str> = Vec::new();
+    if !manifest.privileges.admin {
+        items.push(
+            "沒有以系統管理員身分執行：Security 事件記錄、其他使用者的登錄和部分系統位置讀不到。\
+             請在程式上按右鍵選「以系統管理員身分執行」再掃一次。",
+        );
+    }
+    let security = count("Security", None);
+    if manifest.privileges.admin && security == 0 {
+        items.push("讀不到 Security 事件記錄，帳號與登入相關的偵測沒有資料。");
+    }
+    if security > 0 && count("Security", Some(4688)) == 0 {
+        items.push(
+            "沒有「行程建立」事件（4688）：這台主機沒有開啟行程建立稽核，Sigma 的行程規則幾乎不會觸發。\
+             建議用群組原則開啟「稽核行程建立」並勾選「在行程建立事件中包含命令列」。",
+        );
+    }
+    if !manifest.tool.sigma_ruleset_ver.is_empty()
+        && count("Microsoft-Windows-PowerShell/Operational", Some(4104)) == 0
+    {
+        items.push(
+            "沒有 PowerShell 指令碼區塊記錄（4104）：看不到 PowerShell 實際執行的內容。\
+             建議用群組原則開啟「開啟 PowerShell 指令碼區塊記錄」。",
+        );
+    }
+    if items.is_empty() {
+        return String::new();
+    }
+    let list: String = items.iter().map(|i| format!("<li>{i}</li>")).collect();
+    format!(
+        "<div class=\"card\"><div class=\"card-title\">偵測盲點（結果乾淨不代表沒事）</div>\
+         <ul style=\"padding-left:1.25rem;line-height:1.8\">{list}</ul></div>"
+    )
+}
+
+/// Which Sigma rules could fire on this run, from the analyzer's `sigma_rule`
+/// observations: a summary line, the settings that would unlock the most rules, and a
+/// collapsible list of every rule that cannot run or could not be checked. Empty when
+/// no Sigma rules were loaded.
+fn sigma_rules_panel(observations: &[cairn_core::Observation], findings: &[Finding]) -> String {
+    use cairn_core::observation::{LoggingRequirement, RuleViability, SigmaRuleStatus};
+    use std::collections::BTreeMap;
+    let rules: Vec<(&cairn_core::Observation, &SigmaRuleStatus)> = observations
+        .iter()
+        .filter(|o| o.category == cairn_core::observation::CATEGORY_SIGMA_RULE)
+        .filter_map(|o| o.sigma_rule.as_ref().map(|s| (o, s)))
+        .collect();
+    if rules.is_empty() {
+        return String::new();
+    }
+    let count = |v: RuleViability| rules.iter().filter(|(_, s)| s.viability == v).count();
+    let (runnable, missing, unknown) = (
+        count(RuleViability::Runnable),
+        count(RuleViability::MissingLogging),
+        count(RuleViability::Unknown),
+    );
+    let mut unlock: BTreeMap<LoggingRequirement, usize> = BTreeMap::new();
+    for (_, s) in &rules {
+        for r in &s.missing {
+            *unlock.entry(*r).or_default() += 1;
+        }
+    }
+    let mut unlock: Vec<(LoggingRequirement, usize)> = unlock.into_iter().collect();
+    unlock.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let unlock_html = if unlock.is_empty() {
+        String::new()
+    } else {
+        let items: String = unlock
+            .iter()
+            .map(|(r, n)| {
+                format!(
+                    "<li>{}：{n} 條規則需要</li>",
+                    crate::client_text::logging_requirement_text(*r)
+                )
+            })
+            .collect();
+        format!(
+            "<p style=\"margin-top:.5rem\">這台主機缺少的記錄設定：</p>\
+             <ul style=\"padding-left:1.25rem;line-height:1.8\">{items}</ul>"
+        )
+    };
+    let hits = |id: Option<&str>| {
+        findings
+            .iter()
+            .filter(|f| f.source == cairn_core::FindingSource::Sigma && f.rule_id.as_deref() == id)
+            .count()
+    };
+    let mut listed: Vec<&(&cairn_core::Observation, &SigmaRuleStatus)> = rules
+        .iter()
+        .filter(|(_, s)| s.viability != RuleViability::Runnable)
+        .collect();
+    listed.sort_by_key(|(o, s)| {
+        (
+            s.viability != RuleViability::MissingLogging,
+            o.title.as_str(),
+        )
+    });
+    let rows: String = listed
+        .iter()
+        .map(|(o, s)| {
+            let (status, reqs) = match s.viability {
+                RuleViability::MissingLogging => ("無法觸發", &s.missing),
+                _ => ("無法確認", &s.unknown),
+            };
+            let reqs: Vec<&str> = reqs
+                .iter()
+                .map(|r| crate::client_text::logging_requirement_text(*r))
+                .collect();
+            format!(
+                "<tr><td>{}</td><td>{}</td><td>{status}</td><td>{}</td><td>{}</td></tr>",
+                esc(&o.title),
+                esc(s.level.as_deref().unwrap_or("-")),
+                esc(&reqs.join("、")),
+                hits(s.rule_id.as_deref())
+            )
+        })
+        .collect();
+    let list_html = if listed.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<details style=\"margin-top:.5rem\"><summary>不能執行或無法確認的規則（{} 條）</summary>\
+             <table><tr><th>規則</th><th>等級</th><th>狀態</th><th>需要的記錄設定</th><th>命中</th></tr>{rows}</table></details>",
+            listed.len()
+        )
+    };
+    format!(
+        "<div class=\"card\"><div class=\"card-title\">Sigma 規則這次能不能跑</div>\
+         <p>這次載入 {} 條 Sigma 規則：<b>{runnable}</b> 條在這台主機的記錄上能觸發，\
+         <b>{missing}</b> 條因為缺少記錄設定不可能觸發，<b>{unknown}</b> 條無法確認。\
+         沒有命中的規則不代表沒有發生，只有「能觸發」的規則沒命中才有意義。</p>\
+         {unlock_html}{list_html}</div>",
+        rules.len()
+    )
+}
+
 pub fn html_report(
     findings: &[Finding],
     observations: &[cairn_core::Observation],
@@ -415,8 +622,17 @@ pub fn html_report(
     let netconn_html = netconn_panel(records);
     let process_html = process_panel(records);
     let execution_html = execution_panel(records);
-    let file_activity_html = file_activity_panel(records);
     let logon_html = logon_panel(records);
+    let overview_html = overview_panel(findings, records, manifest);
+    let blind_spots_html = blind_spots_panel(records, manifest);
+    let sigma_rules_html = sigma_rules_panel(observations, findings);
+    // Rule-viability observations have their own panel; the inventory lists host items.
+    let observations: Vec<cairn_core::Observation> = observations
+        .iter()
+        .filter(|o| o.category != cairn_core::observation::CATEGORY_SIGMA_RULE)
+        .cloned()
+        .collect();
+    let observations = observations.as_slice();
     let critical = count_sev(findings, Severity::Critical);
     let high = count_sev(findings, Severity::High);
     let medium = count_sev(findings, Severity::Medium);
@@ -424,15 +640,28 @@ pub fn html_report(
     let info = count_sev(findings, Severity::Info);
 
     let is_alert = critical > 0 || high > 0;
-    let verdict_bg = if is_alert { "#7f1d1d" } else { "#14532d" };
-    let verdict_txt = if is_alert {
-        "⚠ 發現高風險事件，請立即聯絡資安工程師"
+    // Nothing collected at all (no live records, no parsed events) is not a clean bill
+    // of health; say so instead of showing a green banner.
+    let no_data = records.is_empty() && manifest.counts.records == 0;
+    let (verdict_bg, verdict_txt) = if is_alert {
+        ("#7f1d1d", "⚠ 發現高風險事件，請立即聯絡資安工程師")
+    } else if no_data {
+        (
+            "#374151",
+            "沒有收集到可分析的資料，無法判斷這台主機是否安全",
+        )
+    } else if !blind_spots_html.is_empty() {
+        ("#14532d", "✓ 未發現高風險威脅（請看下方「偵測盲點」）")
     } else {
-        "✓ 未發現高風險威脅"
+        ("#14532d", "✓ 未發現高風險威脅")
     };
 
     let hostname = esc(&manifest.host.hostname);
-    let started = esc(&manifest.run.started_utc.to_rfc3339());
+    let started = manifest
+        .run
+        .started_utc
+        .format("%Y-%m-%d %H:%M:%S UTC")
+        .to_string();
     let admin = if manifest.privileges.admin {
         "是"
     } else {
@@ -553,6 +782,15 @@ pub fn html_report(
                     cairn_core::finding::FindingSource::Heuristic => "啟發式",
                 });
                 let desc = esc(f.details_client.as_deref().unwrap_or(&f.details));
+                // Sigma: always show rule title, DRL author, level and matched record.
+                let rule_html = crate::client_text::sigma_rule_line(f)
+                    .map(|l| {
+                        format!(
+                            "<div class=\"rule-line\" style=\"color:#6b7280;font-size:.8em;margin-top:.25rem\">{}</div>",
+                            esc(&l)
+                        )
+                    })
+                    .unwrap_or_default();
                 let ev_html = if f.evidence.is_empty() {
                     String::new()
                 } else {
@@ -586,7 +824,7 @@ pub fn html_report(
                   <td style=\"font-weight:500\">{title}</td>\
                   <td style=\"font-size:0.85em;color:#6b7280\">{mitre}</td>\
                   <td style=\"font-size:0.85em\">{src}</td>\
-                  <td style=\"font-size:0.85em;color:#374151\">{desc}{ev_html}</td>\
+                  <td style=\"font-size:0.85em;color:#374151\">{desc}{rule_html}{ev_html}</td>\
                 </tr>"
                 )
             })
@@ -617,7 +855,7 @@ pub fn html_report(
                 .collect();
             groups.push_str(&format!(
                 "<h3>{} ({})</h3><table><tr><th>項目</th><th>路徑</th><th>詳細</th></tr>{}</table>",
-                esc(cat),
+                esc(&crate::client_text::observation_category_label(cat)),
                 items.len(),
                 rows
             ));
@@ -649,7 +887,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
              text-transform:uppercase;letter-spacing:.05em;margin-bottom:.75rem}}
 .info-grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:.75rem}}
 .info-item label{{font-size:.75rem;color:#9ca3af}}
-.info-item p{{font-weight:500}}
+.info-item p{{font-weight:500;word-break:break-all}}
 .stats{{display:flex;gap:1rem;flex-wrap:wrap}}
 .stat{{flex:1;min-width:80px;background:#fff;border-radius:8px;
        padding:1rem;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.1)}}
@@ -679,6 +917,12 @@ tr:hover td{{background:#f9fafb}}
   <div class="info-item"><label>Sigma 規則版本</label><p>{rules_ver}</p></div>
 </div>
 </div>
+
+{overview_html}
+
+{blind_spots_html}
+
+{sigma_rules_html}
 
 <div class="stats">
   <div class="stat"><div class="stat-num" style="color:#b91c1c">{critical}</div><div class="stat-label">Critical</div></div>
@@ -712,13 +956,13 @@ tr:hover td{{background:#f9fafb}}
 
 {execution_html}
 
-{file_activity_html}
 
 {logon_html}
 
 {obs_html}
 
 <div class="footer">
+  <p>原始資料檔案：<a href="records.jsonl">records.jsonl</a> · <a href="findings.jsonl">findings.jsonl</a> · <a href="timeline.csv">timeline.csv</a> · <a href="manifest.json">manifest.json</a>（雜湊值見 manifest.json，可用 cairn verify 驗證）</p>
   <p>{int_note}</p>
   <p style="margin-top:.25rem">cairn v{tool_ver} &nbsp;·&nbsp; 報告產生時間：{generated}</p>
 </div>
@@ -764,6 +1008,9 @@ mod tests {
                 os_build: String::new(),
                 timezone: "UTC".into(),
                 wall_clock_utc_skew: "unknown".into(),
+                utc_offset_seconds: None,
+                reference_time_utc: None,
+                skew_seconds: None,
             },
             privileges: Privileges {
                 admin: true,
@@ -870,9 +1117,19 @@ mod tests {
 
     #[test]
     fn html_report_clean_verdict_when_no_high() {
-        let html = html_report(&[], &[], &[], &minimal_manifest());
+        let mut m = minimal_manifest();
+        m.counts.records = 10;
+        let html = html_report(&[], &[], &[], &m);
         assert!(html.contains("未發現高風險威脅"));
         assert!(!html.contains("發現高風險事件"));
+    }
+
+    /// No collected data is "cannot tell", never a green all-clear.
+    #[test]
+    fn html_report_says_no_data_instead_of_clean() {
+        let html = html_report(&[], &[], &[], &minimal_manifest());
+        assert!(html.contains("沒有收集到可分析的資料"), "{html}");
+        assert!(!html.contains("未發現高風險威脅"));
     }
 
     #[test]
@@ -882,6 +1139,18 @@ mod tests {
         f.artifact = "evtx:Security".into();
         let html = html_report(&[f], &[], &[], &minimal_manifest());
         assert!(html.contains("發現高風險事件"));
+    }
+
+    #[test]
+    fn html_report_shows_sigma_rule_line_and_raw_data_links() {
+        let mut f = Finding::new(Severity::High, "Rule T", FindingSource::Sigma);
+        f.rule_author = Some("Jane <x>".into());
+        f.evidence_ref = Some("77".into());
+        let html = html_report(&[f], &[], &[], &minimal_manifest());
+        assert!(html.contains("rule-line"), "rule line rendered");
+        assert!(html.contains("Jane &lt;x&gt;"), "author escaped and shown");
+        assert!(html.contains("record 77"));
+        assert!(html.contains("href=\"records.jsonl\""));
     }
 
     #[test]
@@ -967,6 +1236,83 @@ mod tests {
         let html = html_report(&[f], &[], &[], &minimal_manifest());
         assert!(!html.contains("eval("), "must not use eval()");
         assert!(!html.contains("innerHTML ="), "must not assign innerHTML");
+    }
+
+    fn rule_obs(
+        title: &str,
+        id: &str,
+        viability: cairn_core::observation::RuleViability,
+        missing: Vec<cairn_core::observation::LoggingRequirement>,
+        unknown: Vec<cairn_core::observation::LoggingRequirement>,
+    ) -> cairn_core::Observation {
+        let mut o =
+            cairn_core::Observation::new(cairn_core::observation::CATEGORY_SIGMA_RULE, title);
+        o.details = "technical".into();
+        o.sigma_rule = Some(cairn_core::observation::SigmaRuleStatus {
+            rule_id: Some(id.into()),
+            level: Some("high".into()),
+            viability,
+            requirements: missing.iter().chain(&unknown).copied().collect(),
+            missing,
+            unknown,
+        });
+        o
+    }
+
+    /// Rule-viability observations get their own panel (counts, the settings that would
+    /// unlock rules, the rules that cannot run) and stay out of the host inventory.
+    #[test]
+    fn sigma_rules_panel_lists_unrunnable_rules_and_settings() {
+        use cairn_core::observation::{LoggingRequirement as R, RuleViability as V};
+        let obs = vec![
+            rule_obs("Runs Fine", "a", V::Runnable, vec![], vec![]),
+            rule_obs(
+                "Needs 4688",
+                "b",
+                V::MissingLogging,
+                vec![R::ProcessCreationAudit],
+                vec![],
+            ),
+            rule_obs(
+                "Needs 4688 Too",
+                "c",
+                V::MissingLogging,
+                vec![R::ProcessCreationAudit, R::CommandLineIn4688],
+                vec![],
+            ),
+            rule_obs(
+                "Maybe <DC>",
+                "d",
+                V::Unknown,
+                vec![],
+                vec![R::DomainController],
+            ),
+        ];
+        let mut f = Finding::new(Severity::High, "Needs 4688", FindingSource::Sigma);
+        f.rule_id = Some("b".into());
+        let html = html_report(&[f], &obs, &[], &minimal_manifest());
+        assert!(html.contains("Sigma 規則這次能不能跑"));
+        assert!(
+            html.contains("這次載入 4 條 Sigma 規則：<b>1</b> 條"),
+            "{html}"
+        );
+        assert!(html.contains("<b>2</b> 條因為缺少記錄設定"));
+        assert!(html.contains("稽核「行程建立」（4688，預設關閉）：2 條規則需要"));
+        assert!(html.contains("不能執行或無法確認的規則（3 條）"));
+        assert!(html.contains("Maybe &lt;DC&gt;"), "titles are escaped");
+        assert!(
+            !html.contains("Runs Fine"),
+            "runnable rules are only counted"
+        );
+        assert!(
+            !html.contains("主機盤點"),
+            "rule statuses are not host inventory"
+        );
+    }
+
+    #[test]
+    fn sigma_rules_panel_absent_without_rule_observations() {
+        assert_eq!(sigma_rules_panel(&[], &[]), "");
     }
 
     /// Findings render their evidence list (collapsible "佐證來源"), and observations
@@ -1069,6 +1415,7 @@ mod tests {
             integrity: Some("medium".into()),
             user: None,
             start_time: None,
+            signer_source: None,
         })
     }
 
@@ -1107,6 +1454,7 @@ mod tests {
             sha1: None,
             user_sid: None,
             execution_confirmed: Some(true),
+            full_path: None,
         })
     }
 
@@ -1130,69 +1478,6 @@ mod tests {
         assert!(!html.contains("近期執行證據"));
     }
 
-    fn usn(reason: &str, path: &str, ymd: (i32, u32, u32)) -> cairn_core::Record {
-        cairn_core::Record::UsnEvent(cairn_core::record::UsnEventRecord {
-            ts: Utc.with_ymd_and_hms(ymd.0, ymd.1, ymd.2, 0, 0, 0).unwrap(),
-            path: path.into(),
-            reason: reason.into(),
-            mft_ref: 1,
-        })
-    }
-    fn motw_file(path: &str, zone: &str) -> cairn_core::Record {
-        cairn_core::Record::FileMeta(cairn_core::record::FileMetaRecord {
-            path: path.into(),
-            size: 0,
-            sha256: None,
-            si_btime: None,
-            si_mtime: None,
-            fn_btime: None,
-            fn_mtime: None,
-            zone_identifier: Some(zone.into()),
-            path_complete: None,
-        })
-    }
-
-    #[test]
-    fn file_activity_panel_motw_and_usn_filtered() {
-        let recs = vec![
-            usn(
-                "File_Create",
-                r"C:\Users\a\Downloads\dropper.exe",
-                (2026, 6, 1),
-            ),
-            usn("Basic_Info_Change", r"C:\noise.txt", (2026, 6, 2)), // filtered (not create/rename)
-            motw_file(r"C:\Users\a\Downloads\dropper.exe", "ZoneId=3"),
-        ];
-        let html = html_report(&[], &[], &recs, &minimal_manifest());
-        assert!(html.contains("可疑檔案活動 (1 個 MOTW 檔案 / 1 筆近期檔案事件)"));
-        assert!(html.contains("ZoneId=3"));
-        assert!(
-            !html.contains("noise.txt"),
-            "non-create/rename USN filtered"
-        );
-        // MOTW row before USN row
-        let motw_pos = html.find("ZoneId=3").unwrap();
-        let usn_pos = html.rfind("File_Create").unwrap();
-        assert!(motw_pos < usn_pos, "MOTW must sort before USN events");
-    }
-
-    #[test]
-    fn file_activity_panel_caps_usn_at_200() {
-        let mut recs = Vec::new();
-        for i in 0..250 {
-            recs.push(usn("File_Create", &format!(r"C:\f{i}.exe"), (2026, 6, 1)));
-        }
-        let html = html_report(&[], &[], &recs, &minimal_manifest());
-        assert!(html.contains("共 250 筆"), "must note total when capped");
-        assert!(html.contains("顯示前 200 筆"));
-    }
-
-    #[test]
-    fn file_activity_panel_absent_when_no_data() {
-        let html = html_report(&[], &[], &[], &minimal_manifest());
-        assert!(!html.contains("可疑檔案活動"));
-    }
-
     fn session(user: &str, ltype: &str, sid: u32, source: Option<&str>) -> cairn_core::Record {
         cairn_core::Record::LogonSession(cairn_core::record::LogonSessionRecord {
             user: user.into(),
@@ -1201,6 +1486,8 @@ mod tests {
             source: source.map(String::from),
             session_id: Some(sid),
             state_active: false,
+            logon_server: None,
+            session_state: None,
         })
     }
 
@@ -1233,6 +1520,8 @@ mod tests {
                 source: None,
                 session_id: Some(1),
                 state_active: true,
+                logon_server: None,
+                session_state: None,
             }),
             cairn_core::Record::LogonSession(cairn_core::record::LogonSessionRecord {
                 user: r"PC\bob".into(),
@@ -1241,6 +1530,8 @@ mod tests {
                 source: None,
                 session_id: Some(2),
                 state_active: false,
+                logon_server: None,
+                session_state: None,
             }),
         ];
         let html = html_report(&[], &[], &recs, &minimal_manifest());
@@ -1264,5 +1555,99 @@ mod tests {
         let html = html_report(&[], &[], &recs, &minimal_manifest());
         assert!(html.contains("網路連線"), "title must be renamed: {html}");
         assert!(!html.contains("對外連線"), "old title must be gone: {html}");
+    }
+
+    fn persist_record() -> cairn_core::Record {
+        cairn_core::Record::Persistence(cairn_core::record::PersistenceRecord {
+            mechanism: cairn_core::Mechanism::RunKey,
+            location: r"HKLM\Run".into(),
+            value: Some("x".into()),
+            command: Some(r"C:\Program Files\x.exe".into()),
+            binary_path: Some(r"C:\Program Files\x.exe".into()),
+            binary_sha256: None,
+            signed: Some(true),
+            signer: None,
+            last_write: None,
+            bound: None,
+            signer_source: None,
+            service_start: None,
+        })
+    }
+
+    fn event(channel: &str, eid: u32) -> cairn_core::Record {
+        cairn_core::Record::Event(cairn_core::record::EventRecord {
+            ts: Utc.with_ymd_and_hms(2026, 6, 27, 14, 0, 0).unwrap(),
+            channel: channel.into(),
+            event_id: eid,
+            provider: String::new(),
+            computer: String::new(),
+            record_id: 1,
+            data: serde_json::Map::new(),
+        })
+    }
+
+    #[test]
+    fn overview_marks_clean_high_and_unchecked_areas() {
+        let mut m = minimal_manifest();
+        m.sources.push(cairn_core::manifest::SourceEntry {
+            collector: cairn_core::collectors::NET.into(),
+            artifact: "netconn".into(),
+            path: "live:net".into(),
+            method: "api".into(),
+            size: 0,
+            sha256: String::new(),
+            errors: vec!["access denied".into()],
+        });
+        let mut f = Finding::new(Severity::High, "acct", FindingSource::Heuristic);
+        f.artifact = "account".into();
+        let html = overview_panel(&[f], &[persist_record(), event("Security", 4624)], &m);
+        assert!(html.contains("未發現異常（檢查了 1 筆）"), "{html}");
+        assert!(html.contains("發現 1 筆高風險"), "{html}");
+        assert!(html.contains("未檢查：access denied"), "{html}");
+        assert!(
+            html.contains("沒有收集到資料"),
+            "process area had no records: {html}"
+        );
+    }
+
+    #[test]
+    fn offline_overview_shows_only_event_log_areas() {
+        let mut m = minimal_manifest();
+        m.counts.records = 42;
+        let html = overview_panel(&[], &[], &m);
+        assert!(!html.contains("持久化"), "{html}");
+        assert!(html.contains("檢查了 42 筆"), "{html}");
+    }
+
+    #[test]
+    fn blind_spots_flag_missing_process_and_powershell_logging() {
+        let m = minimal_manifest();
+        let html = blind_spots_panel(&[persist_record(), event("Security", 4624)], &m);
+        assert!(html.contains("4688"), "{html}");
+        assert!(html.contains("4104"), "{html}");
+        let none = blind_spots_panel(
+            &[
+                event("Security", 4688),
+                event("Microsoft-Windows-PowerShell/Operational", 4104),
+            ],
+            &m,
+        );
+        assert!(none.is_empty(), "{none}");
+    }
+
+    #[test]
+    fn blind_spots_tell_non_admin_to_elevate() {
+        let mut m = minimal_manifest();
+        m.privileges.admin = false;
+        let html = blind_spots_panel(&[persist_record()], &m);
+        assert!(html.contains("系統管理員"), "{html}");
+    }
+
+    #[test]
+    fn report_places_overview_before_findings() {
+        let html = html_report(&[], &[], &[persist_record()], &minimal_manifest());
+        let ov = html.find("這次檢查了什麼").unwrap();
+        let fi = html.find("Findings（共").unwrap();
+        assert!(ov < fi);
     }
 }

