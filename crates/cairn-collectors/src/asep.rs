@@ -47,6 +47,51 @@ pub enum RegData {
 /// A key's values (default value under the name `""`) plus its LastWrite.
 pub type KeyValues = (Vec<(String, RegData)>, Option<DateTime<Utc>>);
 
+/// Longest string kept from one registry value, in chars. Real commands are far
+/// shorter; fileless malware parks megabyte payloads in values, and every record is
+/// cloned into findings and the HTML report. The head (where a launcher and its flags
+/// are) is kept.
+pub const MAX_REG_STRING_CHARS: usize = 256 * 1024;
+/// Most strings kept from one REG_MULTI_SZ value.
+pub const MAX_REG_MULTI_ENTRIES: usize = 4096;
+/// Most values read from one key.
+pub const MAX_REG_VALUES_PER_KEY: usize = 10_000;
+
+/// Registry values cut by a cap during this process (reported by the persist
+/// collector in its manifest entry, so a cut is never silent).
+pub static REG_VALUES_CAPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `data` within the caps above; true when something was cut. Pure, never panics
+/// (cuts on a char boundary).
+pub fn cap_reg_data(data: RegData) -> (RegData, bool) {
+    fn cap_str(s: String) -> (String, bool) {
+        match s.char_indices().nth(MAX_REG_STRING_CHARS) {
+            Some((at, _)) => (s[..at].to_string(), true),
+            None => (s, false),
+        }
+    }
+    match data {
+        RegData::Str(s) => {
+            let (s, cut) = cap_str(s);
+            (RegData::Str(s), cut)
+        }
+        RegData::Multi(v) => {
+            let mut cut = v.len() > MAX_REG_MULTI_ENTRIES;
+            let v = v
+                .into_iter()
+                .take(MAX_REG_MULTI_ENTRIES)
+                .map(|s| {
+                    let (s, c) = cap_str(s);
+                    cut |= c;
+                    s
+                })
+                .collect();
+            (RegData::Multi(v), cut)
+        }
+        RegData::Other => (RegData::Other, false),
+    }
+}
+
 /// Read-only registry access used by the catalog. `values` returns every value of a
 /// key (default value under the name `""`) plus the key's LastWrite; `subkeys` lists
 /// child key names. Both return empty/None when the key is absent or unreadable.
@@ -714,11 +759,14 @@ pub fn ps_profile_paths(env: impl Fn(&str) -> Option<String>, homes: &[String]) 
 pub fn read_ps_profiles(paths: &[String]) -> Vec<PersistenceRecord> {
     let mut out = Vec::new();
     for path in paths {
-        let Ok(bytes) = std::fs::read(path) else {
+        // Only the excerpt is read: a planted multi-GB profile must not be loaded whole.
+        // Decoded by BOM (ISE and Windows PowerShell 5 often save UTF-16LE).
+        let Some(bytes) =
+            crate::read_head_capped(std::path::Path::new(path), PROFILE_EXCERPT_BYTES as u64)
+        else {
             continue;
         };
-        let excerpt = &bytes[..bytes.len().min(PROFILE_EXCERPT_BYTES)];
-        let text = String::from_utf8_lossy(excerpt)
+        let text = crate::decode_text(&bytes)
             .trim_start_matches('\u{feff}')
             .to_string();
         let last_write = std::fs::metadata(path)
@@ -778,7 +826,12 @@ impl RegRead for WinReg {
             .single()
         });
         let mut out = Vec::new();
-        for item in k.enum_values().flatten() {
+        let mut capped = 0u64;
+        for (i, item) in k.enum_values().flatten().enumerate() {
+            if i >= MAX_REG_VALUES_PER_KEY {
+                capped += 1;
+                break;
+            }
             let (name, raw) = item;
             let data = match raw.vtype {
                 RegType::REG_SZ | RegType::REG_EXPAND_SZ => k
@@ -791,7 +844,12 @@ impl RegRead for WinReg {
                     .unwrap_or(RegData::Other),
                 _ => RegData::Other,
             };
+            let (data, cut) = cap_reg_data(data);
+            capped += u64::from(cut);
             out.push((name, data));
+        }
+        if capped > 0 {
+            REG_VALUES_CAPPED.fetch_add(capped, std::sync::atomic::Ordering::Relaxed);
         }
         Some((out, lw))
     }
@@ -808,6 +866,25 @@ impl RegRead for WinReg {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Oversized strings are cut on a char boundary and multi-strings are capped; small
+    /// values pass through untouched.
+    #[test]
+    fn cap_reg_data_bounds_huge_values() {
+        let small = RegData::Str("cmd.exe /c x".into());
+        assert_eq!(cap_reg_data(small.clone()), (small, false));
+        let huge = "文".repeat(MAX_REG_STRING_CHARS + 10);
+        let (RegData::Str(s), true) = cap_reg_data(RegData::Str(huge)) else {
+            panic!("huge string must be cut");
+        };
+        assert_eq!(s.chars().count(), MAX_REG_STRING_CHARS);
+        let many = vec!["a".to_string(); MAX_REG_MULTI_ENTRIES + 1];
+        let (RegData::Multi(v), true) = cap_reg_data(RegData::Multi(many)) else {
+            panic!("multi must be capped");
+        };
+        assert_eq!(v.len(), MAX_REG_MULTI_ENTRIES);
+        assert_eq!(cap_reg_data(RegData::Other), (RegData::Other, false));
+    }
 
     /// In-memory registry: (hive, lowercased key) -> values; subkeys derived from keys.
     #[derive(Default)]

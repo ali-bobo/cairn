@@ -44,6 +44,27 @@ pub fn tail_lines<R: Read>(
     max_lines: usize,
     max_line_bytes: usize,
 ) -> std::io::Result<Vec<(u64, String)>> {
+    tail_lines_counted(r, max_lines, max_line_bytes).map(|t| t.lines)
+}
+
+/// What [`tail_lines_counted`] read: the kept lines plus whether a cap dropped data.
+#[derive(Debug, Default)]
+pub struct Tail {
+    pub lines: Vec<(u64, String)>,
+    /// Lines in the whole stream (blank ones included).
+    pub total_lines: u64,
+    /// At least one line was longer than the per-line cap and was cut.
+    pub cut_long_line: bool,
+}
+
+/// [`tail_lines`], also reporting the total line count and whether a line was cut, so
+/// a caller can record that a cap was hit.
+pub fn tail_lines_counted<R: Read>(
+    r: R,
+    max_lines: usize,
+    max_line_bytes: usize,
+) -> std::io::Result<Tail> {
+    let mut cut_long_line = false;
     let mut reader = BufReader::new(r);
     let mut ring: VecDeque<(u64, Vec<u8>)> = VecDeque::with_capacity(max_lines.min(1024));
     let mut cur: Vec<u8> = Vec::new();
@@ -76,6 +97,7 @@ pub fn tail_lines<R: Read>(
             match buf[start..].iter().position(|&c| c == b'\n') {
                 Some(i) => {
                     let room = max_line_bytes.saturating_sub(cur.len());
+                    cut_long_line |= i > room;
                     cur.extend_from_slice(&buf[start..start + i.min(room)]);
                     flush(&mut cur, line_no, &mut ring);
                     in_line = false;
@@ -83,6 +105,7 @@ pub fn tail_lines<R: Read>(
                 }
                 None => {
                     let room = max_line_bytes.saturating_sub(cur.len());
+                    cut_long_line |= n - start > room;
                     cur.extend_from_slice(&buf[start..start + (n - start).min(room)]);
                     start = n;
                 }
@@ -94,7 +117,7 @@ pub fn tail_lines<R: Read>(
         flush(&mut cur, line_no, &mut ring);
     }
 
-    Ok(ring
+    let lines = ring
         .into_iter()
         .filter_map(|(no, bytes)| {
             let mut s = String::from_utf8_lossy(&bytes).into_owned();
@@ -104,7 +127,12 @@ pub fn tail_lines<R: Read>(
             let s = s.trim_end_matches('\r').to_string();
             (!s.trim().is_empty()).then_some((no, s))
         })
-        .collect())
+        .collect();
+    Ok(Tail {
+        lines,
+        total_lines: line_no,
+        cut_long_line,
+    })
 }
 
 /// Build the records for one history file from an already-opened reader. Pure given `r`.
@@ -132,8 +160,20 @@ pub fn history_records<R: Read>(
 /// Read every existing PSReadLine history for `homes`. Read-only: `File::open` (read
 /// access) only; a missing or unreadable file is skipped.
 pub fn read_psreadline_history(homes: &[String]) -> Vec<CommandHistoryRecord> {
+    read_psreadline_history_noted(homes, &mut Vec::new())
+}
+
+/// [`read_psreadline_history`], adding one note per file whose tail or line-length cap
+/// was hit (for the manifest: a capped read is partial, and must say so).
+pub fn read_psreadline_history_noted(
+    homes: &[String],
+    notes: &mut Vec<String>,
+) -> Vec<CommandHistoryRecord> {
     let mut out = Vec::new();
     for (user, path) in psreadline_paths(homes) {
+        if cairn_core::paths::must_not_probe(&path) {
+            continue;
+        }
         let Ok(f) = std::fs::File::open(&path) else {
             continue;
         };
@@ -142,9 +182,43 @@ pub fn read_psreadline_history(homes: &[String]) -> Vec<CommandHistoryRecord> {
             .ok()
             .and_then(|m| m.modified().ok())
             .map(DateTime::<Utc>::from);
-        out.extend(history_records(&user, &path, f, last_write));
+        let Ok(tail) = tail_lines_counted(f, MAX_LINES, MAX_LINE_BYTES) else {
+            continue;
+        };
+        out.extend(records_from_tail(&user, &path, tail, last_write, notes));
     }
     out
+}
+
+/// Records for one file's tail, noting the caps it hit.
+fn records_from_tail(
+    user: &str,
+    path: &str,
+    tail: Tail,
+    last_write: Option<DateTime<Utc>>,
+    notes: &mut Vec<String>,
+) -> Vec<CommandHistoryRecord> {
+    if tail.total_lines > MAX_LINES as u64 {
+        notes.push(format!(
+            "{path}: {} lines, only the last {MAX_LINES} read (cap)",
+            tail.total_lines
+        ));
+    }
+    if tail.cut_long_line {
+        notes.push(format!(
+            "{path}: line(s) longer than {MAX_LINE_BYTES} bytes cut (cap)"
+        ));
+    }
+    tail.lines
+        .into_iter()
+        .map(|(line_no, command)| CommandHistoryRecord {
+            user: user.to_string(),
+            path: path.to_string(),
+            line_no,
+            command,
+            last_write,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -167,6 +241,42 @@ mod tests {
             r"C:\Users\alice\AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt"
         );
         assert_eq!(p[1].0, "bob");
+    }
+
+    /// Hitting the line or line-length cap is noted; a short file adds no note.
+    #[test]
+    fn caps_are_noted() {
+        let text: String = (1..=600).map(|i| format!("cmd {i}\n")).collect();
+        let tail = tail_lines_counted(Cursor::new(text.into_bytes()), MAX_LINES, 16).unwrap();
+        assert_eq!(tail.total_lines, 600);
+        assert!(!tail.cut_long_line);
+        let mut notes = Vec::new();
+        let recs = records_from_tail("u", "p", tail, None, &mut notes);
+        assert_eq!(recs.len(), MAX_LINES);
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("600 lines"), "{notes:?}");
+
+        let long = format!("{}\nshort\n", "x".repeat(100));
+        let tail = tail_lines_counted(Cursor::new(long.into_bytes()), MAX_LINES, 10).unwrap();
+        assert!(tail.cut_long_line);
+        let mut notes = Vec::new();
+        records_from_tail("u", "p", tail, None, &mut notes);
+        assert!(notes[0].contains("longer than"), "{notes:?}");
+
+        let tail = tail_lines_counted(Cursor::new(b"a\nb\n".to_vec()), MAX_LINES, 10).unwrap();
+        let mut notes = Vec::new();
+        records_from_tail("u", "p", tail, None, &mut notes);
+        assert!(notes.is_empty());
+    }
+
+    /// Random bytes (CR/LF soup, invalid UTF-8, tiny caps) never panic the tail reader.
+    #[test]
+    fn fuzzed_history_never_panics() {
+        let mut rng = cairn_core::fuzz::Rng::new(0x415);
+        for i in 0..2000 {
+            let bytes = rng.bytes(512);
+            let _ = tail_lines_counted(Cursor::new(bytes), i % 7, i % 13).unwrap();
+        }
     }
 
     #[test]
