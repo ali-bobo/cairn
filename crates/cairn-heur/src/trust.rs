@@ -50,6 +50,28 @@ pub const USER_WRITABLE_DIRS: &[&str] = &[
 /// Start Menu lives here). Excluded from the `\ProgramData\` drop zone.
 pub const MICROSOFT_PROGRAMDATA: &str = r"\programdata\microsoft\";
 
+/// Folders inside the Windows tree that ordinary users can create files in (the
+/// AppLocker-bypass list). Kept apart from [`USER_WRITABLE_DIRS`], whose callers
+/// rate a drop-zone hit on top of other signals; a caller that hands out the
+/// Windows-tree trust tier must check these too, or `C:\Windows\Tasks\x.exe` earns it.
+pub const WINDOWS_USER_WRITABLE_DIRS: &[&str] = &[
+    r"\windows\tasks\",
+    r"\windows\tracing\",
+    r"\windows\registration\crmlog\",
+    r"\spool\drivers\color\",
+    r"\system32\com\dmp\",
+    r"\syswow64\com\dmp\",
+    r"\system32\fxstmp\",
+    r"\syswow64\fxstmp\",
+];
+
+/// True if `path` is in one of [`WINDOWS_USER_WRITABLE_DIRS`] (any spelling
+/// [`normalize_path`] understands).
+pub fn is_windows_user_writable_dir(path: &str) -> bool {
+    let lower = normalize_path(path);
+    WINDOWS_USER_WRITABLE_DIRS.iter().any(|d| lower.contains(d))
+}
+
 /// Environment-variable and NT-namespace spellings of well-known folders, mapped to a
 /// representative drive path, so a path written `%APPDATA%\x.dll` or
 /// `\SystemRoot\System32\x.sys` is judged like its expanded form. Lowercase.

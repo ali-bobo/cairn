@@ -376,12 +376,14 @@ fn no_fixture_finding_is_dated_1601() {
     for n in names {
         let (records, f) = run(&n);
         for r in &records {
+            // 2009: many-events-system.evtx starts with the Windows 7 image's own
+            // build-time events (2009-07-14). A zero header would read 1601.
             if let Record::Event(e) = r {
-                assert!(e.ts.year() >= 2010, "{n}: {e:?}");
+                assert!(e.ts.year() >= 2009, "{n}: {e:?}");
             }
         }
         for x in f {
-            assert!(x.ts.year() >= 2010, "{n}: {}", x.title);
+            assert!(x.ts.year() >= 2009, "{n}: {}", x.title);
         }
     }
 }
@@ -410,4 +412,54 @@ fn print_findings() {
         );
         println!("{}", titles(&a.findings));
     }
+}
+
+/// A real System log (DeepBlueCLI many-events-system.evtx): 42 driver and vendor
+/// service installs from admin-only folders (VMware, Hyper-V, Bluetooth, .NET, Google
+/// Update, EMET), then 19 Metasploit psexec services. Before: 84 findings, 42 of them
+/// Low service installs and every psexec service reported two or three times. Now the
+/// trusted installs are inventory and each psexec service is one finding.
+#[test]
+fn system_log_service_install_noise_is_inventory() {
+    let cfg = Config::for_evtx(vec![fixture("many-events-system.evtx")], Some(rules_dir()));
+    let (_, _, analysis) = analyze(&cfg);
+    assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+    let f = &analysis.findings;
+    let inventory: Vec<&cairn_core::Observation> = analysis
+        .observations
+        .iter()
+        .filter(|o| o.category == cairn_heur::eventlog::OBS_SERVICE_INSTALL)
+        .collect();
+    assert_eq!(inventory.len(), 42, "{inventory:#?}");
+    let drivers = inventory
+        .iter()
+        .filter(|o| {
+            o.path
+                .as_deref()
+                .is_some_and(|p| p.to_ascii_lowercase().ends_with(".sys"))
+        })
+        .count();
+    assert_eq!(drivers, 23);
+    // No finding from a trusted install: every heuristic service finding is psexec.
+    let heur: Vec<&Finding> = f
+        .iter()
+        .filter(|x| x.event_id == Some(7045) && x.analyzer != SIGMA)
+        .collect();
+    assert_eq!(heur.len(), 19, "{}", titles(f));
+    assert!(heur
+        .iter()
+        .all(|x| x.analyzer == LATERAL && x.severity == Severity::High));
+    assert!(heur.iter().all(|x| has_technique(x, "T1543.003")));
+    // One heuristic finding per event.
+    let mut refs: Vec<&str> = heur
+        .iter()
+        .filter_map(|x| x.evidence_ref.as_deref())
+        .collect();
+    refs.sort_unstable();
+    refs.dedup();
+    assert_eq!(refs.len(), 19);
+    // Nothing else but the Sigma service rules (one flood finding, three single hits).
+    assert_eq!(f.len(), 23, "{}", titles(f));
+    assert!(f.iter().all(|x| x.event_id == Some(7045)));
+    assert_explained(f);
 }

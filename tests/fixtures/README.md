@@ -48,7 +48,8 @@ it against `SHA256SUMS`.
 | `metasploit-psexec-native-target-system.evtx` | DeepBlueCLI `evtx/` | Metasploit psexec: 7045 `%SYSTEMROOT%\<random>.exe`, getsystem `cmd.exe /c echo ... > \\.\pipe\...`, 7036 `param1` / `param2` / `Binary`, 104 |
 | `metasploit-psexec-powershell-target-system.evtx` | DeepBlueCLI `evtx/` | Metasploit psexec_psh: 7045 `%COMSPEC% ... powershell ... FromBase64String`, 7009, 104 |
 | `password-spray.evtx` | DeepBlueCLI `evtx/` | 294 x 4648, 41 accounts against one SMB server; TargetServerName = the local name, remote end in `IpAddress` |
-| `smb-password-guessing-security.evtx` | DeepBlueCLI `evtx/` | 3,561 x 4625 against Administrator from one address (largest file, 3.2 MB) |
+| `smb-password-guessing-security.evtx` | DeepBlueCLI `evtx/` | 3,561 x 4625 against Administrator from one address (3.2 MB) |
 | `new-user-security.evtx` | DeepBlueCLI `evtx/` | 4720 account created, 4728 / 4732 group adds (Administrators) |
 | `disablestop-eventlog.evtx` | DeepBlueCLI `evtx/` | 7040 `EventLog` start type set to disabled and back, 104 |
+| `many-events-system.evtx` | DeepBlueCLI `evtx/` | A lab host's real System log (4.2 MB): 42 driver / vendor service installs (7045) from System32\drivers and Program Files (VMware, Hyper-V, Bluetooth, .NET, Google Update, EMET), then 19 Metasploit psexec services; Windows 7 image events from 2009 |
 | `wmi-event-filter-persistance.evtx` | DeepBlueCLI `evtx/` | WMI-Activity 5857 / 5858 / 5859 / 5860 / 5861, one `CommandLineEventConsumer` binding |
