@@ -19,6 +19,9 @@ mod registry;
 mod run;
 mod verify;
 
+#[cfg(test)]
+mod real_evtx;
+
 use clap::Parser;
 use cli::{Cli, Cmd};
 

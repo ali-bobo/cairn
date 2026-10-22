@@ -36,22 +36,16 @@ fn output_dir(cfg: &Config) -> PathBuf {
     }
 }
 
-pub fn run(files: Vec<PathBuf>, rules: Option<PathBuf>) -> anyhow::Result<()> {
-    let started_utc = chrono::Utc::now();
-    let cfg = Config::for_evtx(files, rules.or_else(output::default_rules_dir));
-    let dir = output_dir(&cfg);
-    std::fs::create_dir_all(&dir)?;
-    let guard = output::init_file_logging(&dir);
-
-    tracing::info!(
-        "cairn {} ({}) starting",
-        env!("CARGO_PKG_VERSION"),
-        BUILD_SHA
-    );
-    tracing::info!("{}", evtx_plan(&cfg));
-
-    // Open each input, parse it, log the read with its record count. A failed file is
-    // logged and skipped, never fatal (graceful degrade, golden rule 8).
+/// Parse every input file and run the event-only analyzer set (plus Sigma) over the
+/// records: `(records, hostname, analysis)`, findings stamped with the host and sorted.
+/// A file that fails to parse is logged and skipped, never fatal (golden rule 8).
+pub(crate) fn analyze(
+    cfg: &Config,
+) -> (
+    Vec<cairn_core::Record>,
+    String,
+    cairn_core::orchestrator::AnalysisOutcome,
+) {
     let files: &[PathBuf] = match &cfg.target {
         Target::Files(f) => f,
         _ => &[],
@@ -77,13 +71,31 @@ pub fn run(files: Vec<PathBuf>, rules: Option<PathBuf>) -> anyhow::Result<()> {
         events.into_iter().map(cairn_core::Record::Event).collect();
 
     // Built-in event-log heuristics run with or without Sigma rules.
-    let analyzers = registry::analyzers(&cfg, Mode::Evtx, output::load_sigma(&cfg));
-    let analysis = cairn_core::orchestrator::run_analyzers(&records, &analyzers);
-    let mut findings = analysis.findings;
-    for f in &mut findings {
+    let analyzers = registry::analyzers(cfg, Mode::Evtx, output::load_sigma(cfg));
+    let mut analysis = cairn_core::orchestrator::run_analyzers(&records, &analyzers);
+    for f in &mut analysis.findings {
         f.host = hostname.clone();
     }
-    output::sort_findings(&mut findings);
+    output::sort_findings(&mut analysis.findings);
+    (records, hostname, analysis)
+}
+
+pub fn run(files: Vec<PathBuf>, rules: Option<PathBuf>) -> anyhow::Result<()> {
+    let started_utc = chrono::Utc::now();
+    let cfg = Config::for_evtx(files, rules.or_else(output::default_rules_dir));
+    let dir = output_dir(&cfg);
+    std::fs::create_dir_all(&dir)?;
+    let guard = output::init_file_logging(&dir);
+
+    tracing::info!(
+        "cairn {} ({}) starting",
+        env!("CARGO_PKG_VERSION"),
+        BUILD_SHA
+    );
+    tracing::info!("{}", evtx_plan(&cfg));
+
+    let (records, hostname, analysis) = analyze(&cfg);
+    let mut findings = analysis.findings;
     tracing::info!(findings = findings.len(), "analysis complete");
 
     // The data outputs are written first so their SHA-256s can be embedded into the
