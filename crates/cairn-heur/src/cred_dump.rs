@@ -36,7 +36,7 @@ const NTDS: &str = "T1003.003";
 /// [`crate::trust::exe_name`] of the program, `cmd` the normalized command line.
 pub fn dump_technique(prog: &str, cmd: &str) -> Option<DumpTechnique> {
     let t = |label, mitre| Some(DumpTechnique { label, mitre });
-    if cmd.contains("comsvcs") && (cmd.contains("minidump") || cmd.contains("#24")) {
+    if cmd.contains("comsvcs") && (cmd.contains("minidump") || has_numeric_ordinal(cmd)) {
         return t("comsvcs.dll MiniDump (LOLBin process dump)", LSASS_MEMORY);
     }
     if (prog.starts_with("procdump") || cmd.contains("procdump")) && cmd.contains("lsass") {
@@ -51,7 +51,7 @@ pub fn dump_technique(prog: &str, cmd: &str) -> Option<DumpTechnique> {
     if cmd.contains("out-minidump") {
         return t("PowerShell Out-Minidump", LSASS_MEMORY);
     }
-    if prog == "reg"
+    if (prog == "reg" || invokes(cmd, "reg", &["save", "export"]))
         && [" save ", " export "].iter().any(|v| cmd.contains(v))
         && [
             "hklm\\sam",
@@ -64,7 +64,9 @@ pub fn dump_technique(prog: &str, cmd: &str) -> Option<DumpTechnique> {
     {
         return t("reg save of the SAM / SECURITY hive", SAM);
     }
-    if prog == "ntdsutil" && (cmd.contains("ifm") || cmd.contains("ac i ntds")) {
+    if (prog == "ntdsutil" || invokes(cmd, "ntdsutil", &[]))
+        && (cmd.contains("ifm") || cmd.contains("ac i ntds"))
+    {
         return t("ntdsutil IFM copy of the AD database", NTDS);
     }
     if cmd.contains("ntds.dit")
@@ -75,6 +77,31 @@ pub fn dump_technique(prog: &str, cmd: &str) -> Option<DumpTechnique> {
         return t("copy of ntds.dit", NTDS);
     }
     None
+}
+
+/// A rundll32 export given by ordinal: `#24`, `#+24`, `#0024`, `#-4294967272` (wraps
+/// to 24). comsvcs.dll has no legitimate rundll32 entry point, so any numeric ordinal
+/// on it counts.
+fn has_numeric_ordinal(cmd: &str) -> bool {
+    cmd.match_indices('#').any(|(i, _)| {
+        let rest = &cmd[i + 1..];
+        let rest = rest.strip_prefix(['+', '-']).unwrap_or(rest);
+        rest.starts_with(|c: char| c.is_ascii_digit())
+    })
+}
+
+/// True when some command in a chain (`cmd /c a & reg save ...`,
+/// `powershell -c "reg.exe save ..."`) runs `exe`, followed by one of `verbs` when any
+/// are given. Token based, so `reg` inside another word never matches.
+fn invokes(cmd: &str, exe: &str, verbs: &[&str]) -> bool {
+    let toks: Vec<&str> = cmd
+        .split(|c: char| c.is_whitespace() || matches!(c, '&' | '|' | ';' | '(' | ')'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    toks.iter().enumerate().any(|(i, t)| {
+        crate::trust::exe_name(t) == exe
+            && (verbs.is_empty() || toks.get(i + 1).is_some_and(|v| verbs.contains(v)))
+    })
 }
 
 fn file_name_lower(path: &str) -> String {
@@ -143,12 +170,21 @@ fn file_finding(fl: &FileListingRecord, severity: Severity, reason: String) -> F
             .unwrap_or_else(|| "-".into()),
     );
     f.reason = Some(reason);
-    f.details_client = Some(format!(
-        "在 {} 找到一個記憶體傾印檔。攻擊者常把系統登入程序（LSASS）的記憶體存成這種檔案，\
-         再從中取出帳號密碼；請確認這個檔案是誰、為了什麼產生的，若無法說明，\
-         應視為密碼可能已外洩並更換相關帳號密碼。",
-        fl.path
-    ));
+    f.details_client = Some(if matches!(severity, Severity::High | Severity::Critical) {
+        format!(
+            "在 {} 找到一個以系統登入程序（LSASS）命名的記憶體傾印檔。攻擊者常把 LSASS 的記憶體\
+             存成這種檔案，再從中取出帳號密碼；請確認這個檔案是誰、為了什麼產生的，若無法說明，\
+             應視為密碼可能已外洩並更換相關帳號密碼。",
+            fl.path
+        )
+    } else {
+        format!(
+            "在 {} 找到一個記憶體傾印檔。它可能只是一般程式當機時留下的傾印，也可能是攻擊者\
+             改名後的系統登入程序（LSASS）記憶體；請確認這個檔案是哪個程式、為了什麼產生的，\
+             若無法說明，再進一步調查並考慮更換相關帳號密碼。",
+            fl.path
+        )
+    });
     f.entity.file = Some(EntityFile {
         path: fl.path.clone(),
         sha256: None,
@@ -296,6 +332,24 @@ mod tests {
                 LSASS_MEMORY,
             ),
             ("rundll32 comsvcs.dll #24 624 out.bin full", LSASS_MEMORY),
+            ("rundll32 comsvcs.dll #+24 624 out.bin full", LSASS_MEMORY),
+            ("rundll32 comsvcs.dll #0024 624 out.bin full", LSASS_MEMORY),
+            (
+                "rundll32.exe comsvcs.dll,#-4294967272 624 out.bin full",
+                LSASS_MEMORY,
+            ),
+            (
+                r"cmd.exe /c reg save HKLM\SAM C:\t\s & reg save HKLM\SYSTEM C:\t\y",
+                SAM,
+            ),
+            (
+                r#"powershell -c "C:\Windows\System32\reg.exe save hklm\security C:\t\x""#,
+                SAM,
+            ),
+            (
+                r#"cmd /c ntdsutil "ac i ntds" "ifm" "create full c:\t" q q"#,
+                NTDS,
+            ),
             (
                 "procdump64.exe -accepteula -ma lsass.exe l.dmp",
                 LSASS_MEMORY,
@@ -333,6 +387,9 @@ mod tests {
             "procdump -ma notepad.exe",
             r"C:\Windows\System32\svchost.exe -k netsvcs",
             "ntdsutil snapshot",
+            // A word that merely contains "reg" is not reg.exe.
+            r"C:\Tools\regsave.exe save HKLM\SAM",
+            r"cmd /c echo reg-save HKLM\SAM",
         ] {
             assert!(run(&[proc(cmd)]).is_empty(), "{cmd}");
         }
@@ -346,8 +403,15 @@ mod tests {
             f[0].entity.file.as_ref().unwrap().path,
             r"C:\Users\Public\lsass.dmp"
         );
+        assert!(f[0].details_client.as_deref().unwrap().contains("LSASS"));
         let f = run(&[file(r"C:\Windows\Temp\debug.bin", Some("MDMP"))]);
         assert_eq!(f[0].severity, Severity::Medium);
+        // An unnamed minidump is as likely an app crash dump: the client text says so.
+        assert!(
+            f[0].details_client.as_deref().unwrap().contains("當機"),
+            "{:?}",
+            f[0].details_client
+        );
         let f = run(&[file(r"C:\PerfLogs\lsass_1.dmp", Some("0011223344556677"))]);
         assert_eq!(f[0].severity, Severity::Medium);
         assert!(f[0].reason.as_deref().unwrap().contains("without the MDMP"));
