@@ -220,11 +220,18 @@ pub fn verify_zip(zip_path: &Path) -> Result<(Manifest, VerifyReport)> {
         let expected = s.split_whitespace().next().unwrap_or_default().to_string();
         check_hash(&file_name(zip_path), &expected, sha256_file(zip_path))
     });
+    // Directory entries are structure, not files; every other member must be listed.
+    let members: Vec<String> = ar
+        .file_names()
+        .map(|n| n.map_or_else(|_| "<undecodable member name>".into(), |c| c.into_owned()))
+        .filter(|n| !n.ends_with('/'))
+        .collect();
     let report = VerifyReport {
         outputs,
         sources: verify_sources(&manifest),
         no_outputs: manifest.outputs.is_empty(),
         archive,
+        extra: crate::unexpected(&manifest, members),
     };
     Ok((manifest, report))
 }
@@ -356,6 +363,29 @@ mod tests {
         assert_eq!(ev.size, 9);
         assert!(report.ok(), "{:?}", report.failures());
         assert_eq!(report.archive.as_ref().unwrap().status, CheckStatus::Ok);
+    }
+
+    /// A member the manifest does not list (added to the archive after the run) fails
+    /// verify as Unexpected even when there is no sidecar to catch the change.
+    #[test]
+    fn verify_zip_reports_unlisted_members() {
+        let dir = mk_dir("extra");
+        let zip_path = dir.join("x.zip");
+        let mut sink = ZipSink::new(&zip_path);
+        sink.write_timeline_csv(&[]).unwrap();
+        let mut m = manifest();
+        m.outputs = sink.outputs_so_far();
+        sink.write_manifest(&m).unwrap();
+        // A member slipped in that the manifest never listed.
+        sink.members
+            .push(("evidence/planted.txt".into(), Member::Bytes(b"x".to_vec())));
+        sink.finalize().unwrap();
+        std::fs::remove_file(sidecar_path(&zip_path)).unwrap();
+        let (_, report) = verify_zip(&zip_path).unwrap();
+        assert!(!report.ok());
+        assert_eq!(report.extra.len(), 1, "{:?}", report.extra);
+        assert_eq!(report.extra[0].file, "evidence/planted.txt");
+        assert_eq!(report.extra[0].status, CheckStatus::Unexpected);
     }
 
     /// Tampering with the archive breaks the sidecar check; a member whose bytes no

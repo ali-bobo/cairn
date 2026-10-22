@@ -309,6 +309,27 @@ pub(crate) fn write_output_safe(path: &std::path::Path, bytes: &[u8]) -> Result<
     Ok(())
 }
 
+/// [`write_output_safe`], but atomic: the bytes go to `<name>.partial` first and are
+/// then renamed over `path`. A crash mid-write leaves at most a `.partial` file (which
+/// `verify` reports as unexpected), never a truncated file under the real name. Used
+/// for the manifest, the file that vouches for every other output.
+pub(crate) fn write_output_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(cairn_core::CairnError::Other(format!(
+                "refusing to write through a symlinked output: {}",
+                path.display()
+            )));
+        }
+    }
+    let mut tmp = path.as_os_str().to_os_string();
+    tmp.push(".partial");
+    let tmp = std::path::PathBuf::from(tmp);
+    write_output_safe(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Writes results to a plain directory. S1 default. Off-target path recommended (FR16).
 /// Records each written file's SHA-256 so `finalize` can emit the manifest outputs
 /// (chain-of-custody, SRS §12).
@@ -394,9 +415,14 @@ impl OutputSink for DirSink {
         self.write_file("observations.jsonl", buf.as_bytes())
     }
 
+    /// Written last and atomically (see [`write_output_atomic`]): a run that dies
+    /// before this point leaves no manifest, so its outputs can never verify.
     fn write_manifest(&mut self, manifest: &Manifest) -> Result<()> {
         let json = serde_json::to_vec_pretty(manifest)?;
-        self.write_file("manifest.json", &json)
+        std::fs::create_dir_all(&self.dir)?;
+        write_output_atomic(&output_path(&self.dir, "manifest.json"), &json)?;
+        self.outputs.push(output_entry("manifest.json", &json));
+        Ok(())
     }
 
     fn write_html_report(
@@ -424,6 +450,10 @@ pub enum CheckStatus {
     Mismatch { expected: String, actual: String },
     /// File listed in the manifest is absent on disk.
     Missing,
+    /// File present in the output (directory or archive) but NOT listed in the
+    /// manifest: nothing vouches for it (planted, left by a crashed run, or added
+    /// after the fact).
+    Unexpected,
 }
 
 /// One verified entry: which file, and whether it matched.
@@ -447,6 +477,8 @@ pub struct VerifyReport {
     /// not a zip, or when the sidecar is absent (reported, not failed: the members are
     /// still verified against the manifest inside the archive).
     pub archive: Option<CheckResult>,
+    /// Files in the output that the manifest does not list ([`CheckStatus::Unexpected`]).
+    pub extra: Vec<CheckResult>,
 }
 
 impl VerifyReport {
@@ -462,6 +494,7 @@ impl VerifyReport {
             .iter()
             .chain(&self.sources)
             .chain(self.archive.as_ref())
+            .chain(&self.extra)
             .filter(|c| c.status != CheckStatus::Ok)
             .collect()
     }
@@ -537,7 +570,58 @@ pub fn verify_manifest(manifest: &Manifest, base_dir: &std::path::Path) -> Verif
         sources: verify_sources(manifest),
         no_outputs: manifest.outputs.is_empty(),
         archive: None,
+        extra: unexpected(manifest, list_files(base_dir)),
     }
+}
+
+/// Files a run writes into its output location that the manifest cannot list:
+/// itself, and run.log (still being written after the manifest).
+const UNLISTED_BY_DESIGN: &[&str] = &["manifest.json", "run.log"];
+
+/// `Unexpected` results for every name in `present` that the manifest neither lists
+/// nor exempts, sorted.
+pub(crate) fn unexpected(manifest: &Manifest, present: Vec<String>) -> Vec<CheckResult> {
+    let listed: std::collections::HashSet<&str> =
+        manifest.outputs.iter().map(|o| o.file.as_str()).collect();
+    let mut extra: Vec<CheckResult> = present
+        .into_iter()
+        .filter(|n| !listed.contains(n.as_str()) && !UNLISTED_BY_DESIGN.contains(&n.as_str()))
+        .map(|file| CheckResult {
+            file,
+            status: CheckStatus::Unexpected,
+        })
+        .collect();
+    extra.sort_by(|a, b| a.file.cmp(&b.file));
+    extra
+}
+
+/// Every non-directory entry under `dir`, as `/`-separated names relative to it.
+/// Symbolic links are listed (as entries), never followed; depth and count are capped
+/// so a hostile output directory cannot hang verify.
+fn list_files(dir: &std::path::Path) -> Vec<String> {
+    const MAX_DEPTH: usize = 32;
+    const MAX_ENTRIES: usize = 100_000;
+    let mut out = Vec::new();
+    let mut stack = vec![(dir.to_path_buf(), String::new(), 0usize)];
+    while let Some((d, prefix, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            if out.len() >= MAX_ENTRIES {
+                return out;
+            }
+            let name = format!("{prefix}{}", e.file_name().to_string_lossy());
+            match e.file_type() {
+                Ok(t) if t.is_dir() && depth < MAX_DEPTH => {
+                    stack.push((e.path(), format!("{name}/"), depth + 1));
+                }
+                Ok(t) if t.is_dir() => out.push(format!("{name}/")),
+                _ => out.push(name),
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -983,6 +1067,53 @@ mod tests {
         let report = verify_manifest(&manifest, &dir);
         assert!(!report.ok());
         assert_eq!(report.outputs[0].status, CheckStatus::Missing);
+    }
+
+    /// A file in the output dir that the manifest does not list fails verify as
+    /// Unexpected; manifest.json and run.log are exempt by design.
+    #[test]
+    fn verify_reports_extra_files() {
+        let dir = std::env::temp_dir().join("cairn_verify_extra_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(&dir);
+        sink.write_timeline_csv(&[]).unwrap();
+        let mut manifest = minimal_manifest();
+        manifest.outputs = sink.outputs_so_far();
+        sink.write_manifest(&manifest).unwrap();
+        std::fs::write(dir.join("run.log"), b"log").unwrap();
+        assert!(verify_manifest(&manifest, &dir).ok(), "clean dir verifies");
+
+        std::fs::create_dir_all(dir.join("evidence").join("evtx")).unwrap();
+        std::fs::write(dir.join("evidence").join("evtx").join("planted.evtx"), b"x").unwrap();
+        std::fs::write(dir.join("manifest.json.partial"), b"{").unwrap();
+        let report = verify_manifest(&manifest, &dir);
+        assert!(!report.ok(), "an unlisted file must fail verify");
+        let names: Vec<&str> = report.extra.iter().map(|c| c.file.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["evidence/evtx/planted.evtx", "manifest.json.partial"]
+        );
+        assert!(report
+            .extra
+            .iter()
+            .all(|c| c.status == CheckStatus::Unexpected));
+    }
+
+    /// The manifest is written via a .partial file and renamed: no .partial is left
+    /// behind, and the manifest is not listed among the outputs it vouches for.
+    #[test]
+    fn manifest_write_is_atomic_and_leaves_no_partial() {
+        let dir = std::env::temp_dir().join("cairn_manifest_atomic_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(&dir);
+        sink.write_findings_jsonl(&[]).unwrap();
+        let mut manifest = minimal_manifest();
+        manifest.outputs = sink.outputs_so_far();
+        sink.write_manifest(&manifest).unwrap();
+        assert!(dir.join("manifest.json").is_file());
+        assert!(!dir.join("manifest.json.partial").exists());
+        let back = read_manifest(&dir.join("manifest.json")).unwrap();
+        assert!(back.outputs.iter().all(|o| o.file != "manifest.json"));
     }
 
     /// A manifest that lists no outputs has nothing to vouch for: verify must fail
