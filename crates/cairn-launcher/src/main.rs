@@ -5,6 +5,7 @@ mod package;
 mod runner;
 mod summary;
 
+use cairn_core::paths::{on_system_drive, volume_of};
 use std::path::{Path, PathBuf};
 
 /// launcher 啟動時偵測到的環境
@@ -60,44 +61,6 @@ fn rules_ver(rules_dir: Option<&Path>) -> String {
     rules_dir
         .and_then(|d| cairn_sigma::ruleset::ruleset_version(d).ok())
         .unwrap_or_default()
-}
-
-/// The volume a Windows path lives on: `C:` (upper-cased) for a drive path, or
-/// `\\SERVER\SHARE` for a UNC path; the `\\?\` / `\\?\UNC\` verbatim prefixes are
-/// understood. None when the path names no volume (relative). Pure string logic so it
-/// is testable off Windows.
-fn volume_of(path: &str) -> Option<String> {
-    let p = path.trim();
-    let (p, unc) = if let Some(rest) = p.strip_prefix(r"\\?\UNC\") {
-        (rest, true)
-    } else if let Some(rest) = p.strip_prefix(r"\\?\") {
-        (rest, false)
-    } else if let Some(rest) = p.strip_prefix(r"\\") {
-        (rest, true)
-    } else {
-        (p, false)
-    };
-    if unc {
-        let mut parts = p.split(['\\', '/']).filter(|s| !s.is_empty());
-        let server = parts.next()?;
-        let share = parts.next()?;
-        return Some(format!(r"\\{}\{}", server, share).to_uppercase());
-    }
-    let b = p.as_bytes();
-    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
-        .then(|| p[..2].to_ascii_uppercase())
-}
-
-/// True when `output` is on the same volume as `system_root` (%SystemRoot%), i.e.
-/// evidence would be written onto the disk under investigation.
-fn on_system_drive(output: &Path, system_root: &str) -> bool {
-    match (
-        volume_of(&output.display().to_string()),
-        volume_of(system_root),
-    ) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
 }
 
 /// Warn (zh-TW) and ask before writing evidence onto the system drive. Default N.
@@ -313,31 +276,6 @@ mod tests {
                 PathBuf::from(r"C:\more")
             ])
         );
-    }
-
-    #[test]
-    fn volume_of_drive_unc_and_verbatim_paths() {
-        assert_eq!(volume_of(r"c:\Tools\cairn\output"), Some("C:".into()));
-        assert_eq!(volume_of(r"\\?\D:\cairn\output"), Some("D:".into()));
-        assert_eq!(volume_of(r"\\srv\share\cairn"), Some(r"\\SRV\SHARE".into()));
-        assert_eq!(
-            volume_of(r"\\?\UNC\srv\share\x"),
-            Some(r"\\SRV\SHARE".into())
-        );
-        assert_eq!(volume_of("output"), None);
-    }
-
-    #[test]
-    fn system_drive_detection() {
-        assert!(on_system_drive(
-            Path::new(r"C:\Users\a\Desktop\cairn\output"),
-            r"C:\WINDOWS"
-        ));
-        assert!(!on_system_drive(
-            Path::new(r"E:\cairn\output"),
-            r"C:\Windows"
-        ));
-        assert!(!on_system_drive(Path::new("relative"), r"C:\Windows"));
     }
 
     #[test]
