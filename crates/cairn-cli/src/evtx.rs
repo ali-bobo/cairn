@@ -4,7 +4,7 @@
 use crate::output::{self, BUILD_SHA};
 use crate::registry::{self, Mode};
 use cairn_core::traits::OutputSink;
-use cairn_core::{Config, OutputKind, Target};
+use cairn_core::{Config, OutputKind, SourceEntry, Target};
 use cairn_report::{client_text, DirSink};
 use std::path::PathBuf;
 
@@ -36,6 +36,21 @@ fn output_dir(cfg: &Config) -> PathBuf {
     }
 }
 
+/// Manifest entry for an input file that could not be read completely (graceful
+/// degrade is recorded, not only logged). No sha256: the entry records the failure,
+/// it does not vouch for the file's bytes.
+fn input_failure_entry(path: &std::path::Path, errors: Vec<String>) -> SourceEntry {
+    SourceEntry {
+        collector: "evtx".into(),
+        artifact: "evtx".into(),
+        path: path.display().to_string(),
+        method: "file".into(),
+        size: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        sha256: String::new(),
+        errors,
+    }
+}
+
 pub fn run(files: Vec<PathBuf>, rules: Option<PathBuf>) -> anyhow::Result<()> {
     let started_utc = chrono::Utc::now();
     let cfg = Config::for_evtx(files, rules.or_else(output::default_rules_dir));
@@ -57,15 +72,14 @@ pub fn run(files: Vec<PathBuf>, rules: Option<PathBuf>) -> anyhow::Result<()> {
         _ => &[],
     };
     let mut events = Vec::new();
+    let mut input_errors = Vec::new();
     for path in files {
-        match cairn_collectors::evtx::parse_evtx(path) {
-            Ok(recs) => {
-                tracing::info!(file = %path.display(), records = recs.len(), "parsed evtx");
-                events.extend(recs);
-            }
-            Err(e) => {
-                tracing::warn!(file = %path.display(), error = %e, "skipped (parse failed)");
-            }
+        let (recs, errors) = cairn_collectors::evtx::parse_evtx_contained(path);
+        tracing::info!(file = %path.display(), records = recs.len(), "parsed evtx");
+        events.extend(recs);
+        if !errors.is_empty() {
+            tracing::warn!(file = %path.display(), errors = ?errors, "evtx input incomplete");
+            input_errors.push(input_failure_entry(path, errors));
         }
     }
     tracing::info!(records = events.len(), "evtx parse complete");
@@ -99,7 +113,8 @@ pub fn run(files: Vec<PathBuf>, rules: Option<PathBuf>) -> anyhow::Result<()> {
     // No live collectors ran: the selected module is the evtx engine itself.
     manifest.run.profile = "standard".into();
     manifest.run.selected_modules = vec!["evtx".into()];
-    manifest.sources = analysis.errors;
+    manifest.sources = input_errors;
+    manifest.sources.extend(analysis.errors);
     for f in &mut findings {
         client_text::fill_details_client(f, manifest.run.started_utc);
     }
@@ -132,6 +147,19 @@ mod tests {
         assert!(line.contains("2 file(s)"), "{line}");
         assert!(line.contains("rules=./rules"), "{line}");
         assert!(line.contains("output="), "{line}");
+    }
+
+    /// An unreadable input is recorded for the manifest with its reason, no hash.
+    #[test]
+    fn unreadable_input_becomes_a_manifest_source_with_errors() {
+        let p = PathBuf::from("/definitely/missing/Security.evtx");
+        let (evs, errs) = cairn_collectors::evtx::parse_evtx_contained(&p);
+        assert!(evs.is_empty());
+        let e = input_failure_entry(&p, errs);
+        assert_eq!(e.collector, "evtx");
+        assert!(e.path.ends_with("Security.evtx"));
+        assert!(!e.errors.is_empty());
+        assert!(e.sha256.is_empty(), "verify must not try to re-hash it");
     }
 
     #[test]
