@@ -45,10 +45,19 @@ pub fn run_verify(manifest_path: &Path, rules: Option<PathBuf>) -> anyhow::Resul
              established (a real run always records its outputs)"
         );
     }
+    for c in &report.sources {
+        match &c.status {
+            cairn_report::CheckStatus::Ok => tracing::info!(file = %c.file, "source unchanged"),
+            _ => tracing::warn!(
+                file = %c.file,
+                "source changed or not reachable here since collection (expected for a \
+                 live log, or when verifying off the target); not an output-integrity failure"
+            ),
+        }
+    }
     for c in report
         .outputs
         .iter()
-        .chain(report.sources.iter())
         .chain(report.archive.iter())
         .chain(report.extra.iter())
     {

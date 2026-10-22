@@ -468,6 +468,11 @@ pub struct CheckResult {
 #[derive(Debug, Default)]
 pub struct VerifyReport {
     pub outputs: Vec<CheckResult>,
+    /// Source files re-hashed at their recorded host paths. Informational only: a live
+    /// log keeps growing after collection, and verify normally runs on the analyst's
+    /// machine where the target's paths do not exist, so a changed or missing source is
+    /// reported but never fails `ok()`. Integrity rests on the outputs, which include
+    /// the exported EVTX copies.
     pub sources: Vec<CheckResult>,
     /// The manifest lists no outputs at all. A manifest is only ever written by a real
     /// (non-dry-run) run, which always produces outputs, so an empty list means there is
@@ -488,13 +493,21 @@ impl VerifyReport {
         !self.no_outputs && self.failures().is_empty()
     }
 
-    /// Just the failing entries (mismatch or missing), for reporting.
+    /// Just the failing entries (output mismatch, missing or unexpected), for
+    /// reporting. Source drift is not a failure; see [`Self::source_changes`].
     pub fn failures(&self) -> Vec<&CheckResult> {
         self.outputs
             .iter()
-            .chain(&self.sources)
             .chain(self.archive.as_ref())
             .chain(&self.extra)
+            .filter(|c| c.status != CheckStatus::Ok)
+            .collect()
+    }
+
+    /// Sources that changed or are not reachable from here since collection.
+    pub fn source_changes(&self) -> Vec<&CheckResult> {
+        self.sources
+            .iter()
             .filter(|c| c.status != CheckStatus::Ok)
             .collect()
     }
@@ -986,6 +999,35 @@ mod tests {
             report.failures()
         );
         assert_eq!(report.outputs.len(), 2);
+    }
+
+    /// A host source that is gone or changed (verify on the analyst's machine, or a
+    /// live log that kept growing) is reported, not a verify failure.
+    #[test]
+    fn source_drift_is_reported_but_does_not_fail_verify() {
+        use cairn_core::manifest::SourceEntry;
+        let dir = std::env::temp_dir().join("cairn_verify_source_drift_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut sink = DirSink::new(dir.clone());
+        sink.write_timeline_csv(&[]).unwrap();
+        sink.write_findings_jsonl(&[]).unwrap();
+
+        let mut manifest = minimal_manifest();
+        manifest.outputs = sink.outputs_so_far();
+        manifest.sources = vec![SourceEntry {
+            collector: "evtx_live".into(),
+            artifact: "evtx_live:Security".into(),
+            path: dir.join("not-on-this-machine.evtx").display().to_string(),
+            method: "file".into(),
+            size: 1,
+            sha256: "00".repeat(32),
+            errors: vec![],
+        }];
+        let report = verify_manifest(&manifest, &dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(report.source_changes().len(), 1);
+        assert!(report.failures().is_empty(), "{:?}", report.failures());
+        assert!(report.ok());
     }
 
     /// A live/API source (empty sha256, `live:` pseudo-path — e.g. a process or net
