@@ -426,6 +426,26 @@ pub fn is_under_windows_tree(path: &str) -> bool {
         .is_some_and(|rest| rest.starts_with(r":\windows\"))
 }
 
+/// True when a service ImagePath's executable sits directly in the Windows folder
+/// (`%SYSTEMROOT%\x.exe`, `C:\Windows\x.exe`, any drive), not in a subfolder such as
+/// System32. That folder is the root of the `ADMIN$` share: PsExec-style tools copy
+/// their service binary there (real Metasploit psexec 7045: `%SYSTEMROOT%\duKhLYUX.exe`),
+/// and no stock service runs from it.
+pub fn is_windows_root_exe(image: &str) -> bool {
+    let lower = image.trim().trim_start_matches('"').to_ascii_lowercase();
+    let rest = [r"%systemroot%\", r"%windir%\", r"\systemroot\"]
+        .iter()
+        .find_map(|p| lower.strip_prefix(p))
+        .or_else(|| lower.get(1..).and_then(|r| r.strip_prefix(r":\windows\")));
+    let Some(rest) = rest else {
+        return false;
+    };
+    match rest.find(".exe") {
+        Some(end) => end > 0 && !rest[..end].contains(['\\', '/', ' ']),
+        None => false,
+    }
+}
+
 /// True if `path` is under the Windows tree or Program Files (either bitness).
 /// Both require admin to write — "system or vendor-installed" trust tier (S4 gate).
 pub fn is_system_or_program_files(path: &str) -> bool {

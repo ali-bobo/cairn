@@ -8,8 +8,9 @@
 //!   it, the PsExec / Impacket pattern of copying a binary and starting it as a
 //!   service.
 //! - **Remote-execution service** (7045 whose name or ImagePath is PsExec's
-//!   `PSEXESVC`, points into `ADMIN$` / `\\127.0.0.1\`, or runs `%COMSPEC%` /
-//!   `cmd.exe /c` as the service binary, as smbexec does): High, with the network
+//!   `PSEXESVC`, points into `ADMIN$` / `\\127.0.0.1\`, runs `%COMSPEC%` /
+//!   `cmd.exe /c` as the service binary, as smbexec does, or is an exe directly in
+//!   the Windows folder, where Metasploit psexec / PAExec / RemCom copy it): High, with the network
 //!   logon (4624 type 3) or admin-share access that preceded it within the window
 //!   named as the likely source.
 //! - **NewCredentials logons** (4624 type 9, logon process `seclogo`), grouped per
@@ -27,16 +28,44 @@
 //!   least [`NEW_ACCOUNT_LOOKBACK_HOURS`] of earlier Security log. Console / loopback
 //!   / empty sources are ignored.
 //! - **Explicit-credential logons to another host** (Security 4648 whose
-//!   TargetServerName is neither localhost nor this computer, and whose target account
-//!   differs from the caller), grouped per (caller, target account, server, process):
-//!   Medium, T1021 / T1550 context. Same-account 4648s (lsass / svchost re-using the
-//!   caller's own credentials) are the noise and are skipped.
+//!   TargetServerName is neither localhost nor this computer — or names this computer
+//!   while `IpAddress` is remote, see below — and whose target account differs from
+//!   the caller), grouped per (caller, server, process) with the target accounts
+//!   listed: Medium, T1021 / T1550 context; High with T1110.003 when one group used
+//!   at least [`EXPLICIT_SPRAY_ACCOUNTS`] different accounts (password spraying over
+//!   SMB). Same-account 4648s (lsass / svchost re-using the caller's own
+//!   credentials) are the noise and are skipped.
 //! - **WMI-Activity** (`Microsoft-Windows-WMI-Activity/Operational`): 5861 permanent
 //!   consumer bound (T1546.003): High for CommandLine / ActiveScript consumers, Medium
 //!   for other consumer types, the stock BVTConsumer / SCM Event Log Consumer skipped.
 //!   5860 temporary consumer registered (T1047): Medium, skipped when a system
 //!   account registered it from this computer. 5857 provider loaded (T1047): Medium
 //!   only when the provider DLL is in a user-writable folder.
+//!
+//! Field names checked against real logs (`tests/fixtures/README.md` names the files):
+//! - 5140 / 5145: `ShareName` (`\\*\ADMIN$`), `RelativeTargetName` (5145),
+//!   `IpAddress`, `IpPort`, `SubjectUserName`, `SubjectDomainName`. Confirmed.
+//! - 7045: `ServiceName`, `ImagePath`, `AccountName`. Confirmed (Metasploit psexec
+//!   puts its exe directly in `%SYSTEMROOT%\`, the ADMIN$ root: flagged too).
+//! - 4624: `LogonType` (a number), `IpAddress` (`::ffff:` prefix seen),
+//!   `LogonProcessName` (`seclogo` for type 9), `TargetUserName`. Confirmed.
+//! - 4648: `SubjectUserName`, `TargetUserName`, `TargetServerName`, `TargetInfo`,
+//!   `ProcessId`, `ProcessName`, `IpAddress`, `IpPort`. Confirmed, with a correction:
+//!   an SMB logon to a remote IP is logged with TargetServerName = this computer's
+//!   own name and the remote end only in `IpAddress` (port 445, ProcessName empty,
+//!   PID 4), so that address is the target. Winlogon / lsass 4648s for this host
+//!   (`localhost`, machine-account caller) stay skipped.
+//! - RemoteConnectionManager 1149: UserData `EventXML` { `Param1` user, `Param2`
+//!   domain, `Param3` source address }. Confirmed.
+//! - WMI-Activity 5857: `Operation_StartedOperational` { `ProviderName`, `Code`,
+//!   `HostProcess`, `ProcessID`, `ProviderPath` }. 5860: `Operation_TemporaryEssStarted`
+//!   { `NamespaceName` (not `Namespace`), `Query`, `User`, `Processid`, `ClientMachine`,
+//!   `PossibleCause` }; ClientMachine is the NetBIOS name, cut to 15 characters, so it
+//!   is compared to the computer name with that cut. 5861: `Operation_ESStoConsumerBinding`
+//!   { `Namespace`, `ESS`, `CONSUMER`, `PossibleCause` }. Confirmed.
+//! - NOT yet checked against a real log (no public sample found): LocalSessionManager
+//!   21 / 24 / 25 (`User`, `SessionID`, `Address` in UserData `EventXML`) and 4778
+//!   (`AccountName`, `AccountDomain`, `ClientAddress`).
 //!
 //! The 5140 / 5145 events need "Audit File Share" auditing, which is off by default;
 //! without it only the 7045 path fires. 4778 needs "Other Logon/Logoff Events"
@@ -54,7 +83,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::cmdline::{event_field, event_str};
 use crate::rmm::is_public_ip;
-use crate::trust::is_user_writable_path;
+use crate::trust::{is_user_writable_path, is_windows_root_exe};
 
 /// How long after a remote logon / share access a service install is tied to it.
 pub const CORRELATION_WINDOW_MINUTES: i64 = 10;
@@ -133,6 +162,12 @@ pub fn remote_exec_service(name: &str, image: &str) -> Option<&'static str> {
     let i = i.split_whitespace().collect::<Vec<_>>().join(" ");
     if i.starts_with("%comspec%") || i.contains("cmd.exe /c") || i.contains("cmd.exe /q /c") {
         return Some("service binary is a cmd /c one-liner (smbexec-style)");
+    }
+    if is_windows_root_exe(&i) {
+        return Some(
+            "service binary sits directly in the Windows folder, the ADMIN$ share root where \
+             PsExec-style tools (Metasploit psexec, PAExec, RemCom) copy their service exe",
+        );
     }
     None
 }
@@ -532,6 +567,29 @@ impl<'a> RdpInput<'a> {
 // Explicit credentials (4648)
 // ---------------------------------------------------------------------------
 
+/// Longest NetBIOS computer name. Windows logs the NetBIOS form in some fields
+/// (WMI-Activity 5860 `ClientMachine`), so a 16+ character DNS host name shows up cut
+/// to its first 15 characters (real log: Computer `DESKTOP-BZCP2020`, ClientMachine
+/// `DESKTOP-BZCP202`).
+const NETBIOS_NAME_MAX: usize = 15;
+
+/// True when two host names name the same computer: same first DNS label, or one is
+/// the other's NetBIOS form (the label cut to [`NETBIOS_NAME_MAX`] characters).
+fn same_host(a: &str, b: &str) -> bool {
+    let (a, b) = (host_label(a), host_label(b));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let (short, long) = if a.chars().count() <= b.chars().count() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    a == b
+        || (short.chars().count() == NETBIOS_NAME_MAX
+            && long.chars().take(NETBIOS_NAME_MAX).eq(short.chars()))
+}
+
 /// True when a host name names this computer or the loopback (or is empty).
 fn is_local_target(server: &str, computer: &str) -> bool {
     let srv = server.trim();
@@ -540,19 +598,46 @@ fn is_local_target(server: &str, computer: &str) -> bool {
         || srv == "."
         || srv.eq_ignore_ascii_case("localhost")
         || is_loopback(srv)
-        || (!computer.trim().is_empty() && host_label(srv) == host_label(computer))
+        || same_host(srv, computer)
 }
 
-/// 4648 logons with another account's credentials to another host, grouped.
+/// Distinct target accounts one caller tried against one server (one process) at or
+/// above which the 4648 group reads as password spraying rather than one admin task.
+pub const EXPLICIT_SPRAY_ACCOUNTS: usize = 5;
+const PASSWORD_SPRAYING: &str = "T1110.003";
+
+/// Where a 4648 logon went, or None when it stayed on this computer.
+///
+/// `TargetServerName` is the primary answer. Real logs also show an SMB logon to a
+/// remote IP (`net use \\10.0.0.5 /user:...`) recorded with `TargetServerName` /
+/// `TargetInfo` = this computer's own name, the remote end only in `IpAddress` (with
+/// `IpPort` 445) — DeepBlueCLI `password-spray.evtx`. So a local-looking server name
+/// with a remote `IpAddress` counts as that address, unless the caller is the machine
+/// account: winlogon's 4648 for an incoming RDP / console logon also carries the
+/// client's address there.
+fn explicit_target(ev: &EventRecord, subject: &str) -> Option<String> {
+    let server = s(ev, "TargetServerName").trim().to_string();
+    if !is_local_target(&server, &ev.computer) {
+        return Some(server);
+    }
+    if is_system_account(subject) {
+        return None;
+    }
+    let ip = s(ev, "IpAddress");
+    let ip = ip.trim().trim_start_matches("::ffff:");
+    (!is_not_remote(ip)).then(|| ip.to_string())
+}
+
+/// 4648 logons with another account's credentials to another host, grouped per
+/// (caller, server, process); the target accounts are listed in the finding.
 fn explicit_credential_findings(events: &[&EventRecord]) -> Vec<Finding> {
-    type Key = (String, String, String, String);
-    let mut groups: BTreeMap<Key, Vec<&EventRecord>> = BTreeMap::new();
+    type Key = (String, String, String);
+    let mut groups: BTreeMap<Key, Vec<(&EventRecord, String)>> = BTreeMap::new();
     for ev in events {
-        let server = s(ev, "TargetServerName");
-        if is_local_target(&server, &ev.computer) {
-            continue;
-        }
         let subject = account(ev, "SubjectUserName", "SubjectDomainName");
+        let Some(server) = explicit_target(ev, &subject) else {
+            continue;
+        };
         let target = account(ev, "TargetUserName", "TargetDomainName");
         let (sk, tk) = (account_key(&subject), account_key(&target));
         // Same account: the caller re-using its own credentials (the lsass / svchost
@@ -563,59 +648,105 @@ fn explicit_credential_findings(events: &[&EventRecord]) -> Vec<Finding> {
         groups
             .entry((
                 sk,
-                tk,
-                server.trim().to_ascii_lowercase(),
+                server.to_ascii_lowercase(),
                 s(ev, "ProcessName").trim().to_ascii_lowercase(),
             ))
             .or_default()
-            .push(ev);
+            .push((ev, server));
     }
     let mut out = Vec::new();
     for list in groups.values() {
-        let first = list[0];
+        let (first, server) = (list[0].0, list[0].1.clone());
         let subject = account(first, "SubjectUserName", "SubjectDomainName");
-        let target = account(first, "TargetUserName", "TargetDomainName");
-        let server = s(first, "TargetServerName").trim().to_string();
-        let process = match s(first, "ProcessName").trim() {
-            "" => "-".to_string(),
-            p => p.to_string(),
+        let mut targets: Vec<String> = Vec::new();
+        for (ev, _) in list {
+            let t = account(ev, "TargetUserName", "TargetDomainName");
+            if !targets.iter().any(|x| account_key(x) == account_key(&t)) {
+                targets.push(t);
+            }
+        }
+        // An SMB logon is made by the kernel's SMB client: ProcessName empty, PID 4.
+        let process = match (s(first, "ProcessName").trim(), s(first, "ProcessId").trim()) {
+            ("" | "-", "0x4" | "4") => "System (kernel SMB client, PID 4)".to_string(),
+            ("" | "-", _) => "-".to_string(),
+            (p, _) => p.to_string(),
         };
-        let mut f = base(
-            first,
-            Severity::Medium,
-            format!("以其他帳號憑證連到其他主機：{server}"),
-            &[REMOTE_SERVICES, ALT_AUTH],
-        );
+        let spray = targets.len() >= EXPLICIT_SPRAY_ACCOUNTS;
+        let shown: Vec<&str> = targets.iter().take(10).map(String::as_str).collect();
+        let more = targets.len() - shown.len();
+        let target_list = if more > 0 {
+            format!("{} (+{more} more)", shown.join(", "))
+        } else {
+            shown.join(", ")
+        };
+        let mut f = if spray {
+            base(
+                first,
+                Severity::High,
+                format!("以多個帳號憑證嘗試登入其他主機：{server}"),
+                &[REMOTE_SERVICES, ALT_AUTH, PASSWORD_SPRAYING],
+            )
+        } else {
+            base(
+                first,
+                Severity::Medium,
+                format!("以其他帳號憑證連到其他主機：{server}"),
+                &[REMOTE_SERVICES, ALT_AUTH],
+            )
+        };
         f.user = Some(subject.clone());
         f.details = format!(
-            "{} explicit-credential logon(s) (4648) by {subject} as {target} to {server} via \
-             {process}, first {}",
+            "{} explicit-credential logon(s) (4648) by {subject} to {server} via {process} \
+             with {} account(s): {target_list}; first {}",
             list.len(),
+            targets.len(),
             fmt_ts(first.ts)
         );
-        f.reason = Some(format!(
-            "{process} running as {subject} supplied the credentials of {target} to log on to \
-             {server} ({} time(s), 4648); another account's credentials used against another \
-             host is what runas / net use / PsExec -u and stolen-credential lateral movement \
-             look like",
-            list.len()
-        ));
-        for ev in list.iter().take(5) {
+        f.reason = Some(if spray {
+            format!(
+                "{process} running as {subject} supplied the credentials of {} different \
+                 accounts to log on to {server} ({} time(s), 4648): {target_list}; one caller \
+                 cycling through many accounts against one host is password spraying / \
+                 credential stuffing",
+                targets.len(),
+                list.len()
+            )
+        } else {
+            format!(
+                "{process} running as {subject} supplied the credentials of {target_list} to \
+                 log on to {server} ({} time(s), 4648); another account's credentials used \
+                 against another host is what runas / net use / PsExec -u and \
+                 stolen-credential lateral movement look like",
+                list.len()
+            )
+        });
+        for (ev, _) in list.iter().take(5) {
             f.evidence.push(evidence(
                 ev,
                 format!(
-                    "EID 4648: {subject} -> {target} on {server} via {process} \
-                     (TargetInfo={}, IpAddress={})",
+                    "EID 4648: {subject} -> {} on {server} via {process} \
+                     (TargetServerName={}, TargetInfo={}, IpAddress={}, IpPort={})",
+                    account(ev, "TargetUserName", "TargetDomainName"),
+                    s(ev, "TargetServerName"),
                     s(ev, "TargetInfo"),
-                    s(ev, "IpAddress")
+                    s(ev, "IpAddress"),
+                    s(ev, "IpPort")
                 ),
             ));
         }
-        f.details_client = Some(format!(
-            "帳號 {subject} 在這台主機上透過 {process}，改用另一個帳號 {target} 的密碼登入另一台電腦 {server}。\
-             IT 人員做維護時會這樣做，但攻擊者拿到密碼後橫向移動也會留下同樣的紀錄；\
-             請確認當時是否有人在做這項工作。"
-        ));
+        f.details_client = Some(if spray {
+            format!(
+                "帳號 {subject} 在這台主機上，用 {} 個不同帳號的密碼嘗試登入另一台電腦 {server}。\
+                 這是攻擊者猜測或試用竊得密碼（密碼噴灑）的典型行為；請確認這台主機是否遭到入侵。",
+                targets.len()
+            )
+        } else {
+            format!(
+                "帳號 {subject} 在這台主機上透過 {process}，改用另一個帳號 {target_list} 的密碼登入另一台電腦 {server}。\
+                 IT 人員做維護時會這樣做，但攻擊者拿到密碼後橫向移動也會留下同樣的紀錄；\
+                 請確認當時是否有人在做這項工作。"
+            )
+        });
         out.push(f);
     }
     out
@@ -761,7 +892,8 @@ fn wmi_findings(events: &[&EventRecord]) -> Vec<Finding> {
             "EID 5860 x{}: {user_d} from {} registered a temporary consumer in {}: {}",
             list.len(),
             or_dash(&client),
-            wf(ev, "Namespace"),
+            // 5860 names it `NamespaceName` (5861 uses `Namespace`); real-log verified.
+            or_dash(&wf(ev, "NamespaceName")),
             clip(&query, 400)
         );
         f.reason = Some(format!(
@@ -1179,7 +1311,7 @@ mod tests {
     fn share_access_then_service_install_is_high() {
         let f = run(&[
             share(0, "10.0.0.9", r"\\*\ADMIN$"),
-            service(3, "updsvc", r"C:\Windows\updsvc.exe"),
+            service(3, "updsvc", r"C:\Program Files\Upd\updsvc.exe"),
         ]);
         assert_eq!(f.len(), 1, "plain service: only the share finding");
         assert_eq!(f[0].severity, Severity::High);
@@ -1187,9 +1319,17 @@ mod tests {
         // Outside the window: stays Medium.
         let f = run(&[
             share(0, "10.0.0.9", r"\\*\ADMIN$"),
-            service(30, "updsvc", r"C:\Windows\updsvc.exe"),
+            service(30, "updsvc", r"C:\Program Files\Upd\updsvc.exe"),
         ]);
         assert_eq!(f[0].severity, Severity::Medium);
+        // The same exe copied to the ADMIN$ root (C:\Windows) is itself the remote-exec
+        // pattern (real Metasploit psexec: %SYSTEMROOT%\duKhLYUX.exe).
+        let f = run(&[service(3, "updsvc", r"%SYSTEMROOT%\updsvc.exe")]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].mitre, vec!["T1569.002", "T1021.002"]);
+        assert!(f[0].reason.as_deref().unwrap().contains("Windows folder"));
+        let f = run(&[service(3, "w", r"%SystemRoot%\System32\w.exe")]);
+        assert!(f.is_empty(), "{f:?}");
     }
 
     #[test]
@@ -1502,6 +1642,76 @@ mod tests {
         assert_eq!(f[0].evidence.len(), 2);
     }
 
+    /// Real shape (DeepBlueCLI password-spray.evtx): an SMB logon to a remote IP logs
+    /// this computer's own name as TargetServerName / TargetInfo, an empty
+    /// ProcessName, and the remote end only in IpAddress / IpPort 445.
+    fn smb_explicit(min: i64, target: &str, ip: &str) -> Record {
+        ev(
+            "Security",
+            4648,
+            min,
+            &[
+                ("SubjectUserName", "jwrig"),
+                ("SubjectDomainName", "WS1"),
+                ("TargetUserName", target),
+                ("TargetDomainName", "DOMAIN"),
+                ("TargetServerName", "WS1"),
+                ("TargetInfo", "WS1"),
+                ("ProcessId", "0x4"),
+                ("ProcessName", ""),
+                ("IpAddress", ip),
+                ("IpPort", "445"),
+            ],
+        )
+    }
+
+    #[test]
+    fn explicit_credentials_to_a_remote_address_under_the_local_name() {
+        let f = run(&[smb_explicit(0, "Administrator", "172.16.144.128")]);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].severity, Severity::Medium);
+        assert!(f[0].title.contains("172.16.144.128"), "{}", f[0].title);
+        // Loopback / no address under the local name stays local.
+        let f = run(&[
+            smb_explicit(0, "Administrator", "127.0.0.1"),
+            smb_explicit(1, "Administrator", "-"),
+        ]);
+        assert!(f.is_empty(), "{f:?}");
+        // winlogon's 4648 for an incoming logon: machine account caller, client IP.
+        let Record::Event(mut e) = smb_explicit(0, "bob", "10.0.0.9") else {
+            unreachable!()
+        };
+        e.data.insert("SubjectUserName".into(), "WS1$".into());
+        assert!(run(&[Record::Event(e)]).is_empty());
+    }
+
+    #[test]
+    fn explicit_credentials_for_many_accounts_are_one_spraying_finding() {
+        let names = [
+            "Administrator",
+            "jwright",
+            "bob",
+            "alice",
+            "svc_sql",
+            "carol",
+        ];
+        let recs: Vec<Record> = names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| smb_explicit(i as i64, n, "172.16.144.128"))
+            .collect();
+        let f = run(&recs);
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].severity, Severity::High);
+        assert_eq!(f[0].mitre, vec!["T1021", "T1550", "T1110.003"]);
+        let r = f[0].reason.as_deref().unwrap();
+        assert!(r.contains("6 different accounts"), "{r}");
+        // Below the account threshold: Medium, one finding listing the accounts.
+        let f = run(&recs[..EXPLICIT_SPRAY_ACCOUNTS - 1]);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].severity, Severity::Medium);
+    }
+
     #[test]
     fn explicit_credential_noise_is_quiet() {
         let lsass = r"C:\Windows\System32\lsass.exe";
@@ -1605,8 +1815,7 @@ mod tests {
             min,
             "Operation_TemporaryEssStarted",
             &[
-                ("Namespace", r"ROOT\CIMV2"),
-                ("ID", "1"),
+                ("NamespaceName", r"ROOT\CIMV2"),
                 ("Query", query),
                 ("User", user),
                 ("Processid", "4242"),
@@ -1635,7 +1844,20 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("remote machine ADMINPC"));
-        // Local system agents: quiet.
+        assert!(f[0].details.contains(r"ROOT\CIMV2"), "{}", f[0].details);
+        // Local system agents: quiet. ClientMachine is the NetBIOS name, cut to 15
+        // characters when the host name is longer (real WMI-Activity log).
+        let long = |min, user: &str, client: &str| {
+            let Record::Event(mut e) = temp_consumer(min, user, client, q) else {
+                unreachable!()
+            };
+            e.computer = "DESKTOP-BZCP2020".into();
+            Record::Event(e)
+        };
+        let f = run(&[long(0, r"NT AUTHORITY\LOCAL SERVICE", "DESKTOP-BZCP202")]);
+        assert!(f.is_empty(), "{f:?}");
+        let f = run(&[long(0, r"NT AUTHORITY\LOCAL SERVICE", "DESKTOP-BZCP")]);
+        assert_eq!(f.len(), 1, "a shorter, different name is another machine");
         let f = run(&[
             temp_consumer(0, r"NT AUTHORITY\SYSTEM", "WS1", q),
             temp_consumer(1, "S-1-5-18", "", q),
