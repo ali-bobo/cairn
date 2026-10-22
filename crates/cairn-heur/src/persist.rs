@@ -1252,6 +1252,40 @@ mod tests {
         assert!(evaluate_gate(&old, now).is_empty());
     }
 
+    /// Regression: a Run key running `powershell -e <base64>` (PowerShell's short
+    /// encoded flag) was plain inventory — no S9 hit at all.
+    #[test]
+    fn gate_s9_short_encoded_flag_is_high() {
+        let now = Utc::now();
+        let p = full_rec(
+            Mechanism::RunKey,
+            Some("U"),
+            Some("powershell.exe -w hidden -e SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA"),
+            Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            Some(true),
+            None,
+        );
+        let hits = evaluate_gate(&p, now);
+        assert!(
+            hits.iter()
+                .any(|h| h.severity == Severity::High && h.mitre == "T1059"),
+            "{:?}",
+            hits.iter().map(|h| &h.reason).collect::<Vec<_>>()
+        );
+        // noise: a plain PowerShell script from Program Files stays below High
+        let plain = full_rec(
+            Mechanism::RunKey,
+            Some("U"),
+            Some(r#"powershell.exe -ExecutionPolicy Bypass -File "C:\Program Files\V\start.ps1""#),
+            Some(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"),
+            Some(true),
+            None,
+        );
+        assert!(evaluate_gate(&plain, now)
+            .iter()
+            .all(|h| h.severity != Severity::High));
+    }
+
     #[test]
     fn gate_s9_script_persistence_tiers() {
         let now = Utc::now();

@@ -287,20 +287,52 @@ pub fn launchers_in(cmd: &str) -> Vec<String> {
     out
 }
 
+/// Dash look-alikes PowerShell's parameter binder accepts in place of `-` (en dash,
+/// em dash, horizontal bar).
+const PS_DASHES: &[char] = &['\u{2013}', '\u{2014}', '\u{2015}'];
+
+/// Text with the characters that obfuscate a command without changing what it does
+/// removed: cmd.exe carets (`p^owershell`), PowerShell backticks (`` Do`wnloadString ``)
+/// and quote characters inside words (`i"e"x`, `'Down'+'loadString'` keeps working
+/// for the substring scan once the quotes are gone). For matching only, never shown.
+pub fn deobfuscated(cmd: &str) -> String {
+    cmd.chars()
+        .filter(|c| !matches!(c, '^' | '`' | '"' | '\''))
+        .collect()
+}
+
 /// True if the command line carries a PowerShell encoded-command flag:
 /// `-EncodedCommand` or any prefix of it from `-enc` up, `-ec`, and — only when
-/// `is_powershell` — the bare `-e` short form (other tools use `-e` for unrelated
-/// things). Token-based: `--encoding` or `-encrypt` do not count.
+/// `is_powershell` — the short forms `-e` / `-en` (other tools use `-e` for unrelated
+/// things), the `/` prefix (`/enc`) and the dash look-alikes PowerShell also accepts
+/// (`–enc`). Token-based: `--encoding` or `-encrypt` do not count. Carets and quotes
+/// inside the flag (`-^e^n^c`) are ignored.
 pub fn has_encoded_flag(cmd: &str, is_powershell: bool) -> bool {
-    cmd.split_whitespace().any(|tok| {
-        let Some(flag) = tok.strip_prefix('-') else {
-            return false;
+    deobfuscated(cmd).split_whitespace().any(|tok| {
+        let flag = match tok.strip_prefix('-') {
+            Some(f) => f,
+            None if is_powershell => match tok
+                .strip_prefix(['/'])
+                .or_else(|| tok.strip_prefix(PS_DASHES))
+            {
+                Some(f) => f,
+                None => return false,
+            },
+            None => return false,
         };
         let flag = flag.to_ascii_lowercase();
         (flag.len() >= 3 && "encodedcommand".starts_with(&flag))
             || flag == "ec"
-            || (is_powershell && flag == "e")
+            || (is_powershell && (flag == "e" || flag == "en"))
     })
+}
+
+/// True when a PowerShell binary is named anywhere in the command line (as the
+/// invoked binary or further down a `cmd /c powershell ...` chain).
+pub fn mentions_powershell(cmd: &str) -> bool {
+    launchers_in(&deobfuscated(cmd))
+        .iter()
+        .any(|l| is_powershell(l))
 }
 
 /// True if `s` contains a token that really looks like base64 data: a run of the
@@ -393,14 +425,23 @@ const MARKERS: &[(Needle, &str, MarkerKind)] = &[
 /// Download / encoded-payload / remote markers in a command line or script body. The
 /// one marker scan shared by persistence (S9 script persistence, PowerShell profiles),
 /// event-log service/task commands and ClickFix Run-dialog entries. Labels are
-/// de-duplicated, in table order.
+/// de-duplicated, in table order. The scan ignores carets, backticks and quotes inside
+/// words ([`deobfuscated`]), and accepts PowerShell's short `-e` / `-en` encoded flag
+/// when the text runs PowerShell.
 pub fn script_markers(text: &str) -> Vec<ScriptMarker> {
-    let lower = text.to_ascii_lowercase();
+    let clean = deobfuscated(text);
+    let lower = clean.to_ascii_lowercase();
+    let powershell = mentions_powershell(&clean);
     let mut found: Vec<ScriptMarker> = Vec::new();
     for (needle, label, kind) in MARKERS {
         let hit = match needle {
             Needle::Sub(n) => lower.contains(n),
-            Needle::EncodedFlag => has_encoded_flag(text, false),
+            // The long forms count anywhere; the PowerShell-only short forms (`-e`,
+            // `-en`, `/enc`) also need a real base64 payload next to them.
+            Needle::EncodedFlag => {
+                has_encoded_flag(&clean, false)
+                    || (powershell && has_encoded_flag(&clean, true) && has_base64_token(&clean))
+            }
         };
         if hit && !found.iter().any(|m| m.label == *label) {
             found.push(ScriptMarker { label, kind: *kind });
@@ -595,6 +636,43 @@ mod tests {
         );
         assert!(!has_encoded_flag("tool --encoding utf8", false));
         assert!(!has_encoded_flag("tool -encrypt", false));
+    }
+
+    /// PowerShell also binds `-en`, `/enc` and dash look-alikes to -EncodedCommand,
+    /// and cmd carets inside the flag vanish before PowerShell sees it.
+    #[test]
+    fn encoded_flag_covers_powershell_spellings() {
+        for cmd in [
+            "powershell -en SQBF",
+            "powershell /enc SQBF",
+            "powershell \u{2013}enc SQBF",
+            "powershell -^e^n^c SQBF",
+        ] {
+            assert!(has_encoded_flag(cmd, true), "{cmd}");
+        }
+        // Outside PowerShell the short and slash forms mean something else.
+        assert!(!has_encoded_flag("tool -en x", false));
+        assert!(!has_encoded_flag("tool /enc x", false));
+        assert!(!has_encoded_flag("powershell -Environment x", true));
+    }
+
+    /// Regression: `powershell -e <base64>` (the most common encoded launch) was not
+    /// an Encoded marker, because the marker scan never passed `is_powershell`.
+    #[test]
+    fn script_markers_see_short_encoded_flag_and_obfuscation() {
+        let m = script_markers("powershell.exe -w hidden -e SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA");
+        assert!(m.iter().any(|m| m.kind == MarkerKind::Encoded), "{m:?}");
+        let m = script_markers(
+            r#""C:\Program Files\PowerShell\7\pwsh.exe" -en SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA"#,
+        );
+        assert!(m.iter().any(|m| m.kind == MarkerKind::Encoded), "{m:?}");
+        // cmd carets / PowerShell backticks / split quotes do not hide a download.
+        let m =
+            script_markers("cmd /c p^owershell (New-Object Net.WebClient).Do`wnload\"String\"(x)");
+        assert!(m.iter().any(|m| m.label == "DownloadString"), "{m:?}");
+        // noise: a short -e without a base64 payload, or -e for another tool
+        assert!(script_markers("powershell -e").is_empty());
+        assert!(script_markers("curl -e SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoA x").is_empty());
     }
 
     #[test]
