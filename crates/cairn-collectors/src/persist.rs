@@ -437,10 +437,12 @@ const IFEO_KEYS: &[&str] = &[
 /// the remainder; else None.
 #[allow(dead_code)]
 fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
-    } else {
-        None
+    // `get`, not indexing: prefix.len() may fall inside a non-ASCII character of `s`
+    // (an ImagePath like `abc\u{e9}...`), and a panic here would drop every
+    // persistence record of the run.
+    match (s.get(..prefix.len()), s.get(prefix.len()..)) {
+        (Some(head), Some(rest)) if head.eq_ignore_ascii_case(prefix) => Some(rest),
+        _ => None,
     }
 }
 
@@ -1428,6 +1430,23 @@ mod tests {
         assert_eq!(records[1].signed, Some(false));
         assert_eq!(records[2].signed, None); // verifier didn't know it
         assert_eq!(records[3].signed, None); // no binary_path -> not queried
+    }
+
+    #[test]
+    fn normalize_service_path_survives_non_ascii_at_prefix_boundary() {
+        // Regression: `s[..4]` panicked when byte 4 fell inside `é` (bytes 3..5),
+        // which would have dropped every persistence record of the run.
+        let windir = r"C:\Windows";
+        assert_eq!(
+            normalize_service_path("ab\\\u{e9}x.sys", windir),
+            "C:\\Windows\\ab\\\u{e9}x.sys"
+        );
+        assert_eq!(
+            normalize_service_path("\u{e9}\u{e9}", windir),
+            "C:\\Windows\\\u{e9}\u{e9}"
+        );
+        assert_eq!(strip_prefix_ci("abc\u{e9}", r"\??\"), None);
+        assert_eq!(strip_prefix_ci(r"\??\C:\x", r"\??\"), Some(r"C:\x"));
     }
 
     #[test]

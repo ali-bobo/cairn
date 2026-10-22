@@ -114,11 +114,16 @@ fn normalise_service_cmd(cmd: &str) -> String {
     if let Some(rest) = lower.strip_prefix(r"\systemroot\") {
         return format!(r"<win>\{rest}");
     }
-    // Drive-letter form: exactly one letter + ":\windows\" (11 chars total)
-    if lower.len() > 11 {
-        let (head, rest) = lower.split_at(11);
-        let chars: Vec<char> = head.chars().collect();
-        if chars[0].is_ascii_alphabetic() && chars[1] == ':' && &head[2..] == r"\windows\" {
+    // Drive-letter form: exactly one letter + ":\windows\" (11 bytes total). `get`
+    // instead of `split_at`: byte 11 may fall inside a non-ASCII character
+    // (`C:\Programé\x.exe`), which must not panic the analyzer.
+    if let (Some(head), Some(rest)) = (lower.get(..11), lower.get(11..)) {
+        let b = head.as_bytes();
+        if !rest.is_empty()
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && &head[2..] == r"\windows\"
+        {
             return format!(r"<win>\{rest}");
         }
     }
@@ -560,6 +565,14 @@ mod tests {
         assert!(!is_inbox_service_command(
             r#""C:\Program Files\WindowsApps\Claude_1.15\app\resources\cowork-svc.exe""#
         ));
+    }
+
+    /// Regression: a non-ASCII character spanning byte 11 panicked `split_at(11)`.
+    #[test]
+    fn non_ascii_service_path_does_not_panic() {
+        assert!(!is_inbox_service_command("C:\\Program\u{e9}\\x.exe"));
+        assert!(!is_inbox_service_command("C:\\Windows\u{e9}x\\a.exe"));
+        assert!(is_inbox_service_command(r"C:\Windows\System32\a.exe"));
     }
 
     #[test]
