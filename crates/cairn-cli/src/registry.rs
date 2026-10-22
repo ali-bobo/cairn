@@ -20,8 +20,9 @@ pub fn default_since(now: chrono::DateTime<chrono::Utc>) -> chrono::DateTime<chr
 /// Channels the live EVTX collector reads: whatever the loaded Sigma rules reference,
 /// plus the channels the built-in event-log heuristics need
 /// ([`cairn_heur::heuristic_channels`]: Security, System, Defender, Application,
-/// TerminalServices, WMI-Activity), so account, brute-force, log-clearing, RDP, WMI
-/// and VSS detections still run when no rules are loaded.
+/// TerminalServices, WMI-Activity, Sysmon), so account, brute-force, log-clearing, RDP,
+/// WMI, VSS and process-start (4688 / Sysmon 1 parent-child) detections still run when
+/// no rules are loaded.
 pub fn live_evtx_channels(sigma: Option<&[String]>) -> Vec<String> {
     let mut out: Vec<String> = sigma.map(<[String]>::to_vec).unwrap_or_default();
     for ch in cairn_heur::heuristic_channels() {
@@ -134,14 +135,15 @@ pub fn build_collectors(selected: &[String], ctx: &BuildCtx<'_>) -> Vec<Box<dyn 
 pub enum Mode {
     /// `cairn run`: every analyzer.
     Live,
-    /// `cairn evtx`: only analyzers that read EVTX events alone.
+    /// `cairn evtx`: only analyzers that have something to judge in EVTX events alone.
     Evtx,
 }
 
 struct AnalyzerEntry {
     name: &'static str,
-    /// Reads only `Record::Event`, so it also runs on offline EVTX files.
-    events_only: bool,
+    /// Judges event records (alone, or alongside live records), so it also runs on
+    /// offline EVTX files. False for analyzers that need live state only.
+    offline: bool,
     build: fn(&Config) -> Box<dyn Analyzer>,
 }
 
@@ -149,47 +151,47 @@ struct AnalyzerEntry {
 const ANALYZERS: &[AnalyzerEntry] = &[
     AnalyzerEntry {
         name: cairn_core::analyzers::PARENTCHILD,
-        events_only: false,
+        offline: true,
         build: |_| Box::new(cairn_heur::ParentChildHeuristic),
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::NETCONN,
-        events_only: false,
+        offline: false,
         build: |_| Box::new(cairn_heur::NetConnHeuristic),
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::PERSIST,
-        events_only: false,
+        offline: false,
         build: |_| Box::new(cairn_heur::PersistHeuristic),
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::ACCOUNT,
-        events_only: true,
+        offline: true,
         build: |_| Box::new(cairn_heur::AccountHeuristic),
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::EVENTLOG,
-        events_only: true,
+        offline: true,
         build: |_| Box::new(cairn_heur::EventLogHeuristic),
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::CLICKFIX,
-        events_only: false,
+        offline: false,
         build: |_| Box::new(cairn_heur::ClickFixHeuristic),
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::RMM,
-        events_only: false,
+        offline: false,
         build: |_| Box::new(cairn_heur::RmmHeuristic),
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::DEFENSE,
-        events_only: false,
+        offline: false,
         build: |_| Box::new(cairn_heur::DefenseHeuristic),
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::LOGON_BRUTEFORCE,
-        events_only: true,
+        offline: true,
         build: |cfg| {
             Box::new(cairn_heur::LogonBruteforceHeuristic::new(
                 chrono::Duration::minutes(cfg.logon_bruteforce_window_minutes),
@@ -201,17 +203,17 @@ const ANALYZERS: &[AnalyzerEntry] = &[
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::LATERAL,
-        events_only: true,
+        offline: true,
         build: |_| Box::new(cairn_heur::LateralHeuristic),
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::CRED_DUMP,
-        events_only: false,
+        offline: true,
         build: |_| Box::new(cairn_heur::CredDumpHeuristic),
     },
     AnalyzerEntry {
         name: cairn_core::analyzers::RANSOM,
-        events_only: false,
+        offline: true,
         build: |_| Box::new(cairn_heur::RansomHeuristic),
     },
 ];
@@ -224,7 +226,7 @@ pub fn analyzers(
 ) -> Vec<Box<dyn Analyzer>> {
     let selected: Vec<&AnalyzerEntry> = ANALYZERS
         .iter()
-        .filter(|a| mode == Mode::Live || a.events_only)
+        .filter(|a| mode == Mode::Live || a.offline)
         .collect();
     let mut names: Vec<&str> = selected.iter().map(|a| a.name).collect();
     let mut out: Vec<Box<dyn Analyzer>> = selected.iter().map(|a| (a.build)(cfg)).collect();
@@ -292,9 +294,11 @@ mod tests {
         assert_eq!(built, table);
     }
 
-    /// The offline path runs exactly the event-only subset of the live set.
+    /// The offline path runs exactly the event-reading subset of the live set:
+    /// process starts (4688 / Sysmon 1) feed parent-child, credential-dump and
+    /// ransomware command-line checks offline too.
     #[test]
-    fn evtx_mode_is_the_event_only_subset_of_live() {
+    fn evtx_mode_is_the_offline_subset_of_live() {
         let cfg = Config::default();
         let live: Vec<String> = analyzers(&cfg, Mode::Live, None)
             .iter()
@@ -307,10 +311,13 @@ mod tests {
         assert_eq!(
             evtx,
             vec![
+                cairn_core::analyzers::PARENTCHILD,
                 cairn_core::analyzers::ACCOUNT,
                 cairn_core::analyzers::EVENTLOG,
                 cairn_core::analyzers::LOGON_BRUTEFORCE,
-                cairn_core::analyzers::LATERAL
+                cairn_core::analyzers::LATERAL,
+                cairn_core::analyzers::CRED_DUMP,
+                cairn_core::analyzers::RANSOM,
             ]
         );
         assert!(evtx.iter().all(|n| live.contains(n)));
@@ -323,6 +330,7 @@ mod tests {
             .iter()
             .chain(cairn_heur::lateral::CHANNELS)
             .chain(cairn_heur::ransom::CHANNELS)
+            .chain(cairn_heur::parentchild::CHANNELS)
         {
             assert!(none.iter().any(|c| c == ch), "{ch} missing without Sigma");
         }
@@ -331,6 +339,7 @@ mod tests {
             "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational",
             "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
             "Microsoft-Windows-WMI-Activity/Operational",
+            "Microsoft-Windows-Sysmon/Operational",
         ] {
             assert!(none.iter().any(|c| c == ch), "{ch} missing without Sigma");
         }

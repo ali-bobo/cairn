@@ -1,4 +1,4 @@
-//! `cairn evtx <files>`: offline EVTX triage. Parses the files, runs the event-only
+//! `cairn evtx <files>`: offline EVTX triage. Parses the files, runs the offline
 //! analyzers from the shared registry (plus Sigma) through the same analyzer fan-in as
 //! the live run, and writes timeline/findings/report/manifest to the output dir.
 use crate::output::{self, BUILD_SHA};
@@ -51,7 +51,7 @@ fn input_failure_entry(path: &std::path::Path, errors: Vec<String>) -> SourceEnt
     }
 }
 
-/// Parse every input file and run the event-only analyzer set (plus Sigma) over the
+/// Parse every input file and run the offline analyzer set (plus Sigma) over the
 /// records: `(records, hostname, analysis)`, findings stamped with the host and sorted.
 /// A file that fails to parse is logged, recorded first in `analysis.errors` (it becomes
 /// a manifest source) and skipped, never fatal (golden rule 8).
