@@ -262,7 +262,17 @@ impl Analyzer for AccountHeuristic {
     }
 
     fn analyze(&self, records: &[Record], prior_findings: &[Finding]) -> Result<Vec<Finding>> {
-        let now = Utc::now();
+        // "Recent" is measured from the newest collected event, not the wall clock: an
+        // offline `cairn evtx` run on old logs must judge them as of their own end, and
+        // a live run's newest event is close to now anyway.
+        let now = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Event(ev) => Some(ev.ts),
+                _ => None,
+            })
+            .max()
+            .unwrap_or_else(Utc::now);
         let mut findings = Vec::new();
 
         for r in records {
@@ -484,14 +494,27 @@ mod tests {
 
     #[test]
     fn create_account_old_is_medium() {
+        // Recency is measured from the newest collected event (here a logon now).
+        let findings = run(&[
+            make_event(4720, "Security", old(), account_data("old_user", "admin")),
+            make_event(4624, "Security", Utc::now(), Map::new()),
+        ]);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].severity, Severity::Medium);
+    }
+
+    #[test]
+    fn recency_is_judged_from_the_newest_event_not_the_wall_clock() {
+        // Offline logs that end 120 days ago: an account created on their last day is
+        // recent for that log.
         let findings = run(&[make_event(
             4720,
             "Security",
             old(),
-            account_data("old_user", "admin"),
+            account_data("late_user", "admin"),
         )]);
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].severity, Severity::Medium);
+        assert_eq!(findings[0].severity, Severity::High);
     }
 
     #[test]

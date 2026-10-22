@@ -308,11 +308,12 @@ fn pass_the_hash_newcredentials_logon() {
     assert_explained(&f);
 }
 
-/// Account created and added to Administrators.
+/// Account created and added to Administrators. The creation is recent relative to
+/// the log's own end, so it rates High even though the sample is years old.
 #[test]
 fn new_local_admin_account() {
     let (_, f) = run("new-user-security.evtx");
-    assert_eq!(fired(&f, ACCOUNT, Severity::Medium, "T1136.001").len(), 1);
+    assert_eq!(fired(&f, ACCOUNT, Severity::High, "T1136.001").len(), 1);
     let admin = fired(&f, ACCOUNT, Severity::High, "T1098.007");
     assert_eq!(admin.len(), 1, "{}", titles(&f));
     assert!(admin[0].title.contains("Administrators"));
