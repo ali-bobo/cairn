@@ -38,8 +38,31 @@ pub fn is_device_path(path: &str) -> bool {
 }
 
 /// True when a collector must not open, stat or hash `path`: it is remote or a device.
+/// A drive letter mapped to a network share (`Z:\x.exe` after `net use Z: \\srv\s`)
+/// is remote too, but only the host knows which letters are mapped: collectors use
+/// [`must_not_probe_with`] with the host's drive-type check
+/// (`cairn_collectors_win::drive::must_not_probe`).
 pub fn must_not_probe(path: &str) -> bool {
     is_remote_path(path) || is_device_path(path)
+}
+
+/// [`must_not_probe`], plus: the path's drive letter is one `remote_drive` reports as
+/// a network drive. `remote_drive` is asked only for a drive-letter path.
+pub fn must_not_probe_with(path: &str, remote_drive: impl Fn(char) -> bool) -> bool {
+    must_not_probe(path) || drive_letter(path).is_some_and(remote_drive)
+}
+
+/// The drive letter (upper-cased) of a drive path: `C:\x`, `c:/x`, `C:x`, `C:`, a
+/// quoted `"C:\x" -arg`, or the verbatim `\\?\C:\x`. None for UNC, device, relative
+/// and empty paths.
+pub fn drive_letter(path: &str) -> Option<char> {
+    let p = path.trim_start_matches(['"', ' ']);
+    let p = strip_prefix_ci(p, r"\\?\")
+        .or_else(|| p.strip_prefix("//?/"))
+        .unwrap_or(p);
+    let b = p.as_bytes();
+    (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+        .then(|| char::from(b[0].to_ascii_uppercase()))
 }
 
 /// The volume a Windows path lives on: `C:` (upper-cased) for a drive path, or
@@ -104,6 +127,42 @@ mod tests {
             assert!(is_remote_path(p), "{p}");
             assert!(must_not_probe(p), "{p}");
         }
+    }
+
+    #[test]
+    fn drive_letters_of_every_spelling() {
+        for (p, want) in [
+            (r"C:\Windows\x.exe", Some('C')),
+            ("z:/share/x.exe", Some('Z')),
+            (r#""Z:\Tools\x.exe" -a"#, Some('Z')),
+            (r"\\?\Z:\x.exe", Some('Z')),
+            ("Y:", Some('Y')),
+            (r"\\srv\share\x.exe", None),
+            (r"\\.\pipe\x", None),
+            (r"\??\C:\x", None),
+            ("relative.exe", None),
+            ("", None),
+            ("1:\\x", None),
+            ("é:", None),
+        ] {
+            assert_eq!(drive_letter(p), want, "{p}");
+        }
+    }
+
+    /// A mapped network drive is never probed; a local drive letter, or a host that
+    /// reports no remote drives, changes nothing.
+    #[test]
+    fn mapped_network_drive_is_not_probed() {
+        let z_is_remote = |c: char| c == 'Z';
+        assert!(must_not_probe_with(r"Z:\Tools\evil.exe", z_is_remote));
+        assert!(must_not_probe_with(r#""z:\x.dll",Entry"#, z_is_remote));
+        assert!(!must_not_probe_with(r"C:\Windows\x.exe", z_is_remote));
+        assert!(!must_not_probe_with(r"Z:\x.exe", |_| false));
+        // UNC / device paths stay blocked whatever the drive check says.
+        assert!(must_not_probe_with(r"\\srv\s\x.exe", |_| false));
+        assert!(must_not_probe_with(r"\\.\pipe\x", |_| false));
+        // The drive check is not consulted for a path without a drive letter.
+        assert!(!must_not_probe_with("relative.exe", |_| panic!("asked")));
     }
 
     #[test]

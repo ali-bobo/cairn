@@ -13,6 +13,9 @@
 //!   the Windows folder, where Metasploit psexec / PAExec / RemCom copy it): High, with the network
 //!   logon (4624 type 3) or admin-share access that preceded it within the window
 //!   named as the likely source.
+//!   The same 7045 is also a service install for `heur_eventlog`, which runs first:
+//!   this finding absorbs that one (its technique T1543.003 and reason) under the
+//!   same-evidence rule (`dedup.rs`), so each service is reported once.
 //! - **NewCredentials logons** (4624 type 9, logon process `seclogo`), grouped per
 //!   (account, process): Low. `runas /netonly` and Mimikatz `sekurlsa::pth` both
 //!   produce it, so it is context for the other findings, not a verdict.
@@ -1058,7 +1061,14 @@ impl Analyzer for LateralHeuristic {
         Self::NAME
     }
 
-    fn analyze(&self, records: &[Record], _prior: &[Finding]) -> Result<Vec<Finding>> {
+    /// Runs after `heur_eventlog` (and so after Sigma): a remote-execution service is
+    /// the same 7045 that `heur_eventlog` reports as a service install, so this
+    /// analyzer's finding absorbs that one (same-evidence rule, `dedup.rs`).
+    fn depends_on(&self) -> &[&str] {
+        &[cairn_core::analyzers::EVENTLOG]
+    }
+
+    fn analyze(&self, records: &[Record], prior: &[Finding]) -> Result<Vec<Finding>> {
         let mut events: Vec<&EventRecord> = records
             .iter()
             .filter_map(|r| match r {
@@ -1266,7 +1276,12 @@ impl Analyzer for LateralHeuristic {
                  請確認是否為 IT 人員的遠端管理作業。",
                 sv.ts.format("%Y-%m-%d %H:%M UTC")
             ));
-            out.push(f);
+            f.analyzer = Self::NAME.to_string();
+            out.extend(crate::dedup::resolve(
+                f,
+                &crate::dedup::EvidenceKey::event(sv),
+                prior,
+            ));
         }
 
         // NewCredentials logons per (account, process).

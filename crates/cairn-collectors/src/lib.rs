@@ -24,11 +24,19 @@ pub mod wmi_subscription;
 
 pub use hash::hash_file_capped;
 
+/// True when a path taken from host data must not be opened, stat-ed or hashed: a UNC,
+/// device-namespace or mapped-network-drive path (see `cairn_core::paths::must_not_probe`
+/// for why probing one is unsafe; the drive check is
+/// `cairn_collectors_win::drive::is_remote_drive`). Every probe in this crate goes
+/// through it.
+pub fn must_not_probe(path: &str) -> bool {
+    cairn_collectors_win::drive::must_not_probe(path)
+}
+
 /// `exists()` for a path taken from host data, without ever touching the network or a
-/// device: a remote (UNC) or device-namespace path reads as absent (see
-/// `cairn_core::paths::must_not_probe` for why probing one is unsafe).
+/// device: a path [`must_not_probe`] rejects reads as absent.
 pub fn local_path_exists(path: &str) -> bool {
-    !cairn_core::paths::must_not_probe(path) && std::path::Path::new(path).exists()
+    !must_not_probe(path) && std::path::Path::new(path).exists()
 }
 
 /// Up to `cap` bytes from the start of `path`, opened read-only. Never reads more than
@@ -36,7 +44,7 @@ pub fn local_path_exists(path: &str) -> bool {
 /// None when the path is remote/device (see [`local_path_exists`]) or unreadable.
 pub fn read_head_capped(path: &std::path::Path, cap: u64) -> Option<Vec<u8>> {
     use std::io::Read;
-    if cairn_core::paths::must_not_probe(&path.to_string_lossy()) {
+    if must_not_probe(&path.to_string_lossy()) {
         return None;
     }
     let f = std::fs::File::open(path).ok()?;

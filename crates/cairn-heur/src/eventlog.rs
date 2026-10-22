@@ -7,13 +7,23 @@
 //! |---|---|---|---|
 //! | 1102 | Security | audit log cleared | T1070.001 |
 //! | 104 | System | event log cleared | T1070.001 |
-//! | 7045 | System | service installed | T1543.003 |
+//! | 7045 | System | service installed with a red flag (trusted installs are inventory) | T1543.003 |
 //! | 7040 | System | Windows Event Log service set to disabled | T1562.002 |
 //! | 4698 | Security | scheduled task created (needs "Other Object Access" audit) | T1053.005 |
 //! | 5001 | Defender | real-time protection turned off | T1562.001 |
 //! | 5007 | Defender | configuration changed (exclusion added) | T1562.001 |
 //! | 1116 | Defender | malware detected (PUA/adware Low–Medium, else High) | — |
 //! | 1117 / 1118 / 1119 | Defender | action taken / action failed (High) | — |
+//!
+//! A 7045 with no red flag whose binary sits in a folder only administrators can write
+//! is host inventory (observation category [`OBS_SERVICE_INSTALL`]), not a finding: see
+//! `assess_service`.
+//!
+//! Runs after Sigma; `heur_lateral` and `heur_defense` run after this analyzer. A
+//! per-event finding here follows the same-evidence rule (`dedup.rs`): skipped when a
+//! Sigma hit on the same event already says it, absorbed when `heur_lateral` reports
+//! the same 7045 as remote execution or `heur_defense` finds the 5007 exclusion still
+//! in the registry.
 //!
 //! Field names, checked against real logs (EVTX-ATTACK-SAMPLES, DeepBlueCLI samples;
 //! see `tests/fixtures/README.md`):
@@ -33,17 +43,18 @@
 
 use std::collections::BTreeMap;
 
-use cairn_core::finding::{EvidenceItem, FindingSource, Severity};
+use cairn_core::finding::{EntityRegistry, EvidenceItem, FindingSource, Severity};
 use cairn_core::record::{EventRecord, Record};
 use cairn_core::traits::Analyzer;
-use cairn_core::{Finding, Result};
+use cairn_core::{Finding, Observation, Result};
 use serde_json::{Map, Value};
 
+use crate::dedup::EvidenceKey;
 use crate::defense::{exclusion_value_note, exclusion_value_risk};
 use crate::trust::{
     invocation_args, invoked_path, is_system_or_program_files, is_user_writable_path,
-    is_windows_root_exe, launchers_in, risky_args, script_markers, MarkerKind,
-    MICROSOFT_PROGRAMDATA,
+    is_windows_root_exe, is_windows_user_writable_dir, launchers_in, risky_args, script_markers,
+    MarkerKind, MICROSOFT_PROGRAMDATA,
 };
 use cairn_core::record::ExclusionKind;
 
@@ -107,8 +118,10 @@ impl RedFlags {
 /// counts only next to an interpreter / LOLBin (an agent's `--server https://...` is
 /// configuration, not a download).
 fn command_red_flags(cmd: &str) -> RedFlags {
+    let binary = invoked_path(cmd);
     let mut flags = RedFlags {
-        writable_binary: is_user_writable_path(invoked_path(cmd)),
+        writable_binary: is_user_writable_path(binary)
+            || is_windows_user_writable_dir(&normalize_image(binary)),
         ..RedFlags::default()
     };
     // Interpreters and proxy binaries a legitimate service or task rarely launches
@@ -221,43 +234,144 @@ fn log_cleared(ev: &EventRecord) -> Finding {
     )
 }
 
-fn service_installed(ev: &EventRecord) -> Finding {
-    let name = field_or_dash(ev, "ServiceName");
-    let image = field_or_dash(ev, "ImagePath");
-    let account = field_or_dash(ev, "AccountName");
-    let flags = command_red_flags(&image);
-    let (severity, reason) = if !flags.is_empty() {
-        // A service runs as SYSTEM: a binary in a user-writable folder is a privilege
-        // escalation path on its own, so every red flag is High here.
-        (Severity::High, flags.reason())
-    } else if is_windows_root_exe(&image) {
+/// Driver file names that EDR-killer and ransomware campaigns install for a known
+/// vulnerability (bring-your-own-vulnerable-driver; loldrivers.io lists them). The
+/// vendor's own product ships the same file (MSI Afterburner, Process Explorer, ...),
+/// so a name is a lead to check, not proof.
+const VULNERABLE_DRIVER_NAMES: &[(&str, &str)] = &[
+    ("rtcore64.sys", "MSI Afterburner; BlackByte, AvosLocker"),
+    ("gdrv.sys", "Gigabyte tools; RobbinHood"),
+    ("dbutil_2_3.sys", "Dell BIOS utility, CVE-2021-21551"),
+    (
+        "mhyprot2.sys",
+        "Genshin Impact anti-cheat; ransomware EDR kill",
+    ),
+    (
+        "procexp152.sys",
+        "Process Explorer, which also installs it when an admin runs it; AuKill",
+    ),
+    ("aswarpot.sys", "Avast anti-rootkit; AvosLocker, Cuba"),
+    ("zam64.sys", "Zemana; Terminator / Spyboy"),
+    ("zamguard64.sys", "Zemana; Terminator / Spyboy"),
+    ("iqvw64e.sys", "Intel network diagnostics; kdmapper"),
+    ("kprocesshacker.sys", "Process Hacker"),
+    ("truesight.sys", "RogueKiller anti-rootkit; EDR killers"),
+];
+
+/// How one 7045 service install is reported.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServiceVerdict {
+    /// A finding: severity, reason, ATT&CK techniques beyond T1543.003.
+    Finding(Severity, String, Vec<&'static str>),
+    /// Host inventory, not a finding: a driver or service from a folder only an
+    /// administrator can write, with no red flag. The reason says which tier.
+    Inventory(String),
+}
+
+/// Judge a 7045 ImagePath. Checked in order, the first match decides:
+///
+/// 1. Red flags ([`command_red_flags`]: user-writable binary, launcher, script
+///    markers) -> High. A service runs as SYSTEM, so each is an escalation path.
+/// 2. An exe directly in the Windows folder (the `ADMIN$` root, where PsExec-style
+///    tools drop their service) -> Medium.
+/// 3. A driver whose file name is a known vulnerable driver -> Medium (T1068).
+/// 4. A binary outside the Windows / Program Files / Microsoft ProgramData trees ->
+///    Medium.
+/// 5. A user-mode service with an unquoted path with a space in the binary -> Low
+///    (T1574.009: Windows tries `C:\Program.exe` first, an old privilege-escalation
+///    path).
+/// 6. Otherwise (driver or service from an admin-only folder, no red flag) ->
+///    inventory. A real System log (DeepBlueCLI `many-events-system.evtx`) has 42
+///    such installs (23 drivers under System32\drivers or Program Files, VMware /
+///    Hyper-V / .NET / Google Update / EMET services); each was a Low finding, 42 rows
+///    that never told an analyst anything. The event carries no signature, so the
+///    tier is the folder's ACL, the same "system or vendor-installed" tier the
+///    persistence gate uses.
+fn assess_service(image: &str) -> ServiceVerdict {
+    let flags = command_red_flags(image);
+    if !flags.is_empty() {
+        return ServiceVerdict::Finding(Severity::High, flags.reason(), vec![]);
+    }
+    if is_windows_root_exe(image) {
         // Checked before the Windows-tree trust tier: the root of C:\Windows is the
         // ADMIN$ share, where PsExec-style tools drop their service binary.
-        (
+        return ServiceVerdict::Finding(
             Severity::Medium,
             "binary sits directly in the Windows folder (the ADMIN$ share root), where \
              PsExec-style remote execution drops its service exe; stock services run from \
              System32 or a vendor folder"
                 .to_string(),
-        )
-    } else if is_system_or_program_files(&normalize_image(&image))
-        || image.to_ascii_lowercase().contains(MICROSOFT_PROGRAMDATA)
-    {
-        (
-            Severity::Low,
-            "installed from the Windows or Program Files tree".to_string(),
-        )
-    } else {
-        (
+            vec![],
+        );
+    }
+    let binary = invoked_path(image);
+    let normalized = normalize_image(binary);
+    let file = normalized.rsplit('\\').next().unwrap_or(&normalized);
+    if let Some((name, known)) = VULNERABLE_DRIVER_NAMES.iter().find(|(n, _)| *n == file) {
+        return ServiceVerdict::Finding(
+            Severity::Medium,
+            format!(
+                "driver {name} is a known vulnerable driver ({known}) that attackers load \
+                 to kill security software (BYOVD); check that the product it belongs to \
+                 is installed on purpose"
+            ),
+            vec!["T1068"],
+        );
+    }
+    if !(is_system_or_program_files(&normalized) || normalized.contains(MICROSOFT_PROGRAMDATA)) {
+        return ServiceVerdict::Finding(
             Severity::Medium,
             "binary is outside the Windows and Program Files trees".to_string(),
-        )
+            vec![],
+        );
+    }
+    // Drivers are excluded: the kernel loads the ImagePath as given, with no
+    // CreateProcess-style search (the real VMware `memctl` driver is registered
+    // unquoted under `C:\Program Files\Common Files\...`).
+    let quoted = image.trim_start().starts_with('"');
+    if !quoted && binary.trim().contains(' ') && !is_driver_image(image) {
+        return ServiceVerdict::Finding(
+            Severity::Low,
+            format!(
+                "unquoted service path with a space ({}): Windows tries each shorter \
+                 path first, so a writable parent folder lets another exe run as the \
+                 service (path interception)",
+                binary.trim()
+            ),
+            vec!["T1574.009"],
+        );
+    }
+    ServiceVerdict::Inventory(
+        "no red flag; binary in a folder only administrators can write (Windows, \
+         Program Files or Microsoft ProgramData)"
+            .to_string(),
+    )
+}
+
+/// True when the 7045 ImagePath is a driver (`.sys`), by file name: the `ServiceType`
+/// text is localized.
+fn is_driver_image(image: &str) -> bool {
+    invoked_path(image)
+        .trim()
+        .trim_matches('"')
+        .to_ascii_lowercase()
+        .ends_with(".sys")
+}
+
+fn service_installed(ev: &EventRecord) -> Option<Finding> {
+    let name = field_or_dash(ev, "ServiceName");
+    let image = field_or_dash(ev, "ImagePath");
+    let account = field_or_dash(ev, "AccountName");
+    let ServiceVerdict::Finding(severity, reason, extra) = assess_service(&image) else {
+        return None;
     };
-    finding(
+    let mut mitre = vec!["T1543.003"];
+    mitre.extend(extra);
+    Some(finding(
         ev,
         severity,
         format!("新安裝服務：{name}"),
-        &["T1543.003"],
+        &mitre,
         format!("EID 7045: service {name} installed, ImagePath={image}, account={account}"),
         reason,
         format!(
@@ -265,7 +379,38 @@ fn service_installed(ev: &EventRecord) -> Finding {
              是常見的後門手法；請確認這是不是已知的軟體安裝。",
             ev.ts.format("%Y-%m-%d %H:%M UTC")
         ),
-    )
+    ))
+}
+
+/// Observation category of a 7045 install kept as inventory (see [`assess_service`]).
+pub const OBS_SERVICE_INSTALL: &str = cairn_core::observation::CATEGORY_SERVICE_INSTALL;
+
+/// The inventory side of [`service_installed`]: a 7045 with no red flag from an
+/// admin-only folder.
+fn service_inventory(ev: &EventRecord) -> Option<Observation> {
+    let image = field_or_dash(ev, "ImagePath");
+    let ServiceVerdict::Inventory(why) = assess_service(&image) else {
+        return None;
+    };
+    let name = field_or_dash(ev, "ServiceName");
+    let kind = if is_driver_image(&image) {
+        "驅動程式"
+    } else {
+        "服務"
+    };
+    let mut o = Observation::new(OBS_SERVICE_INSTALL, format!("新安裝{kind}：{name}"));
+    o.ts = ev.ts;
+    o.host = ev.computer.clone();
+    o.path = Some(image.clone());
+    o.source_artifact = format!("evtx:{}", ev.channel);
+    o.details = format!(
+        "EID 7045 record {}: ServiceType={}, StartType={}, account={}; {why}",
+        ev.record_id,
+        field_or_dash(ev, "ServiceType"),
+        field_or_dash(ev, "StartType"),
+        field_or_dash(ev, "AccountName"),
+    );
+    Some(o)
 }
 
 /// 7040 start-type text meaning "disabled" (English, zh-TW); `param3` is localized.
@@ -415,7 +560,7 @@ fn defender_exclusion(ev: &EventRecord) -> Option<Finding> {
             "exclusion entry could not be parsed".to_string(),
         ),
     };
-    Some(finding(
+    let mut f = finding(
         ev,
         severity,
         "Defender 新增排除項目".to_string(),
@@ -427,7 +572,37 @@ fn defender_exclusion(ev: &EventRecord) -> Option<Finding> {
              攻擊者常用這招藏放工具；請確認是不是管理員刻意設定的。",
             ev.ts.format("%Y-%m-%d %H:%M UTC")
         ),
-    ))
+    );
+    // The exclusion as typed data, so heur_defense can recognise the same exclusion it
+    // reads from the registry (same-evidence rule, `dedup.rs`).
+    if let Some(entity) = exclusion_entity(&new) {
+        f.entity.registry = Some(entity);
+    }
+    Some(f)
+}
+
+/// The registry entity a 5007 `New Value` names:
+/// `HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths\C:\x = 0x0` ->
+/// hive HKLM, key `SOFTWARE\...\Exclusions\Paths`, value `C:\x`.
+fn exclusion_entity(new: &str) -> Option<EntityRegistry> {
+    let (_, item) = parse_exclusion_value(new)?;
+    let lower = new.to_ascii_lowercase();
+    let at = lower.find(r"\exclusions\")? + r"\exclusions\".len();
+    let list_end = at + new.get(at..)?.find('\\')?;
+    let full_key = new.get(..list_end)?;
+    let (hive, key) = match full_key.split_once('\\') {
+        Some((h, k)) if h.eq_ignore_ascii_case("HKLM") || h.starts_with("HKEY_") => {
+            ("HKLM".to_string(), k.to_string())
+        }
+        _ => ("HKLM".to_string(), full_key.to_string()),
+    };
+    Some(EntityRegistry {
+        hive,
+        key,
+        value: item,
+        data: String::new(),
+        last_write: None,
+    })
 }
 
 /// Defender threat-name prefixes and category names of potentially unwanted software:
@@ -615,24 +790,51 @@ impl Analyzer for EventLogHeuristic {
         Self::NAME
     }
 
-    fn analyze(&self, records: &[Record], _prior: &[Finding]) -> Result<Vec<Finding>> {
+    /// Runs after Sigma: a per-event finding a Sigma hit on the same event already
+    /// covers is skipped or merged (same-evidence rule, `dedup.rs`).
+    fn depends_on(&self) -> &[&str] {
+        &[cairn_core::analyzers::SIGMA]
+    }
+
+    fn analyze(&self, records: &[Record], prior: &[Finding]) -> Result<Vec<Finding>> {
         let mut out = Vec::new();
         let mut detections = Vec::new();
         for r in records {
             let Record::Event(ev) = r else { continue };
-            match (ev.channel.as_str(), ev.event_id) {
-                ("Security", 1102) | ("System", 104) => out.push(log_cleared(ev)),
-                ("System", 7045) => out.push(service_installed(ev)),
-                ("System", 7040) => out.extend(eventlog_service_disabled(ev)),
-                ("Security", 4698) => out.push(task_created(ev)),
-                (DEFENDER_CHANNEL, 5001) => out.push(defender_rtp_off(ev)),
-                (DEFENDER_CHANNEL, 5007) => out.extend(defender_exclusion(ev)),
-                (DEFENDER_CHANNEL, 1116..=1119) => detections.push(ev),
-                _ => {}
+            let one = match (ev.channel.as_str(), ev.event_id) {
+                ("Security", 1102) | ("System", 104) => Some(log_cleared(ev)),
+                ("System", 7045) => service_installed(ev),
+                ("System", 7040) => eventlog_service_disabled(ev),
+                ("Security", 4698) => Some(task_created(ev)),
+                (DEFENDER_CHANNEL, 5001) => Some(defender_rtp_off(ev)),
+                (DEFENDER_CHANNEL, 5007) => defender_exclusion(ev),
+                (DEFENDER_CHANNEL, 1116..=1119) => {
+                    detections.push(ev);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(f) = one {
+                let mut f = f;
+                f.analyzer = Self::NAME.to_string();
+                out.extend(crate::dedup::resolve(f, &EvidenceKey::event(ev), prior));
             }
         }
         out.extend(defender_detections(&detections));
         Ok(crate::stamped(out, Self::NAME))
+    }
+
+    /// Service installs kept as inventory instead of findings (see `assess_service`).
+    fn observe(&self, records: &[Record]) -> Result<Vec<Observation>> {
+        Ok(records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Event(ev) if ev.channel == "System" && ev.event_id == 7045 => {
+                    service_inventory(ev)
+                }
+                _ => None,
+            })
+            .collect())
     }
 }
 
@@ -696,43 +898,97 @@ mod tests {
         assert!(f[0].reason.as_deref().unwrap().contains("cmd"));
     }
 
-    #[test]
-    fn service_from_program_files_is_low() {
-        let f = run(&[ev(
-            "System",
-            7045,
-            json!({"ServiceName": "Vendor", "ImagePath": "\"C:\\Program Files\\Vendor\\svc.exe\""}),
-        )]);
-        assert_eq!(f[0].severity, Severity::Low);
+    fn observe(records: &[Record]) -> Vec<Observation> {
+        EventLogHeuristic.observe(records).unwrap()
     }
 
+    fn svc(name: &str, image: &str) -> Record {
+        ev(
+            "System",
+            7045,
+            json!({"ServiceName": name, "ImagePath": image, "ServiceType": "kernel mode driver"}),
+        )
+    }
+
+    /// A service or driver from an admin-only folder with no red flag is inventory,
+    /// not a finding (real shapes from DeepBlueCLI many-events-system.evtx).
     #[test]
-    fn driver_image_paths_resolve_to_the_windows_tree() {
+    fn trusted_installs_are_inventory_not_findings() {
         for image in [
+            "\"C:\\Program Files\\Vendor\\svc.exe\"",
             r"\SystemRoot\System32\drivers\x.sys",
             r"System32\drivers\x.sys",
+            r"system32\DRIVERS\VMBusVideoM.sys",
             r"%SystemRoot%\system32\svchost.exe -k netsvcs",
             r"\??\C:\Windows\system32\drivers\y.sys",
+            r"C:\Windows\system32\dllhost.exe /Processid:{F3F72FE3-CF58-4A21-BBED-F596E5AFE5C0}",
+            r#""C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.25010.11-0\MsMpEng.exe""#,
+            r"C:\Program Files\Common Files\VMware\Drivers\memctl\vmmemctl.sys",
         ] {
-            let f = run(&[ev(
-                "System",
-                7045,
-                json!({"ServiceName": "d", "ImagePath": image}),
-            )]);
-            assert_eq!(f[0].severity, Severity::Low, "{image}");
+            let recs = [svc("d", image)];
+            assert!(run(&recs).is_empty(), "{image}: {:?}", run(&recs));
+            let o = observe(&recs);
+            assert_eq!(o.len(), 1, "{image}");
+            assert_eq!(o[0].category, OBS_SERVICE_INSTALL);
+            assert_eq!(o[0].path.as_deref(), Some(image));
+            assert!(o[0].details.contains("record 7"), "{}", o[0].details);
+        }
+        let o = observe(&[svc("vm3dmp", r"system32\DRIVERS\vm3dmp.sys")]);
+        assert!(o[0].title.contains("驅動程式"), "{}", o[0].title);
+    }
+
+    /// Anything with a red flag stays a finding and never reaches the inventory.
+    #[test]
+    fn flagged_installs_are_findings_not_inventory() {
+        for (image, sev) in [
+            (r"C:\Users\a\AppData\Local\Temp\x.sys", Severity::High),
+            (r"cmd.exe /c echo x > \\.\pipe\x", Severity::High),
+            (r"C:\ProgramData\Vendor\svc.exe", Severity::High),
+            (r"C:\Windows\Tasks\svc.exe", Severity::High),
+            (
+                r"C:\Windows\System32\spool\drivers\color\x.sys",
+                Severity::High,
+            ),
+            (r"%SYSTEMROOT%\duKhLYUX.exe", Severity::Medium),
+            (r"D:\tools\x.exe", Severity::Medium),
+            (r"C:\Program Files Evil\x.exe", Severity::Medium),
+        ] {
+            let recs = [svc("x", image)];
+            let f = run(&recs);
+            assert_eq!(f.len(), 1, "{image}");
+            assert_eq!(f[0].severity, sev, "{image}: {:?}", f[0].reason);
+            assert!(observe(&recs).is_empty(), "{image}");
         }
     }
 
+    /// Known vulnerable drivers (BYOVD) stay Medium findings even from System32.
     #[test]
-    fn defender_platform_update_service_is_low() {
+    fn known_vulnerable_driver_is_a_medium_finding() {
+        for image in [
+            r"System32\drivers\RTCore64.sys",
+            r"\??\C:\Windows\System32\drivers\PROCEXP152.SYS",
+            r"C:\Program Files\MSI\gdrv.sys",
+        ] {
+            let f = run(&[svc("v", image)]);
+            assert_eq!(f.len(), 1, "{image}");
+            assert_eq!(f[0].severity, Severity::Medium, "{image}");
+            assert!(f[0].mitre.contains(&"T1068".to_string()));
+            assert!(f[0].reason.as_deref().unwrap().contains("BYOVD"));
+        }
+        // From a drop zone the red flag wins: High.
+        let f = run(&[svc("v", r"C:\Users\Public\RTCore64.sys")]);
+        assert_eq!(f[0].severity, Severity::High);
+    }
+
+    /// An unquoted path with a space stays a Low finding (T1574.009).
+    #[test]
+    fn unquoted_path_with_spaces_is_a_low_finding() {
         let image =
             r"C:\ProgramData\Microsoft\Windows Defender\Platform\4.18.25010.11-0\MsMpEng.exe";
-        let f = run(&[ev(
-            "System",
-            7045,
-            json!({"ServiceName": "WinDefend", "ImagePath": image}),
-        )]);
+        let f = run(&[svc("WinDefend", image)]);
         assert_eq!(f[0].severity, Severity::Low);
+        assert!(f[0].mitre.contains(&"T1574.009".to_string()));
+        assert!(observe(&[svc("WinDefend", image)]).is_empty());
     }
 
     /// Real Metasploit psexec 7045 (DeepBlueCLI metasploit-psexec-native-target-system):
@@ -748,13 +1004,14 @@ mod tests {
             assert_eq!(f[0].severity, Severity::Medium, "{image}");
             assert!(f[0].reason.as_deref().unwrap().contains("ADMIN$"));
         }
-        // A subfolder of the Windows tree keeps the Low trust tier.
-        let f = run(&[ev(
+        // A subfolder of the Windows tree is the trusted tier: inventory.
+        let recs = [ev(
             "System",
             7045,
             json!({"ServiceName": "n", "ImagePath": r"C:\Windows\Microsoft.NET\Framework\v4.0.30319\SMSvcHost.exe"}),
-        )]);
-        assert_eq!(f[0].severity, Severity::Low);
+        )];
+        assert!(run(&recs).is_empty());
+        assert_eq!(observe(&recs).len(), 1);
     }
 
     /// Real 7040 shape (DeepBlueCLI disablestop-eventlog.evtx).
@@ -848,12 +1105,19 @@ mod tests {
             r#""C:\Program Files\Vendor\agent.exe" --server https://mgmt.vendor.example"#,
             r"C:\Program Files\Vendor\svc.exe -log C:\Users\Public\v.log",
         ] {
-            let f = run(&[ev(
+            let recs = [ev(
                 "System",
                 7045,
                 json!({"ServiceName": "Vendor", "ImagePath": image}),
-            )]);
-            assert_eq!(f[0].severity, Severity::Low, "{image}: {:?}", f[0].reason);
+            )];
+            // No red flag: the quoted ones are inventory, the unquoted one a Low
+            // unquoted-path finding; none is judged by its argument's folder.
+            let f = run(&recs);
+            assert!(
+                f.iter().all(|x| x.severity == Severity::Low),
+                "{image}: {f:?}"
+            );
+            assert_eq!(f.len() + observe(&recs).len(), 1, "{image}");
         }
         // The binary itself in a writable folder stays High.
         let f = run(&[ev(

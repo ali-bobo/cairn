@@ -276,11 +276,38 @@ fn matched_event(f: &Finding) -> String {
     if let Some(eid) = f.event_id {
         parts.push(format!("EID {eid}"));
     }
-    parts.push(format!(
-        "record {}",
-        f.evidence_ref.as_deref().unwrap_or("?")
-    ));
+    let record = format!("record {}", f.evidence_ref.as_deref().unwrap_or("?"));
+    // A flood merged into one finding (cairn-heur sigma `aggregate`) lists each hit as
+    // evidence; naming only the first record would read as a single event.
+    let hits = f.evidence.iter().filter(|e| e.ts.is_some()).count();
+    if f.source == FindingSource::Sigma && hits > 1 {
+        parts.push(format!("共多筆（列於佐證來源），第一筆 {record}"));
+    } else {
+        parts.push(record);
+    }
     parts.join(" ")
+}
+
+/// zh-TW heading of a host-inventory (observation) category, with the category key
+/// kept in brackets so analysts can still filter on it. Chosen from the typed
+/// category constants and the persistence `Mechanism` names; an unknown category is
+/// shown as is.
+pub fn observation_category_label(category: &str) -> String {
+    let label = match category {
+        cairn_core::observation::CATEGORY_SERVICE_INSTALL => {
+            "新安裝的服務與驅動程式（位於只有系統管理員能寫入的資料夾、沒有可疑跡象，列出供核對）"
+                .to_string()
+        }
+        cairn_core::observation::CATEGORY_LOGGING_POSTURE => "記錄設定與偵測盲點".to_string(),
+        "winlogon_default" => "Winlogon 預設登入設定".to_string(),
+        other => {
+            match serde_json::from_value::<Mechanism>(serde_json::Value::String(other.into())) {
+                Ok(m) if m.as_str() == other => format!("自動執行項目：{}", mechanism_label(m)),
+                _ => return other.to_string(),
+            }
+        }
+    };
+    format!("{label}（{category}）")
 }
 
 /// zh-TW "why" line for a Sigma finding: rule title, rule author (DRL 1.1 requires
@@ -862,5 +889,79 @@ mod tests {
         let text = f.details_client.unwrap();
         assert!(text.contains("未知程式"), "{text}");
         assert!(text.contains("WS01"));
+    }
+
+    #[test]
+    fn inventory_categories_read_in_zh_tw() {
+        let svc = observation_category_label(cairn_heur::eventlog::OBS_SERVICE_INSTALL);
+        assert!(
+            svc.contains("服務與驅動程式") && svc.contains("service_install"),
+            "{svc}"
+        );
+        assert!(observation_category_label("run_key").contains("Run 機碼"));
+        assert!(observation_category_label("logging_posture").contains("偵測盲點"));
+        // Unknown categories are shown as is, never as a guessed mechanism.
+        assert_eq!(observation_category_label("something_new"), "something_new");
+    }
+
+    /// A Sigma flood finding (several hits merged) says so instead of naming only its
+    /// first record.
+    #[test]
+    fn merged_sigma_flood_names_many_hits() {
+        let mut f = make_sigma(Severity::High, "Suspicious Service Installation");
+        f.artifact = "evtx:System".into();
+        f.event_id = Some(7045);
+        f.evidence_ref = Some("6287".into());
+        let line = sigma_rule_line(&f).unwrap();
+        assert!(
+            line.contains("record 6287") && !line.contains("多筆"),
+            "{line}"
+        );
+        for _ in 0..5 {
+            f.evidence.push(cairn_core::finding::EvidenceItem {
+                artifact: "evtx:System".into(),
+                path: None,
+                ts: Some(run_time()),
+                detail: "record".into(),
+            });
+        }
+        let line = sigma_rule_line(&f).unwrap();
+        assert!(
+            line.contains("共多筆") && line.contains("第一筆 record 6287"),
+            "{line}"
+        );
+    }
+
+    /// A finding the same-evidence rule merged (heur_lateral absorbing heur_eventlog's
+    /// finding on one 7045, produced by the real analyzers) keeps its own zh-TW text,
+    /// says it was merged, and is not replaced by a generic template.
+    #[test]
+    fn merged_finding_reads_correctly_in_zh_tw() {
+        let data =
+            serde_json::json!({"ServiceName": "KgX", "ImagePath": r"%SYSTEMROOT%\duKhLYUX.exe"});
+        let ev = Record::Event(cairn_core::record::EventRecord {
+            ts: run_time(),
+            channel: "System".into(),
+            event_id: 7045,
+            provider: "Service Control Manager".into(),
+            computer: "WS01".into(),
+            record_id: 2,
+            data: data.as_object().unwrap().clone(),
+        });
+        let analyzers: Vec<Box<dyn Analyzer>> = vec![
+            Box::new(cairn_heur::LateralHeuristic),
+            Box::new(cairn_heur::EventLogHeuristic),
+        ];
+        let out = cairn_core::orchestrator::run_analyzers(&[ev], &analyzers);
+        assert_eq!(out.findings.len(), 1, "{:#?}", out.findings);
+        let mut f = out.findings[0].clone();
+        fill_details_client(&mut f, run_time());
+        let text = f.details_client.unwrap();
+        assert!(
+            text.contains("KgX") && text.contains("已合併為這一筆"),
+            "{text}"
+        );
+        assert!(text.contains("事件記錄檢查"), "{text}");
+        assert_eq!(f.severity, Severity::High);
     }
 }

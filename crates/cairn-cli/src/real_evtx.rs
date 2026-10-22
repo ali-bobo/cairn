@@ -125,20 +125,29 @@ fn service_installs_with_qualified_event_ids() {
 fn metasploit_psexec_native() {
     let (_, f) = run("metasploit-psexec-native-target-system.evtx");
     assert_eq!(fired(&f, EVENTLOG, Severity::High, "T1070.001").len(), 1);
-    // %SYSTEMROOT%\duKhLYUX.exe: was Low ("Windows tree") before the fix.
-    let root = fired(&f, EVENTLOG, Severity::Medium, "T1543.003");
-    assert_eq!(root.len(), 1, "{}", titles(&f));
-    assert!(root[0].title.contains("KgXItsbKgTJzdzwl"));
-    // cmd.exe /c echo ... > \\.\pipe\...: launcher flag.
-    let pipe = fired(&f, EVENTLOG, Severity::High, "T1543.003");
-    assert_eq!(pipe.len(), 1);
-    assert!(pipe[0].title.contains("hgabms"));
-    // Both are remote-execution services for heur_lateral.
+    // Both services are remote execution for heur_lateral, whose finding absorbs
+    // heur_eventlog's service-install finding on the same 7045 (same-evidence rule):
+    // one finding per service, with both techniques.
     let remote = fired(&f, LATERAL, Severity::High, "T1569.002");
     assert_eq!(remote.len(), 2, "{}", titles(&f));
-    assert!(remote
+    assert!(remote.iter().all(|x| has_technique(x, "T1543.003")));
+    assert!(!f
         .iter()
-        .any(|x| x.reason.as_deref().unwrap().contains("Windows folder")));
+        .any(|x| x.analyzer == EVENTLOG && x.event_id == Some(7045)));
+    // %SYSTEMROOT%\duKhLYUX.exe: heur_eventlog rated it Medium (was Low, "Windows
+    // tree", before that fix); its reason is kept in the merged finding.
+    let root = remote
+        .iter()
+        .find(|x| x.title.contains("KgXItsbKgTJzdzwl"))
+        .unwrap();
+    let reason = root.reason.as_deref().unwrap();
+    assert!(
+        reason.contains("Windows folder") && reason.contains(EVENTLOG),
+        "{reason}"
+    );
+    // cmd.exe /c echo ... > \\.\pipe\...: heur_eventlog's launcher flag, merged.
+    let pipe = remote.iter().find(|x| x.title.contains("hgabms")).unwrap();
+    assert!(pipe.reason.as_deref().unwrap().contains("launches cmd"));
     // The bundled Sigma rule on 7045 fires too.
     assert!(by(&f, SIGMA)
         .iter()
@@ -150,12 +159,20 @@ fn metasploit_psexec_native() {
 #[test]
 fn metasploit_psexec_powershell() {
     let (_, f) = run("metasploit-psexec-powershell-target-system.evtx");
-    let ps = fired(&f, EVENTLOG, Severity::High, "T1543.003");
-    assert_eq!(ps.len(), 2, "{}", titles(&f));
-    assert!(ps
+    // One finding per service: heur_lateral's, with T1543.003 merged in. The
+    // PowerShell stager's heur_eventlog finding is skipped (the High Sigma rule below
+    // already says it); the pipe service's is absorbed into heur_lateral's.
+    let remote = fired(&f, LATERAL, Severity::High, "T1569.002");
+    assert_eq!(remote.len(), 2, "{}", titles(&f));
+    assert!(remote.iter().all(|x| has_technique(x, "T1543.003")));
+    assert!(!f
         .iter()
-        .any(|x| x.reason.as_deref().unwrap().contains("launches powershell")));
-    assert_eq!(fired(&f, LATERAL, Severity::High, "T1569.002").len(), 2);
+        .any(|x| x.analyzer == EVENTLOG && x.event_id == Some(7045)));
+    assert!(remote.iter().any(|x| x
+        .reason
+        .as_deref()
+        .unwrap()
+        .contains("Suspicious Service Installation")));
     assert!(fired(&f, SIGMA, Severity::High, "t1543.003")
         .iter()
         .any(|x| x.title == "Suspicious Service Installation"));
@@ -366,12 +383,14 @@ fn no_fixture_finding_is_dated_1601() {
     for n in names {
         let (records, f) = run(&n);
         for r in &records {
+            // 2009: many-events-system.evtx starts with the Windows 7 image's own
+            // build-time events (2009-07-14). A zero header would read 1601.
             if let Record::Event(e) = r {
-                assert!(e.ts.year() >= 2010, "{n}: {e:?}");
+                assert!(e.ts.year() >= 2009, "{n}: {e:?}");
             }
         }
         for x in f {
-            assert!(x.ts.year() >= 2010, "{n}: {}", x.title);
+            assert!(x.ts.year() >= 2009, "{n}: {}", x.title);
         }
     }
 }
@@ -550,4 +569,54 @@ fn wmi_consumers_sysmon_19_20_21() {
     assert_eq!(script[0].event_id, Some(20));
     assert_eq!(fired(&f, SIGMA, Severity::Medium, "t1546.003").len(), 2);
     assert_explained(&f);
+}
+
+/// A real System log (DeepBlueCLI many-events-system.evtx): 42 driver and vendor
+/// service installs from admin-only folders (VMware, Hyper-V, Bluetooth, .NET, Google
+/// Update, EMET), then 19 Metasploit psexec services. Before: 84 findings, 42 of them
+/// Low service installs and every psexec service reported two or three times. Now the
+/// trusted installs are inventory and each psexec service is one finding.
+#[test]
+fn system_log_service_install_noise_is_inventory() {
+    let cfg = Config::for_evtx(vec![fixture("many-events-system.evtx")], Some(rules_dir()));
+    let (_, _, analysis) = analyze(&cfg);
+    assert!(analysis.errors.is_empty(), "{:?}", analysis.errors);
+    let f = &analysis.findings;
+    let inventory: Vec<&cairn_core::Observation> = analysis
+        .observations
+        .iter()
+        .filter(|o| o.category == cairn_heur::eventlog::OBS_SERVICE_INSTALL)
+        .collect();
+    assert_eq!(inventory.len(), 42, "{inventory:#?}");
+    let drivers = inventory
+        .iter()
+        .filter(|o| {
+            o.path
+                .as_deref()
+                .is_some_and(|p| p.to_ascii_lowercase().ends_with(".sys"))
+        })
+        .count();
+    assert_eq!(drivers, 23);
+    // No finding from a trusted install: every heuristic service finding is psexec.
+    let heur: Vec<&Finding> = f
+        .iter()
+        .filter(|x| x.event_id == Some(7045) && x.analyzer != SIGMA)
+        .collect();
+    assert_eq!(heur.len(), 19, "{}", titles(f));
+    assert!(heur
+        .iter()
+        .all(|x| x.analyzer == LATERAL && x.severity == Severity::High));
+    assert!(heur.iter().all(|x| has_technique(x, "T1543.003")));
+    // One heuristic finding per event.
+    let mut refs: Vec<&str> = heur
+        .iter()
+        .filter_map(|x| x.evidence_ref.as_deref())
+        .collect();
+    refs.sort_unstable();
+    refs.dedup();
+    assert_eq!(refs.len(), 19);
+    // Nothing else but the Sigma service rules (one flood finding, three single hits).
+    assert_eq!(f.len(), 23, "{}", titles(f));
+    assert!(f.iter().all(|x| x.event_id == Some(7045)));
+    assert_explained(f);
 }

@@ -137,6 +137,12 @@ pub struct Finding {
     /// source (most Sigma hits). Old JSON without the field deserializes to empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<EvidenceItem>,
+    /// In-memory only, never serialized (the JSON schema is unchanged): ids of earlier
+    /// heuristic findings this one merged under the same-evidence rule (see
+    /// `cairn_heur::dedup`). `orchestrator::run_analyzers` drops them once the analyzer
+    /// that returned this finding is done. A Sigma finding is never dropped this way.
+    #[serde(skip)]
+    pub supersedes: Vec<Uuid>,
 }
 
 impl Finding {
@@ -164,6 +170,7 @@ impl Finding {
             details_client: None,
             reason: None,
             evidence: vec![],
+            supersedes: vec![],
         }
     }
 }

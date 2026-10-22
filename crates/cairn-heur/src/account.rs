@@ -229,19 +229,6 @@ fn is_recent(ts: DateTime<Utc>, now: DateTime<Utc>) -> bool {
     age >= Duration::zero() && age <= Duration::days(ACCOUNT_RECENT_DAYS)
 }
 
-/// True if a Sigma finding in `prior` already reports this exact event: same event ID
-/// and record id, or — for a finding that merged a flood of hits — one of its listed
-/// hits carries this event's timestamp.
-fn sigma_already_reported(prior: &[Finding], ae: &AccountEvent) -> bool {
-    let rid = ae.record_id.to_string();
-    prior.iter().any(|f| {
-        f.analyzer == cairn_core::analyzers::SIGMA
-            && f.event_id == Some(ae.event_id)
-            && (f.evidence_ref.as_deref() == Some(rid.as_str())
-                || f.evidence.iter().any(|e| e.ts == Some(ae.ts)))
-    })
-}
-
 /// Heuristic analyzer for account lifecycle and privilege events (see module docs).
 /// All findings carry an explainable reason (golden rule 6).
 pub struct AccountHeuristic;
@@ -256,7 +243,8 @@ impl Analyzer for AccountHeuristic {
         Self::NAME
     }
 
-    /// Runs after Sigma so a group-add a Sigma rule already reported is not repeated.
+    /// Runs after Sigma so an event a Sigma rule already reported is not repeated
+    /// (same-evidence rule, `dedup.rs`).
     fn depends_on(&self) -> &[&str] {
         &[cairn_core::analyzers::SIGMA]
     }
@@ -280,10 +268,6 @@ impl Analyzer for AccountHeuristic {
             let Some(ae) = parse_account_event(ev) else {
                 continue;
             };
-            if sigma_already_reported(prior_findings, &ae) {
-                continue;
-            }
-
             let when = ae.ts.format("%Y-%m-%dT%H:%M:%SZ");
             let recent = is_recent(ae.ts, now);
             let age_days = now.signed_duration_since(ae.ts).num_days();
@@ -391,7 +375,15 @@ impl Analyzer for AccountHeuristic {
                 ),
             }];
 
-            findings.push(f);
+            // A Sigma hit on this same event: skip when it says everything this finding
+            // would, else keep this one with the rule's techniques merged in
+            // (same-evidence rule, `dedup.rs`).
+            f.analyzer = Self::NAME.to_string();
+            findings.extend(crate::dedup::resolve(
+                f,
+                &crate::dedup::EvidenceKey::event(ev),
+                prior_findings,
+            ));
         }
 
         Ok(crate::stamped(findings, Self::NAME))
@@ -604,18 +596,35 @@ mod tests {
             recent(),
             group_data("evil", "Administrators", "admin"),
         )];
+        let Record::Event(ev) = &records[0] else {
+            unreachable!()
+        };
+        // The bundled rule's shape: same event, `attack.t1098` covers T1098.007.
         let mut sigma = Finding::new(
             Severity::High,
             "User Added to Local Administrators",
             FindingSource::Sigma,
         );
         sigma.analyzer = cairn_core::analyzers::SIGMA.into();
+        sigma.artifact = "evtx:Security".into();
+        sigma.ts = ev.ts;
         sigma.event_id = Some(4732);
         sigma.evidence_ref = Some("1".into());
+        sigma.mitre = vec!["attack.persistence".into(), "attack.t1098".into()];
         assert!(AccountHeuristic
             .analyze(&records, std::slice::from_ref(&sigma))
             .unwrap()
             .is_empty());
+        // A Sigma hit at a lower level does not hide the higher heuristic rating: the
+        // account finding stays, with the rule named in its reason.
+        let mut medium = sigma.clone();
+        medium.severity = Severity::Medium;
+        let kept = AccountHeuristic
+            .analyze(&records, std::slice::from_ref(&medium))
+            .unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].severity, Severity::High);
+        assert!(kept[0].reason.as_deref().unwrap().contains("Sigma rule"));
         // a Sigma hit on a different record does not suppress
         sigma.evidence_ref = Some("2".into());
         assert_eq!(
@@ -626,9 +635,7 @@ mod tests {
             1
         );
         // a merged Sigma finding listing this event among its hits suppresses
-        let Record::Event(ev) = &records[0] else {
-            unreachable!()
-        };
+        sigma.ts = ev.ts - Duration::minutes(5);
         sigma.evidence = vec![cairn_core::finding::EvidenceItem {
             artifact: "evtx:Security".into(),
             path: None,

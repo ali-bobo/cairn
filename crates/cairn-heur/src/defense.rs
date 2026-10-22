@@ -2,7 +2,9 @@
 //! [`PostureRecord`]:
 //!
 //! - Defender exclusions (T1562.001): user-writable dirs, whole drives, executable or
-//!   script extensions and interpreters are High; any other exclusion is Medium.
+//!   script extensions and interpreters are High; any other exclusion is Medium. An
+//!   exclusion `heur_eventlog` also saw being added (Defender 5007) is reported once,
+//!   here, with that event as evidence (same-evidence rule, `dedup.rs`).
 //! - Defender disabled by policy (T1562.001): DisableAntiSpyware,
 //!   DisableRealtimeMonitoring, DisableBehaviorMonitoring = 1 are High; Tamper
 //!   Protection not on (`TamperProtection != 5`) is Medium.
@@ -58,7 +60,7 @@ const EXPECTED_ORIGINAL_NAMES: &[(&str, &[&str])] = &[
 ];
 
 /// Observation category for logging / visibility gaps.
-pub const OBS_CATEGORY: &str = "logging_posture";
+pub const OBS_CATEGORY: &str = cairn_core::observation::CATEGORY_LOGGING_POSTURE;
 
 /// Defender, TaskCache and accessibility-binary checks over the posture snapshot.
 pub struct DefenseHeuristic;
@@ -484,15 +486,27 @@ impl Analyzer for DefenseHeuristic {
         Self::NAME
     }
 
-    fn analyze(&self, records: &[Record], _prior: &[Finding]) -> Result<Vec<Finding>> {
+    /// Runs after `heur_eventlog`: an exclusion still in the registry is the same
+    /// exclusion a Defender 5007 event recorded being added. This analyzer's finding
+    /// (the current state) absorbs those events (same-evidence rule, `dedup.rs`), so
+    /// the analyst reads it once, with the time it was added as evidence.
+    fn depends_on(&self) -> &[&str] {
+        &[cairn_core::analyzers::EVENTLOG]
+    }
+
+    fn analyze(&self, records: &[Record], prior: &[Finding]) -> Result<Vec<Finding>> {
         let mut out = Vec::new();
         for p in postures(records) {
             let now = p.collected_at.unwrap_or_else(Utc::now);
-            out.extend(
-                p.defender_exclusions
-                    .iter()
-                    .map(|e| exclusion_finding(e, now)),
-            );
+            for e in &p.defender_exclusions {
+                let mut f = exclusion_finding(e, now);
+                f.analyzer = Self::NAME.to_string();
+                let key = crate::dedup::EvidenceKey::Exclusion {
+                    kind: e.kind,
+                    value: e.value.clone(),
+                };
+                out.extend(crate::dedup::resolve(f, &key, prior));
+            }
             policy_findings(p, now, &mut out);
             out.extend(p.task_cache.iter().filter_map(|t| task_finding(t, now)));
             out.extend(

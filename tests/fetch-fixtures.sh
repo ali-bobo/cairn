@@ -63,6 +63,7 @@ fetch smb-password-guessing-security.evtx "$dbc/smb-password-guessing-security.e
 fetch new-user-security.evtx "$dbc/new-user-security.evtx"
 fetch disablestop-eventlog.evtx "$dbc/disablestop-eventlog.evtx"
 fetch wmi-event-filter-persistance.evtx "$dbc/wmi-event-filter-persistance.evtx"
+fetch many-events-system.evtx "$dbc/many-events-system.evtx"
 
 (cd "$dir" && sha256sum -c SHA256SUMS)
 echo "done -> $dir"

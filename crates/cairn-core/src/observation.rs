@@ -30,6 +30,11 @@ pub struct Observation {
 
 /// `Observation.category` of a per-rule Sigma viability observation.
 pub const CATEGORY_SIGMA_RULE: &str = "sigma_rule";
+/// `Observation.category` of a 7045 service / driver install kept as inventory
+/// (`heur_eventlog`: no red flag, binary in an admin-only folder).
+pub const CATEGORY_SERVICE_INSTALL: &str = "service_install";
+/// `Observation.category` of a logging / visibility gap (`heur_defense`).
+pub const CATEGORY_LOGGING_POSTURE: &str = "logging_posture";
 
 /// A logging setting a Sigma rule needs before it can ever match on this host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
