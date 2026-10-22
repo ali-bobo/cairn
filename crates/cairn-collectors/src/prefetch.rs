@@ -23,6 +23,14 @@ const PREFETCH_DECOMPRESS_CEILING: u64 = 64 * 1024 * 1024;
 
 const PREFETCH_DIR: &str = r"C:\Windows\Prefetch";
 
+/// Largest on-disk .pf read (NFR10). Real compressed .pf files are a few KB to a few
+/// hundred KB; a planted multi-GB "x.pf" must not be read into memory.
+const PREFETCH_MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Most .pf files parsed in one run. Windows keeps at most 1024; a directory stuffed
+/// with more is capped, and the cap is recorded in the manifest.
+const PREFETCH_MAX_FILES: usize = 4096;
+
 #[inline]
 fn prefetch_err(reason: String) -> CairnError {
     CairnError::Collector {
@@ -290,6 +298,8 @@ pub struct PrefetchCollector {
     file_read_errors: AtomicBool,
     decompress_errors: AtomicBool,
     unknown_version: AtomicBool,
+    oversized_files: AtomicBool,
+    file_cap_hit: AtomicBool,
 }
 
 impl PrefetchCollector {
@@ -341,6 +351,7 @@ impl Collector for PrefetchCollector {
 
         let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
         let mut records: Vec<Record> = Vec::new();
+        let mut seen = 0usize;
         for entry in entries.flatten() {
             let path = entry.path();
             if path
@@ -349,6 +360,20 @@ impl Collector for PrefetchCollector {
                 .map(|e| e.eq_ignore_ascii_case("pf"))
                 != Some(true)
             {
+                continue;
+            }
+            seen += 1;
+            if seen > PREFETCH_MAX_FILES {
+                self.file_cap_hit.store(true, Ordering::Relaxed);
+                tracing::warn!(
+                    cap = PREFETCH_MAX_FILES,
+                    "prefetch: file cap reached; rest skipped"
+                );
+                break;
+            }
+            if entry.metadata().map(|m| m.len()).unwrap_or(0) > PREFETCH_MAX_FILE_BYTES {
+                self.oversized_files.store(true, Ordering::Relaxed);
+                tracing::warn!(file = ?path, "prefetch: file over the size cap; skipping");
                 continue;
             }
             let raw = match std::fs::read(&path) {
@@ -395,6 +420,17 @@ impl Collector for PrefetchCollector {
         }
         if self.decompress_errors.load(Ordering::Relaxed) {
             errors.push("partial: one or more .pf files failed MAM decompression".to_string());
+        }
+        if self.oversized_files.load(Ordering::Relaxed) {
+            errors.push(format!(
+                "partial: one or more .pf files over {} MiB skipped (cap)",
+                PREFETCH_MAX_FILE_BYTES / (1024 * 1024)
+            ));
+        }
+        if self.file_cap_hit.load(Ordering::Relaxed) {
+            errors.push(format!(
+                "partial: more than {PREFETCH_MAX_FILES} .pf files; the rest were not read (cap)"
+            ));
         }
         if self.unknown_version.load(Ordering::Relaxed) {
             errors.push(
@@ -707,6 +743,52 @@ mod tests {
         assert!(parse_prefetch(&[31u8, 0, 0, 0]).is_none());
     }
 
+    /// Malformed, truncated, oversized-length and random .pf bodies and MAM containers
+    /// never panic: the parser and the decompressor either parse or abstain.
+    #[test]
+    fn fuzzed_pf_and_mam_never_panic() {
+        let mut rng = cairn_core::fuzz::Rng::new(0x9F_2026);
+        let seeds = [
+            build_pf_full(
+                30,
+                METRICS_OFFSET_FI_DC,
+                "NOTEPAD.EXE",
+                3,
+                &[FT_2021],
+                &[
+                    r"\VOLUME{X}\WINDOWS\SYSTEM32\NTDLL.DLL",
+                    r"\VOLUME{X}\WINDOWS\NOTEPAD.EXE",
+                ],
+            ),
+            build_pf(31, "A.EXE", 1, &[132_000_000_000_000_000]),
+        ];
+        let mam = {
+            let body = &seeds[0];
+            let mut c = MAM_MAGIC.to_vec();
+            c.extend(
+                compcol::vec::compress_to_vec::<compcol::xpress_huffman::XpressHuffman>(body)
+                    .unwrap(),
+            );
+            c
+        };
+        for i in 0..3000 {
+            let input = match i % 4 {
+                0 => rng.mutate(&seeds[i % 2]),
+                1 => rng.bytes(600),
+                2 => rng.mutate(&mam),
+                _ => {
+                    let mut v = MAM_MAGIC.to_vec();
+                    v.extend(rng.bytes(300));
+                    v
+                }
+            };
+            if let Ok(body) = decompress_mam(&input) {
+                let _ = parse_prefetch(&body);
+            }
+            let _ = parse_prefetch(&input);
+        }
+    }
+
     #[test]
     fn parse_all_zero_run_times_yields_empty_vec() {
         let body = build_pf(31, "Z.EXE", 0, &[]);
@@ -762,6 +844,20 @@ mod tests {
             .errors
             .iter()
             .any(|e| e.contains("unrecognised or incomplete")));
+    }
+
+    /// Hitting the size or file-count cap is recorded, never silent.
+    #[test]
+    fn sources_reports_caps() {
+        let c = PrefetchCollector::default();
+        c.oversized_files.store(true, Ordering::Relaxed);
+        c.file_cap_hit.store(true, Ordering::Relaxed);
+        let errs = &c.sources()[0].errors;
+        assert!(errs.iter().any(|e| e.contains("over 16 MiB")), "{errs:?}");
+        assert!(
+            errs.iter().any(|e| e.contains("more than 4096")),
+            "{errs:?}"
+        );
     }
 
     #[test]

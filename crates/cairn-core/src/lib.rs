@@ -22,6 +22,8 @@ pub mod analyzers;
 pub mod collectors;
 pub mod config;
 pub mod finding;
+#[cfg(any(test, feature = "test-util"))]
+pub mod fuzz;
 pub mod manifest;
 pub mod observation;
 pub mod orchestrator;

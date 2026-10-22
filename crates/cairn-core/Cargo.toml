@@ -11,3 +11,8 @@ chrono.workspace = true
 uuid.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+
+[features]
+# Deterministic fuzz-input generator (src/fuzz.rs) for never-panic parser tests.
+# Enabled only from other crates' [dev-dependencies]; never in a release build.
+test-util = []

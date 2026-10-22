@@ -495,6 +495,53 @@ pub fn is_masquerade(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// The shared command-line / path helpers every analyzer calls on attacker text
+    /// never panic: unbalanced quotes, multi-byte characters at slice points, empty
+    /// and separator-only input, NULs, right-to-left overrides, huge tokens.
+    #[test]
+    fn fuzzed_command_lines_never_panic() {
+        let mut rng = cairn_core::fuzz::Rng::new(0x7_2057);
+        let frags = [
+            "powershell",
+            "-enc",
+            "-e",
+            "-EncodedCommand",
+            "cmd.exe",
+            "/c",
+            "\"C:\\Program Files\\x.exe\"",
+            "rundll32",
+            "x.dll,Entry",
+            "/i:http://x",
+            "\\\\srv\\s\\a.dll",
+            "%TEMP%\\a.ps1",
+            "SQBFAFgAIAAoAE4AZQB3AC0ATwBiAGoAZQBjAHQA==",
+            "FromBase64String",
+            "C:\\Windows\\System32\\svchost.exe",
+            "\\programdata\\",
+            "文",
+        ];
+        for _ in 0..5000 {
+            let s = rng.text(16, &frags);
+            let _ = exe_name(&s);
+            let _ = invoked_exe(&s);
+            let _ = invocation_args(&s);
+            let _ = risky_args(&s);
+            let _ = has_arguments(&s);
+            let _ = launchers_in(&s);
+            let _ = has_encoded_flag(&s, true);
+            let _ = has_base64_token(&s);
+            let _ = script_markers(&s);
+            let _ = is_user_writable_path(&s);
+            let _ = is_under_windows_tree(&s);
+            let _ = is_system_or_program_files(&s);
+            let _ = is_masquerade(&s);
+        }
+        let huge = "A".repeat(1 << 20);
+        assert!(!has_encoded_flag(&huge, true));
+        let _ = has_base64_token(&huge);
+        let _ = risky_args(&huge);
+    }
+
     #[test]
     fn user_writable_covers_every_drop_zone() {
         for p in [
