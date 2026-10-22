@@ -1,7 +1,10 @@
 //! Centralized "this is normal" knowledge (spec §5b). Analyzers MUST use these
 //! instead of re-deriving path/name trust locally — the whack-a-mole suppression
 //! patches of S2 (TRUSTED_APPDATA, inbox-service, winlogon-default, correlation
-//! matrix) all came from NOT having this module.
+//! matrix) all came from NOT having this module. (The S2 inbox-service helper,
+//! `is_inbox_service_command`, was removed: nothing called it, and it trusted
+//! `system32\..\` traversal and `system32\cmd.exe /c ...`. Service ImagePaths are
+//! judged by the persistence gate and `eventlog::assess_service` instead.)
 //!
 //! It is also the single home of the detection vocabulary several analyzers share:
 //! the user-writable drop-zone list, the launcher (interpreter / LOLBin) table, the exe
@@ -10,9 +13,7 @@
 //!
 //! Existing trust fns stay in score.rs and are re-exported here so analyzers have
 //! ONE import surface: `use crate::trust::*;`.
-pub use crate::score::{
-    is_inbox_service_command, is_trusted_appdata_location, winlogon_value_is_default,
-};
+pub use crate::score::{is_trusted_appdata_location, winlogon_value_is_default};
 
 /// System-binary names an attacker plants outside C:\Windows to masquerade (S3).
 /// Matched against the lowercased basename.
