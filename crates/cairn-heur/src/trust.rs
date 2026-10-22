@@ -59,6 +59,8 @@ const PATH_VARS: &[(&str, &str)] = &[
     ("%temp%", r"c:\users\_\appdata\local\temp"),
     ("%tmp%", r"c:\users\_\appdata\local\temp"),
     ("%userprofile%", r"c:\users\_"),
+    ("%homedrive%%homepath%", r"c:\users\_"),
+    ("%homepath%", r"c:\users\_"),
     ("%public%", r"c:\users\public"),
     ("%programdata%", r"c:\programdata"),
     ("%allusersprofile%", r"c:\programdata"),
