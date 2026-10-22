@@ -96,7 +96,8 @@ pub const RMM_TOOLS: &[RmmTool] = &[
         &["screenconnect client", "connectwise control client"],
         &[r"\screenconnect client", r"\connectwise control client"],
         &["connectwise", "screenconnect"],
-        false,
+        // ConnectWise also signs Automate (LTSvc.exe) and other products.
+        true,
     ),
     t(
         "TeamViewer",
@@ -212,7 +213,8 @@ pub const RMM_TOOLS: &[RmmTool] = &[
         &["cloudflared"],
         &[r"\cloudflared\"],
         &["cloudflare"],
-        false,
+        // Cloudflare also signs the WARP client.
+        true,
     ),
     t(
         "Tailscale",
@@ -385,6 +387,9 @@ struct Hits {
     seen: Vec<String>,
     high: Vec<String>,
     recent: Vec<String>,
+    /// Live connections to public addresses. Sanctioned TeamViewer/AnyDesk agents
+    /// hold a relay connection all the time, so this alone is "in use", not High.
+    connected: Vec<String>,
     /// Incoming connections from the tool's own log, inside the window.
     incoming: Vec<String>,
     /// Newest incoming connection: (time, remote ID).
@@ -644,7 +649,7 @@ fn on_conn(
         "{raddr}:{}",
         c.rport.map(|p| p.to_string()).unwrap_or_default()
     );
-    h.high.push(format!(
+    h.connected.push(format!(
         "netconn {state} from pid {} to public {remote}",
         c.pid.unwrap_or_default()
     ));
@@ -717,22 +722,25 @@ impl Analyzer for RmmHeuristic {
                     }
                 )
             });
+            // High: the install itself is suspect (renamed, unsigned, portable in a
+            // writable folder). Medium: it is in use or new (live public connection,
+            // incoming sessions in its log, recent install). Low: present only.
+            let mut medium: Vec<String> = Vec::new();
+            if !h.connected.is_empty() {
+                medium.push(h.connected.join("; "));
+            }
+            if let Some(i) = incoming {
+                medium.push(i);
+            }
+            if !h.recent.is_empty() {
+                medium.push(format!("recently installed: {}", h.recent.join("; ")));
+            }
             let (severity, why) = if !h.high.is_empty() {
-                let mut why = h.high.join("; ");
-                if let Some(i) = &incoming {
-                    why.push_str(&format!("; {i}"));
-                }
-                (Severity::High, why)
-            } else if let Some(mut i) = incoming {
-                if !h.recent.is_empty() {
-                    i.push_str(&format!("; recently installed: {}", h.recent.join("; ")));
-                }
-                (Severity::Medium, i)
-            } else if !h.recent.is_empty() {
-                (
-                    Severity::Medium,
-                    format!("recently installed: {}", h.recent.join("; ")),
-                )
+                let mut parts = vec![h.high.join("; ")];
+                parts.extend(medium);
+                (Severity::High, parts.join("; "))
+            } else if !medium.is_empty() {
+                (Severity::Medium, medium.join("; "))
             } else {
                 (Severity::Low, "present; no risk signal".to_string())
             };
@@ -961,7 +969,8 @@ mod tests {
             proc(10, ANYDESK, Some(true), Some("AnyDesk Software GmbH")),
             conn(10, "8.8.4.4", "established"),
         ]);
-        assert_eq!(connected[0].severity, Severity::High);
+        // A sanctioned agent holds a relay connection all the time: in use, Medium.
+        assert_eq!(connected[0].severity, Severity::Medium);
         assert!(connected[0]
             .reason
             .as_deref()
@@ -1005,6 +1014,28 @@ mod tests {
             Some("Google LLC"),
         )])
         .is_empty());
+        // ConnectWise Automate and Cloudflare WARP share their vendor's signer with
+        // ScreenConnect and cloudflared; the signer alone must not call them renamed.
+        for (img, signer) in [
+            (r"C:\Windows\LTSvc\LTSvc.exe", "ConnectWise, LLC"),
+            (
+                r"C:\Program Files\Cloudflare\Cloudflare WARP\warp-svc.exe",
+                "Cloudflare, Inc.",
+            ),
+        ] {
+            assert!(
+                run(&[proc(8, img, Some(true), Some(signer))]).is_empty(),
+                "{img}"
+            );
+        }
+        // The real cloudflared binary is still found by name.
+        let cf = run(&[proc(
+            9,
+            r"C:\Users\bob\AppData\Local\Temp\cloudflared.exe",
+            Some(true),
+            Some("Cloudflare, Inc."),
+        )]);
+        assert_eq!(cf[0].severity, Severity::High);
     }
 
     #[test]
