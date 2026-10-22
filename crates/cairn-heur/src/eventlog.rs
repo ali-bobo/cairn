@@ -27,8 +27,8 @@ use serde_json::{Map, Value};
 
 use crate::defense::{exclusion_value_note, exclusion_value_risk};
 use crate::trust::{
-    invocation_args, is_system_or_program_files, is_user_writable_path, launchers_in, risky_args,
-    script_markers, MarkerKind, MICROSOFT_PROGRAMDATA,
+    invocation_args, invoked_path, is_system_or_program_files, is_user_writable_path, launchers_in,
+    risky_args, script_markers, MarkerKind, MICROSOFT_PROGRAMDATA,
 };
 use cairn_core::record::ExclusionKind;
 
@@ -121,34 +121,6 @@ fn command_red_flags(cmd: &str) -> RedFlags {
         flags.other.push(format!("contains {}", markers.join(", ")));
     }
     flags
-}
-
-/// The binary a command line runs: the quoted first token, or for an unquoted command
-/// the text up to the first executable extension followed by a space (so
-/// `C:\Users\Public\My Tools\x.exe -a` keeps its spaces), else the first token.
-fn invoked_path(cmd: &str) -> &str {
-    let t = cmd.trim();
-    if let Some(rest) = t.strip_prefix('"') {
-        return rest.split('"').next().unwrap_or(rest);
-    }
-    let lower = t.to_ascii_lowercase();
-    let earliest = [".exe", ".sys", ".dll", ".com", ".bat", ".cmd", ".scr"]
-        .iter()
-        .filter_map(|ext| {
-            lower
-                .match_indices(ext)
-                .map(|(i, _)| i + ext.len())
-                .find(|&end| {
-                    lower
-                        .get(end..)
-                        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
-                })
-        })
-        .min();
-    match earliest {
-        Some(end) => &t[..end],
-        None => t.split_whitespace().next().unwrap_or(""),
-    }
 }
 
 /// Normalize a service ImagePath / task command to an absolute path for the trust

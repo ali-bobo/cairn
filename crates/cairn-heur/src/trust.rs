@@ -227,6 +227,34 @@ pub fn invoked_exe(cmd: &str) -> Option<String> {
     (!name.is_empty()).then_some(name)
 }
 
+/// The binary a command line runs: the quoted first token, or for an unquoted command
+/// the text up to the first executable extension followed by a space (so
+/// `C:\Users\Public\My Tools\x.exe -a` keeps its spaces), else the first token.
+pub fn invoked_path(cmd: &str) -> &str {
+    let t = cmd.trim();
+    if let Some(rest) = t.strip_prefix('"') {
+        return rest.split('"').next().unwrap_or(rest);
+    }
+    let lower = t.to_ascii_lowercase();
+    let earliest = [".exe", ".sys", ".dll", ".com", ".bat", ".cmd", ".scr"]
+        .iter()
+        .filter_map(|ext| {
+            lower
+                .match_indices(ext)
+                .map(|(i, _)| i + ext.len())
+                .find(|&end| {
+                    lower
+                        .get(end..)
+                        .is_some_and(|r| r.is_empty() || r.starts_with(char::is_whitespace))
+                })
+        })
+        .min();
+    match earliest {
+        Some(end) => &t[..end],
+        None => t.split_whitespace().next().unwrap_or(""),
+    }
+}
+
 /// The argument text after the invoked binary (empty when there is none).
 pub fn invocation_args(cmd: &str) -> &str {
     split_invocation(cmd).1.trim()
