@@ -1389,8 +1389,11 @@ mod tests {
             service(3, "updsvc", r"C:\Program Files\Upd\updsvc.exe"),
         ]);
         assert_eq!(f.len(), 1, "plain service: only the share finding");
-        assert_eq!(f[0].severity, Severity::High);
-        assert!(f[0].reason.as_deref().unwrap().contains("updsvc"));
+        assert_eq!(
+            f[0].severity,
+            Severity::Medium,
+            "a Program Files service not tied to the share access does not raise it"
+        );
         // Outside the window: stays Medium.
         let f = run(&[
             share(0, "10.0.0.9", r"\\*\ADMIN$"),
@@ -1419,12 +1422,13 @@ mod tests {
             ),
         ]);
         assert_eq!(f[0].severity, Severity::Medium, "{:?}", f[0].reason);
-        // A Windows-root binary is only tied after ADMIN$ access, not C$.
+        // A Windows-root service binary is the PsExec drop pattern on its own (real
+        // Metasploit psexec samples), so it ties the preceding C$ access too.
         let f = run(&[
             share(0, "10.0.0.9", r"\\*\C$"),
             service(2, "updsvc", r"C:\Windows\updsvc.exe"),
         ]);
-        assert_eq!(f[0].severity, Severity::Medium);
+        assert!(f.iter().all(|x| x.severity == Severity::High), "{f:?}");
     }
 
     #[test]
