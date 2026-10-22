@@ -1,6 +1,11 @@
 //! cairn-heur: heuristic analyzers (SRS §10). Pure logic over the normalized Record
 //! stream; touches no host state. Every Finding carries an explainable `reason`
 //! (golden rule 6). The only analysis source besides Sigma.
+//!
+//! When two analyzers judge the same evidence (a 7045 read by `heur_eventlog` and
+//! `heur_lateral`, a Defender exclusion seen in the registry and in its 5007 event, a
+//! Sigma hit on an event a heuristic also judges), the later one applies the
+//! same-evidence rule in `dedup.rs`: one merged finding, never two.
 #![forbid(unsafe_code)]
 
 pub mod account;
@@ -9,6 +14,7 @@ pub mod clickfix;
 pub(crate) mod cmdline;
 pub mod coverage;
 pub mod cred_dump;
+pub(crate) mod dedup;
 pub mod defense;
 pub mod eventlog;
 pub mod lateral;

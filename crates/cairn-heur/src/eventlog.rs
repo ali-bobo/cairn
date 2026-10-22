@@ -15,6 +15,12 @@
 //! | 1116 | Defender | malware detected (PUA/adware Low–Medium, else High) | — |
 //! | 1117 / 1118 / 1119 | Defender | action taken / action failed (High) | — |
 //!
+//! Runs after Sigma; `heur_lateral` and `heur_defense` run after this analyzer. A
+//! per-event finding here follows the same-evidence rule (`dedup.rs`): skipped when a
+//! Sigma hit on the same event already says it, absorbed when `heur_lateral` reports
+//! the same 7045 as remote execution or `heur_defense` finds the 5007 exclusion still
+//! in the registry.
+//!
 //! Field names, checked against real logs (EVTX-ATTACK-SAMPLES, DeepBlueCLI samples;
 //! see `tests/fixtures/README.md`):
 //! - 1102 / 104: UserData `LogFileCleared` { `SubjectUserName`, `SubjectDomainName`,
@@ -33,12 +39,13 @@
 
 use std::collections::BTreeMap;
 
-use cairn_core::finding::{EvidenceItem, FindingSource, Severity};
+use cairn_core::finding::{EntityRegistry, EvidenceItem, FindingSource, Severity};
 use cairn_core::record::{EventRecord, Record};
 use cairn_core::traits::Analyzer;
 use cairn_core::{Finding, Result};
 use serde_json::{Map, Value};
 
+use crate::dedup::EvidenceKey;
 use crate::defense::{exclusion_value_note, exclusion_value_risk};
 use crate::trust::{
     invocation_args, invoked_path, is_system_or_program_files, is_user_writable_path,
@@ -415,7 +422,7 @@ fn defender_exclusion(ev: &EventRecord) -> Option<Finding> {
             "exclusion entry could not be parsed".to_string(),
         ),
     };
-    Some(finding(
+    let mut f = finding(
         ev,
         severity,
         "Defender 新增排除項目".to_string(),
@@ -427,7 +434,37 @@ fn defender_exclusion(ev: &EventRecord) -> Option<Finding> {
              攻擊者常用這招藏放工具；請確認是不是管理員刻意設定的。",
             ev.ts.format("%Y-%m-%d %H:%M UTC")
         ),
-    ))
+    );
+    // The exclusion as typed data, so heur_defense can recognise the same exclusion it
+    // reads from the registry (same-evidence rule, `dedup.rs`).
+    if let Some(entity) = exclusion_entity(&new) {
+        f.entity.registry = Some(entity);
+    }
+    Some(f)
+}
+
+/// The registry entity a 5007 `New Value` names:
+/// `HKLM\SOFTWARE\Microsoft\Windows Defender\Exclusions\Paths\C:\x = 0x0` ->
+/// hive HKLM, key `SOFTWARE\...\Exclusions\Paths`, value `C:\x`.
+fn exclusion_entity(new: &str) -> Option<EntityRegistry> {
+    let (_, item) = parse_exclusion_value(new)?;
+    let lower = new.to_ascii_lowercase();
+    let at = lower.find(r"\exclusions\")? + r"\exclusions\".len();
+    let list_end = at + new.get(at..)?.find('\\')?;
+    let full_key = new.get(..list_end)?;
+    let (hive, key) = match full_key.split_once('\\') {
+        Some((h, k)) if h.eq_ignore_ascii_case("HKLM") || h.starts_with("HKEY_") => {
+            ("HKLM".to_string(), k.to_string())
+        }
+        _ => ("HKLM".to_string(), full_key.to_string()),
+    };
+    Some(EntityRegistry {
+        hive,
+        key,
+        value: item,
+        data: String::new(),
+        last_write: None,
+    })
 }
 
 /// Defender threat-name prefixes and category names of potentially unwanted software:
@@ -615,20 +652,34 @@ impl Analyzer for EventLogHeuristic {
         Self::NAME
     }
 
-    fn analyze(&self, records: &[Record], _prior: &[Finding]) -> Result<Vec<Finding>> {
+    /// Runs after Sigma: a per-event finding a Sigma hit on the same event already
+    /// covers is skipped or merged (same-evidence rule, `dedup.rs`).
+    fn depends_on(&self) -> &[&str] {
+        &[cairn_core::analyzers::SIGMA]
+    }
+
+    fn analyze(&self, records: &[Record], prior: &[Finding]) -> Result<Vec<Finding>> {
         let mut out = Vec::new();
         let mut detections = Vec::new();
         for r in records {
             let Record::Event(ev) = r else { continue };
-            match (ev.channel.as_str(), ev.event_id) {
-                ("Security", 1102) | ("System", 104) => out.push(log_cleared(ev)),
-                ("System", 7045) => out.push(service_installed(ev)),
-                ("System", 7040) => out.extend(eventlog_service_disabled(ev)),
-                ("Security", 4698) => out.push(task_created(ev)),
-                (DEFENDER_CHANNEL, 5001) => out.push(defender_rtp_off(ev)),
-                (DEFENDER_CHANNEL, 5007) => out.extend(defender_exclusion(ev)),
-                (DEFENDER_CHANNEL, 1116..=1119) => detections.push(ev),
-                _ => {}
+            let one = match (ev.channel.as_str(), ev.event_id) {
+                ("Security", 1102) | ("System", 104) => Some(log_cleared(ev)),
+                ("System", 7045) => Some(service_installed(ev)),
+                ("System", 7040) => eventlog_service_disabled(ev),
+                ("Security", 4698) => Some(task_created(ev)),
+                (DEFENDER_CHANNEL, 5001) => Some(defender_rtp_off(ev)),
+                (DEFENDER_CHANNEL, 5007) => defender_exclusion(ev),
+                (DEFENDER_CHANNEL, 1116..=1119) => {
+                    detections.push(ev);
+                    None
+                }
+                _ => None,
+            };
+            if let Some(f) = one {
+                let mut f = f;
+                f.analyzer = Self::NAME.to_string();
+                out.extend(crate::dedup::resolve(f, &EvidenceKey::event(ev), prior));
             }
         }
         out.extend(defender_detections(&detections));

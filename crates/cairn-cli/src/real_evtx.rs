@@ -123,20 +123,29 @@ fn service_installs_with_qualified_event_ids() {
 fn metasploit_psexec_native() {
     let (_, f) = run("metasploit-psexec-native-target-system.evtx");
     assert_eq!(fired(&f, EVENTLOG, Severity::High, "T1070.001").len(), 1);
-    // %SYSTEMROOT%\duKhLYUX.exe: was Low ("Windows tree") before the fix.
-    let root = fired(&f, EVENTLOG, Severity::Medium, "T1543.003");
-    assert_eq!(root.len(), 1, "{}", titles(&f));
-    assert!(root[0].title.contains("KgXItsbKgTJzdzwl"));
-    // cmd.exe /c echo ... > \\.\pipe\...: launcher flag.
-    let pipe = fired(&f, EVENTLOG, Severity::High, "T1543.003");
-    assert_eq!(pipe.len(), 1);
-    assert!(pipe[0].title.contains("hgabms"));
-    // Both are remote-execution services for heur_lateral.
+    // Both services are remote execution for heur_lateral, whose finding absorbs
+    // heur_eventlog's service-install finding on the same 7045 (same-evidence rule):
+    // one finding per service, with both techniques.
     let remote = fired(&f, LATERAL, Severity::High, "T1569.002");
     assert_eq!(remote.len(), 2, "{}", titles(&f));
-    assert!(remote
+    assert!(remote.iter().all(|x| has_technique(x, "T1543.003")));
+    assert!(!f
         .iter()
-        .any(|x| x.reason.as_deref().unwrap().contains("Windows folder")));
+        .any(|x| x.analyzer == EVENTLOG && x.event_id == Some(7045)));
+    // %SYSTEMROOT%\duKhLYUX.exe: heur_eventlog rated it Medium (was Low, "Windows
+    // tree", before that fix); its reason is kept in the merged finding.
+    let root = remote
+        .iter()
+        .find(|x| x.title.contains("KgXItsbKgTJzdzwl"))
+        .unwrap();
+    let reason = root.reason.as_deref().unwrap();
+    assert!(
+        reason.contains("Windows folder") && reason.contains(EVENTLOG),
+        "{reason}"
+    );
+    // cmd.exe /c echo ... > \\.\pipe\...: heur_eventlog's launcher flag, merged.
+    let pipe = remote.iter().find(|x| x.title.contains("hgabms")).unwrap();
+    assert!(pipe.reason.as_deref().unwrap().contains("launches cmd"));
     // The bundled Sigma rule on 7045 fires too.
     assert!(by(&f, SIGMA)
         .iter()
@@ -148,12 +157,20 @@ fn metasploit_psexec_native() {
 #[test]
 fn metasploit_psexec_powershell() {
     let (_, f) = run("metasploit-psexec-powershell-target-system.evtx");
-    let ps = fired(&f, EVENTLOG, Severity::High, "T1543.003");
-    assert_eq!(ps.len(), 2, "{}", titles(&f));
-    assert!(ps
+    // One finding per service: heur_lateral's, with T1543.003 merged in. The
+    // PowerShell stager's heur_eventlog finding is skipped (the High Sigma rule below
+    // already says it); the pipe service's is absorbed into heur_lateral's.
+    let remote = fired(&f, LATERAL, Severity::High, "T1569.002");
+    assert_eq!(remote.len(), 2, "{}", titles(&f));
+    assert!(remote.iter().all(|x| has_technique(x, "T1543.003")));
+    assert!(!f
         .iter()
-        .any(|x| x.reason.as_deref().unwrap().contains("launches powershell")));
-    assert_eq!(fired(&f, LATERAL, Severity::High, "T1569.002").len(), 2);
+        .any(|x| x.analyzer == EVENTLOG && x.event_id == Some(7045)));
+    assert!(remote.iter().any(|x| x
+        .reason
+        .as_deref()
+        .unwrap()
+        .contains("Suspicious Service Installation")));
     assert!(fired(&f, SIGMA, Severity::High, "t1543.003")
         .iter()
         .any(|x| x.title == "Suspicious Service Installation"));
