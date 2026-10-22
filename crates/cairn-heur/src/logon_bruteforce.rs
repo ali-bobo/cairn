@@ -5,7 +5,7 @@ use cairn_core::record::{EventRecord, Record};
 use cairn_core::traits::Analyzer;
 use cairn_core::{Finding, Result};
 use chrono::{DateTime, Duration, Utc};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn extract_str(data: &serde_json::Map<String, serde_json::Value>, key: &str) -> String {
     data.get(key)
@@ -63,11 +63,42 @@ struct LogonAttempt {
 fn normalize_source(raw: &str) -> Option<String> {
     let t = raw.trim();
     let t = t.strip_prefix("::ffff:").unwrap_or(t);
-    let lower = t.to_ascii_lowercase();
-    if matches!(lower.as_str(), "" | "-" | "127.0.0.1" | "::1" | "localhost") {
+    if t.is_empty() || t == "-" || is_loopback(t) {
         return None;
     }
     Some(t.to_string())
+}
+
+/// 127.0.0.0/8, `::1` or `localhost`, in any case.
+fn is_loopback(addr: &str) -> bool {
+    let a = addr.trim();
+    let a = a.strip_prefix("::ffff:").unwrap_or(a);
+    a.eq_ignore_ascii_case("localhost")
+        || a.parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The attempt's origin. IpAddress when it is a remote address. When IpAddress is
+/// loopback the attempt was made on this host: it counts only if WorkstationName names
+/// another machine (RDP through a local tunnel), never when it is this host itself (a
+/// user mistyping at the lock screen). Without an IpAddress, the workstation name.
+fn attempt_source(
+    d: &serde_json::Map<String, serde_json::Value>,
+    computer: &str,
+) -> Option<String> {
+    let ip = extract_str(d, "IpAddress");
+    if let Some(src) = normalize_source(&ip) {
+        return Some(src);
+    }
+    let ws = normalize_source(&extract_str(d, "WorkstationName"))
+        .or_else(|| normalize_source(&extract_str(d, "Workstation")))?;
+    if is_loopback(&ip) {
+        let host = computer.split('.').next().unwrap_or(computer);
+        if ws.eq_ignore_ascii_case(host) {
+            return None;
+        }
+    }
+    Some(ws)
 }
 
 /// Window Manager / font driver session accounts Windows logs on by itself.
@@ -124,9 +155,7 @@ fn parse_logon_attempt(ev: &EventRecord) -> Option<LogonAttempt> {
     if target_user == "-" || is_system_session_account(&target_user) {
         return None;
     }
-    let source = normalize_source(&extract_str(d, "IpAddress"))
-        .or_else(|| normalize_source(&extract_str(d, "WorkstationName")))
-        .or_else(|| normalize_source(&extract_str(d, "Workstation")))?;
+    let source = attempt_source(d, &ev.computer)?;
     Some(LogonAttempt {
         ts: ev.ts,
         target_user,
@@ -159,8 +188,9 @@ fn evidence_label(a: &LogonAttempt) -> &'static str {
     }
 }
 
-/// Bruteforce group key: (TargetUserName, source). Groups repeated failures against
-/// the same account from the same origin.
+/// Bruteforce group key: (TargetUserName, source), both lowercased. Windows account
+/// and host names are case-insensitive, so `Admin` / `ADMIN` / `admin` are one account
+/// and must not split a guessing run into groups each below the threshold.
 type BruteforceKey = (String, String);
 
 /// Spraying group key: source only. Groups distinct-account attempts from one origin.
@@ -168,21 +198,27 @@ type SprayingKey = String;
 
 fn group_by_bruteforce_key(
     attempts: &[LogonAttempt],
-) -> HashMap<BruteforceKey, Vec<&LogonAttempt>> {
-    let mut groups: HashMap<BruteforceKey, Vec<&LogonAttempt>> = HashMap::new();
+) -> BTreeMap<BruteforceKey, Vec<&LogonAttempt>> {
+    let mut groups: BTreeMap<BruteforceKey, Vec<&LogonAttempt>> = BTreeMap::new();
     for a in attempts {
         groups
-            .entry((a.target_user.clone(), a.source.clone()))
+            .entry((
+                a.target_user.to_ascii_lowercase(),
+                a.source.to_ascii_lowercase(),
+            ))
             .or_default()
             .push(a);
     }
     groups
 }
 
-fn group_by_spraying_key(attempts: &[LogonAttempt]) -> HashMap<SprayingKey, Vec<&LogonAttempt>> {
-    let mut groups: HashMap<SprayingKey, Vec<&LogonAttempt>> = HashMap::new();
+fn group_by_spraying_key(attempts: &[LogonAttempt]) -> BTreeMap<SprayingKey, Vec<&LogonAttempt>> {
+    let mut groups: BTreeMap<SprayingKey, Vec<&LogonAttempt>> = BTreeMap::new();
     for a in attempts {
-        groups.entry(a.source.clone()).or_default().push(a);
+        groups
+            .entry(a.source.to_ascii_lowercase())
+            .or_default()
+            .push(a);
     }
     groups
 }
@@ -236,7 +272,10 @@ impl LogonBruteforceHeuristic {
     fn analyze_bruteforce(&self, attempts: &[LogonAttempt]) -> Vec<Finding> {
         let mut findings = Vec::new();
         let groups = group_by_bruteforce_key(attempts);
-        for ((target_user, source), group) in groups {
+        for group in groups.into_values() {
+            // Shown as first logged; the group key is the lowercased form.
+            let target_user = group[0].target_user.clone();
+            let source = group[0].source.clone();
             let (max_failures, has_success) = window_stats(&group, self.bruteforce_window);
             if max_failures < self.bruteforce_threshold {
                 continue;
@@ -291,7 +330,8 @@ impl LogonBruteforceHeuristic {
     fn analyze_spraying(&self, attempts: &[LogonAttempt]) -> Vec<Finding> {
         let mut findings = Vec::new();
         let groups = group_by_spraying_key(attempts);
-        for (source, group) in groups {
+        for group in groups.into_values() {
+            let source = group[0].source.clone();
             // Distinct-account counting within the spraying window: anchor on every
             // failure and find the window with the most distinct TargetUserName values
             // among FAILURES (successes are not guesses; they only decide severity).
@@ -305,8 +345,10 @@ impl LogonBruteforceHeuristic {
                     .filter(|a| !a.success && a.ts >= anchor.ts && a.ts <= window_end)
                     .copied()
                     .collect();
-                let distinct_users: std::collections::HashSet<&str> =
-                    in_window.iter().map(|a| a.target_user.as_str()).collect();
+                let distinct_users: BTreeSet<String> = in_window
+                    .iter()
+                    .map(|a| a.target_user.to_ascii_lowercase())
+                    .collect();
                 let count = distinct_users.len() as u32;
                 if count > max_distinct {
                     max_distinct = count;
@@ -704,6 +746,112 @@ mod tests {
                 event_with(eid, base + Duration::seconds(i * 10), &f)
             })
             .collect()
+    }
+
+    #[test]
+    fn case_variants_are_one_account_and_one_source() {
+        let base = Utc::now();
+        let users = ["Admin", "ADMIN", "admin", "aDmin", "AdMiN"];
+        let records: Vec<Record> = users
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                let host = if i % 2 == 0 { "EVIL-PC" } else { "evil-pc" };
+                event_with(
+                    4625,
+                    base + Duration::seconds(i as i64 * 10),
+                    &[
+                        ("TargetUserName", u),
+                        ("IpAddress", "-"),
+                        ("WorkstationName", host),
+                        ("LogonType", "3"),
+                    ],
+                )
+            })
+            .collect();
+        let f = heuristic().analyze(&records, &[]).unwrap();
+        assert_eq!(f.len(), 1, "{f:?}");
+        assert_eq!(f[0].mitre, vec!["T1110.001"]);
+        // Ten case variants of one name are not ten sprayed accounts.
+        let records: Vec<Record> = (0..10)
+            .map(|i| {
+                let name: String = "administra"
+                    .chars()
+                    .enumerate()
+                    .map(|(j, c)| if j == i { c.to_ascii_uppercase() } else { c })
+                    .collect();
+                make_logon_event(4625, base + Duration::seconds(i as i64), &name, "10.0.0.5")
+            })
+            .collect();
+        let f = heuristic().analyze(&records, &[]).unwrap();
+        assert!(f.iter().all(|f| f.mitre != vec!["T1110.003"]), "{f:?}");
+    }
+
+    #[test]
+    fn findings_are_in_a_stable_order() {
+        let base = Utc::now();
+        let mut records = Vec::new();
+        for (n, ip) in ["10.0.0.9", "10.0.0.1", "10.0.0.5", "10.0.0.3"]
+            .iter()
+            .enumerate()
+        {
+            for i in 0..5 {
+                records.push(make_logon_event(
+                    4625,
+                    base + Duration::seconds((n * 100 + i) as i64),
+                    "alice",
+                    ip,
+                ));
+            }
+        }
+        let titles: Vec<String> = heuristic()
+            .analyze(&records, &[])
+            .unwrap()
+            .into_iter()
+            .map(|f| f.title)
+            .collect();
+        let mut sorted = titles.clone();
+        sorted.sort();
+        assert_eq!(titles, sorted);
+    }
+
+    #[test]
+    fn local_lock_screen_typos_are_not_bruteforce_but_a_tunnel_is() {
+        let typos = five(
+            4625,
+            &[
+                ("IpAddress", "127.0.0.1"),
+                ("WorkstationName", "TEST-PC"),
+                ("LogonType", "7"),
+            ],
+        );
+        // five() already sets IpAddress 10.0.0.5; rebuild without it.
+        let typos: Vec<Record> = typos
+            .into_iter()
+            .map(|r| match r {
+                Record::Event(mut e) => {
+                    e.data
+                        .insert("IpAddress".into(), Value::String("127.0.0.1".into()));
+                    Record::Event(e)
+                }
+                r => r,
+            })
+            .collect();
+        assert!(heuristic().analyze(&typos, &[]).unwrap().is_empty());
+        let tunnel: Vec<Record> = typos
+            .into_iter()
+            .map(|r| match r {
+                Record::Event(mut e) => {
+                    e.data
+                        .insert("WorkstationName".into(), Value::String("KALI".into()));
+                    e.data
+                        .insert("LogonType".into(), Value::String("10".into()));
+                    Record::Event(e)
+                }
+                r => r,
+            })
+            .collect();
+        assert_eq!(heuristic().analyze(&tunnel, &[]).unwrap().len(), 1);
     }
 
     #[test]
