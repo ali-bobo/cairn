@@ -44,9 +44,11 @@ pub(crate) struct CommandLine<'a> {
 }
 
 impl CommandLine<'_> {
-    /// Lowercase command line with runs of whitespace collapsed to one space.
+    /// Lowercase command line with cmd/PowerShell escape and quote characters removed
+    /// ([`crate::trust::deobfuscated`]: `v^s^s^a^d^m^i^n`, ``vss`admin``, `"vssadmin"`)
+    /// and runs of whitespace collapsed to one space.
     pub fn normalized(&self) -> String {
-        self.cmd
+        crate::trust::deobfuscated(&self.cmd)
             .to_ascii_lowercase()
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -119,6 +121,18 @@ pub(crate) fn command_lines(records: &[Record]) -> Vec<CommandLine<'_>> {
             _ => {}
         }
     }
+    // A process that is still running also has its 4688 creation event: keep the live
+    // record and drop the event copy, so one execution is not reported twice.
+    let live: std::collections::BTreeSet<(u32, String)> = out
+        .iter()
+        .filter(|c| c.event.is_none())
+        .filter_map(|c| Some((c.pid?, c.normalized())))
+        .collect();
+    out.retain(|c| {
+        c.event.is_none()
+            || c.pid
+                .is_none_or(|pid| !live.contains(&(pid, c.normalized())))
+    });
     out
 }
 
@@ -173,5 +187,66 @@ mod tests {
         assert_eq!(cl[0].normalized(), "cmd.exe /c echo hi");
         assert_eq!(cl[1].pid, Some(500));
         assert_eq!(program(&cl[1]), "vssadmin");
+    }
+
+    fn ev4688(pid: &str, cmd: &str) -> Record {
+        let Value::Object(data) = json!({
+            "CommandLine": cmd,
+            "NewProcessName": r"C:\Windows\System32\cmd.exe",
+            "NewProcessId": pid,
+        }) else {
+            unreachable!()
+        };
+        Record::Event(EventRecord {
+            ts: Utc::now(),
+            channel: "Security".into(),
+            event_id: 4688,
+            provider: String::new(),
+            computer: String::new(),
+            record_id: 9,
+            data,
+        })
+    }
+
+    fn live(pid: u32, cmd: &str) -> Record {
+        Record::Process(ProcessRecord {
+            pid,
+            ppid: 4,
+            image: r"C:\Windows\System32\cmd.exe".into(),
+            cmdline: cmd.into(),
+            signed: None,
+            signer: None,
+            binary_sha256: None,
+            integrity: None,
+            user: None,
+            start_time: None,
+            signer_source: None,
+        })
+    }
+
+    #[test]
+    fn normalized_removes_caret_and_quote_obfuscation() {
+        let records = [live(1, r#"c^m^d /c "v^ssad""min" delete  shadows /all"#)];
+        let cl = command_lines(&records);
+        assert_eq!(cl[0].normalized(), "cmd /c vssadmin delete shadows /all");
+    }
+
+    #[test]
+    fn a_running_process_and_its_4688_event_are_one_command_line() {
+        // The event comes first in record order; the live copy is still the one kept.
+        let records = [
+            ev4688("0x1f4", "cmd.exe /c whoami"),
+            live(500, "cmd.exe  /c whoami"),
+            // Same pid, different command (pid reused): both kept.
+            ev4688("0x1f4", "cmd.exe /c ipconfig"),
+            // Same command, different pid: both kept.
+            ev4688("0x1f5", "cmd.exe /c whoami"),
+        ];
+        let cl = command_lines(&records);
+        assert_eq!(cl.len(), 3, "{cl:?}");
+        assert!(cl.iter().any(|c| c.event.is_none() && c.pid == Some(500)));
+        assert!(!cl
+            .iter()
+            .any(|c| c.event.is_some() && c.pid == Some(500) && c.cmd.contains("whoami")));
     }
 }
